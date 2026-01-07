@@ -1,0 +1,6 @@
+role,priority,market,dow,thr_min,oos_n,oos_meanROI,oos_p_one,rule
+core,1,FT,Seg,0.20,48,0.294167,0.0185774,aplicar em ordem de prioridade; primeira regra que bater
+core,1,FT,Sex,0.20,189,0.103815,0.062767,aplicar em ordem de prioridade; primeira regra que bater
+sat,1,FH,Sáb,0.30,146,0.178493,0.00564177,aplicar em ordem de prioridade; primeira regra que bater
+sat,1,FH,Ter,0.60,38,0.389132,0.00122699,aplicar em ordem de prioridade; primeira regra que bater
+core,2,FT,Ter,0.50,166,0.331889,2.54952e-06,aplicar em ordem de prioridade; primeira regra que bater
