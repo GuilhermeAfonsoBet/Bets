@@ -1,0 +1,101 @@
+{
+  "bankroll": 2300.0,
+  "max_frac_per_bet": 0.07,
+  "train_period": {
+    "start": "2025-10-01",
+    "end": "2025-12-31"
+  },
+  "definition": {
+    "type_filter": "FT (exclude first half)",
+    "score": "proba_raw (operational, clipped)"
+  },
+  "constraints": {
+    "cap2_mean_week_gt_0": true,
+    "cap2_pneg_week_le": 0.35,
+    "cap2_var05_52w_gt_0": true,
+    "cap2_dd_p95_52w_le_bankroll_frac": 0.6,
+    "wf_cap2_mean_gt_0": true,
+    "wf_cap2_p05_ge": -322.00000000000006,
+    "cap1_mean_not_too_negative": "cap1_mean >= -0.10 * cap2_mean",
+    "cap1_dd_p95_le": 3450.0
+  },
+  "portfolio": {
+    "segunda-feira": {
+      "type": "FT",
+      "score_col": "proba_raw_segunda",
+      "cutoff": 0.19,
+      "stake_frac": 0.07
+    },
+    "terça-feira": {
+      "type": "FT",
+      "score_col": "proba_raw_terca",
+      "cutoff": 0.14,
+      "stake_frac": 0.05
+    },
+    "quarta-feira": {
+      "type": "FT",
+      "score_col": "proba_raw_quarta",
+      "cutoff": 0.06,
+      "stake_frac": 0.03
+    },
+    "quinta-feira": {
+      "type": "FT",
+      "score_col": "proba_raw_segqui",
+      "cutoff": 1.0,
+      "stake_frac": 0.0
+    }
+  },
+  "per_leg_stability": {
+    "segunda-feira": {
+      "status": "ok",
+      "cap2_mean_week": 347.78571428571433,
+      "cap2_std_week": 469.86449414394247,
+      "cap2_pneg_week": 0.07142857142857142,
+      "cap2_var05_52w": 12852.950000000003,
+      "cap2_cvar05_52w": 11676.9244,
+      "cap2_dd_p95_52w": 276.0,
+      "cap1_mean_week": 258.92857142857144,
+      "cap1_pneg_week": 0.07142857142857142,
+      "cap1_dd_p95_52w": 992.5,
+      "wf_cap2_mean": 465.7142857142857,
+      "wf_cap2_pneg": 0.0,
+      "wf_cap2_p05": 164.60000000000002,
+      "obj": 227.55959074972873
+    },
+    "terça-feira": {
+      "status": "ok",
+      "cap2_mean_week": 360.60714285714283,
+      "cap2_std_week": 568.1178161455404,
+      "cap2_pneg_week": 0.14285714285714285,
+      "cap2_var05_52w": 12471.975,
+      "cap2_cvar05_52w": 11007.4076,
+      "cap2_dd_p95_52w": 1133.5499999999993,
+      "cap1_mean_week": 267.25,
+      "cap1_pneg_week": 0.14285714285714285,
+      "cap1_dd_p95_52w": 1257.1499999999978,
+      "wf_cap2_mean": 341.0,
+      "wf_cap2_pneg": 0.3333333333333333,
+      "wf_cap2_p05": -242.8,
+      "obj": 207.24218882075775
+    },
+    "quarta-feira": {
+      "status": "ok",
+      "cap2_mean_week": 202.42857142857142,
+      "cap2_std_week": 281.818739969155,
+      "cap2_pneg_week": 0.14285714285714285,
+      "cap2_var05_52w": 7330.975,
+      "cap2_cvar05_52w": 6531.2696,
+      "cap2_dd_p95_52w": 856.0499999999993,
+      "cap1_mean_week": 84.07142857142857,
+      "cap1_pneg_week": 0.21428571428571427,
+      "cap1_dd_p95_52w": 1780.0,
+      "wf_cap2_mean": 120.38888888888889,
+      "wf_cap2_pneg": 0.2222222222222222,
+      "wf_cap2_p05": -260.0,
+      "obj": 123.41338643628268
+    },
+    "quinta-feira": {
+      "status": "no_candidate"
+    }
+  }
+}
