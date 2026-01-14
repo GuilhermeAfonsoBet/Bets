@@ -26,14 +26,14 @@
       "stake_frac": 0.07
     },
     "quinta-feira": {
-      "score_col": "proba_raw_quarta",
-      "cutoff": 0.11,
+      "score_col": "proba_raw_segqui",
+      "cutoff": 0.05,
       "stake_frac": 0.07
     }
   },
   "train_metrics": {
-    "mean_monthly_profit": 26893.695000000003,
-    "std_monthly_profit": 6153.641863658871,
+    "mean_monthly_profit": 26303.361666666668,
+    "std_monthly_profit": 6210.671311702815,
     "p_monthly_negative": 0.0,
     "n_months": 3
   },

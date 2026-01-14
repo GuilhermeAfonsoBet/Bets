@@ -150,7 +150,7 @@ def dedup_by_id_aposta(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features_weekday_models(df: pd.DataFrame) -> pd.DataFrame:
     """
     Constrói as colunas esperadas pelos modelos `model_logit_{segunda,terca,quarta}.joblib`
     (nomes *exatos*).
@@ -168,6 +168,36 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     missing = [src for src in required_map.values() if src not in df.columns]
     if missing:
         raise ValueError(f"Faltam colunas para scoring: {missing}")
+
+    out = pd.DataFrame(index=df.index)
+    for dst, src in required_map.items():
+        out[dst] = df[src]
+
+    # Dia/turno em UTC a partir de BIA_ApostaUTC
+    dt = pd.to_datetime(df["BIA_ApostaUTC"], errors="coerce")
+    out["Dia Semana Aposta (UTC)"] = dt.dt.weekday.map(lambda x: WEEKDAY_PT[int(x)] if pd.notna(x) else None)
+    out["Turno Aposta (UTC)"] = dt.apply(lambda x: infer_turno_utc(x) if pd.notna(x) else None)
+
+    return out
+
+
+def build_features_segqui(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Constrói as colunas esperadas por `model_logit_SegQui.joblib` (nomes *exatos*).
+    """
+    required_map = {
+        "Número de casas disponíveis no momento da aposta": "ApostaLive.Número de casas disponíveis no momento da aposta",
+        "Dif % maior odd e segunda maior": "ApostaLive.Dif % maior odd e segunda maior",
+        "Dif % maior odd e odd mediana": "ApostaLive.Dif % maior odd e odd mediana",
+        "Dif Odds RB & BIA": "Dif Odds RB & BIA",
+        "MinutesToMatchStart": "RebelBetting.MinutesToMatchStart",
+        "TempoApostas.Tempo total bot": "TempoApostas.Tempo total bot",
+        "Subtipo da Aposta": "Subtipo da Aposta",
+        "Casa aposta vencedora": "ApostaLive.Casa aposta vencedora",
+    }
+    missing = [src for src in required_map.values() if src not in df.columns]
+    if missing:
+        raise ValueError(f"Faltam colunas para scoring SegQui: {missing}")
 
     out = pd.DataFrame(index=df.index)
     for dst, src in required_map.items():
@@ -207,13 +237,15 @@ class Models:
     segunda: object
     terca: object
     quarta: object
+    segqui: object
 
 
 def load_models() -> Models:
     m_seg = patch_sklearn_compat(joblib.load("/workspace/model_logit_segunda.joblib"))
     m_ter = patch_sklearn_compat(joblib.load("/workspace/model_logit_terca.joblib"))
     m_qua = patch_sklearn_compat(joblib.load("/workspace/model_logit_quarta.joblib"))
-    return Models(segunda=m_seg, terca=m_ter, quarta=m_qua)
+    m_segqui = patch_sklearn_compat(joblib.load("/workspace/model_logit_SegQui.joblib"))
+    return Models(segunda=m_seg, terca=m_ter, quarta=m_qua, segqui=m_segqui)
 
 
 def clip_proba(p: np.ndarray, floor: float) -> np.ndarray:
@@ -260,6 +292,14 @@ def score_proba_raw(df_feat: pd.DataFrame, models: Models, calib_floor: float) -
     proba_oper[dow == "quarta-feira"] = p_qua[dow == "quarta-feira"]
     out["proba_raw_operacional"] = proba_oper
     return out
+
+
+def score_proba_raw_segqui(df_feat_segqui: pd.DataFrame, models: Models, calib_floor: float) -> pd.Series:
+    """
+    Score do modelo SegQui (Seg..Qui), no formato operacional (predict_proba com clip).
+    """
+    p = clip_proba(models.segqui.predict_proba(df_feat_segqui)[:, 1], calib_floor)
+    return pd.Series(p, index=df_feat_segqui.index, name="proba_raw_segqui")
 
 
 # ---------------------------------------------------------------------
@@ -452,11 +492,21 @@ def main() -> int:
     df["house_cap"] = df.apply(stake_cap_from_house, axis=1)
 
     # features + scoring
-    feat = build_features(df)
+    feat_week = build_features_weekday_models(df)
+    feat_segqui = build_features_segqui(df)
     models = load_models()
-    scored = score_proba_raw(feat, models, CALIB_FLOOR_DEFAULT)
+    scored_week = score_proba_raw(feat_week, models, CALIB_FLOOR_DEFAULT)
+    scored_segqui = score_proba_raw_segqui(feat_segqui, models, CALIB_FLOOR_DEFAULT)
 
-    df_scored = pd.concat([df.reset_index(drop=True), feat.reset_index(drop=True), scored.reset_index(drop=True)], axis=1)
+    df_scored = pd.concat(
+        [
+            df.reset_index(drop=True),
+            feat_week.reset_index(drop=True),
+            scored_week.reset_index(drop=True),
+            scored_segqui.reset_index(drop=True),
+        ],
+        axis=1,
+    )
 
     # splits
     train_start = pd.Timestamp(TRAIN_START_DEFAULT)
@@ -471,14 +521,14 @@ def main() -> int:
 
     # otimização por dia
     results: Dict[str, OptResult] = {}
-    # seg/ter/qua usam seu próprio score; qui testamos 3 colunas
+    # seg/ter/qua usam seu próprio score; qui usa SegQui
     results["segunda-feira"] = optimize_day(df_train, "segunda-feira", ["proba_raw_segunda"], BANKROLL_DEFAULT, MAX_FRAC_DEFAULT)
     results["terça-feira"] = optimize_day(df_train, "terça-feira", ["proba_raw_terca"], BANKROLL_DEFAULT, MAX_FRAC_DEFAULT)
     results["quarta-feira"] = optimize_day(df_train, "quarta-feira", ["proba_raw_quarta"], BANKROLL_DEFAULT, MAX_FRAC_DEFAULT)
     results["quinta-feira"] = optimize_day(
         df_train,
         "quinta-feira",
-        ["proba_raw_segunda", "proba_raw_terca", "proba_raw_quarta"],
+        ["proba_raw_segqui"],
         BANKROLL_DEFAULT,
         MAX_FRAC_DEFAULT,
     )
@@ -529,9 +579,8 @@ def main() -> int:
     lines.append(f"- **P(mês < 0)**: {test_metrics['p_monthly_negative']*100:.1f}% (n={test_metrics['n_months']})\n")
     lines.append("\n### Nota operacional (quinta-feira)\n")
     lines.append(
-        "- O seu `score_logit_weekdays_cli.py` **não tem modelo de quinta**. Aqui eu avaliei quinta aplicando os modelos de seg/ter/qua e escolhendo o melhor no treino. "
-        "Para operar quinta **sem mexer no Python**, a forma mais simples é o PAD preencher `Dia Semana Aposta (UTC)` como o dia-modelo escolhido (ex.: `quarta-feira`) nas quintas, "
-        "ou então você passa a usar um CLI que tenha `model_logit_qui.joblib`/`model_logit_SegQui.joblib`.\n"
+        "- Para quinta-feira, este portfólio usa o modelo **`model_logit_SegQui.joblib`** (score `proba_raw_segqui`). "
+        "Isso permite operar quinta sem precisar \"fingir\" que é quarta no payload.\n"
     )
 
     (out_dir / "summary_proba_raw.md").write_text("".join(lines), encoding="utf-8")
