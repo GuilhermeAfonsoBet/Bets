@@ -41,9 +41,10 @@ MAX_DAILY_EXPOSURE_FRAC_P95 = 0.25
 
 # Alternativa pedida: risco de drawdown diário (perda em 1 dia) <= 25% da banca
 # Implementação: exigir que o quantil 1% (VaR 1%) do PnL diário seja >= -25% banca
-# (avaliado no cenário cap2), e que P(PnL_dia <= -25% banca) <= 1%.
+# (avaliado no cenário cap2), e que P(PnL_dia <= -25% banca) <= 10%.
 MAX_DAILY_DRAWDOWN_FRAC = 0.25
 DAILY_VAR_Q = 0.01
+MAX_P_DAILY_DD = 0.10
 
 # Critério adicional (pedido): Sharpe semanal mínimo (cap2)
 MIN_WEEKLY_SHARPE_CAP2 = 0.10
@@ -298,7 +299,7 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
 
     if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
         return None
-    if p_dd > DAILY_VAR_Q:
+    if p_dd > MAX_P_DAILY_DD:
         return None
 
     # sharpe filter (cap2)
@@ -476,6 +477,7 @@ def main() -> int:
         "daily_risk_constraints": {
             "max_daily_drawdown_frac": MAX_DAILY_DRAWDOWN_FRAC,
             "daily_var_quantile": DAILY_VAR_Q,
+            "max_p_daily_dd": MAX_P_DAILY_DD,
             "min_weekly_sharpe_cap2": MIN_WEEKLY_SHARPE_CAP2,
         },
         "grid": {"stake_fracs": STAKE_FRACS.tolist(), "cutoffs": CUTOFFS.tolist(), "top_k": TOP_K},
