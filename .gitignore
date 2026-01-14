@@ -1,2 +1,6 @@
-analysis_proba_raw/
+analysis_proba_raw/**
+!analysis_proba_raw/pro_portfolio_all/
+!analysis_proba_raw/pro_portfolio_all/**
+
+# artefato grande gerado localmente
 scored_dedup_proba_raw_all.csv
