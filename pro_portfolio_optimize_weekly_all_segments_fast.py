@@ -48,6 +48,8 @@ TOP_K = 8
 N_BOOT = 8_000
 N_BOOT_DD = 3_000
 SEED = 7
+N_SCORE_BINS = 5
+MIN_POS_BINS_CAP2 = 4
 
 WEEKDAY_PT = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
 
@@ -170,6 +172,9 @@ class CandFinal:
     wf_mean: float
     wf_pneg: float
     wf_p05: float
+    # score-bin stability (cap2)
+    n_bins: int
+    pos_bins: int
     obj: float
 
 
@@ -281,6 +286,48 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
     if wf_p05 < -0.5 * BANKROLL * MAX_FRAC * 4:
         return None
 
+    # -----------------------------------------
+    # Filtro de estabilidade por bins de score
+    # -----------------------------------------
+    score_sel = score[m]
+    profit_sel_cap2 = stake_eff[m] * roi2[m]
+    if score_sel.size == 0:
+        return None
+
+    # bins por quantis dentro do conjunto selecionado
+    edges = np.unique(np.quantile(score_sel, np.linspace(0.0, 1.0, N_SCORE_BINS + 1)))
+    # se não tem spread suficiente, vira 1 bin
+    if edges.size < 3:
+        n_bins = 1
+        pos_bins = 1 if float(np.mean(profit_sel_cap2)) > 0 else 0
+    else:
+        bins = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            if b == edges[-1]:
+                sel = (score_sel >= a) & (score_sel <= b)
+            else:
+                sel = (score_sel >= a) & (score_sel < b)
+            if not np.any(sel):
+                continue
+            bins.append(sel)
+        n_bins = len(bins)
+        pos_bins = sum(1 for sel in bins if float(np.mean(profit_sel_cap2[sel])) > 0)
+
+    # regra: exigir >=4/5 quando temos 5 bins; relaxa proporcionalmente se n_bins<5
+    if n_bins >= N_SCORE_BINS:
+        if pos_bins < MIN_POS_BINS_CAP2:
+            return None
+    elif n_bins == 4:
+        if pos_bins < 3:
+            return None
+    elif n_bins == 3:
+        if pos_bins < 2:
+            return None
+    else:
+        # 1-2 bins: exigir todos positivos
+        if pos_bins < n_bins:
+            return None
+
     # objective final
     obj = cap2_mean - 0.25 * cap2_std - 0.01 * dd2 - 0.001 * p95_exp
     return CandFinal(
@@ -300,6 +347,8 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
         wf_mean=wf_mean,
         wf_pneg=wf_pneg,
         wf_p05=wf_p05,
+        n_bins=int(n_bins),
+        pos_bins=int(pos_bins),
         obj=obj,
     )
 
@@ -353,6 +402,7 @@ def optimize_segment(df: pd.DataFrame, dow: str, bet_type: str) -> Tuple[Dict, D
         "wf_mean": best.wf_mean,
         "wf_pneg": best.wf_pneg,
         "wf_p05": best.wf_p05,
+        "score_bins_cap2": {"pos": best.pos_bins, "n": best.n_bins},
         "obj": best.obj,
     }
     return rule, rep
