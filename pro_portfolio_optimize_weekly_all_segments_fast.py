@@ -36,14 +36,15 @@ TRAIN_END = pd.Timestamp("2025-12-31 23:59:59")
 BANKROLL = 2300.0
 MAX_FRAC = 0.07
 
-# Mesa: p95 da exposição diária (stake somado) <= 25% da banca
+# A exposição diária ainda é calculada e reportada, mas não é mais um \"hard constraint\"
+# (pois o usuário prefere controlar por risco de drawdown diário).
 MAX_DAILY_EXPOSURE_FRAC_P95 = 0.25
 
 # Alternativa pedida: risco de drawdown diário (perda em 1 dia) <= 25% da banca
-# Implementação: exigir que o quantil 1% (VaR 1%) do PnL diário seja >= -25% banca
-# (avaliado no cenário cap2), e que P(PnL_dia <= -25% banca) <= 10%.
+# Implementação alinhada ao pedido: exigir que P(PnL_dia <= -25% banca) <= 10%.
+# Isso equivale a exigir que o quantil 10% (VaR 10%) do PnL diário seja >= -25% banca.
 MAX_DAILY_DRAWDOWN_FRAC = 0.25
-DAILY_VAR_Q = 0.01
+DAILY_VAR_Q = 0.10
 MAX_P_DAILY_DD = 0.10
 
 # Critério adicional (pedido): Sharpe semanal mínimo (cap2)
@@ -234,9 +235,6 @@ def stage1_candidates(df: pd.DataFrame, score_col: str) -> List[Cand1]:
             if stake_day.size == 0:
                 continue
             p95_exp = float(np.quantile(stake_day, 0.95))
-            if p95_exp > MAX_DAILY_EXPOSURE_FRAC_P95 * BANKROLL:
-                continue
-
             # objective (barato): mean - 0.25 std - penalty exposure
             obj = mean - 0.25 * std - 0.001 * p95_exp
             out.append(Cand1(cutoff=float(c), stake_frac=float(f), mean_w=mean, std_w=std, pneg_w=pneg, cap1_mean_w=mean1, p95_daily_exposure=p95_exp, obj=obj))
@@ -281,14 +279,14 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
     if dd1 > 1.5 * BANKROLL:
         return None
 
-    # daily exposure and bet counts (mantido como métrica, mas não como constraint principal)
+    # daily exposure and bet counts (métrica)
     stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_exp = float(np.quantile(stake_day, 0.95)) if stake_day.size else 0.0
     cnt_day = pd.Series(np.ones_like(stake_eff[m], dtype=int), index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_bets = float(np.quantile(cnt_day, 0.95)) if cnt_day.size else 0.0
 
     # daily drawdown risk constraint (cap2)
-    # PnL diário em cap2: soma de stake_eff*roi2 por dia, apenas em dias com apostas selecionadas
+    # PnL diário em cap2: soma de stake_eff*roi2 por dia (dias com apostas selecionadas)
     pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     if pnl_day.size > 0:
         daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
