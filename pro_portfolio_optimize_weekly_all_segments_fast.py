@@ -40,6 +40,10 @@ MAX_FRAC = 0.07
 # (pois o usuário prefere controlar por risco de drawdown diário).
 MAX_DAILY_EXPOSURE_FRAC_P95 = 0.25
 
+# Novo pedido: controlar exposição diária via percentil 80 do somatório de stakes no dia
+DAILY_EXPOSURE_Q = 0.80
+MAX_DAILY_EXPOSURE_FRAC_Q = 0.70
+
 # Alternativa pedida: risco de drawdown diário (perda em 1 dia) <= 25% da banca
 # Implementação alinhada ao pedido: exigir que P(PnL_dia <= -25% banca) <= 10%.
 # Isso equivale a exigir que o quantil 10% (VaR 10%) do PnL diário seja >= -25% banca.
@@ -180,6 +184,8 @@ class CandFinal:
     cap1_dd_p95_52w: float
     p95_daily_exposure: float
     p95_daily_bets: float
+    p80_daily_exposure: float
+    p80_daily_bets: float
     # daily drawdown risk (cap2)
     daily_var_q: float
     p_daily_dd: float
@@ -243,9 +249,12 @@ def stage1_candidates(df: pd.DataFrame, score_col: str) -> List[Cand1]:
             if p_dd > MAX_P_DAILY_DD:
                 continue
 
-            # daily exposure p95 (stake somado) (métrica/penalidade)
+            # daily exposure constraint (p80 do somatório de stakes) <= 70% da banca
             stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
             if stake_day.size == 0:
+                continue
+            p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q))
+            if p80_exp > MAX_DAILY_EXPOSURE_FRAC_Q * BANKROLL:
                 continue
             p95_exp = float(np.quantile(stake_day, 0.95))
             # objective (barato): mean - 0.25 std - penalty exposure
@@ -295,8 +304,12 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
     # daily exposure and bet counts (métrica)
     stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_exp = float(np.quantile(stake_day, 0.95)) if stake_day.size else 0.0
+    p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q)) if stake_day.size else 0.0
+    if p80_exp > MAX_DAILY_EXPOSURE_FRAC_Q * BANKROLL:
+        return None
     cnt_day = pd.Series(np.ones_like(stake_eff[m], dtype=int), index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_bets = float(np.quantile(cnt_day, 0.95)) if cnt_day.size else 0.0
+    p80_bets = float(np.quantile(cnt_day, DAILY_EXPOSURE_Q)) if cnt_day.size else 0.0
 
     # daily drawdown risk constraint (cap2)
     # PnL diário em cap2: soma de stake_eff*roi2 por dia (dias com apostas selecionadas)
@@ -387,6 +400,8 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
         cap1_dd_p95_52w=dd1,
         p95_daily_exposure=p95_exp,
         p95_daily_bets=p95_bets,
+        p80_daily_exposure=p80_exp,
+        p80_daily_bets=p80_bets,
         daily_var_q=daily_var,
         p_daily_dd=p_dd,
         sharpe_week_cap2=sharpe_week,
@@ -445,6 +460,8 @@ def optimize_segment(df: pd.DataFrame, dow: str, bet_type: str) -> Tuple[Dict, D
         "cap1_dd_p95_52w": best.cap1_dd_p95_52w,
         "p95_daily_bets": best.p95_daily_bets,
         "p95_daily_exposure": best.p95_daily_exposure,
+        "p80_daily_bets": best.p80_daily_bets,
+        "p80_daily_exposure": best.p80_daily_exposure,
         "daily_var_q": best.daily_var_q,
         "p_daily_dd": best.p_daily_dd,
         "sharpe_week_cap2": best.sharpe_week_cap2,
@@ -486,6 +503,8 @@ def main() -> int:
         "max_frac_per_bet": MAX_FRAC,
         "train_period": {"start": str(TRAIN_START.date()), "end": str(TRAIN_END.date())},
         "daily_risk_constraints": {
+            "daily_exposure_quantile": DAILY_EXPOSURE_Q,
+            "max_daily_stake_sum_frac": MAX_DAILY_EXPOSURE_FRAC_Q,
             "max_daily_drawdown_frac": MAX_DAILY_DRAWDOWN_FRAC,
             "daily_var_quantile": DAILY_VAR_Q,
             "max_p_daily_dd": MAX_P_DAILY_DD,
@@ -503,8 +522,8 @@ def main() -> int:
     lines.append("## Portfólio mesa profissional — FT e FH (todos os dias)\n")
     lines.append(f"- Banca: USD {BANKROLL:,.0f}; max por aposta: {MAX_FRAC*100:.1f}%\n")
     lines.append(
-        f"- Exposição diária (métrica): reportamos p95 da exposição por dia (stake somado); não é hard-constraint. "
-        f"A restrição diária ativa é **P(PnL_dia <= -{MAX_DAILY_DRAWDOWN_FRAC*100:.0f}% banca) <= {MAX_P_DAILY_DD*100:.0f}%** (via VaR{int(DAILY_VAR_Q*100)}%).\n"
+        f"- Exposição diária (constraint): p{int(DAILY_EXPOSURE_Q*100)} do somatório de stakes no dia <= {MAX_DAILY_EXPOSURE_FRAC_Q*100:.0f}% da banca.\n"
+        f"- Risco diário (constraint): P(PnL_dia <= -{MAX_DAILY_DRAWDOWN_FRAC*100:.0f}% banca) <= {MAX_P_DAILY_DD*100:.0f}% (via VaR{int(DAILY_VAR_Q*100)}%).\n"
     )
 
     for bet_type in ("FT", "FH"):
@@ -517,7 +536,7 @@ def main() -> int:
             else:
                 lines.append(
                     f"- **{dow}**: `{r['score_col']}` ≥ **{r['cutoff']:.2f}**, stake **{r['stake_frac']*100:.1f}%** "
-                    f"(p95 exp dia ~USD {rep.get('p95_daily_exposure',0):.0f}; wf_mean {rep.get('wf_mean',0):.0f})\n"
+                    f"(p80 exp dia ~USD {rep.get('p80_daily_exposure',0):.0f}; wf_mean {rep.get('wf_mean',0):.0f})\n"
                 )
 
     (OUT_DIR / "report_pro_all.md").write_text("".join(lines), encoding="utf-8")
