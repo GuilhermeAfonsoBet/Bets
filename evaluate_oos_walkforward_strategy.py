@@ -63,6 +63,17 @@ ENABLE_SCORE_BIN_STABILITY = True
 MIN_GLOBAL_TRAIN_WEEKS = 10
 MIN_SEG_TRAIN_WEEKS = 6
 
+# Seleção Bayesiana (robusta) no treino de cada passo:
+# - posterior via Bayesian bootstrap sobre semanas (Dirichlet)
+# - objetivo conservador: maximizar p05 do lucro semanal médio (cap2),
+#   com penalidade de exposição diária (p95) para desempate
+# - requer "confiança": P(mean>0) >= MIN_POST_P_MEAN_POS
+BAYES_SELECT = True  # default; main() roda tanto bayes quanto clássico
+BAYES_N = 8_000
+MIN_POST_P_MEAN_POS = 0.75
+POST_Q_OBJ = 0.05  # p05 do mean semanal (posterior)
+EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -142,7 +153,7 @@ def score_bin_ok(score_sel: np.ndarray, profit_sel: np.ndarray) -> Tuple[int, in
     return int(n_bins), int(pos_bins), bool(ok)
 
 
-def optimize_segment_train(x: pd.DataFrame, score_col: str) -> Rule:
+def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) -> Rule:
     """
     x já vem filtrado para um único (dow, bet_type) e apenas semanas de treino.
     Retorna a melhor regra (ou stake_frac=0 com status).
@@ -228,7 +239,24 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str) -> Rule:
                 if not ok:
                     continue
 
-            obj = mean - 0.25 * std - 0.001 * p95_exp
+            # -----------------------------
+            # Objetivo no treino:
+            #   - clássico: mean - 0.25*std - penalty exposure
+            #   - bayesiano: maximiza p05 posterior do mean semanal (edge conservador)
+            # -----------------------------
+            if not bayes_select:
+                obj = mean - 0.25 * std - EXPOSURE_PENALTY * p95_exp
+            else:
+                # Bayesian bootstrap sobre semanas (não-paramétrico)
+                rng = np.random.default_rng(SEED + 123)
+                W = w2.astype(float)
+                weights = rng.dirichlet(np.ones(W.size), size=BAYES_N)
+                post_means = weights @ W
+                p_mean_pos = float(np.mean(post_means > 0))
+                if p_mean_pos < MIN_POST_P_MEAN_POS:
+                    continue
+                q_obj = float(np.quantile(post_means, POST_Q_OBJ))
+                obj = q_obj - EXPOSURE_PENALTY * p95_exp
             if obj > best_obj:
                 best_obj = obj
                 best = (float(c), float(f))
@@ -374,11 +402,12 @@ def main() -> int:
     if len(weeks) < (MIN_GLOBAL_TRAIN_WEEKS + 3):
         raise SystemExit(f"Poucas semanas no dataset: {len(weeks)}")
 
-    def run_walkforward(global_risk: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def run_walkforward(global_risk: bool, bayes_select: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         all_rules_rows = []
         weekly_rows = []
         weekly_seg_rows = []
         weekly_global_rows = []
+        daily_rows = []
 
         for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
             w_test = weeks[i]
@@ -396,7 +425,7 @@ def main() -> int:
                     if x.empty:
                         rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
                     else:
-                        rule = optimize_segment_train(x, sc)
+                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select)
                     rules[f"{bet_type}|{dow}"] = rule
 
             # se pedir risco global, ajustar stakes por alpha
@@ -458,6 +487,12 @@ def main() -> int:
             )
 
             if len(bets):
+                # daily series OOS (para métricas globais no teste)
+                dd = bets.groupby("date", as_index=False).agg(stake_usd=("stake_eff", "sum"), profit_cap2_usd=("profit_cap2", "sum"))
+                dd["week"] = w_test
+                dd["alpha_global"] = float(alpha)
+                daily_rows.append(dd)
+
                 g = bets.groupby("rule_key", as_index=False).agg(n_bets=("profit_cap2", "size"), stake_usd=("stake_eff", "sum"), profit_cap2_usd=("profit_cap2", "sum"))
                 for _, r in g.iterrows():
                     weekly_seg_rows.append(
@@ -472,11 +507,13 @@ def main() -> int:
                         }
                     )
 
+        daily_df = pd.concat(daily_rows, axis=0, ignore_index=True) if daily_rows else pd.DataFrame(columns=["date", "stake_usd", "profit_cap2_usd", "week", "alpha_global"])
         return (
             pd.DataFrame(all_rules_rows),
             pd.DataFrame(weekly_rows),
             pd.DataFrame(weekly_seg_rows),
             pd.DataFrame(weekly_global_rows),
+            daily_df,
         )
 
     # ------------------------
@@ -484,13 +521,19 @@ def main() -> int:
     #  - por segmento (alpha=1)
     #  - com risco global (alpha ajustado)
     # ------------------------
-    for mode_name, global_risk in (("segment", False), ("global", True)):
-        rules_df, weekly_df, weekly_seg_df, weekly_global_df = run_walkforward(global_risk=global_risk)
+    for mode_name, global_risk, bayes_select in (
+        ("segment_classic", False, False),
+        ("global_classic", True, False),
+        ("segment_bayes", False, True),
+        ("global_bayes", True, True),
+    ):
+        rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(global_risk=global_risk, bayes_select=bayes_select)
 
         rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
         weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
         weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
         weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
+        daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_daily.csv", index=False)
 
         # resumo robusto
         w = weekly_df["profit_cap2_usd"].to_numpy(dtype=float)
@@ -508,6 +551,16 @@ def main() -> int:
         stake_tot = float(weekly_df["stake_usd"].sum())
         pnl_tot = float(weekly_df["profit_cap2_usd"].sum())
         roi_tot = float(pnl_tot / stake_tot) if stake_tot > 0 else float("nan")
+
+        # métricas de risco no OOS (teste) — portfólio agregado
+        if not daily_df.empty:
+            stake_day = daily_df["stake_usd"].to_numpy(dtype=float)
+            pnl_day = daily_df["profit_cap2_usd"].to_numpy(dtype=float)
+            oos_p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q)) if stake_day.size else float("nan")
+            oos_var10 = float(np.quantile(pnl_day, DAILY_VAR_Q)) if pnl_day.size else float("nan")
+            oos_p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean()) if pnl_day.size else float("nan")
+        else:
+            oos_p80_exp, oos_var10, oos_p_dd = float("nan"), float("nan"), float("nan")
 
         # frequência de ativação por segmento
         rules_df["active"] = (rules_df["stake_frac"] > 0) & (rules_df["status"] == "ok")
@@ -527,6 +580,20 @@ def main() -> int:
         a_mean = float(np.mean(alpha))
         a_p10, a_p50, a_p90 = (float(np.quantile(alpha, q)) for q in (0.10, 0.50, 0.90))
         a_lt1 = float(np.mean(alpha < 0.999))
+
+        # estabilidade por segmento no OOS (semana-a-semana)
+        # alinhamos semanas testadas; faltas => 0
+        seg_rows = []
+        weeks_test = weekly_df["week"].tolist()
+        for rk in sorted(weekly_seg_df["rule_key"].unique().tolist()) if not weekly_seg_df.empty else []:
+            s = weekly_seg_df[weekly_seg_df["rule_key"] == rk].set_index("week")["profit_cap2_usd"]
+            v = np.array([float(s.get(w, 0.0)) for w in weeks_test], dtype=float)
+            m, lo, hi = bootstrap_ci_mean(v, n_boot=N_BOOT, seed=SEED + 31)
+            ppos = float(np.mean(v > 0))
+            pnegw = float(np.mean(v < 0))
+            seg_rows.append({"rule_key": rk, "mean_week_profit": m, "ci95_lo": lo, "ci95_hi": hi, "p_week_pos": ppos, "p_week_neg": pnegw})
+        seg_stab = pd.DataFrame(seg_rows).sort_values("mean_week_profit", ascending=False) if seg_rows else pd.DataFrame()
+        seg_stab.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_segment_stability.csv", index=False)
 
         lines: List[str] = []
         lines.append(f"## OOS walk-forward ({mode_name}) — estratégia completa\n")
@@ -551,6 +618,12 @@ def main() -> int:
         lines.append(f"- **Desvio padrão semanal**: USD {std2:.1f}\n")
         lines.append(f"- **P(semana < 0)**: {pneg2*100:.1f}%\n")
         lines.append(f"- **ROI on stake agregado (ponderado)**: {roi_tot:.4f}\n")
+        lines.append("\n### Risco no OOS (teste) — portfólio agregado\n")
+        lines.append(
+            f"- p80(soma stakes/dia) = USD {oos_p80_exp:.0f} (limite=USD {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:.0f})\n"
+            f"- VaR10%(PnL diário) = USD {oos_var10:.1f} (limite >= USD {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:.0f})\n"
+            f"- P(PnL diário <= -25% banca) = {oos_p_dd*100:.1f}% (limite <= {MAX_P_DAILY_DD*100:.0f}%)\n"
+        )
 
         lines.append("\n### Ajuste de stake global (α)\n")
         lines.append(f"- α médio={a_mean:.3f}; p10={a_p10:.3f}; p50={a_p50:.3f}; p90={a_p90:.3f}; P(α<1)={a_lt1*100:.1f}%\n")
@@ -562,6 +635,16 @@ def main() -> int:
                 f"- **{r['bet_type']} | {r['dow_pt']}**: active_rate={r['active_rate']*100:.1f}%, ok_rate={r['ok_rate']*100:.1f}%, "
                 f"stake_frac_médio={r['mean_stake_frac']*100:.2f}%, cutoff_médio={r['mean_cutoff']:.2f}\n"
             )
+
+        if not seg_stab.empty:
+            lines.append("\n### Segmentos mais estáveis no OOS (por lucro semanal)\n")
+            lines.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}_segment_stability.csv`\n")
+            top = seg_stab.head(8)
+            for _, rr in top.iterrows():
+                lines.append(
+                    f"- **{rr['rule_key']}**: mean_week={rr['mean_week_profit']:.1f} (IC95% {rr['ci95_lo']:.1f}..{rr['ci95_hi']:.1f}), "
+                    f"P(semana>0)={rr['p_week_pos']*100:.1f}%\n"
+                )
 
         (OUT_DIR / f"oos_walkforward_{mode_name}_strategy.md").write_text("".join(lines), encoding="utf-8")
 
