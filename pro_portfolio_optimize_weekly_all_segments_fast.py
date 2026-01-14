@@ -39,6 +39,15 @@ MAX_FRAC = 0.07
 # Mesa: p95 da exposição diária (stake somado) <= 25% da banca
 MAX_DAILY_EXPOSURE_FRAC_P95 = 0.25
 
+# Alternativa pedida: risco de drawdown diário (perda em 1 dia) <= 25% da banca
+# Implementação: exigir que o quantil 1% (VaR 1%) do PnL diário seja >= -25% banca
+# (avaliado no cenário cap2), e que P(PnL_dia <= -25% banca) <= 1%.
+MAX_DAILY_DRAWDOWN_FRAC = 0.25
+DAILY_VAR_Q = 0.01
+
+# Critério adicional (pedido): Sharpe semanal mínimo (cap2)
+MIN_WEEKLY_SHARPE_CAP2 = 0.10
+
 # Estágio 1 (barato)
 STAKE_FRACS = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
 CUTOFFS = np.round(np.arange(0.05, 0.951, 0.02), 2)  # mais grosso para velocidade
@@ -169,6 +178,10 @@ class CandFinal:
     cap1_dd_p95_52w: float
     p95_daily_exposure: float
     p95_daily_bets: float
+    # daily drawdown risk (cap2)
+    daily_var_q: float
+    p_daily_dd: float
+    sharpe_week_cap2: float
     wf_mean: float
     wf_pneg: float
     wf_p05: float
@@ -253,6 +266,7 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
     cap2_mean = float(w2.mean())
     cap2_std = float(w2.std(ddof=1)) if w2.size >= 2 else 0.0
     cap2_pneg = float((w2 < 0).mean())
+    sharpe_week = float(cap2_mean / cap2_std) if cap2_std > 0 else (float("inf") if cap2_mean > 0 else -float("inf"))
     cap1_mean = float(w1.mean())
     cap1_pneg = float((w1 < 0).mean())
 
@@ -266,13 +280,30 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
     if dd1 > 1.5 * BANKROLL:
         return None
 
-    # daily exposure and bet counts
+    # daily exposure and bet counts (mantido como métrica, mas não como constraint principal)
     stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_exp = float(np.quantile(stake_day, 0.95)) if stake_day.size else 0.0
-    if p95_exp > MAX_DAILY_EXPOSURE_FRAC_P95 * BANKROLL:
-        return None
     cnt_day = pd.Series(np.ones_like(stake_eff[m], dtype=int), index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
     p95_bets = float(np.quantile(cnt_day, 0.95)) if cnt_day.size else 0.0
+
+    # daily drawdown risk constraint (cap2)
+    # PnL diário em cap2: soma de stake_eff*roi2 por dia, apenas em dias com apostas selecionadas
+    pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
+    if pnl_day.size > 0:
+        daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
+        p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean())
+    else:
+        daily_var = 0.0
+        p_dd = 0.0
+
+    if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
+        return None
+    if p_dd > DAILY_VAR_Q:
+        return None
+
+    # sharpe filter (cap2)
+    if np.isfinite(sharpe_week) and sharpe_week < MIN_WEEKLY_SHARPE_CAP2:
+        return None
 
     # walk-forward
     wf = walkforward_weekly_cap2(df, score_col, stake_eff, cutoff_grid=CUTOFFS)
@@ -344,6 +375,9 @@ def stage2_validate(df: pd.DataFrame, score_col: str, c1: Cand1, seed: int) -> C
         cap1_dd_p95_52w=dd1,
         p95_daily_exposure=p95_exp,
         p95_daily_bets=p95_bets,
+        daily_var_q=daily_var,
+        p_daily_dd=p_dd,
+        sharpe_week_cap2=sharpe_week,
         wf_mean=wf_mean,
         wf_pneg=wf_pneg,
         wf_p05=wf_p05,
@@ -399,6 +433,9 @@ def optimize_segment(df: pd.DataFrame, dow: str, bet_type: str) -> Tuple[Dict, D
         "cap1_dd_p95_52w": best.cap1_dd_p95_52w,
         "p95_daily_bets": best.p95_daily_bets,
         "p95_daily_exposure": best.p95_daily_exposure,
+        "daily_var_q": best.daily_var_q,
+        "p_daily_dd": best.p_daily_dd,
+        "sharpe_week_cap2": best.sharpe_week_cap2,
         "wf_mean": best.wf_mean,
         "wf_pneg": best.wf_pneg,
         "wf_p05": best.wf_p05,
@@ -436,7 +473,11 @@ def main() -> int:
         "bankroll": BANKROLL,
         "max_frac_per_bet": MAX_FRAC,
         "train_period": {"start": str(TRAIN_START.date()), "end": str(TRAIN_END.date())},
-        "daily_exposure_constraint": {"p95_daily_exposure_le_frac_bankroll": MAX_DAILY_EXPOSURE_FRAC_P95},
+        "daily_risk_constraints": {
+            "max_daily_drawdown_frac": MAX_DAILY_DRAWDOWN_FRAC,
+            "daily_var_quantile": DAILY_VAR_Q,
+            "min_weekly_sharpe_cap2": MIN_WEEKLY_SHARPE_CAP2,
+        },
         "grid": {"stake_fracs": STAKE_FRACS.tolist(), "cutoffs": CUTOFFS.tolist(), "top_k": TOP_K},
         "bootstrap": {"n_boot": N_BOOT, "n_boot_dd": N_BOOT_DD},
         "portfolio": portfolio,
