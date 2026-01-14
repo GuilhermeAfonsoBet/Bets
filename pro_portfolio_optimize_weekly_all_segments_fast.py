@@ -53,7 +53,7 @@ MIN_WEEKLY_SHARPE_CAP2 = 0.10
 # Estágio 1 (barato)
 STAKE_FRACS = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
 CUTOFFS = np.round(np.arange(0.05, 0.951, 0.02), 2)  # mais grosso para velocidade
-TOP_K = 8
+TOP_K = 20
 
 # Estágio 2 (pesado)
 N_BOOT = 8_000
@@ -230,7 +230,20 @@ def stage1_candidates(df: pd.DataFrame, score_col: str) -> List[Cand1]:
             if mean1 < -0.10 * mean:
                 continue
 
-            # daily exposure p95 (stake somado) e p95 bets/day
+            # daily drawdown risk (barato, cap2)
+            pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
+            if pnl_day.size:
+                daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
+                p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean())
+            else:
+                daily_var = 0.0
+                p_dd = 0.0
+            if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
+                continue
+            if p_dd > MAX_P_DAILY_DD:
+                continue
+
+            # daily exposure p95 (stake somado) (métrica/penalidade)
             stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
             if stake_day.size == 0:
                 continue
