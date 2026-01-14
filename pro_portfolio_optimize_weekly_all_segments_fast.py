@@ -502,7 +502,10 @@ def main() -> int:
     lines = []
     lines.append("## Portfólio mesa profissional — FT e FH (todos os dias)\n")
     lines.append(f"- Banca: USD {BANKROLL:,.0f}; max por aposta: {MAX_FRAC*100:.1f}%\n")
-    lines.append(f"- Constraint volume: p95 exposição diária <= {MAX_DAILY_EXPOSURE_FRAC_P95*100:.0f}% da banca\n")
+    lines.append(
+        f"- Exposição diária (métrica): reportamos p95 da exposição por dia (stake somado); não é hard-constraint. "
+        f"A restrição diária ativa é **P(PnL_dia <= -{MAX_DAILY_DRAWDOWN_FRAC*100:.0f}% banca) <= {MAX_P_DAILY_DD*100:.0f}%** (via VaR{int(DAILY_VAR_Q*100)}%).\n"
+    )
 
     for bet_type in ("FT", "FH"):
         lines.append(f"\n### {bet_type}\n")
