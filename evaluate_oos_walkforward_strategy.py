@@ -261,6 +261,92 @@ def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
     return x
 
 
+def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float) -> pd.DataFrame:
+    """
+    Aplica um conjunto de regras (para vários segmentos) num DataFrame qualquer (treino ou teste),
+    com um fator global alpha multiplicando os stake_fracs.
+    Retorna apostas selecionadas com stake/profit cap2.
+    """
+    rows = []
+    for rule in rules.values():
+        if rule.stake_frac <= 0:
+            continue
+        stake0 = BANKROLL * rule.stake_frac * float(alpha)
+        if stake0 <= 0:
+            continue
+        x = df_any[(df_any["dow_pt"] == rule.dow) & (df_any["bet_type"] == rule.bet_type)].copy()
+        if x.empty:
+            continue
+        score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(dtype=float)
+        roi2 = x["roi_cap2"].to_numpy(dtype=float)
+        m = np.isfinite(score) & (score >= rule.cutoff) & np.isfinite(roi2)
+        if not np.any(m):
+            continue
+        x = x.iloc[np.where(m)[0]].copy()
+        x["stake_eff"] = np.minimum(stake0, x["house_cap"].to_numpy(dtype=float))
+        x["profit_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_cap2"].to_numpy(dtype=float)
+        x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
+        rows.append(x[["date", "week", "stake_eff", "profit_cap2", "rule_key"]])
+    if not rows:
+        return df_any.iloc[:0].copy()
+    return pd.concat(rows, axis=0, ignore_index=True)
+
+
+def portfolio_global_constraints_ok(df_train: pd.DataFrame, rules: Dict[str, Rule], alpha: float) -> Tuple[bool, Dict[str, float]]:
+    """
+    Checa constraints no portfólio agregado (treino):
+      - p80 soma stakes/dia <= 70% banca
+      - VaR10%(PnL_dia) >= -25% banca
+      - P(PnL_dia <= -25% banca) <= 10%
+    Retorna (ok, metrics)
+    """
+    bets = apply_rules_on_df(df_train, rules, alpha=alpha)
+    if bets.empty:
+        # sem trades -> trivialmente ok, mas não desejável
+        return True, {"p80_exp": 0.0, "daily_var10": 0.0, "p_dd": 0.0, "n_days": 0}
+    stake_day = bets.groupby("date")["stake_eff"].sum().to_numpy(dtype=float)
+    pnl_day = bets.groupby("date")["profit_cap2"].sum().to_numpy(dtype=float)
+    p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q)) if stake_day.size else 0.0
+    daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q)) if pnl_day.size else 0.0
+    p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean()) if pnl_day.size else 0.0
+    ok = True
+    if p80_exp > MAX_DAILY_EXPOSURE_FRAC_Q * BANKROLL:
+        ok = False
+    if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
+        ok = False
+    if p_dd > MAX_P_DAILY_DD:
+        ok = False
+    return ok, {"p80_exp": p80_exp, "daily_var10": daily_var, "p_dd": p_dd, "n_days": int(pnl_day.size)}
+
+
+def find_alpha_global(df_train: pd.DataFrame, rules: Dict[str, Rule]) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    """
+    Encontra o maior alpha in [0,1] que satisfaz constraints globais no treino.
+    Retorna (alpha, metrics_at_1, metrics_at_alpha).
+    """
+    ok1, m1 = portfolio_global_constraints_ok(df_train, rules, alpha=1.0)
+    if ok1:
+        return 1.0, m1, m1
+    lo, hi = 0.0, 1.0
+    best = 0.0
+    best_m = None
+    # busca binária monotônica (alpha menor => risco/exposição menor)
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        ok, mm = portfolio_global_constraints_ok(df_train, rules, alpha=mid)
+        if ok:
+            best = mid
+            best_m = mm
+            lo = mid
+        else:
+            hi = mid
+    if best_m is None:
+        # mesmo alpha~0 não achou trades? ou ainda viola (deveria não violar)
+        ok0, m0 = portfolio_global_constraints_ok(df_train, rules, alpha=0.0)
+        return 0.0, m1, m0
+    return float(best), m1, best_m
+
+
 def bootstrap_ci_mean(x: np.ndarray, n_boot: int, seed: int) -> Tuple[float, float, float]:
     rng = np.random.default_rng(seed)
     a = np.asarray(x, dtype=float)
@@ -288,165 +374,198 @@ def main() -> int:
     if len(weeks) < (MIN_GLOBAL_TRAIN_WEEKS + 3):
         raise SystemExit(f"Poucas semanas no dataset: {len(weeks)}")
 
-    all_rules_rows = []
-    weekly_rows = []
-    weekly_seg_rows = []
+    def run_walkforward(global_risk: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        all_rules_rows = []
+        weekly_rows = []
+        weekly_seg_rows = []
+        weekly_global_rows = []
 
-    # walk-forward por semana disponível
-    for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
-        w_test = weeks[i]
-        train_weeks = weeks[:i]
+        for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
+            w_test = weeks[i]
+            train_weeks = weeks[:i]
 
-        df_train = df[df["week"].isin(train_weeks)].copy()
-        df_test = df[df["week"] == w_test].copy()
+            df_train = df[df["week"].isin(train_weeks)].copy()
+            df_test = df[df["week"] == w_test].copy()
 
-        # otimiza regras no treino (para cada segmento)
-        rules: Dict[str, Rule] = {}
-        for bet_type in ("FT", "FH"):
-            for dow in WEEKDAY_PT:
-                sc = segment_score_col(dow)
-                x = df_train[(df_train["dow_pt"] == dow) & (df_train["bet_type"] == bet_type)].copy()
-                if x.empty:
-                    rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
-                else:
-                    rule = optimize_segment_train(x, sc)
-                rules[f"{bet_type}|{dow}"] = rule
+            # otimiza regras no treino (para cada segmento)
+            rules: Dict[str, Rule] = {}
+            for bet_type in ("FT", "FH"):
+                for dow in WEEKDAY_PT:
+                    sc = segment_score_col(dow)
+                    x = df_train[(df_train["dow_pt"] == dow) & (df_train["bet_type"] == bet_type)].copy()
+                    if x.empty:
+                        rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
+                    else:
+                        rule = optimize_segment_train(x, sc)
+                    rules[f"{bet_type}|{dow}"] = rule
+
+            # se pedir risco global, ajustar stakes por alpha
+            if global_risk:
+                alpha, m_at1, m_ata = find_alpha_global(df_train, rules)
+            else:
+                alpha, m_at1, m_ata = 1.0, {"p80_exp": float("nan"), "daily_var10": float("nan"), "p_dd": float("nan"), "n_days": 0}, {"p80_exp": float("nan"), "daily_var10": float("nan"), "p_dd": float("nan"), "n_days": 0}
+
+            # salvar regras daquela semana (com alpha)
+            for key, rule in rules.items():
                 all_rules_rows.append(
                     {
                         "test_week": w_test,
                         "train_weeks": len(train_weeks),
-                        "bet_type": bet_type,
-                        "dow_pt": dow,
-                        "score_col": sc,
+                        "bet_type": rule.bet_type,
+                        "dow_pt": rule.dow,
+                        "score_col": rule.score_col,
                         "cutoff": rule.cutoff,
                         "stake_frac": rule.stake_frac,
+                        "alpha_global": float(alpha),
                         "status": rule.status,
+                        "rule_key": key,
                     }
                 )
 
-        # aplica no teste e agrega
-        bets_rows = []
-        for key, rule in rules.items():
-            xb = apply_rule_on_week(df_test, rule)
-            if xb.empty:
-                continue
-            bets_rows.append(xb)
+            weekly_global_rows.append(
+                {
+                    "week": w_test,
+                    "train_weeks": len(train_weeks),
+                    "alpha_global": float(alpha),
+                    "train_global_p80_exp_at1": float(m_at1.get("p80_exp", float("nan"))),
+                    "train_global_var10_at1": float(m_at1.get("daily_var10", float("nan"))),
+                    "train_global_p_dd_at1": float(m_at1.get("p_dd", float("nan"))),
+                    "train_global_p80_exp_at_alpha": float(m_ata.get("p80_exp", float("nan"))),
+                    "train_global_var10_at_alpha": float(m_ata.get("daily_var10", float("nan"))),
+                    "train_global_p_dd_at_alpha": float(m_ata.get("p_dd", float("nan"))),
+                    "train_global_n_days": int(m_ata.get("n_days", 0)),
+                }
+            )
 
-        if bets_rows:
-            bets = pd.concat(bets_rows, axis=0, ignore_index=True)
-        else:
-            bets = df_test.iloc[:0].copy()
-            bets["stake_eff"] = []
-            bets["profit_cap2"] = []
-            bets["rule_key"] = []
+            # aplica no teste e agrega (usando alpha)
+            bets = apply_rules_on_df(df_test, rules, alpha=alpha)
 
-        # total semanal
-        stake_sum = float(bets["stake_eff"].sum()) if len(bets) else 0.0
-        pnl_sum = float(bets["profit_cap2"].sum()) if len(bets) else 0.0
-        roi_on_stake = float(pnl_sum / stake_sum) if stake_sum > 0 else float("nan")
-        n_bets = int(len(bets))
+            stake_sum = float(bets["stake_eff"].sum()) if len(bets) else 0.0
+            pnl_sum = float(bets["profit_cap2"].sum()) if len(bets) else 0.0
+            roi_on_stake = float(pnl_sum / stake_sum) if stake_sum > 0 else float("nan")
+            n_bets = int(len(bets))
 
-        weekly_rows.append(
-            {
-                "week": w_test,
-                "train_weeks": len(train_weeks),
-                "n_bets": n_bets,
-                "stake_usd": stake_sum,
-                "profit_cap2_usd": pnl_sum,
-                "roi_on_stake_cap2": roi_on_stake,
-            }
+            weekly_rows.append(
+                {
+                    "week": w_test,
+                    "train_weeks": len(train_weeks),
+                    "alpha_global": float(alpha),
+                    "n_bets": n_bets,
+                    "stake_usd": stake_sum,
+                    "profit_cap2_usd": pnl_sum,
+                    "roi_on_stake_cap2": roi_on_stake,
+                }
+            )
+
+            if len(bets):
+                g = bets.groupby("rule_key", as_index=False).agg(n_bets=("profit_cap2", "size"), stake_usd=("stake_eff", "sum"), profit_cap2_usd=("profit_cap2", "sum"))
+                for _, r in g.iterrows():
+                    weekly_seg_rows.append(
+                        {
+                            "week": w_test,
+                            "alpha_global": float(alpha),
+                            "rule_key": r["rule_key"],
+                            "n_bets": int(r["n_bets"]),
+                            "stake_usd": float(r["stake_usd"]),
+                            "profit_cap2_usd": float(r["profit_cap2_usd"]),
+                            "roi_on_stake_cap2": float(r["profit_cap2_usd"] / r["stake_usd"]) if float(r["stake_usd"]) > 0 else float("nan"),
+                        }
+                    )
+
+        return (
+            pd.DataFrame(all_rules_rows),
+            pd.DataFrame(weekly_rows),
+            pd.DataFrame(weekly_seg_rows),
+            pd.DataFrame(weekly_global_rows),
         )
 
-        # por segmento
-        if len(bets):
-            g = bets.groupby("rule_key", as_index=False).agg(n_bets=("profit_cap2", "size"), stake_usd=("stake_eff", "sum"), profit_cap2_usd=("profit_cap2", "sum"))
-            for _, r in g.iterrows():
-                weekly_seg_rows.append(
-                    {
-                        "week": w_test,
-                        "rule_key": r["rule_key"],
-                        "n_bets": int(r["n_bets"]),
-                        "stake_usd": float(r["stake_usd"]),
-                        "profit_cap2_usd": float(r["profit_cap2_usd"]),
-                        "roi_on_stake_cap2": float(r["profit_cap2_usd"] / r["stake_usd"]) if float(r["stake_usd"]) > 0 else float("nan"),
-                    }
-                )
-        else:
-            # sem bets: ainda registramos zeros para facilitar plots posteriores (opcional)
-            pass
+    # ------------------------
+    # Rodar 2 modos:
+    #  - por segmento (alpha=1)
+    #  - com risco global (alpha ajustado)
+    # ------------------------
+    for mode_name, global_risk in (("segment", False), ("global", True)):
+        rules_df, weekly_df, weekly_seg_df, weekly_global_df = run_walkforward(global_risk=global_risk)
 
-    rules_df = pd.DataFrame(all_rules_rows)
-    weekly_df = pd.DataFrame(weekly_rows)
-    weekly_seg_df = pd.DataFrame(weekly_seg_rows)
+        rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
+        weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
+        weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
+        weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
 
-    rules_df.to_csv(OUT_DIR / "oos_walkforward_selected_rules.csv", index=False)
-    weekly_df.to_csv(OUT_DIR / "oos_walkforward_weekly.csv", index=False)
-    weekly_seg_df.to_csv(OUT_DIR / "oos_walkforward_weekly_by_segment.csv", index=False)
+        # resumo robusto
+        w = weekly_df["profit_cap2_usd"].to_numpy(dtype=float)
+        mean_w, lo_w, hi_w = bootstrap_ci_mean(w, n_boot=N_BOOT, seed=SEED + (11 if global_risk else 0))
+        pneg = float((w < 0).mean())
+        std = float(np.std(w, ddof=1)) if w.size >= 2 else 0.0
 
-    # resumo robusto
-    w = weekly_df["profit_cap2_usd"].to_numpy(dtype=float)
-    mean_w, lo_w, hi_w = bootstrap_ci_mean(w, n_boot=N_BOOT, seed=SEED)
-    pneg = float((w < 0).mean())
-    std = float(np.std(w, ddof=1)) if w.size >= 2 else 0.0
+        # mesma coisa, mas excluindo semanas com stake=0
+        w2 = weekly_df.loc[weekly_df["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(dtype=float)
+        mean_w2, lo_w2, hi_w2 = bootstrap_ci_mean(w2, n_boot=N_BOOT, seed=SEED + 1 + (11 if global_risk else 0))
+        pneg2 = float((w2 < 0).mean()) if w2.size else float("nan")
+        std2 = float(np.std(w2, ddof=1)) if w2.size >= 2 else 0.0
 
-    # mesma coisa, mas excluindo semanas com stake=0 (sem trades)
-    w2 = weekly_df.loc[weekly_df["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(dtype=float)
-    mean_w2, lo_w2, hi_w2 = bootstrap_ci_mean(w2, n_boot=N_BOOT, seed=SEED + 1)
-    pneg2 = float((w2 < 0).mean()) if w2.size else float("nan")
-    std2 = float(np.std(w2, ddof=1)) if w2.size >= 2 else 0.0
+        # ROI on stake agregado
+        stake_tot = float(weekly_df["stake_usd"].sum())
+        pnl_tot = float(weekly_df["profit_cap2_usd"].sum())
+        roi_tot = float(pnl_tot / stake_tot) if stake_tot > 0 else float("nan")
 
-    # frequência de ativação por segmento (stake>0 e status ok)
-    rules_df["active"] = (rules_df["stake_frac"] > 0) & (rules_df["status"] == "ok")
-    act = (
-        rules_df.groupby(["bet_type", "dow_pt"], as_index=False)
-        .agg(active_rate=("active", "mean"), mean_stake_frac=("stake_frac", "mean"), mean_cutoff=("cutoff", "mean"), ok_rate=("status", lambda s: float(np.mean(np.asarray(s) == "ok"))))
-        .sort_values(["bet_type", "dow_pt"])
-    )
+        # frequência de ativação por segmento
+        rules_df["active"] = (rules_df["stake_frac"] > 0) & (rules_df["status"] == "ok")
+        act = (
+            rules_df.groupby(["bet_type", "dow_pt"], as_index=False)
+            .agg(
+                active_rate=("active", "mean"),
+                mean_stake_frac=("stake_frac", "mean"),
+                mean_cutoff=("cutoff", "mean"),
+                ok_rate=("status", lambda s: float(np.mean(np.asarray(s) == "ok"))),
+            )
+            .sort_values(["bet_type", "dow_pt"])
+        )
 
-    lines: List[str] = []
-    lines.append("## OOS walk-forward (semana-a-semana) — validação da estratégia completa\n")
-    lines.append(f"- Dataset: `{SCORED}`\n")
-    lines.append(
-        f"- Semanas totais no dataset: **{len(weeks)}**; semanas testadas OOS (WF): **{len(weekly_df)}** "
-        f"(a partir de {MIN_GLOBAL_TRAIN_WEEKS} semanas globais de treino; por-segmento exige >= {MIN_SEG_TRAIN_WEEKS})\n"
-    )
-    lines.append(
-        f"- Constraints por segmento (no treino de cada passo): p80 soma stakes/dia <= {MAX_DAILY_EXPOSURE_FRAC_Q*100:.0f}% banca; "
-        f"VaR{int(DAILY_VAR_Q*100)}% do PnL diário >= -{MAX_DAILY_DRAWDOWN_FRAC*100:.0f}% banca e P(loss>=25%)<=10%; Sharpe semanal cap2 >= {MIN_WEEKLY_SHARPE_CAP2:.2f}.\n"
-    )
-    lines.append("\n### Performance OOS (cap2) — portfólio agregado\n")
-    lines.append(f"- **PnL semanal médio (bootstrap IC95%)**: **USD {mean_w:.1f}** (IC95% {lo_w:.1f}..{hi_w:.1f})\n")
-    lines.append(f"- **Desvio padrão semanal**: USD {std:.1f}\n")
-    lines.append(f"- **P(semana < 0)**: {pneg*100:.1f}%\n")
-    lines.append("\n### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)\n")
-    lines.append(f"- **PnL semanal médio (bootstrap IC95%)**: **USD {mean_w2:.1f}** (IC95% {lo_w2:.1f}..{hi_w2:.1f})\n")
-    lines.append(f"- **Desvio padrão semanal**: USD {std2:.1f}\n")
-    lines.append(f"- **P(semana < 0)**: {pneg2*100:.1f}%\n")
-    lines.append(f"- Série semanal OOS: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_weekly.csv`\n")
+        # alpha summary
+        alpha = weekly_df["alpha_global"].to_numpy(dtype=float)
+        a_mean = float(np.mean(alpha))
+        a_p10, a_p50, a_p90 = (float(np.quantile(alpha, q)) for q in (0.10, 0.50, 0.90))
+        a_lt1 = float(np.mean(alpha < 0.999))
 
-    # ROI on stake (médio, ponderado por stake)
-    stake_tot = float(weekly_df["stake_usd"].sum())
-    pnl_tot = float(weekly_df["profit_cap2_usd"].sum())
-    roi_tot = float(pnl_tot / stake_tot) if stake_tot > 0 else float("nan")
-    lines.append(f"- **ROI on stake agregado (ponderado)**: {roi_tot:.4f}\n")
-
-    lines.append("\n### Estabilidade OOS da decisão por segmento (frequência de ativação)\n")
-    lines.append("- Arquivo: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_selected_rules.csv`\n\n")
-    for _, r in act.iterrows():
+        lines: List[str] = []
+        lines.append(f"## OOS walk-forward ({mode_name}) — estratégia completa\n")
+        lines.append(f"- Dataset: `{SCORED}`\n")
         lines.append(
-            f"- **{r['bet_type']} | {r['dow_pt']}**: active_rate={r['active_rate']*100:.1f}%, ok_rate={r['ok_rate']*100:.1f}%, "
-            f"stake_frac_médio={r['mean_stake_frac']*100:.2f}%, cutoff_médio={r['mean_cutoff']:.2f}\n"
+            f"- Semanas totais no dataset: **{len(weeks)}**; semanas testadas OOS (WF): **{len(weekly_df)}** "
+            f"(a partir de {MIN_GLOBAL_TRAIN_WEEKS} semanas globais de treino; por-segmento exige >= {MIN_SEG_TRAIN_WEEKS})\n"
         )
+        if global_risk:
+            lines.append(
+                f"- **Modo global**: aplica um fator α (0..1) multiplicando todos os stakes para satisfazer constraints do portfólio agregado no treino de cada passo.\n"
+            )
+        else:
+            lines.append("- **Modo segment**: constraints avaliadas por segmento (equivalente ao que já rodamos antes), α=1.\n")
 
-    lines.append("\n### Observação importante\n")
-    lines.append(
-        "- Este WF valida **a estratégia completa por combinação** (cutoff+stake por segmento) de forma honesta no tempo. "
-        "Ele ainda não impõe um constraint de risco **global do portfólio** no treino de cada passo (as constraints são por segmento, como no otimizador atual); "
-        "se você quiser, eu adapto para otimizar/filtrar também por risco global diário/semanal do portfólio no passo de treino.\n"
-    )
+        lines.append("\n### Performance OOS (cap2) — portfólio agregado\n")
+        lines.append(f"- **PnL semanal médio (bootstrap IC95%)**: **USD {mean_w:.1f}** (IC95% {lo_w:.1f}..{hi_w:.1f})\n")
+        lines.append(f"- **Desvio padrão semanal**: USD {std:.1f}\n")
+        lines.append(f"- **P(semana < 0)**: {pneg*100:.1f}%\n")
+        lines.append("\n### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)\n")
+        lines.append(f"- **PnL semanal médio (bootstrap IC95%)**: **USD {mean_w2:.1f}** (IC95% {lo_w2:.1f}..{hi_w2:.1f})\n")
+        lines.append(f"- **Desvio padrão semanal**: USD {std2:.1f}\n")
+        lines.append(f"- **P(semana < 0)**: {pneg2*100:.1f}%\n")
+        lines.append(f"- **ROI on stake agregado (ponderado)**: {roi_tot:.4f}\n")
 
-    (OUT_DIR / "oos_walkforward_strategy.md").write_text("".join(lines), encoding="utf-8")
-    print(str(OUT_DIR / "oos_walkforward_strategy.md"))
+        lines.append("\n### Ajuste de stake global (α)\n")
+        lines.append(f"- α médio={a_mean:.3f}; p10={a_p10:.3f}; p50={a_p50:.3f}; p90={a_p90:.3f}; P(α<1)={a_lt1*100:.1f}%\n")
+
+        lines.append("\n### Estabilidade OOS da decisão por segmento (frequência de ativação)\n")
+        lines.append(f"- Arquivo regras: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}_selected_rules.csv`\n\n")
+        for _, r in act.iterrows():
+            lines.append(
+                f"- **{r['bet_type']} | {r['dow_pt']}**: active_rate={r['active_rate']*100:.1f}%, ok_rate={r['ok_rate']*100:.1f}%, "
+                f"stake_frac_médio={r['mean_stake_frac']*100:.2f}%, cutoff_médio={r['mean_cutoff']:.2f}\n"
+            )
+
+        (OUT_DIR / f"oos_walkforward_{mode_name}_strategy.md").write_text("".join(lines), encoding="utf-8")
+
+    print(str(OUT_DIR / "oos_walkforward_global_strategy.md"))
     return 0
 
 
