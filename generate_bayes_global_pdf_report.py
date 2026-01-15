@@ -282,6 +282,10 @@ def main() -> int:
 
     # build document
     styles = getSampleStyleSheet()
+    # helper: wrapped paragraph in table cells
+    def P(txt: str) -> Paragraph:
+        return Paragraph(str(txt).replace("\n", "<br/>"), styles["BodyText"])
+
     story: List = []
 
     story.append(Paragraph(f"<b>Relatório — Portfólio Bayes Global (mesa profissional)</b>", styles["Title"]))
@@ -323,10 +327,15 @@ def main() -> int:
         ["Sharpe mínimo (cap2)", "Sharpe semanal ≥ 0.10"],
         ["Score-bin stability", "bins=5; exigir ≥4 bins com lucro médio positivo (com relaxamentos se <5 bins)"],
         ["Walk-forward", "semanal, expanding window; mínimo global 10 semanas; mínimo por segmento 6 semanas"],
-        ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 80%; objetivo = p05(mean) − 0.001·p95_exposição"],
+        ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 80%; objetivo = p05(mean) − 0.001·p95(exposição diária)"],
         ["α global", "busca binária em [0,1] para satisfazer constraints globais no treino do passo"],
     ]
-    t = Table(params_tbl, colWidths=[6.5 * cm, 10.5 * cm])
+    # wrap long strings
+    params_tbl_wrapped = [[params_tbl[0][0], params_tbl[0][1]]]
+    for k, v in params_tbl[1:]:
+        params_tbl_wrapped.append([P(k), P(v)])
+
+    t = Table(params_tbl_wrapped, colWidths=[6.2 * cm, 10.8 * cm], repeatRows=1)
     t.setStyle(
         TableStyle(
             [
@@ -334,6 +343,9 @@ def main() -> int:
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ]
         )
     )
@@ -476,6 +488,7 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ]
             )
         )
@@ -577,7 +590,7 @@ def main() -> int:
                     f"{float(r['stake_change_rate']):.3f}" if np.isfinite(float(r["stake_change_rate"])) else "nan",
                 ]
             )
-        tt3 = Table(rows, colWidths=[3.2 * cm, 2.2 * cm, 2.1 * cm, 2.0 * cm, 3.3 * cm, 3.3 * cm])
+        tt3 = Table(rows, colWidths=[3.2 * cm, 2.0 * cm, 2.0 * cm, 1.8 * cm, 3.6 * cm, 3.6 * cm], repeatRows=1)
         tt3.setStyle(
             TableStyle(
                 [
@@ -585,6 +598,7 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ]
             )
         )
@@ -605,8 +619,15 @@ def main() -> int:
     else:
         rows = [["Semana", "α", "N ativos", "Segmentos ativos"]]
         for _, rr in weekly_audit.iterrows():
-            rows.append([rr["week"], f"{float(rr['alpha']):.3f}" if np.isfinite(float(rr["alpha"])) else "nan", str(int(rr["n_active"])), rr["segments"]])
-        ta = Table(rows, colWidths=[4.0 * cm, 1.2 * cm, 1.6 * cm, 10.2 * cm])
+            rows.append(
+                [
+                    P(rr["week"]),
+                    P(f"{float(rr['alpha']):.3f}" if np.isfinite(float(rr["alpha"])) else "nan"),
+                    P(str(int(rr["n_active"]))),
+                    P(rr["segments"]),
+                ]
+            )
+        ta = Table(rows, colWidths=[3.6 * cm, 1.0 * cm, 1.4 * cm, 11.0 * cm], repeatRows=1)
         ta.setStyle(
             TableStyle(
                 [
@@ -614,6 +635,9 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                 ]
             )
         )
