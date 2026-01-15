@@ -367,19 +367,109 @@ def main() -> int:
     else:
         cur2 = cur[["bet_type", "dow_pt", "score_col", "cutoff", "stake_frac", "alpha_global"]].copy()
         cur2 = cur2.sort_values(["bet_type", "dow_pt"])
-        rows = [["Tipo", "Dia", "Score", "Cutoff", "Stake", "α"]]
-        for _, r in cur2.iterrows():
+        # ---------------------------------------------------------
+        # Métricas por combinação (estimadas no histórico disponível
+        # antes da semana atual, com stake_eff = min(banca*stake*α, cap))
+        # ---------------------------------------------------------
+        # Para refletir a política dinâmica, usamos o histórico anterior
+        # à semana corrente (última semana do WF).
+        def week_start(week_str: str) -> pd.Timestamp:
+            return pd.to_datetime(str(week_str).split("/")[0])
+
+        last_week = str(cur["test_week"].iloc[0]) if "test_week" in cur.columns and not cur.empty else str(wf_rules["test_week"].iloc[-1])
+        last_start = week_start(last_week)
+
+        df_all = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
+        df_all["roi_raw"] = pd.to_numeric(df_all["ROI Real"], errors="coerce").astype(float)
+        df_all["roi_cap2"] = np.minimum(df_all["roi_raw"].to_numpy(dtype=float), 2.0)
+        df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
+        df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+        df_all["week_start"] = pd.to_datetime(df_all["week"].str.split("/").str[0])
+        df_train_cur = df_all[df_all["week_start"] < last_start].copy()
+        weeks_all_train = sorted(df_train_cur["week"].unique().tolist())
+
+        def per_combo_metrics(bt: str, dow: str, score_col: str, cutoff: float, stake_frac: float, alpha: float) -> Dict[str, float]:
+            x = df_train_cur[(df_train_cur["bet_type"] == bt) & (df_train_cur["dow_pt"] == dow)].copy()
+            if x.empty:
+                return {"mean_week_profit": float("nan"), "std_week_profit": float("nan"), "roi_on_stake": float("nan"), "mean_week_stake": float("nan"), "mean_week_bets": float("nan"), "pneg_week": float("nan")}
+            score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
+            roi2 = x["roi_cap2"].to_numpy(dtype=float)
+            cap = x["house_cap"].to_numpy(dtype=float)
+            wk = x["week"].to_numpy()
+            m = np.isfinite(score) & (score >= cutoff) & np.isfinite(roi2) & np.isfinite(cap) & (cap > 0)
+            if not np.any(m):
+                # sem apostas selecionadas: semanas zeradas
+                w = np.zeros(len(weeks_all_train), dtype=float)
+                s = np.zeros(len(weeks_all_train), dtype=float)
+                b = np.zeros(len(weeks_all_train), dtype=float)
+            else:
+                stake0 = BANKROLL * stake_frac * alpha
+                stake_eff = np.minimum(stake0, cap[m])
+                profit = stake_eff * roi2[m]
+                g = pd.DataFrame({"week": wk[m], "stake": stake_eff, "profit": profit}).groupby("week", as_index=False).agg(stake=("stake", "sum"), profit=("profit", "sum"), bets=("profit", "size"))
+                g = g.set_index("week").reindex(weeks_all_train, fill_value=0.0)
+                w = g["profit"].to_numpy(dtype=float)
+                s = g["stake"].to_numpy(dtype=float)
+                b = g["bets"].to_numpy(dtype=float)
+            mean_w = float(np.mean(w))
+            std_w = float(np.std(w, ddof=1)) if w.size > 1 else 0.0
+            pneg = float(np.mean(w < 0))
+            roi = float(np.sum(w) / np.sum(s)) if float(np.sum(s)) > 0 else float("nan")
+            return {
+                "mean_week_profit": mean_w,
+                "std_week_profit": std_w,
+                "pneg_week": pneg,
+                "roi_on_stake": roi,
+                "mean_week_stake": float(np.mean(s)),
+                "mean_week_bets": float(np.mean(b)),
+            }
+
+        # tabela com métricas
+        rows = [[
+            P("<b>Tipo</b>"),
+            P("<b>Dia</b>"),
+            P("<b>Score</b>"),
+            P("<b>Cutoff</b>"),
+            P("<b>Stake</b>"),
+            P("<b>α</b>"),
+            P("<b>Mean PnL<br/>sem (USD)</b>"),
+            P("<b>Std PnL<br/>sem (USD)</b>"),
+            P("<b>P(sem&lt;0)</b>"),
+            P("<b>ROI/$</b>"),
+            P("<b>Stake/sem<br/>(USD)</b>"),
+            P("<b>Apostas/sem</b>"),
+        ]]
+
+        for _, rr in cur2.iterrows():
+            bt = str(rr["bet_type"])
+            dow = str(rr["dow_pt"])
+            sc = str(rr["score_col"])
+            cut = float(rr["cutoff"])
+            frac = float(rr["stake_frac"])
+            a = float(rr["alpha_global"])
+            met = per_combo_metrics(bt, dow, sc, cut, frac, a)
             rows.append(
                 [
-                    str(r["bet_type"]),
-                    str(r["dow_pt"]),
-                    str(r["score_col"]),
-                    f"{float(r['cutoff']):.2f}",
-                    f"{float(r['stake_frac'])*100:.1f}%",
-                    f"{float(r['alpha_global']):.3f}",
+                    P(bt),
+                    P(dow),
+                    P(sc),
+                    P(f"{cut:.2f}"),
+                    P(f"{frac*100:.1f}%"),
+                    P(f"{a:.3f}"),
+                    P(f"{met['mean_week_profit']:.0f}"),
+                    P(f"{met['std_week_profit']:.0f}"),
+                    P(f"{met['pneg_week']*100:.1f}%"),
+                    P(f"{met['roi_on_stake']:.3f}" if np.isfinite(met["roi_on_stake"]) else "nan"),
+                    P(f"{met['mean_week_stake']:.0f}"),
+                    P(f"{met['mean_week_bets']:.1f}"),
                 ]
             )
-        tt = Table(rows, colWidths=[1.3 * cm, 3.1 * cm, 4.8 * cm, 1.6 * cm, 1.6 * cm, 1.2 * cm])
+
+        tt = Table(
+            rows,
+            colWidths=[1.0 * cm, 2.5 * cm, 3.6 * cm, 1.2 * cm, 1.2 * cm, 0.9 * cm, 1.6 * cm, 1.6 * cm, 1.2 * cm, 1.0 * cm, 1.5 * cm, 1.2 * cm],
+            repeatRows=1,
+        )
         tt.setStyle(
             TableStyle(
                 [
@@ -387,6 +477,9 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                 ]
             )
         )
