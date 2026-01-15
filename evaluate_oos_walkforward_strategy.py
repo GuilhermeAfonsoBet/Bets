@@ -84,11 +84,9 @@ EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
-# Histerese / custo de mudança (reduzir churn):
-# Compara o melhor candidato do passo com a regra anterior do segmento (se existir)
-# e só troca se houver evidência forte.
-HYSTERESIS_ENABLED = True
-HYST_P_SWITCH = 0.90  # exige P(novo > antigo) >= 90% (Bayesian bootstrap semanal)
+# Histerese / custo de mudança (reduzir churn) — DESLIGADO por ora.
+HYSTERESIS_ENABLED = False
+HYST_P_SWITCH = 0.90  # se habilitar no futuro
 
 N_BOOT = 20_000
 SEED = 7

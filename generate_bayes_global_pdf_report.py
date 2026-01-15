@@ -48,7 +48,7 @@ MIN_BETS_PER_BIN = 20
 MIN_BINS_FOR_STABILITY = 3
 
 # estabilidade de decisão (histerese)
-HYSTERESIS_ENABLED = True
+HYSTERESIS_ENABLED = False
 HYST_P_SWITCH = 0.90
 
 
