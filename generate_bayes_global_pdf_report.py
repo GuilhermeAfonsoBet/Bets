@@ -181,6 +181,105 @@ def main() -> int:
     jac = jaccard_instability(wf_rules)
     rc = rule_change_stats(wf_rules)
 
+    # -------------------------
+    # Extra: auditoria por semana
+    # -------------------------
+    r = wf_rules.copy()
+    r["active"] = (r["status"] == "ok") & (r["stake_frac"] > 0)
+    weekly_audit_rows = []
+    for wk, g in r.groupby("test_week", sort=False):
+        ga = g[g["active"]].copy()
+        segs = ga["rule_key"].astype(str).tolist()
+        segs_sorted = sorted(segs)
+        weekly_audit_rows.append(
+            {
+                "week": str(wk),
+                "alpha": float(ga["alpha_global"].iloc[0]) if (not ga.empty and "alpha_global" in ga.columns) else float("nan"),
+                "n_active": int(len(segs_sorted)),
+                "segments": ", ".join(segs_sorted),
+            }
+        )
+    weekly_audit = pd.DataFrame(weekly_audit_rows)
+
+    # -------------------------
+    # Extra: operação no "máximo" (banca não limita stake)
+    # - Mantém as mesmas regras por semana, mas usa stake_eff_max = house_cap.
+    # - Calcula banca necessária para que stake0 = banca*stake_frac >= house_cap em (p95 e max).
+    # -------------------------
+    df_all = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
+    df_all["roi_raw"] = pd.to_numeric(df_all["ROI Real"], errors="coerce").astype(float)
+    df_all["roi_cap2"] = np.minimum(df_all["roi_raw"].to_numpy(dtype=float), 2.0)
+    df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
+    df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+
+    # only weeks evaluated in WF
+    wf_weeks = set(wf_week["week"].astype(str).tolist())
+    df_oos_wf = df_all[df_all["week"].astype(str).isin(wf_weeks)].copy()
+
+    # build rules map per week
+    max_rows = []
+    bank_reqs = []
+    for wk, g in r.groupby("test_week", sort=False):
+        wk = str(wk)
+        df_w = df_oos_wf[df_oos_wf["week"].astype(str) == wk].copy()
+        if df_w.empty:
+            continue
+        for _, row in g.iterrows():
+            if not bool(row["active"]):
+                continue
+            rk = str(row["rule_key"])
+            bt = str(row["bet_type"])
+            dow = str(row["dow_pt"])
+            score_col = str(row["score_col"])
+            cutoff = float(row["cutoff"])
+            stake_frac = float(row["stake_frac"])
+
+            x = df_w[(df_w["bet_type"] == bt) & (df_w["dow_pt"] == dow)].copy()
+            if x.empty:
+                continue
+            score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
+            roi2 = x["roi_cap2"].to_numpy(dtype=float)
+            cap = x["house_cap"].to_numpy(dtype=float)
+            m = np.isfinite(score) & (score >= cutoff) & np.isfinite(roi2) & np.isfinite(cap) & (cap > 0)
+            if not np.any(m):
+                continue
+            cap_sel = cap[m]
+            roi_sel = roi2[m]
+            # stake atual (com banca=2300 e alpha da semana)
+            alpha_used = float(row["alpha_global"]) if "alpha_global" in row and np.isfinite(float(row["alpha_global"])) else 1.0
+            stake0 = BANKROLL * stake_frac * alpha_used
+            stake_eff_cur = np.minimum(stake0, cap_sel)
+            profit_cur = stake_eff_cur * roi_sel
+            # stake máximo (banca não limita): stake_eff_max = cap
+            stake_eff_max = cap_sel
+            profit_max = stake_eff_max * roi_sel
+
+            max_rows.append({"week": wk, "rule_key": rk, "stake_cur": float(stake_eff_cur.sum()), "profit_cur": float(profit_cur.sum()), "stake_max": float(stake_eff_max.sum()), "profit_max": float(profit_max.sum())})
+
+            # banca necessária para não limitar (alpha=1): banca >= house_cap / stake_frac
+            # (ignorando α, pois em banca grande α tende a 1 e o limitante vira o cap)
+            bank_reqs.extend((cap_sel / max(stake_frac, 1e-9)).tolist())
+
+    max_df = pd.DataFrame(max_rows)
+    if not max_df.empty:
+        weekly_max = max_df.groupby("week", as_index=False).agg(stake_cur=("stake_cur", "sum"), profit_cur=("profit_cur", "sum"), stake_max=("stake_max", "sum"), profit_max=("profit_max", "sum"))
+        weekly_max["roi_cur"] = np.where(weekly_max["stake_cur"] > 0, weekly_max["profit_cur"] / weekly_max["stake_cur"], np.nan)
+        weekly_max["roi_max"] = np.where(weekly_max["stake_max"] > 0, weekly_max["profit_max"] / weekly_max["stake_max"], np.nan)
+        pnl_max = weekly_max["profit_max"].to_numpy(dtype=float)
+        pnl_cur = weekly_max["profit_cur"].to_numpy(dtype=float)
+        max_week_stats = compute_weekly_stats(pnl_max)
+    else:
+        weekly_max = pd.DataFrame()
+        max_week_stats = {"n": 0}
+
+    if bank_reqs:
+        bank_reqs = np.asarray(bank_reqs, dtype=float)
+        bank_p95 = float(np.quantile(bank_reqs, 0.95))
+        bank_max = float(np.max(bank_reqs))
+    else:
+        bank_p95 = float("nan")
+        bank_max = float("nan")
+
     # build document
     styles = getSampleStyleSheet()
     story: List = []
@@ -382,6 +481,56 @@ def main() -> int:
         )
         story.append(tt2)
 
+    # 3.3 maximum operation
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph("<b>3.3 Operação no máximo (banca não limita stake)</b>", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "Aqui calculamos um cenário hipotético em que a banca é grande o suficiente para que o stake por aposta não seja limitado pela banca, "
+            "ou seja, <b>stake_eff_max = house_cap</b> (o limitante passa a ser apenas o cap da casa). "
+            "Mantivemos as mesmas regras (cutoff/stake_frac) escolhidas semanalmente no walk-forward para não misturar mudanças de estratégia com sizing.",
+            styles["BodyText"],
+        )
+    )
+    story.append(
+        Paragraph(
+            f"Banca necessária para que a banca não limite a maioria das apostas: "
+            f"<b>p95(house_cap / stake_frac) ≈ USD {bank_p95:,.0f}</b>. "
+            f"Para não limitar nenhuma aposta na amostra: <b>max ≈ USD {bank_max:,.0f}</b>.",
+            styles["BodyText"],
+        )
+    )
+    if max_week_stats.get("n", 0) > 0:
+        # ROI on bank using bank_p95 (as reference)
+        mean_week_max = float(max_week_stats["mean"])
+        roi_bank_week_max = (mean_week_max / bank_p95) if np.isfinite(bank_p95) and bank_p95 > 0 else float("nan")
+        m_tbl2 = [
+            ["Métrica", "Valor"],
+            ["Semanas (amostra WF)", f"{int(max_week_stats['n'])}"],
+            ["Stake total (máx)", f"USD {float(weekly_max['stake_max'].sum()):,.0f}"],
+            ["Lucro total (máx)", f"USD {float(weekly_max['profit_max'].sum()):,.0f}"],
+            ["ROI por $ apostado (máx)", f"{float(weekly_max['profit_max'].sum()/weekly_max['stake_max'].sum()):.4f}"],
+            ["Lucro médio semanal (máx)", f"USD {mean_week_max:,.1f}"],
+            ["Mediana semanal (máx)", f"USD {float(max_week_stats['median']):,.1f}"],
+            ["Std semanal (máx)", f"USD {float(max_week_stats['std']):,.1f}"],
+            ["Sharpe anualizado (máx)", f"{float(max_week_stats['sharpe_annual']):.3f}"],
+            ["ROI banca/sem (usando banca p95)", f"{roi_bank_week_max*100:.2f}%"],
+        ]
+        tmax = Table(m_tbl2, colWidths=[7.5 * cm, 9.5 * cm])
+        tmax.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(tmax)
+    else:
+        story.append(Paragraph("Não foi possível calcular o cenário de operação máxima (faltam dados/alinhamento de amostra).", styles["BodyText"]))
+
     story.append(PageBreak())
 
     # 5) stability
@@ -414,7 +563,8 @@ def main() -> int:
     if rc.empty:
         story.append(Paragraph("Sem dados suficientes para estatísticas de mudança.", styles["BodyText"]))
     else:
-        top_unstable = rc.sort_values("cutoff_std", ascending=False).head(8)
+        # incluir todas as combinações (tabela completa, 14 segmentos)
+        top_unstable = rc.sort_values(["n_active_weeks", "cutoff_std"], ascending=[False, False]).copy()
         rows = [["Segmento", "Semanas ativas", "Cutoff std", "Stake std", "Taxa mudança cutoff", "Taxa mudança stake"]]
         for _, r in top_unstable.iterrows():
             rows.append(
@@ -440,8 +590,37 @@ def main() -> int:
         )
         story.append(tt3)
 
+    # extra page: full audit of active segments by week
+    story.append(PageBreak())
+    story.append(Paragraph("<b>Anexo A — Auditoria: segmentos ativos por semana (walk-forward)</b>", styles["Heading2"]))
+    story.append(
+        Paragraph(
+            "Tabela para auditoria operacional: em cada semana do walk-forward, quais segmentos ficaram ativos (status=ok e stake>0), "
+            "o α global da semana e a lista de segmentos.",
+            styles["BodyText"],
+        )
+    )
+    if weekly_audit.empty:
+        story.append(Paragraph("Sem dados para auditoria semanal.", styles["BodyText"]))
+    else:
+        rows = [["Semana", "α", "N ativos", "Segmentos ativos"]]
+        for _, rr in weekly_audit.iterrows():
+            rows.append([rr["week"], f"{float(rr['alpha']):.3f}" if np.isfinite(float(rr["alpha"])) else "nan", str(int(rr["n_active"])), rr["segments"]])
+        ta = Table(rows, colWidths=[4.0 * cm, 1.2 * cm, 1.6 * cm, 10.2 * cm])
+        ta.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(ta)
+
     # 4) improvements / suggestions
-    story.append(Spacer(1, 0.4 * cm))
+    story.append(PageBreak())
     story.append(Paragraph("<b>4 & 8. Melhorias sugeridas e evoluções necessárias</b>", styles["Heading2"]))
     story.append(
         Paragraph(
