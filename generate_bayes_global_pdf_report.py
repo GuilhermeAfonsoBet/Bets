@@ -42,6 +42,12 @@ MAX_DAILY_EXPOSURE_FRAC_Q = 0.70
 MAX_DAILY_DRAWDOWN_FRAC = 0.25
 MAX_P_DAILY_DD = 0.10
 
+# filtros de confiança (versão atual do global_bayes)
+MIN_SELECTED_BETS = 6
+MIN_NONZERO_WEEKS = 6
+MIN_BETS_PER_BIN = 20
+MIN_BINS_FOR_STABILITY = 3
+
 
 def quantiles(a: np.ndarray, qs: List[float]) -> Dict[str, float]:
     x = np.asarray(a, dtype=float)
@@ -154,6 +160,9 @@ def main() -> int:
     # core metrics for chosen policy (WF 16 weeks)
     w = wf_week["profit_cap2_usd"].to_numpy(dtype=float)
     wstats = compute_weekly_stats(w)
+    # condicional: apenas semanas com trades (stake>0)
+    w_traded = wf_week.loc[wf_week["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(dtype=float)
+    wstats_traded = compute_weekly_stats(w_traded)
     stake_tot = float(wf_week["stake_usd"].sum())
     profit_tot = float(wf_week["profit_cap2_usd"].sum())
     roi_on_stake = float(profit_tot / stake_tot) if stake_tot > 0 else float("nan")
@@ -326,6 +335,8 @@ def main() -> int:
         ["Risco diário", "VaR10% do PnL diário ≥ -25% da banca e P(loss≥25%) ≤ 10%"],
         ["Sharpe mínimo (cap2)", "Sharpe semanal ≥ 0.10"],
         ["Score-bin stability", "bins=5; exigir ≥4 bins com lucro médio positivo (com relaxamentos se <5 bins)"],
+        ["Confiança mínima (apostas)", f"MIN_SELECTED_BETS={MIN_SELECTED_BETS}; MIN_NONZERO_WEEKS={MIN_NONZERO_WEEKS}"],
+        ["Confiança mínima (bins)", f"MIN_BETS_PER_BIN={MIN_BETS_PER_BIN}; exigir ≥{MIN_BINS_FOR_STABILITY} bins"],
         ["Walk-forward", "semanal, expanding window; mínimo global 10 semanas; mínimo por segmento 6 semanas"],
         ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 80%; objetivo = p05(mean) − 0.001·p95(exposição diária)"],
         ["α global", "busca binária em [0,1] para satisfazer constraints globais no treino do passo"],
@@ -391,7 +402,16 @@ def main() -> int:
         def per_combo_metrics(bt: str, dow: str, score_col: str, cutoff: float, stake_frac: float, alpha: float) -> Dict[str, float]:
             x = df_train_cur[(df_train_cur["bet_type"] == bt) & (df_train_cur["dow_pt"] == dow)].copy()
             if x.empty:
-                return {"mean_week_profit": float("nan"), "std_week_profit": float("nan"), "roi_on_stake": float("nan"), "mean_week_stake": float("nan"), "mean_week_bets": float("nan"), "pneg_week": float("nan")}
+                return {
+                    "mean_week_profit_trade": float("nan"),
+                    "std_week_profit_trade": float("nan"),
+                    "pneg_week_trade": float("nan"),
+                    "roi_on_stake": float("nan"),
+                    "mean_week_stake_trade": float("nan"),
+                    "mean_week_bets_trade": float("nan"),
+                    "trade_weeks": 0,
+                    "trade_rate": float("nan"),
+                }
             score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
             roi2 = x["roi_cap2"].to_numpy(dtype=float)
             cap = x["house_cap"].to_numpy(dtype=float)
@@ -411,17 +431,25 @@ def main() -> int:
                 w = g["profit"].to_numpy(dtype=float)
                 s = g["stake"].to_numpy(dtype=float)
                 b = g["bets"].to_numpy(dtype=float)
-            mean_w = float(np.mean(w))
-            std_w = float(np.std(w, ddof=1)) if w.size > 1 else 0.0
-            pneg = float(np.mean(w < 0))
+            trade_mask = b > 0
+            trade_weeks = int(np.sum(trade_mask))
+            trade_rate = float(trade_weeks / len(weeks_all_train)) if len(weeks_all_train) else float("nan")
+            wt = w[trade_mask] if trade_weeks else np.array([], dtype=float)
+            st = s[trade_mask] if trade_weeks else np.array([], dtype=float)
+            bt_arr = b[trade_mask] if trade_weeks else np.array([], dtype=float)
+            mean_w = float(np.mean(wt)) if wt.size else float("nan")
+            std_w = float(np.std(wt, ddof=1)) if wt.size > 1 else (0.0 if wt.size == 1 else float("nan"))
+            pneg = float(np.mean(wt < 0)) if wt.size else float("nan")
             roi = float(np.sum(w) / np.sum(s)) if float(np.sum(s)) > 0 else float("nan")
             return {
-                "mean_week_profit": mean_w,
-                "std_week_profit": std_w,
-                "pneg_week": pneg,
+                "mean_week_profit_trade": mean_w,
+                "std_week_profit_trade": std_w,
+                "pneg_week_trade": pneg,
                 "roi_on_stake": roi,
-                "mean_week_stake": float(np.mean(s)),
-                "mean_week_bets": float(np.mean(b)),
+                "mean_week_stake_trade": float(np.mean(st)) if st.size else float("nan"),
+                "mean_week_bets_trade": float(np.mean(bt_arr)) if bt_arr.size else float("nan"),
+                "trade_weeks": trade_weeks,
+                "trade_rate": trade_rate,
             }
 
         # tabela com métricas
@@ -432,12 +460,13 @@ def main() -> int:
             P("<b>Cutoff</b>"),
             P("<b>Stake</b>"),
             P("<b>α</b>"),
-            P("<b>Mean PnL<br/>sem (USD)</b>"),
-            P("<b>Std PnL<br/>sem (USD)</b>"),
-            P("<b>P(sem&lt;0)</b>"),
+            P("<b>Mean PnL<br/>sem (trade)</b>"),
+            P("<b>Std PnL<br/>sem (trade)</b>"),
+            P("<b>P(sem&lt;0 | trade)</b>"),
             P("<b>ROI/$</b>"),
-            P("<b>Stake/sem<br/>(USD)</b>"),
-            P("<b>Apostas/sem</b>"),
+            P("<b>Sem<br/>c/trade</b>"),
+            P("<b>Stake/sem<br/>(trade)</b>"),
+            P("<b>Apostas/sem<br/>(trade)</b>"),
         ]]
 
         for _, rr in cur2.iterrows():
@@ -456,18 +485,19 @@ def main() -> int:
                     P(f"{cut:.2f}"),
                     P(f"{frac*100:.1f}%"),
                     P(f"{a:.3f}"),
-                    P(f"{met['mean_week_profit']:.0f}"),
-                    P(f"{met['std_week_profit']:.0f}"),
-                    P(f"{met['pneg_week']*100:.1f}%"),
+                    P(f"{met['mean_week_profit_trade']:.0f}" if np.isfinite(met["mean_week_profit_trade"]) else "nan"),
+                    P(f"{met['std_week_profit_trade']:.0f}" if np.isfinite(met["std_week_profit_trade"]) else "nan"),
+                    P(f"{met['pneg_week_trade']*100:.1f}%" if np.isfinite(met["pneg_week_trade"]) else "nan"),
                     P(f"{met['roi_on_stake']:.3f}" if np.isfinite(met["roi_on_stake"]) else "nan"),
-                    P(f"{met['mean_week_stake']:.0f}"),
-                    P(f"{met['mean_week_bets']:.1f}"),
+                    P(str(int(met["trade_weeks"]))),
+                    P(f"{met['mean_week_stake_trade']:.0f}" if np.isfinite(met["mean_week_stake_trade"]) else "nan"),
+                    P(f"{met['mean_week_bets_trade']:.1f}" if np.isfinite(met["mean_week_bets_trade"]) else "nan"),
                 ]
             )
 
         tt = Table(
             rows,
-            colWidths=[1.0 * cm, 2.5 * cm, 3.6 * cm, 1.2 * cm, 1.2 * cm, 0.9 * cm, 1.6 * cm, 1.6 * cm, 1.2 * cm, 1.0 * cm, 1.5 * cm, 1.2 * cm],
+            colWidths=[0.9 * cm, 2.1 * cm, 3.0 * cm, 1.0 * cm, 1.0 * cm, 0.8 * cm, 1.5 * cm, 1.5 * cm, 1.4 * cm, 0.9 * cm, 0.9 * cm, 1.4 * cm, 1.4 * cm],
             repeatRows=1,
         )
         tt.setStyle(
@@ -477,7 +507,7 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("FONTSIZE", (0, 0), (-1, -1), 6),
                     ("LEFTPADDING", (0, 0), (-1, -1), 3),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                 ]
@@ -509,6 +539,11 @@ def main() -> int:
         ["Mediana semanal", f"USD {wstats.get('median', float('nan')):,.1f}"],
         ["Std semanal", f"USD {wstats.get('std', float('nan')):,.1f}"],
         ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
+        ["— Apenas semanas com trades (stake>0) —", ""],
+        ["Lucro médio semanal (trades)", f"USD {wstats_traded.get('mean', float('nan')):,.1f}"],
+        ["Mediana semanal (trades)", f"USD {wstats_traded.get('median', float('nan')):,.1f}"],
+        ["Std semanal (trades)", f"USD {wstats_traded.get('std', float('nan')):,.1f}"],
+        ["P(semana<0 | trade)", f"{wstats_traded.get('pneg', float('nan'))*100:.1f}%"],
         ["Assimetria (skewness)", f"{wstats.get('skew', float('nan')):.3f}"],
         ["Sharpe semanal (cap2)", f"{wstats.get('sharpe_week', float('nan')):.3f}"],
         ["Sharpe anualizado (cap2)", f"{wstats.get('sharpe_annual', float('nan')):.3f}"],

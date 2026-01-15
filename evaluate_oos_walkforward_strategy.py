@@ -64,6 +64,7 @@ MIN_SELECTED_BETS = 6
 # - bins de score: exigir pelo menos ~20 apostas por bin para estimar médias com menor variância
 MIN_BETS_PER_BIN = 20
 MIN_BINS_FOR_STABILITY = 3  # se não dá para formar ao menos 3 bins, consideramos evidência insuficiente
+MIN_NONZERO_WEEKS = 6  # mínimo de semanas com >=1 aposta selecionada (confiança temporal)
 
 # Para o walk-forward: exigimos um mínimo de histórico global para começar,
 # mas cada segmento pode ter menos semanas (como no otimizador original, que exigia ~6).
@@ -198,6 +199,10 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
                 continue
             # mínimo de apostas selecionadas (evita regras que passam por acaso)
             if int(np.sum(m)) < MIN_SELECTED_BETS:
+                continue
+            # mínimo de semanas com apostas (evita regras com bets concentradas em 1-2 semanas)
+            nonzero_weeks = int(pd.Series(np.ones(int(np.sum(m))), index=wk[m]).groupby(level=0).sum().shape[0])
+            if nonzero_weeks < MIN_NONZERO_WEEKS:
                 continue
 
             # weekly pnl (cap2) aligned to weeks_all (fill 0 for empty weeks)
