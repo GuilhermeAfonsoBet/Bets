@@ -47,6 +47,10 @@ MIN_NONZERO_WEEKS = 6
 MIN_BETS_PER_BIN = 20
 MIN_BINS_FOR_STABILITY = 3
 
+# estabilidade de decisão (histerese)
+HYSTERESIS_ENABLED = True
+HYST_P_SWITCH = 0.90
+
 
 def quantiles(a: np.ndarray, qs: List[float]) -> Dict[str, float]:
     x = np.asarray(a, dtype=float)
@@ -335,6 +339,7 @@ def main() -> int:
         ["Score-bin stability", "bins=5; exigir ≥4 bins com lucro médio positivo (com relaxamentos se <5 bins)"],
         ["Confiança mínima (apostas)", f"MIN_SELECTED_BETS={MIN_SELECTED_BETS}; MIN_NONZERO_WEEKS={MIN_NONZERO_WEEKS}"],
         ["Confiança mínima (bins)", f"MIN_BETS_PER_BIN={MIN_BETS_PER_BIN}; exigir ≥{MIN_BINS_FOR_STABILITY} bins"],
+        ["Estabilidade de decisão (histerese)", f"habilitado={HYSTERESIS_ENABLED}; P(switch)≥{HYST_P_SWITCH:.2f}"],
         ["Walk-forward", "semanal, expanding window; mínimo global 10 semanas; mínimo por segmento 6 semanas"],
         ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 80%; objetivo = p05(mean) − 0.001·p95(exposição diária)"],
         ["α global", "busca binária em [0,1] para satisfazer constraints globais no treino do passo"],

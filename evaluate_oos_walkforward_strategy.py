@@ -84,6 +84,12 @@ EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
+# Histerese / custo de mudança (reduzir churn):
+# Compara o melhor candidato do passo com a regra anterior do segmento (se existir)
+# e só troca se houver evidência forte.
+HYSTERESIS_ENABLED = True
+HYST_P_SWITCH = 0.90  # exige P(novo > antigo) >= 90% (Bayesian bootstrap semanal)
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -171,7 +177,7 @@ def score_bin_ok(score_sel: np.ndarray, profit_sel: np.ndarray) -> Tuple[int, in
     return int(n_bins), int(pos_bins), bool(ok)
 
 
-def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) -> Rule:
+def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, prev_rule: Rule | None) -> Rule:
     """
     x já vem filtrado para um único (dow, bet_type) e apenas semanas de treino.
     Retorna a melhor regra (ou stake_frac=0 com status).
@@ -187,8 +193,15 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
     wk = x["week"].to_numpy()
     d = x["date"].to_numpy()
 
+    # Bayesian bootstrap weights (fixos por chamada, para comparabilidade entre candidatos)
+    bb_weights = None
+    if bayes_select:
+        rng = np.random.default_rng(SEED + 123 + hash((str(x["dow_pt"].iloc[0]), str(x["bet_type"].iloc[0]))) % 10_000)
+        bb_weights = rng.dirichlet(np.ones(len(weeks_all)), size=BAYES_N)
+
     best_obj = -np.inf
     best = None
+    best_post = None
 
     for f in STAKE_FRACS:
         stake0 = BANKROLL * float(f)
@@ -273,10 +286,9 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
                 obj = mean - 0.25 * std - EXPOSURE_PENALTY * p95_exp
             else:
                 # Bayesian bootstrap sobre semanas (não-paramétrico)
-                rng = np.random.default_rng(SEED + 123)
+                assert bb_weights is not None
                 W = w2.astype(float)
-                weights = rng.dirichlet(np.ones(W.size), size=BAYES_N)
-                post_means = weights @ W
+                post_means = bb_weights @ W
                 p_mean_pos = float(np.mean(post_means > 0))
                 if p_mean_pos < MIN_POST_P_MEAN_POS:
                     continue
@@ -285,9 +297,38 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
             if obj > best_obj:
                 best_obj = obj
                 best = (float(c), float(f))
+                best_post = post_means if bayes_select else None
 
     if best is None:
         return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, status="no_candidate")
+
+    # Histerese: comparar contra a regra anterior, se válida
+    if HYSTERESIS_ENABLED and bayes_select and prev_rule is not None and prev_rule.status == "ok" and prev_rule.stake_frac > 0 and best_post is not None:
+        # Reavaliar a regra anterior no treino atual
+        stake0_prev = BANKROLL * float(prev_rule.stake_frac)
+        stake_eff_prev = np.minimum(stake0_prev, cap)
+        mprev = np.isfinite(score) & (score >= float(prev_rule.cutoff)) & np.isfinite(roi2)
+        ok_prev = True
+        if not np.any(mprev) or int(np.sum(mprev)) < MIN_SELECTED_BETS:
+            ok_prev = False
+        else:
+            nonzero_prev = int(pd.Series(np.ones(int(np.sum(mprev))), index=wk[mprev]).groupby(level=0).sum().shape[0])
+            if nonzero_prev < MIN_NONZERO_WEEKS:
+                ok_prev = False
+        if ok_prev:
+            pnl2_prev = stake_eff_prev[mprev] * roi2[mprev]
+            w2_prev = (
+                pd.Series(pnl2_prev, index=wk[mprev])
+                .groupby(level=0)
+                .sum()
+                .reindex(weeks_all, fill_value=0.0)
+                .to_numpy(dtype=float)
+            )
+            assert bb_weights is not None
+            post_prev = bb_weights @ w2_prev.astype(float)
+            p_switch = float(np.mean(best_post > post_prev))
+            if p_switch < HYST_P_SWITCH:
+                return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=float(prev_rule.cutoff), stake_frac=float(prev_rule.stake_frac), status="ok")
 
     return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=best[0], stake_frac=best[1], status="ok")
 
@@ -433,6 +474,7 @@ def main() -> int:
         weekly_seg_rows = []
         weekly_global_rows = []
         daily_rows = []
+        prev_rules: Dict[str, Rule] = {}
 
         for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
             w_test = weeks[i]
@@ -450,7 +492,8 @@ def main() -> int:
                     if x.empty:
                         rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
                     else:
-                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select)
+                        prev = prev_rules.get(f"{bet_type}|{dow}")
+                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev)
                     rules[f"{bet_type}|{dow}"] = rule
 
             # se pedir risco global, ajustar stakes por alpha
@@ -531,6 +574,9 @@ def main() -> int:
                             "roi_on_stake_cap2": float(r["profit_cap2_usd"] / r["stake_usd"]) if float(r["stake_usd"]) > 0 else float("nan"),
                         }
                     )
+
+            # atualizar regras anteriores (histerese) para o próximo passo
+            prev_rules = rules.copy()
 
         daily_df = pd.concat(daily_rows, axis=0, ignore_index=True) if daily_rows else pd.DataFrame(columns=["date", "stake_usd", "profit_cap2_usd", "week", "alpha_global"])
         return (
