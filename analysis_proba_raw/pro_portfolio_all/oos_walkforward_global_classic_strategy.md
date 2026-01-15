@@ -4,15 +4,15 @@
 - **Modo global**: aplica um fator α (0..1) multiplicando todos os stakes para satisfazer constraints do portfólio agregado no treino de cada passo.
 
 ### Performance OOS (cap2) — portfólio agregado
-- **PnL semanal médio (bootstrap IC95%)**: **USD 145.8** (IC95% -111.8..434.7)
-- **Desvio padrão semanal**: USD 578.8
+- **PnL semanal médio (bootstrap IC95%)**: **USD 146.6** (IC95% -110.4..435.2)
+- **Desvio padrão semanal**: USD 578.1
 - **P(semana < 0)**: 43.8%
 
 ### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)
-- **PnL semanal médio (bootstrap IC95%)**: **USD 155.6** (IC95% -119.0..463.9)
-- **Desvio padrão semanal**: USD 597.8
+- **PnL semanal médio (bootstrap IC95%)**: **USD 156.3** (IC95% -117.9..464.3)
+- **Desvio padrão semanal**: USD 597.0
 - **P(semana < 0)**: 46.7%
-- **ROI on stake agregado (ponderado)**: 0.0294
+- **ROI on stake agregado (ponderado)**: 0.0298
 
 ### Risco no OOS (teste) — portfólio agregado
 - p80(soma stakes/dia) = USD 1968 (limite=USD 1610)
@@ -30,7 +30,7 @@
 - **FH | quinta-feira**: active_rate=75.0%, ok_rate=75.0%, stake_frac_médio=3.38%, cutoff_médio=0.42
 - **FH | segunda-feira**: active_rate=0.0%, ok_rate=0.0%, stake_frac_médio=0.00%, cutoff_médio=1.00
 - **FH | sexta-feira**: active_rate=31.2%, ok_rate=31.2%, stake_frac_médio=0.31%, cutoff_médio=0.71
-- **FH | sábado**: active_rate=87.5%, ok_rate=87.5%, stake_frac_médio=1.50%, cutoff_médio=0.39
+- **FH | sábado**: active_rate=81.2%, ok_rate=81.2%, stake_frac_médio=1.44%, cutoff_médio=0.43
 - **FH | terça-feira**: active_rate=50.0%, ok_rate=50.0%, stake_frac_médio=2.94%, cutoff_médio=0.68
 - **FT | domingo**: active_rate=50.0%, ok_rate=50.0%, stake_frac_médio=2.19%, cutoff_médio=0.63
 - **FT | quarta-feira**: active_rate=75.0%, ok_rate=75.0%, stake_frac_médio=4.50%, cutoff_médio=0.56
@@ -46,7 +46,7 @@
 - **FT|terça-feira**: mean_week=54.4 (IC95% 2.6..112.0), P(semana>0)=43.8%
 - **FT|segunda-feira**: mean_week=39.2 (IC95% -20.3..96.2), P(semana>0)=43.8%
 - **FT|quarta-feira**: mean_week=36.9 (IC95% -53.5..128.0), P(semana>0)=37.5%
-- **FH|sábado**: mean_week=21.1 (IC95% -10.5..56.5), P(semana>0)=43.8%
+- **FH|sábado**: mean_week=21.9 (IC95% -9.7..57.0), P(semana>0)=43.8%
 - **FH|quinta-feira**: mean_week=16.8 (IC95% -46.4..99.3), P(semana>0)=31.2%
 - **FH|sexta-feira**: mean_week=-6.5 (IC95% -39.2..28.9), P(semana>0)=6.2%
 - **FT|quinta-feira**: mean_week=-9.2 (IC95% -98.3..89.4), P(semana>0)=6.2%
