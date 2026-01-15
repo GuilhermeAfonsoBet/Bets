@@ -58,6 +58,13 @@ N_SCORE_BINS = 5
 MIN_POS_BINS_CAP2 = 4
 ENABLE_SCORE_BIN_STABILITY = True
 
+# Confiança estatística mínima (pedido):
+# - mínimo de apostas selecionadas por candidato (para evitar regras com 1-2 bets)
+MIN_SELECTED_BETS = 6
+# - bins de score: exigir pelo menos ~20 apostas por bin para estimar médias com menor variância
+MIN_BETS_PER_BIN = 20
+MIN_BINS_FOR_STABILITY = 3  # se não dá para formar ao menos 3 bins, consideramos evidência insuficiente
+
 # Para o walk-forward: exigimos um mínimo de histórico global para começar,
 # mas cada segmento pode ter menos semanas (como no otimizador original, que exigia ~6).
 MIN_GLOBAL_TRAIN_WEEKS = 10
@@ -128,7 +135,15 @@ def score_bin_ok(score_sel: np.ndarray, profit_sel: np.ndarray) -> Tuple[int, in
     profit_sel = np.asarray(profit_sel, dtype=float)
     if score_sel.size == 0:
         return 0, 0, False
-    edges = np.unique(np.quantile(score_sel, np.linspace(0.0, 1.0, N_SCORE_BINS + 1)))
+
+    # Exigir evidência mínima para avaliar estabilidade por bins:
+    # se não há apostas suficientes para formar ao menos 3 bins com ~MIN_BETS_PER_BIN cada, falha.
+    max_bins_by_n = int(score_sel.size // max(MIN_BETS_PER_BIN, 1))
+    n_bins_target = int(min(N_SCORE_BINS, max_bins_by_n))
+    if n_bins_target < MIN_BINS_FOR_STABILITY:
+        return 0, 0, False
+
+    edges = np.unique(np.quantile(score_sel, np.linspace(0.0, 1.0, n_bins_target + 1)))
     if edges.size < 3:
         n_bins = 1
         pos_bins = 1 if float(np.mean(profit_sel)) > 0 else 0
@@ -180,6 +195,9 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
         for c in CUTOFFS:
             m = np.isfinite(score) & (score >= c) & np.isfinite(roi2)
             if not np.any(m):
+                continue
+            # mínimo de apostas selecionadas (evita regras que passam por acaso)
+            if int(np.sum(m)) < MIN_SELECTED_BETS:
                 continue
 
             # weekly pnl (cap2) aligned to weeks_all (fill 0 for empty weeks)
