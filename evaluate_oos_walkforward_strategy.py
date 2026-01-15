@@ -84,6 +84,12 @@ EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
+# Robustez do cutoff (sensibilidade):
+# No modo bayesiano, em vez de escolher apenas o pico, escolhemos o cutoff que maximiza
+# o pior caso numa vizinhança pequena (± um passo do grid).
+ROBUST_CUTOFF_ENABLED = True
+ROBUST_CUTOFF_DELTA = 0.02  # 1 passo do grid
+
 # Histerese / custo de mudança (reduzir churn) — DESLIGADO por ora.
 HYSTERESIS_ENABLED = False
 HYST_P_SWITCH = 0.90  # se habilitar no futuro
@@ -197,6 +203,85 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         rng = np.random.default_rng(SEED + 123 + hash((str(x["dow_pt"].iloc[0]), str(x["bet_type"].iloc[0]))) % 10_000)
         bb_weights = rng.dirichlet(np.ones(len(weeks_all)), size=BAYES_N)
 
+    def eval_obj_for_cutoff(stake_eff: np.ndarray, cutoff: float) -> Tuple[bool, float, np.ndarray | None]:
+        """
+        Avalia um cutoff fixo (stake_eff já definido pelo stake_frac).
+        Retorna (ok, obj, post_means) onde post_means só existe no modo bayes_select.
+        """
+        m = np.isfinite(score) & (score >= float(cutoff)) & np.isfinite(roi2)
+        if not np.any(m):
+            return False, -np.inf, None
+        if int(np.sum(m)) < MIN_SELECTED_BETS:
+            return False, -np.inf, None
+        nonzero_weeks = int(pd.Series(np.ones(int(np.sum(m))), index=wk[m]).groupby(level=0).sum().shape[0])
+        if nonzero_weeks < MIN_NONZERO_WEEKS:
+            return False, -np.inf, None
+
+        pnl2 = stake_eff[m] * roi2[m]
+        w2 = (
+            pd.Series(pnl2, index=wk[m])
+            .groupby(level=0)
+            .sum()
+            .reindex(weeks_all, fill_value=0.0)
+            .to_numpy(dtype=float)
+        )
+        mean = float(w2.mean())
+        if mean <= 0:
+            return False, -np.inf, None
+        std = float(w2.std(ddof=1)) if w2.size >= 2 else 0.0
+        pneg = float((w2 < 0).mean())
+        if pneg > 0.40:
+            return False, -np.inf, None
+        sharpe = float(mean / std) if std > 0 else (float("inf") if mean > 0 else -float("inf"))
+        if np.isfinite(sharpe) and sharpe < MIN_WEEKLY_SHARPE_CAP2:
+            return False, -np.inf, None
+
+        pnl1 = stake_eff[m] * roi1[m]
+        w1 = (
+            pd.Series(pnl1, index=wk[m])
+            .groupby(level=0)
+            .sum()
+            .reindex(weeks_all, fill_value=0.0)
+            .to_numpy(dtype=float)
+        )
+        mean1 = float(w1.mean())
+        if mean1 < -0.10 * mean:
+            return False, -np.inf, None
+
+        pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
+        if pnl_day.size == 0:
+            return False, -np.inf, None
+        daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
+        p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean())
+        if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
+            return False, -np.inf, None
+        if p_dd > MAX_P_DAILY_DD:
+            return False, -np.inf, None
+
+        stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
+        if stake_day.size == 0:
+            return False, -np.inf, None
+        p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q))
+        if p80_exp > MAX_DAILY_EXPOSURE_FRAC_Q * BANKROLL:
+            return False, -np.inf, None
+        p95_exp = float(np.quantile(stake_day, 0.95))
+
+        if ENABLE_SCORE_BIN_STABILITY:
+            n_bins, pos_bins, ok = score_bin_ok(score[m], stake_eff[m] * roi2[m])
+            if not ok:
+                return False, -np.inf, None
+
+        if not bayes_select:
+            return True, float(mean - 0.25 * std - EXPOSURE_PENALTY * p95_exp), None
+
+        assert bb_weights is not None
+        post_means = bb_weights @ w2.astype(float)
+        p_mean_pos = float(np.mean(post_means > 0))
+        if p_mean_pos < MIN_POST_P_MEAN_POS:
+            return False, -np.inf, None
+        q_obj = float(np.quantile(post_means, POST_Q_OBJ))
+        return True, float(q_obj - EXPOSURE_PENALTY * p95_exp), post_means
+
     best_obj = -np.inf
     best = None
     best_post = None
@@ -205,97 +290,30 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         stake0 = BANKROLL * float(f)
         stake_eff = np.minimum(stake0, cap)
         for c in CUTOFFS:
-            m = np.isfinite(score) & (score >= c) & np.isfinite(roi2)
-            if not np.any(m):
-                continue
-            # mínimo de apostas selecionadas (evita regras que passam por acaso)
-            if int(np.sum(m)) < MIN_SELECTED_BETS:
-                continue
-            # mínimo de semanas com apostas (evita regras com bets concentradas em 1-2 semanas)
-            nonzero_weeks = int(pd.Series(np.ones(int(np.sum(m))), index=wk[m]).groupby(level=0).sum().shape[0])
-            if nonzero_weeks < MIN_NONZERO_WEEKS:
+            ok0, obj0, post0 = eval_obj_for_cutoff(stake_eff, float(c))
+            if not ok0:
                 continue
 
-            # weekly pnl (cap2) aligned to weeks_all (fill 0 for empty weeks)
-            pnl2 = stake_eff[m] * roi2[m]
-            w2 = (
-                pd.Series(pnl2, index=wk[m])
-                .groupby(level=0)
-                .sum()
-                .reindex(weeks_all, fill_value=0.0)
-                .to_numpy(dtype=float)
-            )
-            mean = float(w2.mean())
-            if mean <= 0:
-                continue
-            std = float(w2.std(ddof=1)) if w2.size >= 2 else 0.0
-            pneg = float((w2 < 0).mean())
-            if pneg > 0.40:
-                continue
-            sharpe = float(mean / std) if std > 0 else (float("inf") if mean > 0 else -float("inf"))
-            if np.isfinite(sharpe) and sharpe < MIN_WEEKLY_SHARPE_CAP2:
-                continue
-
-            # cap1 sanity
-            pnl1 = stake_eff[m] * roi1[m]
-            w1 = (
-                pd.Series(pnl1, index=wk[m])
-                .groupby(level=0)
-                .sum()
-                .reindex(weeks_all, fill_value=0.0)
-                .to_numpy(dtype=float)
-            )
-            mean1 = float(w1.mean())
-            if mean1 < -0.10 * mean:
-                continue
-
-            # daily risk constraints (cap2)
-            pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
-            if pnl_day.size == 0:
-                continue
-            daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
-            p_dd = float((pnl_day <= (-MAX_DAILY_DRAWDOWN_FRAC * BANKROLL)).mean())
-            if daily_var < -MAX_DAILY_DRAWDOWN_FRAC * BANKROLL:
-                continue
-            if p_dd > MAX_P_DAILY_DD:
-                continue
-
-            # exposure constraint (p80 sum stakes/day)
-            stake_day = pd.Series(stake_eff[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
-            if stake_day.size == 0:
-                continue
-            p80_exp = float(np.quantile(stake_day, DAILY_EXPOSURE_Q))
-            if p80_exp > MAX_DAILY_EXPOSURE_FRAC_Q * BANKROLL:
-                continue
-            p95_exp = float(np.quantile(stake_day, 0.95))
-
-            # score-bin stability (cap2), opcional
-            if ENABLE_SCORE_BIN_STABILITY:
-                n_bins, pos_bins, ok = score_bin_ok(score[m], stake_eff[m] * roi2[m])
-                if not ok:
+            obj_use = obj0
+            if bayes_select and ROBUST_CUTOFF_ENABLED:
+                # pior caso em cutoff±delta (se vizinhos falham constraints, conta como -inf)
+                worst = obj0
+                for cc in (float(c) - ROBUST_CUTOFF_DELTA, float(c) + ROBUST_CUTOFF_DELTA):
+                    if cc < float(CUTOFFS.min()) or cc > float(CUTOFFS.max()):
+                        continue
+                    okn, objn, _ = eval_obj_for_cutoff(stake_eff, float(cc))
+                    if not okn:
+                        worst = -np.inf
+                        break
+                    worst = min(worst, objn)
+                obj_use = worst
+                if not np.isfinite(obj_use):
                     continue
 
-            # -----------------------------
-            # Objetivo no treino:
-            #   - clássico: mean - 0.25*std - penalty exposure
-            #   - bayesiano: maximiza p05 posterior do mean semanal (edge conservador)
-            # -----------------------------
-            if not bayes_select:
-                obj = mean - 0.25 * std - EXPOSURE_PENALTY * p95_exp
-            else:
-                # Bayesian bootstrap sobre semanas (não-paramétrico)
-                assert bb_weights is not None
-                W = w2.astype(float)
-                post_means = bb_weights @ W
-                p_mean_pos = float(np.mean(post_means > 0))
-                if p_mean_pos < MIN_POST_P_MEAN_POS:
-                    continue
-                q_obj = float(np.quantile(post_means, POST_Q_OBJ))
-                obj = q_obj - EXPOSURE_PENALTY * p95_exp
-            if obj > best_obj:
-                best_obj = obj
+            if obj_use > best_obj:
+                best_obj = float(obj_use)
                 best = (float(c), float(f))
-                best_post = post_means if bayes_select else None
+                best_post = post0
 
     if best is None:
         return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, status="no_candidate")
