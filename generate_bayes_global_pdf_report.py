@@ -463,11 +463,23 @@ def main() -> int:
         # choose a few rows
         cols = ["name", "weeks", "bets", "stake", "profit", "roi_on_stake", "mean_week", "std_week", "pneg_week", "p80_day_stake", "var10_day_pnl"]
         show = show[cols].copy()
-        rows = [["Cenário", "Sem", "Apostas", "Stake", "Lucro", "ROI/$", "Mean/sem", "Std/sem", "P(sem<0)", "p80 stake/dia", "VaR10% dia"]]
+        rows = [[
+            P("<b>Cenário</b>"),
+            P("<b>Sem</b>"),
+            P("<b>Apostas</b>"),
+            P("<b>Stake</b>"),
+            P("<b>Lucro</b>"),
+            P("<b>ROI/$</b>"),
+            P("<b>Mean<br/>sem</b>"),
+            P("<b>Std<br/>sem</b>"),
+            P("<b>P(sem&lt;0)</b>"),
+            P("<b>p80<br/>stake/dia</b>"),
+            P("<b>VaR10%<br/>dia</b>"),
+        ]]
         for _, r in show.iterrows():
             rows.append(
                 [
-                    str(r["name"]),
+                    P(str(r["name"])),
                     str(int(r["weeks"])),
                     str(int(r["bets"])),
                     f"{float(r['stake']):,.0f}",
@@ -480,7 +492,12 @@ def main() -> int:
                     f"{float(r['var10_day_pnl']):,.0f}" if np.isfinite(float(r["var10_day_pnl"])) else "nan",
                 ]
             )
-        tt2 = Table(rows, colWidths=[4.2 * cm, 1.0 * cm, 1.2 * cm, 1.4 * cm, 1.4 * cm, 1.2 * cm, 1.4 * cm, 1.2 * cm, 1.3 * cm, 1.5 * cm, 1.2 * cm])
+        tt2 = Table(
+            rows,
+            colWidths=[3.9 * cm, 1.0 * cm, 1.4 * cm, 1.35 * cm, 1.35 * cm, 1.1 * cm, 1.1 * cm, 1.1 * cm, 1.2 * cm, 1.45 * cm, 1.3 * cm],
+            rowHeights=[1.1 * cm] + [None] * (len(rows) - 1),
+            repeatRows=1,
+        )
         tt2.setStyle(
             TableStyle(
                 [
@@ -488,7 +505,11 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("FONTSIZE", (0, 0), (-1, -1), 6),
+                    ("LEADING", (0, 0), (-1, 0), 7),
+                    ("ALIGN", (1, 0), (-1, 0), "CENTER"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                 ]
             )
         )
