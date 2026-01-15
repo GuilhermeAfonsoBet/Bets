@@ -51,8 +51,8 @@ MIN_BINS_FOR_STABILITY = 3
 HYSTERESIS_ENABLED = False
 HYST_P_SWITCH = 0.90
 
-# robustez de cutoff (sensibilidade local)
-ROBUST_CUTOFF_ENABLED = True
+# robustez de cutoff (sensibilidade local) — DESLIGADO por ora
+ROBUST_CUTOFF_ENABLED = False
 ROBUST_CUTOFF_DELTA = 0.02
 
 

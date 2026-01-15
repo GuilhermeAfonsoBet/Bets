@@ -84,11 +84,9 @@ EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
-# Robustez do cutoff (sensibilidade):
-# No modo bayesiano, em vez de escolher apenas o pico, escolhemos o cutoff que maximiza
-# o pior caso numa vizinhança pequena (± um passo do grid).
-ROBUST_CUTOFF_ENABLED = True
-ROBUST_CUTOFF_DELTA = 0.02  # 1 passo do grid
+# Robustez do cutoff (sensibilidade) — DESLIGADO por ora.
+ROBUST_CUTOFF_ENABLED = False
+ROBUST_CUTOFF_DELTA = 0.02  # 1 passo do grid, se habilitar no futuro
 
 # Histerese / custo de mudança (reduzir churn) — DESLIGADO por ora.
 HYSTERESIS_ENABLED = False
