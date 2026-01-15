@@ -70,9 +70,14 @@ MIN_SEG_TRAIN_WEEKS = 6
 # - requer "confiança": P(mean>0) >= MIN_POST_P_MEAN_POS
 BAYES_SELECT = True  # default; main() roda tanto bayes quanto clássico
 BAYES_N = 8_000
-MIN_POST_P_MEAN_POS = 0.75
+MIN_POST_P_MEAN_POS = 0.80
 POST_Q_OBJ = 0.05  # p05 do mean semanal (posterior)
 EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
+
+# Lower bound adicional (pedido):
+# exigir que o p05 empírico do PnL semanal (cap2) não seja "ruim demais" vs média.
+# Regra: q05_week_pnl >= -LB_WEEK_PNL_FRAC * mean_week_pnl
+LB_WEEK_PNL_FRAC = 0.50
 
 N_BOOT = 20_000
 SEED = 7
@@ -255,6 +260,11 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool) 
                 p_mean_pos = float(np.mean(post_means > 0))
                 if p_mean_pos < MIN_POST_P_MEAN_POS:
                     continue
+                # lower bound empírico do PnL semanal
+                q05_week = float(np.quantile(W, 0.05))
+                if q05_week < -LB_WEEK_PNL_FRAC * mean:
+                    continue
+
                 q_obj = float(np.quantile(post_means, POST_Q_OBJ))
                 obj = q_obj - EXPOSURE_PENALTY * p95_exp
             if obj > best_obj:
