@@ -33,7 +33,6 @@ PORT_FIXED = OUT_DIR / "portfolio_pro_all.json"
 WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
 WF_DAILY = OUT_DIR / "oos_walkforward_global_bayes_daily.csv"
 WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
-CUR_RULES = OUT_DIR / "global_bayes_current_week_rules.csv"
 COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
 
 BANKROLL = 2300.0
@@ -154,7 +153,6 @@ def main() -> int:
     wf_week = pd.read_csv(WF_WEEKLY)
     wf_daily = pd.read_csv(WF_DAILY)
     wf_rules = pd.read_csv(WF_RULES)
-    cur = pd.read_csv(CUR_RULES) if CUR_RULES.exists() else pd.DataFrame()
     comp = pd.read_csv(COMPARISON) if COMPARISON.exists() else pd.DataFrame()
 
     # core metrics for chosen policy (WF 16 weeks)
@@ -373,10 +371,19 @@ def main() -> int:
             styles["BodyText"],
         )
     )
+    # Regras da semana mais recente (garantidamente consistentes com o Anexo A):
+    # sempre derivadas de WF_RULES (e não de um CSV separado).
+    wf_rules["active"] = (wf_rules["status"] == "ok") & (wf_rules["stake_frac"] > 0)
+    last_week = str(wf_rules["test_week"].iloc[-1])
+    cur = wf_rules[(wf_rules["test_week"] == last_week) & (wf_rules["active"])].copy()
+    # persistir também como artefato auxiliar (para uso externo)
+    cur_csv_path = OUT_DIR / "global_bayes_current_week_rules.csv"
+    cur.to_csv(cur_csv_path, index=False)
+
     if cur.empty:
-        story.append(Paragraph("Arquivo de regras atuais não encontrado.", styles["BodyText"]))
+        story.append(Paragraph("Nenhuma combinação ativa na última semana do walk-forward.", styles["BodyText"]))
     else:
-        cur2 = cur[["bet_type", "dow_pt", "score_col", "cutoff", "stake_frac", "alpha_global"]].copy()
+        cur2 = cur[["bet_type", "dow_pt", "score_col", "cutoff", "stake_frac", "alpha_global", "rule_key"]].copy()
         cur2 = cur2.sort_values(["bet_type", "dow_pt"])
         # ---------------------------------------------------------
         # Métricas por combinação (estimadas no histórico disponível
@@ -387,7 +394,6 @@ def main() -> int:
         def week_start(week_str: str) -> pd.Timestamp:
             return pd.to_datetime(str(week_str).split("/")[0])
 
-        last_week = str(cur["test_week"].iloc[0]) if "test_week" in cur.columns and not cur.empty else str(wf_rules["test_week"].iloc[-1])
         last_start = week_start(last_week)
 
         df_all = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
@@ -829,7 +835,7 @@ def main() -> int:
     story.append(Paragraph("<b>9. Data e reprodutibilidade</b>", styles["Heading2"]))
     story.append(
         Paragraph(
-            f"Relatório gerado em {today}. Fontes principais: `{WF_WEEKLY.name}`, `{WF_DAILY.name}`, `{WF_RULES.name}`, `{CUR_RULES.name}`, `{COMPARISON.name}`.",
+            f"Relatório gerado em {today}. Fontes principais: `{WF_WEEKLY.name}`, `{WF_DAILY.name}`, `{WF_RULES.name}`, `global_bayes_current_week_rules.csv`, `{COMPARISON.name}`.",
             styles["BodyText"],
         )
     )
