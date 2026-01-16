@@ -3,7 +3,7 @@
 - Base: `/workspace/pr1_snapshot/dedup_scored_base.csv`
 - Modelos: `/workspace`
 - `calib_floor` (clip): **0.005**
-- parse-mode: **robust**
+- parse-mode: **weekdays_cli**
 - Janela: últimos **30** dias (coluna `BIA_ApostaUTC`, se disponível)
 
 ### Resumo (rf_prob vs proba_cli)
