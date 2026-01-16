@@ -394,18 +394,25 @@ def main() -> int:
     df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
     df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
 
-    # garantir coluna calibrada para Sex/Sáb/Dom se necessária (regras podem referenciar proba_cal_sexdom)
-    if "proba_cal_sexdom" not in df_all.columns:
-        df_all["proba_cal_sexdom"] = np.nan
-    if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
-        try:
+    # garantir scores calibrados para qui e fim de semana (podem ser referenciados em score_col)
+    for c in ("proba_cal_segqui", "proba_cal_sexdom"):
+        if c not in df_all.columns:
+            df_all[c] = np.nan
+    try:
+        if "proba_raw_segqui" in df_all.columns and CALIB_SEGQUI.exists():
+            calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
+            x0 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y0 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_segqui"] = np.clip(np.maximum(np.interp(p_raw, x0, y0, left=float(y0[0]), right=float(y0[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
+        if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
             calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
-            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
-            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            x1 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y1 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
             p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
-            df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x, y, left=float(y[0]), right=float(y[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
-        except Exception:
-            pass
+            df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x1, y1, left=float(y1[0]), right=float(y1[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
+    except Exception:
+        pass
 
     # only weeks evaluated in WF
     wf_weeks = set(wf_week["week"].astype(str).tolist())
@@ -591,6 +598,25 @@ def main() -> int:
         df_all["roi_cap2"] = np.minimum(df_all["roi_raw"].to_numpy(dtype=float), 2.0)
         df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
         df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+        # garantir scores calibrados para qui e fim de semana (podem ser referenciados em score_col)
+        for c in ("proba_cal_segqui", "proba_cal_sexdom"):
+            if c not in df_all.columns:
+                df_all[c] = np.nan
+        try:
+            if "proba_raw_segqui" in df_all.columns and CALIB_SEGQUI.exists():
+                calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
+                x0 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+                y0 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+                p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+                df_all["proba_cal_segqui"] = np.clip(np.maximum(np.interp(p_raw, x0, y0, left=float(y0[0]), right=float(y0[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
+            if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
+                calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
+                x1 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+                y1 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+                p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+                df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x1, y1, left=float(y1[0]), right=float(y1[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
+        except Exception:
+            pass
         df_all["week_start"] = pd.to_datetime(df_all["week"].str.split("/").str[0])
         df_train_cur = df_all[df_all["week_start"] < last_start].copy()
         weeks_all_train = sorted(df_train_cur["week"].unique().tolist())

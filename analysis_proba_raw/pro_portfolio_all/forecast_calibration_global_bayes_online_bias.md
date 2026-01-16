@@ -3,10 +3,10 @@
 - Janela de bias (rolling): **8** semanas passadas
 
 ### Métricas (OOS, por semana)
-- Bias (real - pred), modelo cru: **USD -168.6**
-- Bias (real - pred), bias-adjusted on-line: **USD -101.5**
-- MAE, modelo cru: **USD 475.5**
-- MAE, bias-adjusted on-line: **USD 493.2**
+- Bias (real - pred), modelo cru: **USD -97.5**
+- Bias (real - pred), bias-adjusted on-line: **USD -124.2**
+- MAE, modelo cru: **USD 506.4**
+- MAE, bias-adjusted on-line: **USD 531.2**
 
 ### Arquivos
 - CSV: `analysis_proba_raw/pro_portfolio_all/forecast_calibration_global_bayes_online_bias.csv`

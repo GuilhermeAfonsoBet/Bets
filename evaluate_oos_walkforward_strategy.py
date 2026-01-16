@@ -41,7 +41,8 @@ import pandas as pd
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
-CALIB_FLOOR_SEXDOM = 0.005  # mesmo piso do RPA/CLI
+CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
+CALIB_FLOOR = 0.005  # mesmo piso do RPA/CLI
 
 # sizing / constraints (iguais ao portfólio pro_all)
 BANKROLL = 2300.0
@@ -146,7 +147,8 @@ def segment_score_col(dow: str) -> str:
     if dow == "quarta-feira":
         return "proba_raw_quarta"
     if dow == "quinta-feira":
-        return "proba_raw_segqui"
+        # Quinta: no RPA (score_logit_by_dow_cli) é subset SegQui + isotonic + floor
+        return "proba_cal_segqui"
     # Sex/Sáb/Dom: usar score calibrado (mesmo do RPA) para alinhar execução com estudo
     return "proba_cal_sexdom"
 
@@ -596,19 +598,29 @@ def main() -> int:
     df["roi_cap2"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 2.0)
     df["roi_cap1"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 1.0)
 
-    # Construir score calibrado para Sex/Sáb/Dom (proba_cal_sexdom) a partir do proba_raw_sexdom + isotonic.
-    # Isso replica a lógica do CLI (apply_isotonic + calib_floor).
+    # Construir scores calibrados para SegQui (qui) e SexDom (sex/sab/dom) a partir dos proba_raw_* + isotonic.
+    # Replica a lógica do CLI (apply_isotonic + calib_floor).
+    df["proba_cal_segqui"] = np.nan
+    if "proba_raw_segqui" in df.columns and CALIB_SEGQUI.exists():
+        try:
+            calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df["proba_cal_segqui"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR)
+        except Exception:
+            pass
+
+    df["proba_cal_sexdom"] = np.nan
     if "proba_raw_sexdom" in df.columns and CALIB_SEXDOM.exists():
         try:
             calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
             x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
             y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
             p_raw = pd.to_numeric(df["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
-            df["proba_cal_sexdom"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR_SEXDOM)
+            df["proba_cal_sexdom"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR)
         except Exception:
-            df["proba_cal_sexdom"] = np.nan
-    else:
-        df["proba_cal_sexdom"] = np.nan
+            pass
 
     weeks = sorted(df["week"].unique().tolist())
     if len(weeks) < (MIN_GLOBAL_TRAIN_WEEKS + 3):
