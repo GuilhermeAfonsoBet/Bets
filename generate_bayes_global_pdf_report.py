@@ -214,10 +214,21 @@ def main() -> int:
         if "crps" in fc.columns:
             fc_crps = float(np.mean(fc["crps"].to_numpy(dtype=float)))
 
-    # cenário conservador: ajustar projeção semanal usando o viés médio de forecast (se disponível)
-    mean_week_cal = float(mean_week + fc_bias) if (np.isfinite(mean_week) and np.isfinite(fc_bias)) else float("nan")
-    exp_month_cal = float(mean_week_cal * 4.33) if np.isfinite(mean_week_cal) else float("nan")
-    exp_year_cal = float(mean_week_cal * 52.0) if np.isfinite(mean_week_cal) else float("nan")
+    # Forecast: média prevista e correção de viés
+    fc_pred_mean = float("nan")
+    if FORECAST_CALIB.exists():
+        try:
+            fc0 = pd.read_csv(FORECAST_CALIB)
+            if (not fc0.empty) and ("pred_mean" in fc0.columns):
+                fc_pred_mean = float(np.mean(fc0["pred_mean"].to_numpy(dtype=float)))
+        except Exception:
+            fc_pred_mean = float("nan")
+    # bias-corrected forecast mean = E[pred_mean + bias] = E[pred_mean] + bias
+    fc_pred_mean_cal = float(fc_pred_mean + fc_bias) if (np.isfinite(fc_pred_mean) and np.isfinite(fc_bias)) else float("nan")
+    exp_month_fc = float(fc_pred_mean * 4.33) if np.isfinite(fc_pred_mean) else float("nan")
+    exp_year_fc = float(fc_pred_mean * 52.0) if np.isfinite(fc_pred_mean) else float("nan")
+    exp_month_fc_cal = float(fc_pred_mean_cal * 4.33) if np.isfinite(fc_pred_mean_cal) else float("nan")
+    exp_year_fc_cal = float(fc_pred_mean_cal * 52.0) if np.isfinite(fc_pred_mean_cal) else float("nan")
 
     # calibração por combinação (rule_key): top vieses de ROI (shrink)
     top_bias_rows = []
@@ -635,11 +646,14 @@ def main() -> int:
         ["ROI banca (médio por semana)", f"{roi_bank_week*100:.2f}%"],
         ["Lucro esperado mensal (≈4,33 sem)", f"USD {exp_month:,.0f}"],
         ["Lucro esperado anual (≈52 sem)", f"USD {exp_year:,.0f}"],
-        ["— Projeção ajustada por calibração (conservadora) —", ""],
-        ["Bias médio de forecast (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
-        ["Lucro médio semanal ajustado (mean + bias)", f"USD {mean_week_cal:,.1f}" if np.isfinite(mean_week_cal) else "nan"],
-        ["Lucro esperado mensal ajustado", f"USD {exp_month_cal:,.0f}" if np.isfinite(exp_month_cal) else "nan"],
-        ["Lucro esperado anual ajustado", f"USD {exp_year_cal:,.0f}" if np.isfinite(exp_year_cal) else "nan"],
+        ["— Forecast (média prevista) e correção de viés —", ""],
+        ["Forecast: média prevista (E[pred_mean])", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan"],
+        ["Forecast: Bias médio (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
+        ["Forecast: média corrigida (E[pred_mean]+Bias)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
+        ["Forecast: lucro mensal (previsto)", f"USD {exp_month_fc:,.0f}" if np.isfinite(exp_month_fc) else "nan"],
+        ["Forecast: lucro anual (previsto)", f"USD {exp_year_fc:,.0f}" if np.isfinite(exp_year_fc) else "nan"],
+        ["Forecast: lucro mensal (corrigido)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
+        ["Forecast: lucro anual (corrigido)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
         ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
         ["Calibração: coverage 90% (p05..p95)", f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan"],
         ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],

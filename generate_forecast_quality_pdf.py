@@ -273,10 +273,14 @@ def main() -> int:
         )
     )
     story.append(Spacer(1, 8))
+    pred_mean_mean = float(np.mean(df["pred_mean"].to_numpy(dtype=float))) if "pred_mean" in df.columns else float("nan")
+    pred_mean_cal = float(pred_mean_mean + bias) if np.isfinite(pred_mean_mean) and np.isfinite(bias) else float("nan")
     story.append(
         Paragraph(
             f"No estado atual, o modelo apresenta <b>Bias = {_fmt_usd(bias)}</b>. "
             "Bias negativo significa que, em média, o realizado ficou abaixo do previsto (otimismo). "
+            f"A média prevista (E[pred_mean]) é {_fmt_usd(pred_mean_mean)} e, ao aplicar correção de viés "
+            f"(E[pred_mean]+Bias), cai para {_fmt_usd(pred_mean_cal)}. "
             f"O erro típico (MAE) é {_fmt_usd(mae)} e o RMSE é {_fmt_usd(rmse)}: "
             "isso indica que a incerteza semanal é grande e que a previsão pontual sozinha não é suficiente para tomada de decisão.",
             style_p,
