@@ -35,6 +35,7 @@ WF_DAILY = OUT_DIR / "oos_walkforward_global_bayes_daily.csv"
 WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
 COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
 FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
+FORECAST_CALIB_BY_RULE = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
 
 BANKROLL = 2300.0
 # mesmos limites do otimizador
@@ -215,6 +216,16 @@ def main() -> int:
     mean_week_cal = float(mean_week + fc_bias) if (np.isfinite(mean_week) and np.isfinite(fc_bias)) else float("nan")
     exp_month_cal = float(mean_week_cal * 4.33) if np.isfinite(mean_week_cal) else float("nan")
     exp_year_cal = float(mean_week_cal * 52.0) if np.isfinite(mean_week_cal) else float("nan")
+
+    # calibração por combinação (rule_key): top vieses de ROI (shrink)
+    top_bias_rows = []
+    if FORECAST_CALIB_BY_RULE.exists():
+        br = pd.read_csv(FORECAST_CALIB_BY_RULE)
+        if (not br.empty) and ("bias_roi_shrunk" in br.columns):
+            br = br[np.isfinite(br["bias_roi_shrunk"].to_numpy(dtype=float))].copy()
+            br = br.sort_values("bias_roi_shrunk").head(6)
+            for _, rr in br.iterrows():
+                top_bias_rows.append([str(rr["rule_key"]), f"{float(rr['bias_roi_shrunk']):.5f}", str(int(rr.get('n_obs', 0)))])
 
     # stability of rules
     jac = jaccard_instability(wf_rules)
@@ -617,6 +628,29 @@ def main() -> int:
         )
     )
     story.append(t2)
+
+    if top_bias_rows:
+        story.append(Spacer(1, 0.25 * cm))
+        story.append(Paragraph("<b>3.1.1 Calibração por combinação (ROI bias shrunken)</b>", styles["Heading3"]))
+        story.append(
+            Paragraph(
+                "Estimamos o viés de ROI por segmento (rule_key) no walk-forward e aplicamos shrinkage (pooling) "
+                "para reduzir ruído. Valores negativos indicam previsão otimista (ROI realizado menor que o previsto).",
+                styles["BodyText"],
+            )
+        )
+        tbr = Table([["rule_key", "bias_roi_shrunk", "n_obs"]] + top_bias_rows, colWidths=[5.0 * cm, 4.0 * cm, 2.0 * cm])
+        tbr.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(tbr)
 
     # weekly quantiles section
     story.append(Spacer(1, 0.3 * cm))

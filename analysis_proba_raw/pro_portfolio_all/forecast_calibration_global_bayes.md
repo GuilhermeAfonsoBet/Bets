@@ -4,9 +4,9 @@
 - Draws por fold (posterior preditivo): **10000**
 
 ### Erros (ponto: média prevista)
-- Bias (média do erro): **USD -201.1**
-- MAE: **USD 489.5**
-- RMSE: **USD 565.0**
+- Bias (média do erro): **USD -181.3**
+- MAE: **USD 380.9**
+- RMSE: **USD 449.1**
 
 ### Decomposição do erro (stake vs ROI)
 - Identidade: PnL = Stake * ROI.
@@ -14,21 +14,21 @@
 - Termo de dependência (cov): cov = E[S*R] - E[S]E[R].
 - Decomposição que fecha a conta do erro y - P̂:
   y - P̂ = (S-Ŝ)R̂ + Ŝ(R-R̂) + (S-Ŝ)(R-R̂) - cov.
-- Média componente **stake** ((S-Ŝ)R̂): **USD 65.7**
-- Média componente **ROI** (Ŝ(R-R̂)): **USD -44.6**
-- Média **interação** ((S-Ŝ)(R-R̂)): **USD -46.8**
-- Média **cov** (E[S*R]-E[S]E[R]): **USD 175.4**
-- Média total (decomp): **USD -201.1** (deve bater com Bias)
+- Média componente **stake** ((S-Ŝ)R̂): **USD 53.8**
+- Média componente **ROI** (Ŝ(R-R̂)): **USD -84.0**
+- Média **interação** ((S-Ŝ)(R-R̂)): **USD -34.2**
+- Média **cov** (E[S*R]-E[S]E[R]): **USD 117.0**
+- Média total (decomp): **USD -181.3** (deve bater com Bias)
 
 ### Diagnóstico direto (stake e ROI, semanas com trade)
-- Stake: média (real - previsto): **USD 1,687.6** (positivo => o previsto estava menor que o realizado)
-- ROI: média (real - previsto): **-0.01102** (negativo => o previsto estava maior que o realizado)
+- Stake: média (real - previsto): **USD 1,371.2** (positivo => o previsto estava menor que o realizado)
+- ROI: média (real - previsto): **-0.07475** (negativo => o previsto estava maior que o realizado)
 
 ### Calibração probabilística
-- Coverage 80% (p10..p90): **62.5%** (ideal ~80%)
-- Coverage 90% (p05..p95): **75.0%** (ideal ~90%)
-- PIT médio: **0.417** (ideal ~0.5)
-- CRPS médio (aprox): **307.2** (menor é melhor)
+- Coverage 80% (p10..p90): **50.0%** (ideal ~80%)
+- Coverage 90% (p05..p95): **62.5%** (ideal ~90%)
+- PIT médio: **0.375** (ideal ~0.5)
+- CRPS médio (aprox): **260.3** (menor é melhor)
 
 ### Arquivos
 - CSV: `analysis_proba_raw/pro_portfolio_all/forecast_calibration_global_bayes.csv`

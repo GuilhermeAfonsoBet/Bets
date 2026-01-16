@@ -82,6 +82,14 @@ MIN_POST_P_MEAN_POS = 0.80
 POST_Q_OBJ = 0.05  # p05 do mean semanal (posterior)
 EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 
+# Calibração por combinação (rule_key) para reduzir otimismo sistemático:
+# - Mantém um histórico de erros de ROI por segmento no walk-forward (usando apenas passado)
+# - Estima um bias por segmento com shrinkage (pooling) entre segmentos (Empirical Bayes)
+# - Aplica correção conservadora na etapa de seleção (apenas penaliza; não "premia" otimismo positivo)
+SEGMENT_CALIB_ENABLED = True
+SEGMENT_CALIB_ONLY_PENALIZE = True
+SEGMENT_CALIB_MIN_TOTAL_OBS = 8  # mínimo de observações (somadas em todos segmentos) para ativar shrinkage
+
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
 # Robustez do cutoff (sensibilidade) — DESLIGADO por ora.
@@ -179,7 +187,13 @@ def score_bin_ok(score_sel: np.ndarray, profit_sel: np.ndarray) -> Tuple[int, in
     return int(n_bins), int(pos_bins), bool(ok)
 
 
-def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, prev_rule: Rule | None) -> Rule:
+def optimize_segment_train(
+    x: pd.DataFrame,
+    score_col: str,
+    bayes_select: bool,
+    prev_rule: Rule | None,
+    roi_bias_adj: float = 0.0,
+) -> Rule:
     """
     x já vem filtrado para um único (dow, bet_type) e apenas semanas de treino.
     Retorna a melhor regra (ou stake_frac=0 com status).
@@ -191,6 +205,11 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
     score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
     roi2 = x["roi_cap2"].to_numpy(dtype=float)
     roi1 = x["roi_cap1"].to_numpy(dtype=float)
+    # ajuste conservador de ROI (calibração por segmento):
+    # roi_bias_adj é erro (ROI_real - ROI_previsto); se negativo => modelo otimista => reduzir ROI esperado.
+    roi_bias = float(roi_bias_adj)
+    roi2_adj = roi2 + roi_bias
+    roi1_adj = roi1 + roi_bias
     cap = x["house_cap"].to_numpy(dtype=float)
     wk = x["week"].to_numpy()
     d = x["date"].to_numpy()
@@ -206,7 +225,7 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         Avalia um cutoff fixo (stake_eff já definido pelo stake_frac).
         Retorna (ok, obj, post_means) onde post_means só existe no modo bayes_select.
         """
-        m = np.isfinite(score) & (score >= float(cutoff)) & np.isfinite(roi2)
+        m = np.isfinite(score) & (score >= float(cutoff)) & np.isfinite(roi2_adj)
         if not np.any(m):
             return False, -np.inf, None
         if int(np.sum(m)) < MIN_SELECTED_BETS:
@@ -215,7 +234,7 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         if nonzero_weeks < MIN_NONZERO_WEEKS:
             return False, -np.inf, None
 
-        pnl2 = stake_eff[m] * roi2[m]
+        pnl2 = stake_eff[m] * roi2_adj[m]
         w2 = (
             pd.Series(pnl2, index=wk[m])
             .groupby(level=0)
@@ -234,7 +253,7 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         if np.isfinite(sharpe) and sharpe < MIN_WEEKLY_SHARPE_CAP2:
             return False, -np.inf, None
 
-        pnl1 = stake_eff[m] * roi1[m]
+        pnl1 = stake_eff[m] * roi1_adj[m]
         w1 = (
             pd.Series(pnl1, index=wk[m])
             .groupby(level=0)
@@ -246,7 +265,7 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         if mean1 < -0.10 * mean:
             return False, -np.inf, None
 
-        pnl_day = pd.Series(stake_eff[m] * roi2[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
+        pnl_day = pd.Series(stake_eff[m] * roi2_adj[m], index=d[m]).groupby(level=0).sum().to_numpy(dtype=float)
         if pnl_day.size == 0:
             return False, -np.inf, None
         daily_var = float(np.quantile(pnl_day, DAILY_VAR_Q))
@@ -265,7 +284,7 @@ def optimize_segment_train(x: pd.DataFrame, score_col: str, bayes_select: bool, 
         p95_exp = float(np.quantile(stake_day, 0.95))
 
         if ENABLE_SCORE_BIN_STABILITY:
-            n_bins, pos_bins, ok = score_bin_ok(score[m], stake_eff[m] * roi2[m])
+            n_bins, pos_bins, ok = score_bin_ok(score[m], stake_eff[m] * roi2_adj[m])
             if not ok:
                 return False, -np.inf, None
 
@@ -400,6 +419,90 @@ def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float
     return pd.concat(rows, axis=0, ignore_index=True)
 
 
+def _empirical_bayes_shrink(means: np.ndarray, se2: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    """
+    Shrinkage Empirical Bayes para estimar um efeito por grupo:
+      m_i ~ Normal(mu0, tau^2 + se_i^2)
+    Retorna (mu0, tau2, post_mean_i).
+    """
+    m = np.asarray(means, dtype=float)
+    v = np.asarray(se2, dtype=float)
+    ok = np.isfinite(m) & np.isfinite(v) & (v > 0)
+    m = m[ok]
+    v = v[ok]
+    if m.size == 0:
+        return float("nan"), 0.0, np.array([], dtype=float)
+    w = 1.0 / v
+    mu0 = float(np.sum(w * m) / np.sum(w))
+    # método de momentos (aprox): var(m) ≈ tau2 + mean(se2)
+    var_m = float(np.var(m, ddof=1)) if m.size > 1 else 0.0
+    tau2 = float(max(0.0, var_m - float(np.mean(v))))
+    if tau2 <= 1e-12:
+        post = np.full(m.size, mu0, dtype=float)
+    else:
+        post = (m / v + mu0 / tau2) / (1.0 / v + 1.0 / tau2)
+    return mu0, tau2, post
+
+
+def _segment_roi_bias_shrunk(roi_err_hist: Dict[str, List[float]]) -> Dict[str, float]:
+    """
+    Estima bias de ROI por segmento usando apenas histórico observado:
+    - bias = ROI_real - ROI_previsto (negativo => otimismo)
+    - aplica shrinkage entre segmentos para reduzir ruído em amostras pequenas
+    """
+    keys = sorted(roi_err_hist.keys())
+    all_err = np.array([e for k in keys for e in roi_err_hist.get(k, []) if np.isfinite(float(e))], dtype=float)
+    total_obs = int(all_err.size)
+    if total_obs < SEGMENT_CALIB_MIN_TOTAL_OBS:
+        return {}
+    global_var = float(np.var(all_err, ddof=1)) if all_err.size > 1 else 0.0
+    means = []
+    se2 = []
+    used_keys = []
+    for k in keys:
+        a = np.asarray(roi_err_hist.get(k, []), dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            continue
+        m = float(np.mean(a))
+        vv = float(np.var(a, ddof=1)) if a.size > 1 else global_var
+        # se global_var==0 e n==1, ainda precisamos de um se2>0
+        vv = float(vv if vv > 1e-12 else 1e-6)
+        means.append(m)
+        se2.append(vv / float(a.size))
+        used_keys.append(k)
+
+    if len(used_keys) < 2:
+        return {}
+    mu0, tau2, post = _empirical_bayes_shrink(np.asarray(means), np.asarray(se2))
+    out = {}
+    for k, pm in zip(used_keys, post):
+        val = float(pm)
+        if SEGMENT_CALIB_ONLY_PENALIZE:
+            val = min(0.0, val)
+        out[k] = val
+    return out
+
+
+def _rule_weekly_roi_mean(df_train: pd.DataFrame, rule: Rule, train_weeks: List[str]) -> float:
+    """
+    ROI semanal médio no treino, incluindo semanas sem trade como ROI=0.
+    Usado como "ROI previsto" para calibração por segmento.
+    """
+    if not train_weeks:
+        return 0.0
+    bets = apply_rules_on_df(df_train, {f"{rule.bet_type}|{rule.dow}": rule}, alpha=1.0)
+    if bets.empty:
+        return 0.0
+    g = bets.groupby("week", as_index=False).agg(stake=("stake_eff", "sum"), pnl=("profit_cap2", "sum"))
+    gm = g.set_index("week").reindex(train_weeks, fill_value=0.0)
+    stake = gm["stake"].to_numpy(dtype=float)
+    pnl = gm["pnl"].to_numpy(dtype=float)
+    roi_w = np.zeros_like(stake, dtype=float)
+    np.divide(pnl, stake, out=roi_w, where=(stake > 0))
+    return float(np.mean(roi_w))
+
+
 def portfolio_global_constraints_ok(df_train: pd.DataFrame, rules: Dict[str, Rule], alpha: float) -> Tuple[bool, Dict[str, float]]:
     """
     Checa constraints no portfólio agregado (treino):
@@ -489,6 +592,8 @@ def main() -> int:
         weekly_global_rows = []
         daily_rows = []
         prev_rules: Dict[str, Rule] = {}
+        # histórico de calibração por segmento (só usa passado)
+        seg_roi_err_hist: Dict[str, List[float]] = {}
 
         for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
             w_test = weeks[i]
@@ -496,6 +601,10 @@ def main() -> int:
 
             df_train = df[df["week"].isin(train_weeks)].copy()
             df_test = df[df["week"] == w_test].copy()
+
+            roi_bias_adj_map: Dict[str, float] = {}
+            if bayes_select and SEGMENT_CALIB_ENABLED:
+                roi_bias_adj_map = _segment_roi_bias_shrunk(seg_roi_err_hist)
 
             # otimiza regras no treino (para cada segmento)
             rules: Dict[str, Rule] = {}
@@ -507,7 +616,9 @@ def main() -> int:
                         rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
                     else:
                         prev = prev_rules.get(f"{bet_type}|{dow}")
-                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev)
+                        rk = f"{bet_type}|{dow}"
+                        roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
+                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
                     rules[f"{bet_type}|{dow}"] = rule
 
             # se pedir risco global, ajustar stakes por alpha
@@ -530,6 +641,7 @@ def main() -> int:
                         "alpha_global": float(alpha),
                         "status": rule.status,
                         "rule_key": key,
+                        "roi_bias_adj_used": float(roi_bias_adj_map.get(key, 0.0)) if (bayes_select and SEGMENT_CALIB_ENABLED) else 0.0,
                     }
                 )
 
@@ -588,6 +700,22 @@ def main() -> int:
                             "roi_on_stake_cap2": float(r["profit_cap2_usd"] / r["stake_usd"]) if float(r["stake_usd"]) > 0 else float("nan"),
                         }
                     )
+
+            # atualizar histórico de calibração por segmento (para próximos passos)
+            # usa ROI previsto no treino (média semanal, incluindo semanas sem trade como 0) e ROI realizado no teste
+            if bayes_select and SEGMENT_CALIB_ENABLED:
+                for key, rule in rules.items():
+                    if rule.status != "ok" or rule.stake_frac <= 0:
+                        continue
+                    roi_pred = _rule_weekly_roi_mean(df_train, rule, train_weeks=train_weeks)
+                    b_test = apply_rules_on_df(df_test, {key: rule}, alpha=1.0)
+                    stake_t = float(b_test["stake_eff"].sum()) if not b_test.empty else 0.0
+                    pnl_t = float(b_test["profit_cap2"].sum()) if not b_test.empty else 0.0
+                    if stake_t <= 0:
+                        continue
+                    roi_real = float(pnl_t / stake_t)
+                    err_roi = float(roi_real - roi_pred)
+                    seg_roi_err_hist.setdefault(key, []).append(err_roi)
 
             # atualizar regras anteriores (histerese) para o próximo passo
             prev_rules = rules.copy()
