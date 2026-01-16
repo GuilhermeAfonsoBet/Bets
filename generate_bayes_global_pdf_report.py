@@ -37,6 +37,7 @@ COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
 FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
 FORECAST_CALIB_BY_RULE = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
 FORECAST_CALIB_MAX = OUT_DIR / "forecast_calibration_global_bayes_max.csv"
+FORECAST_CALIB_ONLINE = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
 BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
 BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
 OOS_GATE_WEEKLY = OUT_DIR / "oos_postfilter_debiased_roi_weekly.csv"
@@ -248,6 +249,19 @@ def main() -> int:
     exp_year_fc_cal = float(fc_pred_mean_cal * 52.0) if np.isfinite(fc_pred_mean_cal) else float("nan")
     roi_bank_week_fc_cal = float(fc_pred_mean_cal / BANKROLL) if np.isfinite(fc_pred_mean_cal) else float("nan")
     roi_on_stake_fc_cal = float(fc_pred_mean_cal / fc_pred_stake_cal) if np.isfinite(fc_pred_stake_cal) and fc_pred_stake_cal > 0 else float("nan")
+
+    # online bias-adjusted (walk-forward): usa apenas passado em cada semana
+    fc_online_mean = float("nan")
+    fc_online_roi_bank = float("nan")
+    if FORECAST_CALIB_ONLINE.exists():
+        try:
+            fco = pd.read_csv(FORECAST_CALIB_ONLINE)
+            if (not fco.empty) and ("pred_mean_bias_adj_online" in fco.columns):
+                fc_online_mean = float(np.mean(fco["pred_mean_bias_adj_online"].to_numpy(dtype=float)))
+                fc_online_roi_bank = float(fc_online_mean / BANKROLL) if np.isfinite(fc_online_mean) else float("nan")
+        except Exception:
+            fc_online_mean = float("nan")
+            fc_online_roi_bank = float("nan")
 
     # calibração por combinação (rule_key): vieses de ROI
     # Nota: o shrinkage Empirical Bayes pode colapsar para mu0 (tau2≈0). Por isso reportamos também o bias bruto.
@@ -709,10 +723,13 @@ def main() -> int:
     story.append(Paragraph("<b>3.1.A Resumo executivo (forecast bias-corrected)</b>", styles["BodyText"]))
     exec_tbl = [
         ["Métrica", "Valor (bias-corrected)"],
-        ["Forecast: média semanal corrigida", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
-        ["Forecast: lucro mensal corrigido", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
-        ["Forecast: lucro anual corrigido", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
-        ["Forecast: ROI banca/sem (corrigido)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
+        ["Forecast: média semanal corrigida (on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "nan"],
+        ["Forecast: ROI banca/sem (corrigido, on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "nan"],
+        ["— (referência) correção ex-post no período —", ""],
+        ["Forecast: média semanal corrigida (ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
+        ["Forecast: lucro mensal corrigido (ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
+        ["Forecast: lucro anual corrigido (ex-post)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
+        ["Forecast: ROI banca/sem (ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
         ["Forecast: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
         ["Forecast: ROI por $ (corrigido)", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
         ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],

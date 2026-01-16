@@ -26,6 +26,7 @@ import pandas as pd
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
 BEFORE_AFTER = OUT_DIR / "before_after_global_comparison.csv"
+CALIB_ONLINE = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
 
 
 def _fmt_usd(x: float) -> str:
@@ -84,6 +85,14 @@ def main() -> int:
             ba = pd.read_csv(BEFORE_AFTER)
         except Exception:
             ba = None
+
+    # on-line bias adjusted (se existir)
+    online = None
+    if CALIB_ONLINE.exists():
+        try:
+            online = pd.read_csv(CALIB_ONLINE)
+        except Exception:
+            online = None
 
     doc = SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=1.6 * cm, bottomMargin=1.6 * cm)
     story = []
@@ -309,6 +318,42 @@ def main() -> int:
         )
     )
     story.append(Spacer(1, 10))
+
+    if online is not None and (not online.empty) and {"diff_real_minus_model_raw", "diff_real_minus_model_bias_adj", "abs_diff_raw", "abs_diff_bias_adj"}.issubset(set(online.columns)):
+        story.append(Paragraph("Bias-adjusted on-line (walk-forward)", styles["Heading3"]))
+        e0 = online["diff_real_minus_model_raw"].to_numpy(dtype=float)
+        e1 = online["diff_real_minus_model_bias_adj"].to_numpy(dtype=float)
+        mae0 = float(np.mean(np.abs(e0)))
+        mae1 = float(np.mean(np.abs(e1)))
+        b0 = float(np.mean(e0))
+        b1 = float(np.mean(e1))
+        story.append(
+            Paragraph(
+                "O ajuste de bias operacional deve ser <b>on-line</b>: para cada semana, estimamos o bias usando apenas semanas anteriores "
+                "(ex.: média móvel) e aplicamos na previsão da semana corrente. Isso evita correção ex-post que “fecha a conta” no período completo.",
+                style_p,
+            )
+        )
+        t_on = Table(
+            [
+                ["Métrica", "Modelo cru", "Bias-adjusted on-line"],
+                ["Bias (média de y - pred)", _fmt_usd(b0), _fmt_usd(b1)],
+                ["MAE", _fmt_usd(mae0), _fmt_usd(mae1)],
+            ],
+            colWidths=[6.0 * cm, 5.0 * cm, 5.0 * cm],
+        )
+        t_on.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ]
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(t_on)
 
     if ba is not None and (not ba.empty) and {"scenario", "mean_week", "std_week", "sharpe_annual", "roi_on_stake", "fc_bias", "fc_mae", "fc_cov80"}.issubset(set(ba.columns)):
         story.append(Paragraph("Antes vs depois (com correções)", styles["Heading3"]))
