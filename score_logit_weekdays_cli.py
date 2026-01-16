@@ -156,20 +156,48 @@ def _payload_hash(row: pd.Series) -> str:
     return hashlib.sha256(s).hexdigest()[:16]
 
 
+def coerce_decimal_string(x):
+    """
+    Converte números que podem vir como string em formato BR/EN.
+    Regras:
+      - se tem exatamente 1 vírgula e >1 ponto => pontos são milhares; vírgula é decimal
+      - se tem 1 vírgula e 0 pontos           => vírgula é decimal
+      - senão, tenta float direto (ponto decimal comum)
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return np.nan
+    # caso típico BR com milhares (.) e decimal (,)
+    if s.count(",") == 1 and s.count(".") > 1:
+        s_clean = s.replace(".", "").replace(",", ".")
+        try:
+            return float(s_clean)
+        except Exception:
+            return np.nan
+    # vírgula decimal simples
+    if s.count(",") == 1 and s.count(".") == 0:
+        try:
+            return float(s.replace(",", "."))
+        except Exception:
+            return np.nan
+    # ponto decimal comum
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
 def preparar_payload(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
 
-    # converter colunas numéricas com vírgula decimal, se vierem como texto
+    # converter colunas numéricas vindas como texto (aceita ponto OU vírgula decimal)
     for col in NUM_FEATURES:
-        if col in df.columns and df[col].dtype == object:
-            s = (
-                df[col]
-                .astype(str)
-                .str.replace(".", "", regex=False)   # remove separador de milhar
-                .str.replace(",", ".", regex=False)  # vírgula -> ponto decimal
-            )
-            df[col] = pd.to_numeric(s, errors="coerce")
+        if col in df.columns:
+            # aplica coerção robusta em qualquer dtype (string/object/num)
+            df[col] = df[col].apply(coerce_decimal_string)
 
     return df
 
