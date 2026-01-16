@@ -34,6 +34,7 @@ WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
 WF_DAILY = OUT_DIR / "oos_walkforward_global_bayes_daily.csv"
 WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
 COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
+FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
 
 BANKROLL = 2300.0
 # mesmos limites do otimizador
@@ -191,6 +192,29 @@ def main() -> int:
     alpha_p50 = float(np.quantile(alpha, 0.50))
     alpha_p90 = float(np.quantile(alpha, 0.90))
     p_alpha_lt1 = float(np.mean(alpha < 0.999))
+
+    # forecast calibration (PnL previsto -> PnL teórico realizado)
+    fc_bias = fc_mae = fc_rmse = fc_cov80 = fc_cov90 = fc_pit = fc_crps = float("nan")
+    if FORECAST_CALIB.exists():
+        fc = pd.read_csv(FORECAST_CALIB)
+        if not fc.empty and "error" in fc.columns:
+            e = fc["error"].to_numpy(dtype=float)  # y - pred_mean
+            fc_bias = float(np.mean(e))
+            fc_mae = float(np.mean(np.abs(e)))
+            fc_rmse = float(np.sqrt(np.mean(e * e)))
+        if {"pnl_theoretical", "pred_p10", "pred_p90"}.issubset(set(fc.columns)):
+            fc_cov80 = float(np.mean((fc["pnl_theoretical"] >= fc["pred_p10"]) & (fc["pnl_theoretical"] <= fc["pred_p90"])))
+        if {"pnl_theoretical", "pred_p05", "pred_p95"}.issubset(set(fc.columns)):
+            fc_cov90 = float(np.mean((fc["pnl_theoretical"] >= fc["pred_p05"]) & (fc["pnl_theoretical"] <= fc["pred_p95"])))
+        if "pit" in fc.columns:
+            fc_pit = float(np.mean(fc["pit"].to_numpy(dtype=float)))
+        if "crps" in fc.columns:
+            fc_crps = float(np.mean(fc["crps"].to_numpy(dtype=float)))
+
+    # cenário conservador: ajustar projeção semanal usando o viés médio de forecast (se disponível)
+    mean_week_cal = float(mean_week + fc_bias) if (np.isfinite(mean_week) and np.isfinite(fc_bias)) else float("nan")
+    exp_month_cal = float(mean_week_cal * 4.33) if np.isfinite(mean_week_cal) else float("nan")
+    exp_year_cal = float(mean_week_cal * 52.0) if np.isfinite(mean_week_cal) else float("nan")
 
     # stability of rules
     jac = jaccard_instability(wf_rules)
@@ -566,6 +590,15 @@ def main() -> int:
         ["ROI banca (médio por semana)", f"{roi_bank_week*100:.2f}%"],
         ["Lucro esperado mensal (≈4,33 sem)", f"USD {exp_month:,.0f}"],
         ["Lucro esperado anual (≈52 sem)", f"USD {exp_year:,.0f}"],
+        ["— Projeção ajustada por calibração (conservadora) —", ""],
+        ["Bias médio de forecast (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
+        ["Lucro médio semanal ajustado (mean + bias)", f"USD {mean_week_cal:,.1f}" if np.isfinite(mean_week_cal) else "nan"],
+        ["Lucro esperado mensal ajustado", f"USD {exp_month_cal:,.0f}" if np.isfinite(exp_month_cal) else "nan"],
+        ["Lucro esperado anual ajustado", f"USD {exp_year_cal:,.0f}" if np.isfinite(exp_year_cal) else "nan"],
+        ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
+        ["Calibração: coverage 90% (p05..p95)", f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan"],
+        ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
+        ["Calibração: CRPS médio", f"{fc_crps:,.1f}" if np.isfinite(fc_crps) else "nan"],
         ["Risco diário: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite USD {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
         ["Risco diário: VaR10%(PnL dia)", f"USD {var10:,.1f} (limite ≥ USD {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
         ["Risco diário: P(PnL dia ≤ -25% banca)", f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)"],

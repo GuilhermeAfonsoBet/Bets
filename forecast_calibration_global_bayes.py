@@ -79,22 +79,31 @@ def apply_rules_to_df(df: pd.DataFrame, rules_week: pd.DataFrame, alpha: float) 
     return pd.concat(rows, axis=0, ignore_index=True) if rows else pd.DataFrame(columns=["week", "stake_eff", "profit_cap2", "rule_key"])
 
 
-def posterior_predictive_weekly(w_train: np.ndarray, rng: np.random.Generator, n_draws: int) -> np.ndarray:
+def posterior_predictive_weekly_joint(
+    w_pnl: np.ndarray, w_stake: np.ndarray, rng: np.random.Generator, n_draws: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Bayesian bootstrap posterior predictive for a single future week:
-    - sample Dirichlet weights over historical weeks
-    - sample one week index from those weights
+    Posterior preditivo Bayesiano (bootstrap) para UMA semana futura, preservando a dependência PnL<->Stake:
+    - amostra pesos Dirichlet sobre semanas históricas
+    - amostra um índice de semana de acordo com esses pesos
+    - retorna draws de (pnl, stake, roi=pnl/stake)
     """
-    w = np.asarray(w_train, dtype=float)
-    n = w.size
+    p = np.asarray(w_pnl, dtype=float)
+    s = np.asarray(w_stake, dtype=float)
+    n = p.size
     if n == 0:
-        return np.zeros(n_draws, dtype=float)
-    draws = np.empty(n_draws, dtype=float)
+        z = np.zeros(n_draws, dtype=float)
+        return z, z, z
+    pnl = np.empty(n_draws, dtype=float)
+    stk = np.empty(n_draws, dtype=float)
+    roi = np.empty(n_draws, dtype=float)
     for i in range(n_draws):
-        p = rng.dirichlet(np.ones(n))
-        idx = rng.choice(n, p=p)
-        draws[i] = w[idx]
-    return draws
+        w = rng.dirichlet(np.ones(n))
+        idx = rng.choice(n, p=w)
+        pnl[i] = p[idx]
+        stk[i] = s[idx]
+        roi[i] = (pnl[i] / stk[i]) if stk[i] > 0 else 0.0
+    return pnl, stk, roi
 
 
 def crps_from_sample(draws: np.ndarray, y: float) -> float:
@@ -147,12 +156,18 @@ def main() -> int:
         w_pnl = bets_train.groupby("week")["profit_cap2"].sum().reindex(train_weeks, fill_value=0.0).to_numpy(dtype=float) if len(train_weeks) else np.array([], dtype=float)
         w_stake = bets_train.groupby("week")["stake_eff"].sum().reindex(train_weeks, fill_value=0.0).to_numpy(dtype=float) if len(train_weeks) else np.array([], dtype=float)
 
-        # predictive draws
-        draws = posterior_predictive_weekly(w_pnl, rng=rng, n_draws=N_DRAWS)
-        pred_mean = float(np.mean(draws))
-        pred_p10, pred_p50, pred_p90 = (float(np.quantile(draws, q)) for q in (0.10, 0.50, 0.90))
-        pred_p05, pred_p95 = (float(np.quantile(draws, q)) for q in (0.05, 0.95))
-        pred_prob_pos = float(np.mean(draws > 0))
+        # predictive draws (joint: pnl, stake, roi)
+        draws_pnl, draws_stake, draws_roi = posterior_predictive_weekly_joint(w_pnl, w_stake, rng=rng, n_draws=N_DRAWS)
+        pred_mean = float(np.mean(draws_pnl))
+        pred_p10, pred_p50, pred_p90 = (float(np.quantile(draws_pnl, q)) for q in (0.10, 0.50, 0.90))
+        pred_p05, pred_p95 = (float(np.quantile(draws_pnl, q)) for q in (0.05, 0.95))
+        pred_prob_pos = float(np.mean(draws_pnl > 0))
+
+        pred_stake_mean = float(np.mean(draws_stake))
+        pred_stake_p10, pred_stake_p50, pred_stake_p90 = (float(np.quantile(draws_stake, q)) for q in (0.10, 0.50, 0.90))
+
+        pred_roi_mean = float(np.mean(draws_roi))
+        pred_roi_p10, pred_roi_p50, pred_roi_p90 = (float(np.quantile(draws_roi, q)) for q in (0.10, 0.50, 0.90))
 
         # realized theoretical
         row = wf_week[wf_week["week"].astype(str) == w_test].iloc[0]
@@ -160,8 +175,22 @@ def main() -> int:
         stake = float(row["stake_usd"])
         roi = float(y / stake) if stake > 0 else float("nan")
 
-        pit = float(np.mean(draws <= y))
-        crps = crps_from_sample(draws, y=y)
+        pit = float(np.mean(draws_pnl <= y))
+        crps = crps_from_sample(draws_pnl, y=y)
+
+        # decomposição do erro: PnL = Stake * ROI
+        # Nota: como a previsão de PnL usa Phat = E[S*R] (draws conjuntos), precisamos expor também o termo
+        # de covariância: cov = E[S*R] - E[S]E[R], para fechar a conta.
+        stake_theo = float(stake)
+        roi_theo = float(roi) if np.isfinite(float(roi)) else 0.0
+        dS = stake_theo - pred_stake_mean
+        dR = roi_theo - pred_roi_mean
+        err_stake = dS * pred_roi_mean
+        err_roi = pred_stake_mean * dR
+        err_interaction = dS * dR
+        cov_term = pred_mean - (pred_stake_mean * pred_roi_mean)  # E[S*R] - E[S]E[R]
+        err_decomp_total = err_stake + err_roi + err_interaction - cov_term  # == (y - E[S*R]) = error
+        err_vs_prodmeans = (y - (pred_stake_mean * pred_roi_mean))  # y - E[S]E[R]
 
         out_rows.append(
             {
@@ -178,10 +207,24 @@ def main() -> int:
                 "pred_p90": pred_p90,
                 "pred_p95": pred_p95,
                 "pred_prob_pos": pred_prob_pos,
+                "pred_stake_mean": pred_stake_mean,
+                "pred_stake_p10": pred_stake_p10,
+                "pred_stake_p50": pred_stake_p50,
+                "pred_stake_p90": pred_stake_p90,
+                "pred_roi_mean": pred_roi_mean,
+                "pred_roi_p10": pred_roi_p10,
+                "pred_roi_p50": pred_roi_p50,
+                "pred_roi_p90": pred_roi_p90,
                 "pit": pit,
                 "crps": crps,
                 "error": y - pred_mean,
                 "abs_error": abs(y - pred_mean),
+                "error_stake_component": err_stake,
+                "error_roi_component": err_roi,
+                "error_interaction": err_interaction,
+                "pred_cov_term": cov_term,
+                "error_vs_prodmeans": err_vs_prodmeans,
+                "error_decomp_total": err_decomp_total,
             }
         )
 
@@ -207,6 +250,26 @@ def main() -> int:
     md.append(f"- Bias (média do erro): **USD {bias:,.1f}**\n")
     md.append(f"- MAE: **USD {mae:,.1f}**\n")
     md.append(f"- RMSE: **USD {rmse:,.1f}**\n\n")
+    md.append("### Decomposição do erro (stake vs ROI)\n")
+    md.append("- Identidade: PnL = Stake * ROI.\n")
+    md.append("- Definições no preditivo: P̂ = E[S*R], Ŝ = E[S], R̂ = E[R].\n")
+    md.append("- Termo de dependência (cov): cov = E[S*R] - E[S]E[R].\n")
+    md.append("- Decomposição que fecha a conta do erro y - P̂:\n")
+    md.append("  y - P̂ = (S-Ŝ)R̂ + Ŝ(R-R̂) + (S-Ŝ)(R-R̂) - cov.\n")
+    md.append(f"- Média componente **stake** ((S-Ŝ)R̂): **USD {float(out['error_stake_component'].mean()):,.1f}**\n")
+    md.append(f"- Média componente **ROI** (Ŝ(R-R̂)): **USD {float(out['error_roi_component'].mean()):,.1f}**\n")
+    md.append(f"- Média **interação** ((S-Ŝ)(R-R̂)): **USD {float(out['error_interaction'].mean()):,.1f}**\n")
+    md.append(f"- Média **cov** (E[S*R]-E[S]E[R]): **USD {float(out['pred_cov_term'].mean()):,.1f}**\n")
+    md.append(f"- Média total (decomp): **USD {float(out['error_decomp_total'].mean()):,.1f}** (deve bater com Bias)\n\n")
+
+    # diagnóstico direto de stake e ROI (somente semanas com stake>0)
+    nz = out[out["stake_theoretical"] > 0].copy()
+    if not nz.empty:
+        stake_bias = float((nz["stake_theoretical"] - nz["pred_stake_mean"]).mean())
+        roi_bias = float((nz["roi_on_stake_theoretical"] - nz["pred_roi_mean"]).mean())
+        md.append("### Diagnóstico direto (stake e ROI, semanas com trade)\n")
+        md.append(f"- Stake: média (real - previsto): **USD {stake_bias:,.1f}** (positivo => o previsto estava menor que o realizado)\n")
+        md.append(f"- ROI: média (real - previsto): **{roi_bias:.5f}** (negativo => o previsto estava maior que o realizado)\n\n")
     md.append("### Calibração probabilística\n")
     md.append(f"- Coverage 80% (p10..p90): **{cov80*100:.1f}%** (ideal ~80%)\n")
     md.append(f"- Coverage 90% (p05..p95): **{cov90*100:.1f}%** (ideal ~90%)\n")
