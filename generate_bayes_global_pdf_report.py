@@ -683,7 +683,9 @@ def main() -> int:
         story.append(
             Paragraph(
                 "Estimamos o viés de ROI por segmento (rule_key) no walk-forward e aplicamos shrinkage (pooling) "
-                "para reduzir ruído. Valores negativos indicam previsão otimista (ROI realizado menor que o previsto).",
+                "para reduzir ruído. Valores negativos indicam previsão otimista (ROI realizado menor que o previsto). "
+                "<b>Nesta versão, esse diagnóstico é usado para monitoramento e reporte (ajuste de expectativas), "
+                "não para alterar a seleção do otimizador.</b>",
                 styles["BodyText"],
             )
         )
@@ -702,10 +704,12 @@ def main() -> int:
 
     if ba_global_rows:
         story.append(Spacer(1, 0.25 * cm))
-        story.append(Paragraph("<b>3.1.2 Comparação antes vs depois (calibração por combinação)</b>", styles["Heading3"]))
+        story.append(Paragraph("<b>3.1.2 Comparação baseline vs atual (resultado OOS)</b>", styles["Heading3"]))
         story.append(
             Paragraph(
-                "Comparação do modelo global_bayes antes e depois de usar a calibração por combinação como correção conservadora (penaliza otimismo em ROI).",
+                "Comparação do global_bayes baseline (snapshot anterior) vs a versão atual. "
+                "Esse quadro reflete mudanças de modelagem/otimização ao longo do tempo, e não deve ser interpretado como "
+                "efeito isolado de calibração no otimizador.",
                 styles["BodyText"],
             )
         )

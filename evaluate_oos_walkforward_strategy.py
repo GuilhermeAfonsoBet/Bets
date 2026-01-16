@@ -86,7 +86,7 @@ EXPOSURE_PENALTY = 0.001  # mesmo scale do otimizador
 # - Mantém um histórico de erros de ROI por segmento no walk-forward (usando apenas passado)
 # - Estima um bias por segmento com shrinkage (pooling) entre segmentos (Empirical Bayes)
 # - Aplica correção conservadora na etapa de seleção (apenas penaliza; não "premia" otimismo positivo)
-SEGMENT_CALIB_ENABLED = True
+SEGMENT_CALIB_ENABLED = False
 SEGMENT_CALIB_ONLY_PENALIZE = True
 SEGMENT_CALIB_MIN_TOTAL_OBS = 8  # mínimo de observações (somadas em todos segmentos) para ativar shrinkage
 

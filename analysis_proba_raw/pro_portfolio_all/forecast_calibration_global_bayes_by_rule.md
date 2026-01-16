@@ -1,6 +1,6 @@
 ## Calibração por combinação (rule_key) — global_bayes
 
-- Observações (linhas): **62**
+- Observações (linhas): **101**
 - Segmentos (rule_key): **12**
 
 ### Interpretação rápida
@@ -8,13 +8,13 @@
 - `bias_roi_shrunk`: bias de ROI com shrinkage (pooling) entre segmentos.
 
 ### Segmentos com ROI mais otimista (bias shrunken mais negativo)
-- **FT|sábado**: bias_roi_shrunk=-0.12504, n=7
-- **FT|domingo**: bias_roi_shrunk=-0.10173, n=3
-- **FT|quarta-feira**: bias_roi_shrunk=-0.09821, n=11
-- **FH|quarta-feira**: bias_roi_shrunk=-0.09808, n=1
-- **FH|sábado**: bias_roi_shrunk=-0.09600, n=5
-- **FT|terça-feira**: bias_roi_shrunk=-0.09051, n=4
-- **FH|sexta-feira**: bias_roi_shrunk=-0.08935, n=1
+- **FH|domingo**: bias_roi_shrunk=-0.01876, n=2
+- **FH|quarta-feira**: bias_roi_shrunk=-0.01876, n=8
+- **FH|quinta-feira**: bias_roi_shrunk=-0.01876, n=12
+- **FH|sexta-feira**: bias_roi_shrunk=-0.01876, n=5
+- **FH|sábado**: bias_roi_shrunk=-0.01876, n=13
+- **FH|terça-feira**: bias_roi_shrunk=-0.01876, n=7
+- **FT|domingo**: bias_roi_shrunk=-0.01876, n=8
 
 ### Arquivos
 - CSV (por semana e segmento): `analysis_proba_raw/pro_portfolio_all/forecast_calibration_global_bayes_by_rule.csv`

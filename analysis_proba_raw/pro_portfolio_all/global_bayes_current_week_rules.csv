@@ -1,5 +1,11 @@
 test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,status,rule_key,roi_bias_adj_used,active
 2026-01-12/2026-01-18,25,FT,segunda-feira,proba_raw_segunda,0.19,0.03,1.0,ok,FT|segunda-feira,0.0,True
-2026-01-12/2026-01-18,25,FT,sábado,proba_raw_sexdom,0.57,0.01,1.0,ok,FT|sábado,-0.175856945885872,True
-2026-01-12/2026-01-18,25,FH,terça-feira,proba_raw_terca,0.59,0.07,1.0,ok,FH|terça-feira,0.0,True
+2026-01-12/2026-01-18,25,FT,terça-feira,proba_raw_terca,0.25,0.03,1.0,ok,FT|terça-feira,0.0,True
+2026-01-12/2026-01-18,25,FT,quarta-feira,proba_raw_quarta,0.53,0.07,1.0,ok,FT|quarta-feira,0.0,True
+2026-01-12/2026-01-18,25,FT,sábado,proba_raw_sexdom,0.57,0.07,1.0,ok,FT|sábado,0.0,True
+2026-01-12/2026-01-18,25,FT,domingo,proba_raw_sexdom,0.23,0.02,1.0,ok,FT|domingo,0.0,True
+2026-01-12/2026-01-18,25,FH,terça-feira,proba_raw_terca,0.59,0.05,1.0,ok,FH|terça-feira,0.0,True
+2026-01-12/2026-01-18,25,FH,quarta-feira,proba_raw_quarta,0.11,0.01,1.0,ok,FH|quarta-feira,0.0,True
 2026-01-12/2026-01-18,25,FH,quinta-feira,proba_raw_segqui,0.53,0.07,1.0,ok,FH|quinta-feira,0.0,True
+2026-01-12/2026-01-18,25,FH,sexta-feira,proba_raw_sexdom,0.07,0.01,1.0,ok,FH|sexta-feira,0.0,True
+2026-01-12/2026-01-18,25,FH,sábado,proba_raw_sexdom,0.19,0.01,1.0,ok,FH|sábado,0.0,True

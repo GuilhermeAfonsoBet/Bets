@@ -342,9 +342,12 @@ def main() -> int:
         story.append(Spacer(1, 8))
         story.append(
             Paragraph(
-                "Leitura: após aplicar correções por calibração, o Bias/MAE/RMSE/CRPS tendem a melhorar (menos erro médio), "
-                "mas isso pode reduzir retorno OOS se a correção estiver “forte demais” para o tamanho de amostra. "
-                "O ponto correto é usar correções com <b>shrinkage</b>, janelas móveis e mínimos de observações por combinação.",
+                "Leitura: a calibração pode ser usada de duas formas.\n"
+                "<br/>- <b>Somente no reporte</b>: ajusta expectativas (ex.: média prevista corrigida por Bias), sem alterar o OOS realizado.\n"
+                "<br/>- <b>Dentro do otimizador</b>: muda seleção/stakes/cutoffs e, portanto, pode alterar (e até degradar) o OOS realizado.\n"
+                "<br/><br/>Na prática, com amostra curta, é comum que usar correção por combinação diretamente no otimizador gere over-penalização. "
+                "Por isso, nesta versão, recomendamos usar calibração por combinação como <b>monitoramento/reporte</b> (com shrinkage) "
+                "e tratar o problema de risco principalmente via <b>recalibração de dispersão</b> (coverage/PIT).",
                 style_p,
             )
         )
