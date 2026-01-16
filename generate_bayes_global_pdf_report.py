@@ -38,6 +38,7 @@ FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
 FORECAST_CALIB_BY_RULE = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
 BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
 BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
+OOS_GATE_WEEKLY = OUT_DIR / "oos_postfilter_debiased_roi_weekly.csv"
 
 BANKROLL = 2300.0
 # mesmos limites do otimizador
@@ -230,15 +231,41 @@ def main() -> int:
     exp_month_fc_cal = float(fc_pred_mean_cal * 4.33) if np.isfinite(fc_pred_mean_cal) else float("nan")
     exp_year_fc_cal = float(fc_pred_mean_cal * 52.0) if np.isfinite(fc_pred_mean_cal) else float("nan")
 
-    # calibração por combinação (rule_key): top vieses de ROI (shrink)
+    # calibração por combinação (rule_key): vieses de ROI
+    # Nota: o shrinkage Empirical Bayes pode colapsar para mu0 (tau2≈0). Por isso reportamos também o bias bruto.
     top_bias_rows = []
+    bias_tau2 = float("nan")
     if FORECAST_CALIB_BY_RULE.exists():
         br = pd.read_csv(FORECAST_CALIB_BY_RULE)
-        if (not br.empty) and ("bias_roi_shrunk" in br.columns):
-            br = br[np.isfinite(br["bias_roi_shrunk"].to_numpy(dtype=float))].copy()
-            br = br.sort_values("bias_roi_shrunk").head(6)
+        if not br.empty:
+            if "bias_roi_shrunk_tau2" in br.columns and np.isfinite(float(br["bias_roi_shrunk_tau2"].iloc[0])):
+                bias_tau2 = float(br["bias_roi_shrunk_tau2"].iloc[0])
+            # escolher critério de ordenação: se tau2≈0 ou todos iguais, ordenar pelo bias bruto
+            use_raw = False
+            if "bias_roi_shrunk" in br.columns:
+                uniq = int(pd.Series(br["bias_roi_shrunk"]).dropna().nunique())
+                if (not np.isfinite(bias_tau2)) or (bias_tau2 <= 1e-12) or (uniq <= 1):
+                    use_raw = True
+            else:
+                use_raw = True
+            # preparar colunas
+            if "bias_roi" not in br.columns:
+                br["bias_roi"] = float("nan")
+            if "bias_roi_shrunk" not in br.columns:
+                br["bias_roi_shrunk"] = float("nan")
+            br["n_obs"] = br.get("n_obs", np.nan)
+            br = br.copy()
+            br = br[np.isfinite(br["bias_roi"].to_numpy(dtype=float)) | np.isfinite(br["bias_roi_shrunk"].to_numpy(dtype=float))]
+            br = br.sort_values("bias_roi" if use_raw else "bias_roi_shrunk").head(8)
             for _, rr in br.iterrows():
-                top_bias_rows.append([str(rr["rule_key"]), f"{float(rr['bias_roi_shrunk']):.5f}", str(int(rr.get('n_obs', 0)))])
+                top_bias_rows.append(
+                    [
+                        str(rr["rule_key"]),
+                        f"{float(rr['bias_roi']):.5f}" if np.isfinite(float(rr["bias_roi"])) else "nan",
+                        f"{float(rr['bias_roi_shrunk']):.5f}" if np.isfinite(float(rr["bias_roi_shrunk"])) else "nan",
+                        str(int(rr["n_obs"])) if np.isfinite(float(rr["n_obs"])) else "nan",
+                    ]
+                )
 
     # comparação antes vs depois (global e por combinação)
     ba_global_rows = []
@@ -248,9 +275,14 @@ def main() -> int:
         bg = pd.read_csv(BEFORE_AFTER_GLOBAL)
         if not bg.empty and {"scenario", "mean_week", "std_week", "sharpe_annual", "roi_on_stake", "fc_bias", "fc_mae", "fc_cov80"}.issubset(set(bg.columns)):
             for _, r0 in bg.iterrows():
+                scen = str(r0["scenario"])
+                if scen == "before":
+                    scen = "before (a206d56)"
+                elif scen == "after":
+                    scen = "after (atual)"
                 ba_global_rows.append(
                     [
-                        str(r0["scenario"]),
+                        scen,
                         f"{float(r0['mean_week']):,.1f}",
                         f"{float(r0['std_week']):,.1f}",
                         f"{float(r0['sharpe_annual']):.3f}" if np.isfinite(float(r0["sharpe_annual"])) else "nan",
@@ -264,13 +296,33 @@ def main() -> int:
         brc = pd.read_csv(BEFORE_AFTER_RULE)
         if not brc.empty:
             if "delta_mean_week" in brc.columns:
-                show = brc.sort_values("delta_mean_week").head(6)
+                b2 = brc.copy()
+                b2 = b2[np.isfinite(b2["delta_mean_week"].to_numpy(dtype=float))]
+                b2 = b2[np.abs(b2["delta_mean_week"].to_numpy(dtype=float)) > 1e-6]
+                show = b2.sort_values("delta_mean_week").head(6)
                 for _, rr in show.iterrows():
                     ba_rule_drop_rows.append([str(rr["rule_key"]), f"{float(rr['mean_week_before']):,.1f}", f"{float(rr['mean_week_after']):,.1f}", f"{float(rr['delta_mean_week']):,.1f}"])
             if "bias_roi_shrunk_after" in brc.columns:
                 show = brc.sort_values("bias_roi_shrunk_after").head(6)
                 for _, rr in show.iterrows():
                     ba_rule_bias_rows.append([str(rr["rule_key"]), f"{float(rr['bias_roi_shrunk_after']):.5f}", str(int(rr.get("n_obs_after", 0)))])
+
+    # experimento: pós-filtro por ROI debiased (gating)
+    gate_stats = None
+    if OOS_GATE_WEEKLY.exists():
+        try:
+            gw = pd.read_csv(OOS_GATE_WEEKLY)
+            if not gw.empty and {"profit_cap2_usd", "stake_usd"}.issubset(set(gw.columns)):
+                pnl = gw["profit_cap2_usd"].to_numpy(dtype=float)
+                mean = float(np.mean(pnl))
+                std = float(np.std(pnl, ddof=1)) if pnl.size > 1 else 0.0
+                sharpe_ann = float((mean * 52.0) / (std * math.sqrt(52.0))) if std > 0 else float("nan")
+                stake = float(gw["stake_usd"].sum())
+                profit = float(gw["profit_cap2_usd"].sum())
+                roi = float(profit / stake) if stake > 0 else float("nan")
+                gate_stats = {"profit": profit, "mean_week": mean, "std_week": std, "sharpe_annual": sharpe_ann, "roi_on_stake": roi}
+        except Exception:
+            gate_stats = None
 
     # stability of rules
     jac = jaccard_instability(wf_rules)
@@ -625,46 +677,61 @@ def main() -> int:
     story.append(Paragraph("<b>3. Métricas estatísticas e de negócio</b>", styles["Heading2"]))
     story.append(Paragraph("<b>3.1 Métricas do Bayes Global (walk-forward OOS, cap2)</b>", styles["Heading3"]))
 
-    m_tbl = [
-        ["Métrica", "Valor"],
-        ["Semanas avaliadas (WF OOS)", f"{wstats.get('n', 0)}"],
-        ["Lucro total (WF)", f"USD {profit_tot:,.1f}"],
-        ["Stake total (turnover, WF)", f"USD {stake_tot:,.1f}"],
-        ["ROI por $ apostado (WF)", f"{roi_on_stake:.4f}"],
-        ["Lucro médio semanal", f"USD {wstats.get('mean', float('nan')):,.1f}"],
-        ["Mediana semanal", f"USD {wstats.get('median', float('nan')):,.1f}"],
-        ["Std semanal", f"USD {wstats.get('std', float('nan')):,.1f}"],
-        ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
-        ["— Apenas semanas com trades (stake>0) —", ""],
-        ["Lucro médio semanal (trades)", f"USD {wstats_traded.get('mean', float('nan')):,.1f}"],
-        ["Mediana semanal (trades)", f"USD {wstats_traded.get('median', float('nan')):,.1f}"],
-        ["Std semanal (trades)", f"USD {wstats_traded.get('std', float('nan')):,.1f}"],
-        ["P(semana<0 | trade)", f"{wstats_traded.get('pneg', float('nan'))*100:.1f}%"],
-        ["Assimetria (skewness)", f"{wstats.get('skew', float('nan')):.3f}"],
-        ["Sharpe semanal (cap2)", f"{wstats.get('sharpe_week', float('nan')):.3f}"],
-        ["Sharpe anualizado (cap2)", f"{wstats.get('sharpe_annual', float('nan')):.3f}"],
-        ["ROI banca (médio por semana)", f"{roi_bank_week*100:.2f}%"],
-        ["Lucro esperado mensal (≈4,33 sem)", f"USD {exp_month:,.0f}"],
-        ["Lucro esperado anual (≈52 sem)", f"USD {exp_year:,.0f}"],
-        ["— Forecast (média prevista) e correção de viés —", ""],
-        ["Forecast: média prevista (E[pred_mean])", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan"],
-        ["Forecast: Bias médio (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
-        ["Forecast: média corrigida (E[pred_mean]+Bias)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
-        ["Forecast: lucro mensal (previsto)", f"USD {exp_month_fc:,.0f}" if np.isfinite(exp_month_fc) else "nan"],
-        ["Forecast: lucro anual (previsto)", f"USD {exp_year_fc:,.0f}" if np.isfinite(exp_year_fc) else "nan"],
-        ["Forecast: lucro mensal (corrigido)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
-        ["Forecast: lucro anual (corrigido)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
-        ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
-        ["Calibração: coverage 90% (p05..p95)", f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan"],
-        ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
-        ["Calibração: CRPS médio", f"{fc_crps:,.1f}" if np.isfinite(fc_crps) else "nan"],
-        ["Risco diário: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite USD {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
-        ["Risco diário: VaR10%(PnL dia)", f"USD {var10:,.1f} (limite ≥ USD {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
-        ["Risco diário: P(PnL dia ≤ -25% banca)", f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)"],
-        ["α global: média / p10 / p50 / p90", f"{alpha_mean:.3f} / {alpha_p10:.3f} / {alpha_p50:.3f} / {alpha_p90:.3f}"],
-        ["α global: P(α<1)", f"{p_alpha_lt1*100:.1f}%"],
+    def V(x: str) -> str:
+        # helper to duplicate when correction not applicable
+        return x
+
+    m_tbl = [["Métrica", "Sem correção", "Com correção (bias)"]]
+    # realizado OOS (não muda com correção de viés de forecast)
+    m_tbl += [
+        ["Semanas avaliadas (WF OOS)", V(f"{wstats.get('n', 0)}"), V(f"{wstats.get('n', 0)}")],
+        ["Lucro total (WF)", V(f"USD {profit_tot:,.1f}"), V(f"USD {profit_tot:,.1f}")],
+        ["Stake total (turnover, WF)", V(f"USD {stake_tot:,.1f}"), V(f"USD {stake_tot:,.1f}")],
+        ["ROI por $ apostado (WF)", V(f"{roi_on_stake:.4f}"), V(f"{roi_on_stake:.4f}")],
+        ["Lucro médio semanal (realizado)", V(f"USD {wstats.get('mean', float('nan')):,.1f}"), V(f"USD {wstats.get('mean', float('nan')):,.1f}")],
+        ["Mediana semanal (realizado)", V(f"USD {wstats.get('median', float('nan')):,.1f}"), V(f"USD {wstats.get('median', float('nan')):,.1f}")],
+        ["Std semanal (realizado)", V(f"USD {wstats.get('std', float('nan')):,.1f}"), V(f"USD {wstats.get('std', float('nan')):,.1f}")],
+        ["P(semana<0) (realizado)", V(f"{wstats.get('pneg', float('nan'))*100:.1f}%"), V(f"{wstats.get('pneg', float('nan'))*100:.1f}%")],
+        ["Assimetria (skewness)", V(f"{wstats.get('skew', float('nan')):.3f}"), V(f"{wstats.get('skew', float('nan')):.3f}")],
+        ["Sharpe semanal (cap2)", V(f"{wstats.get('sharpe_week', float('nan')):.3f}"), V(f"{wstats.get('sharpe_week', float('nan')):.3f}")],
+        ["Sharpe anualizado (cap2)", V(f"{wstats.get('sharpe_annual', float('nan')):.3f}"), V(f"{wstats.get('sharpe_annual', float('nan')):.3f}")],
+        ["ROI banca (médio por semana)", V(f"{roi_bank_week*100:.2f}%"), V(f"{roi_bank_week*100:.2f}%")],
+        ["Lucro esperado mensal (≈4,33 sem) (realizado)", V(f"USD {exp_month:,.0f}"), V(f"USD {exp_month:,.0f}")],
+        ["Lucro esperado anual (≈52 sem) (realizado)", V(f"USD {exp_year:,.0f}"), V(f"USD {exp_year:,.0f}")],
+        ["— Apenas semanas com trades (stake>0) —", "", ""],
+        ["Lucro médio semanal (trades)", V(f"USD {wstats_traded.get('mean', float('nan')):,.1f}"), V(f"USD {wstats_traded.get('mean', float('nan')):,.1f}")],
+        ["Mediana semanal (trades)", V(f"USD {wstats_traded.get('median', float('nan')):,.1f}"), V(f"USD {wstats_traded.get('median', float('nan')):,.1f}")],
+        ["Std semanal (trades)", V(f"USD {wstats_traded.get('std', float('nan')):,.1f}"), V(f"USD {wstats_traded.get('std', float('nan')):,.1f}")],
+        ["P(semana<0 | trade)", V(f"{wstats_traded.get('pneg', float('nan'))*100:.1f}%"), V(f"{wstats_traded.get('pneg', float('nan'))*100:.1f}%")],
     ]
-    t2 = Table(m_tbl, colWidths=[7.5 * cm, 9.5 * cm])
+    # forecast + correção
+    m_tbl += [
+        ["— Forecast (média prevista) —", "", ""],
+        ["Forecast: média prevista (E[pred_mean])", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan"],
+        ["Forecast: Bias médio (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
+        ["Forecast: média corrigida", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
+        ["Forecast: lucro mensal", f"USD {exp_month_fc:,.0f}" if np.isfinite(exp_month_fc) else "nan", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
+        ["Forecast: lucro anual", f"USD {exp_year_fc:,.0f}" if np.isfinite(exp_year_fc) else "nan", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
+    ]
+    # calibração de incerteza (não muda ao só corrigir a média)
+    m_tbl += [
+        ["— Calibração (incerteza) —", "", ""],
+        ["Coverage 80% (p10..p90)", V(f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"), V(f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan")],
+        ["Coverage 90% (p05..p95)", V(f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan"), V(f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan")],
+        ["PIT médio", V(f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"), V(f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan")],
+        ["CRPS médio", V(f"{fc_crps:,.1f}" if np.isfinite(fc_crps) else "nan"), V(f"{fc_crps:,.1f}" if np.isfinite(fc_crps) else "nan")],
+    ]
+    # risco/alpha (realizado OOS)
+    m_tbl += [
+        ["— Risco diário (OOS) e α —", "", ""],
+        ["Risco diário: p80(stake/dia)", V(f"USD {p80_exp:,.0f} (limite USD {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"), V(f"USD {p80_exp:,.0f} (limite USD {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})")],
+        ["Risco diário: VaR10%(PnL dia)", V(f"USD {var10:,.1f} (limite ≥ USD {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"), V(f"USD {var10:,.1f} (limite ≥ USD {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})")],
+        ["Risco diário: P(PnL dia ≤ -25% banca)", V(f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)"), V(f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)")],
+        ["α global: média / p10 / p50 / p90", V(f"{alpha_mean:.3f} / {alpha_p10:.3f} / {alpha_p50:.3f} / {alpha_p90:.3f}"), V(f"{alpha_mean:.3f} / {alpha_p10:.3f} / {alpha_p50:.3f} / {alpha_p90:.3f}")],
+        ["α global: P(α<1)", V(f"{p_alpha_lt1*100:.1f}%"), V(f"{p_alpha_lt1*100:.1f}%")],
+    ]
+
+    t2 = Table(m_tbl, colWidths=[7.0 * cm, 5.0 * cm, 5.0 * cm])
     t2.setStyle(
         TableStyle(
             [
@@ -672,6 +739,7 @@ def main() -> int:
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
             ]
         )
     )
@@ -689,7 +757,15 @@ def main() -> int:
                 styles["BodyText"],
             )
         )
-        tbr = Table([["rule_key", "bias_roi_shrunk", "n_obs"]] + top_bias_rows, colWidths=[5.0 * cm, 4.0 * cm, 2.0 * cm])
+        if np.isfinite(bias_tau2) and bias_tau2 <= 1e-12:
+            story.append(
+                Paragraph(
+                    "Observação: o shrinkage Empirical Bayes estimou variância entre-segmentos tau²≈0, então o bias shrunken colapsa "
+                    "para um valor global (mu0). Por isso reportamos também o bias bruto por segmento (sem pooling).",
+                    styles["BodyText"],
+                )
+            )
+        tbr = Table([["rule_key", "bias_roi (bruto)", "bias_roi_shrunk", "n_obs"]] + top_bias_rows, colWidths=[4.0 * cm, 4.0 * cm, 4.0 * cm, 1.0 * cm])
         tbr.setStyle(
             TableStyle(
                 [
@@ -697,6 +773,7 @@ def main() -> int:
                     ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
                 ]
             )
         )
@@ -709,7 +786,9 @@ def main() -> int:
             Paragraph(
                 "Comparação do global_bayes baseline (snapshot anterior) vs a versão atual. "
                 "Esse quadro reflete mudanças de modelagem/otimização ao longo do tempo, e não deve ser interpretado como "
-                "efeito isolado de calibração no otimizador.",
+                "efeito isolado de calibração no otimizador. "
+                "<br/>- <b>before</b>: snapshot do repo no commit baseline (a206d56). "
+                "<br/>- <b>after</b>: versão atual do repo (sem correção de viés por combinação no otimizador).",
                 styles["BodyText"],
             )
         )
@@ -763,6 +842,25 @@ def main() -> int:
                 )
             )
             story.append(tbias)
+
+        if gate_stats is not None:
+            story.append(Spacer(1, 0.25 * cm))
+            story.append(Paragraph("<b>Experimento: desligar combinações com ROI debiased ≤ 0</b>", styles["Heading3"]))
+            story.append(
+                Paragraph(
+                    "Testamos um pós-filtro (gating) que, a cada semana, estima o ROI esperado realizado por combinação (ROI_pred_train + bias estimado apenas com passado) "
+                    "e desliga combinações com ROI_debiased ≤ 0. Isso é uma heurística de seleção (não re-otimiza cutoffs/stakes).",
+                    styles["BodyText"],
+                )
+            )
+            story.append(
+                Paragraph(
+                    f"Resultado: baseline mean/sem=USD {mean_week:,.1f}, Sharpe_ann={wstats.get('sharpe_annual', float('nan')):.3f} "
+                    f"vs gating mean/sem=USD {gate_stats['mean_week']:,.1f}, Sharpe_ann={gate_stats['sharpe_annual']:.3f}. "
+                    "Na nossa amostra OOS, esse gating <b>não melhorou</b> o resultado agregado.",
+                    styles["BodyText"],
+                )
+            )
 
     # weekly quantiles section
     story.append(Spacer(1, 0.3 * cm))

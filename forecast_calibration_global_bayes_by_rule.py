@@ -256,21 +256,29 @@ def main() -> int:
         keys = [k for k, _, _ in roi_stats]
         means = np.array([m for _, m, _ in roi_stats], dtype=float)
         se2 = np.array([v for _, _, v in roi_stats], dtype=float)
-        _, _, post = _empirical_bayes_shrink(means, se2)
+        mu0, tau2, post = _empirical_bayes_shrink(means, se2)
         post_map = {k: float(v) for k, v in zip(keys, post)}
         g["bias_roi_shrunk"] = g["rule_key"].map(post_map).astype(float)
+        g["bias_roi_shrunk_mu0"] = float(mu0)
+        g["bias_roi_shrunk_tau2"] = float(tau2)
     else:
         g["bias_roi_shrunk"] = float("nan")
+        g["bias_roi_shrunk_mu0"] = float("nan")
+        g["bias_roi_shrunk_tau2"] = float("nan")
 
     if pnl_stats:
         keys = [k for k, _, _ in pnl_stats]
         means = np.array([m for _, m, _ in pnl_stats], dtype=float)
         se2 = np.array([v for _, _, v in pnl_stats], dtype=float)
-        _, _, post = _empirical_bayes_shrink(means, se2)
+        mu0, tau2, post = _empirical_bayes_shrink(means, se2)
         post_map = {k: float(v) for k, v in zip(keys, post)}
         g["bias_pnl_shrunk"] = g["rule_key"].map(post_map).astype(float)
+        g["bias_pnl_shrunk_mu0"] = float(mu0)
+        g["bias_pnl_shrunk_tau2"] = float(tau2)
     else:
         g["bias_pnl_shrunk"] = float("nan")
+        g["bias_pnl_shrunk_mu0"] = float("nan")
+        g["bias_pnl_shrunk_tau2"] = float("nan")
 
     sum_path = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
     g.sort_values(["rule_key"]).to_csv(sum_path, index=False)
