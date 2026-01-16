@@ -4,12 +4,80 @@
 import argparse
 import sys
 import json
+import datetime
+import hashlib
 from pathlib import Path
 import re
+import unicodedata
 
 import pandas as pd
 import numpy as np
 import joblib
+
+
+# ============================================================================
+# PATCH DE COMPATIBILIDADE (carregar modelos antigos em sklearn novo)
+# ============================================================================
+def _walk_estimators(est):
+    """Itera recursivamente estimadores em Pipeline/ColumnTransformer/afins."""
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+    except Exception:
+        Pipeline = ()
+        ColumnTransformer = ()
+    yield est
+    if isinstance(est, Pipeline):
+        for _, sub in est.steps:
+            yield from _walk_estimators(sub)
+    elif isinstance(est, ColumnTransformer):
+        for _, sub, _ in est.transformers_:
+            if sub in ("drop", "passthrough"):
+                continue
+            yield from _walk_estimators(sub)
+    elif hasattr(est, "estimators"):  # Stacking/FeatureUnion/etc
+        for _, sub in getattr(est, "estimators", []):
+            yield from _walk_estimators(sub)
+
+
+def patch_sklearn_compat(est):
+    """
+    Define atributos que mudaram entre versões (1.1.x -> 1.4+),
+    evitando AttributeError em SimpleImputer e OneHotEncoder.
+    """
+    try:
+        from sklearn.impute import SimpleImputer
+    except Exception:
+        SimpleImputer = ()
+    try:
+        from sklearn.preprocessing import OneHotEncoder
+    except Exception:
+        OneHotEncoder = ()
+
+    for obj in _walk_estimators(est):
+        # SimpleImputer: versões novas referenciam keep_empty_features
+        try:
+            if isinstance(obj, SimpleImputer):
+                if not hasattr(obj, "keep_empty_features"):
+                    setattr(obj, "keep_empty_features", False)
+                # algumas versões novas esperam _fill_dtype (modelos antigos têm _fit_dtype)
+                if not hasattr(obj, "_fill_dtype") and hasattr(obj, "_fit_dtype"):
+                    try:
+                        setattr(obj, "_fill_dtype", getattr(obj, "_fit_dtype"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # OneHotEncoder: 1.2+ usa sparse_output; modelos antigos tinham sparse
+        try:
+            if isinstance(obj, OneHotEncoder):
+                if not hasattr(obj, "sparse_output"):
+                    setattr(obj, "sparse_output", bool(getattr(obj, "sparse", True)))
+                if not hasattr(obj, "_drop_idx_after_grouping"):
+                    setattr(obj, "_drop_idx_after_grouping", None)
+        except Exception:
+            pass
+    return est
 
 # Colunas esperadas no PAYLOAD (as mesmas que usamos no treino)
 NUM_FEATURES = [
@@ -32,10 +100,60 @@ DOW_COL = "Dia Semana Aposta (UTC)"
 
 # Nomes dos arquivos de modelo (dentro de --models-dir)
 MODEL_FILENAMES = {
+    # chaves são DOW normalizados (lowercase, sem acento)
     "segunda-feira": "model_logit_segunda.joblib",
-    "terça-feira":   "model_logit_terca.joblib",
+    "terca-feira":   "model_logit_terca.joblib",
     "quarta-feira":  "model_logit_quarta.joblib",
 }
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn"
+    )
+
+
+def normalize_dow(x) -> str:
+    """
+    Normaliza o dia da semana vindo do payload para casar com MODEL_FILENAMES.
+    Aceita variações comuns: maiúsculas, sem acento (terca), abreviações (seg/ter/qua).
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = _strip_accents(s)  # terça -> terca
+    # normaliza abreviações comuns
+    s3 = s[:3]
+    if s3 in {"seg"}:
+        return "segunda-feira"
+    if s3 in {"ter"}:
+        return "terca-feira"
+    if s3 in {"qua"}:
+        return "quarta-feira"
+    # formas completas
+    if s.startswith("segunda"):
+        return "segunda-feira"
+    if s.startswith("terca") or s.startswith("terça"):
+        return "terca-feira"
+    if s.startswith("quarta"):
+        return "quarta-feira"
+    return s
+
+
+def _payload_hash(row: pd.Series) -> str:
+    """
+    Hash estável do registro para auditoria (sem expor PII).
+    Usa apenas as features do modelo, já após coerção em preparar_payload().
+    """
+    parts = []
+    for c in (NUM_FEATURES + CAT_FEATURES):
+        v = row.get(c, "")
+        if pd.isna(v):
+            v = ""
+        parts.append(f"{c}={v}")
+    s = "|".join(parts).encode("utf-8", errors="ignore")
+    return hashlib.sha256(s).hexdigest()[:16]
 
 
 def preparar_payload(df: pd.DataFrame) -> pd.DataFrame:
@@ -90,24 +208,25 @@ def main():
 
     # Loop nas linhas do payload, na ordem
     for idx, row in df.iterrows():
-        dow = row.get(DOW_COL, None)
+        dow_raw = row.get(DOW_COL, None)
+        dow_norm = normalize_dow(dow_raw)
 
-        if pd.isna(dow):
+        if pd.isna(dow_raw) or not dow_norm:
             p = 0.0
             d = 0
         else:
-            dow_str = str(dow).strip()
-            if dow_str in MODEL_FILENAMES:
+            if dow_norm in MODEL_FILENAMES:
                 # carrega modelo correspondente, se ainda não carregou
-                if dow_str not in model_cache:
-                    model_path = models_dir / MODEL_FILENAMES[dow_str]
+                if dow_norm not in model_cache:
+                    model_path = models_dir / MODEL_FILENAMES[dow_norm]
                     if not model_path.exists():
                         # se não existir modelo, não aprova
-                        model_cache[dow_str] = None
+                        model_cache[dow_norm] = None
                     else:
-                        model_cache[dow_str] = joblib.load(model_path)
+                        model = joblib.load(model_path)
+                        model_cache[dow_norm] = patch_sklearn_compat(model)
 
-                model = model_cache[dow_str]
+                model = model_cache[dow_norm]
                 if model is None:
                     p = 0.0
                     d = 0
@@ -127,13 +246,30 @@ def main():
 
         # logging opcional
         if logfile_handle is not None:
+            model_path = None
+            try:
+                model_path = str(models_dir / MODEL_FILENAMES.get(dow_norm, "")) if dow_norm else None
+            except Exception:
+                model_path = None
+            mstat = None
+            try:
+                if model_path and Path(model_path).exists():
+                    st = Path(model_path).stat()
+                    mstat = {"mtime": st.st_mtime, "size": st.st_size}
+            except Exception:
+                mstat = None
             log_entry = {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "idx": int(idx),
-                "dia_semana": str(row.get(DOW_COL, "")),
+                "dia_semana_raw": (None if pd.isna(dow_raw) else str(dow_raw)),
+                "dia_semana_norm": dow_norm,
                 "proba": p,
                 "decision": d,
                 "cutoff": cutoff,
                 "calib_floor": calib_floor,
+                "model_path": model_path,
+                "model_stat": mstat,
+                "payload_hash": _payload_hash(row),
             }
             logfile_handle.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
