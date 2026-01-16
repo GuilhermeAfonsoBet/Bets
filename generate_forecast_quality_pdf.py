@@ -25,6 +25,7 @@ import pandas as pd
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
+BEFORE_AFTER = OUT_DIR / "before_after_global_comparison.csv"
 
 
 def _fmt_usd(x: float) -> str:
@@ -75,6 +76,14 @@ def main() -> int:
     m_roi = float(df["error_roi_component"].mean()) if "error_roi_component" in df.columns else float("nan")
     m_inter = float(df["error_interaction"].mean()) if "error_interaction" in df.columns else float("nan")
     m_cov = float(df["pred_cov_term"].mean()) if "pred_cov_term" in df.columns else float("nan")
+
+    # comparativo antes vs depois (se existir)
+    ba = None
+    if BEFORE_AFTER.exists():
+        try:
+            ba = pd.read_csv(BEFORE_AFTER)
+        except Exception:
+            ba = None
 
     doc = SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=1.6 * cm, bottomMargin=1.6 * cm)
     story = []
@@ -250,6 +259,102 @@ def main() -> int:
         Paragraph(
             "<b>4) Atualizar o PDF principal</b>: usar Bias/coverage para reportar um “cenário calibrado” conservador "
             "(lucro esperado ajustado) além do cenário base.",
+            style_p,
+        )
+    )
+
+    story.append(PageBreak())
+    story.append(Paragraph("6. Avaliação e conclusão (o que os números significam na prática)", style_h))
+    story.append(
+        Paragraph(
+            "Estas métricas respondem duas perguntas: (i) o modelo é <b>otimista/pessimista</b> na média? "
+            "(ii) o modelo está <b>calibrado</b> na incerteza (intervalos/quantis)?",
+            style_p,
+        )
+    )
+    story.append(Spacer(1, 8))
+    story.append(
+        Paragraph(
+            f"No estado atual, o modelo apresenta <b>Bias = {_fmt_usd(bias)}</b>. "
+            "Bias negativo significa que, em média, o realizado ficou abaixo do previsto (otimismo). "
+            f"O erro típico (MAE) é {_fmt_usd(mae)} e o RMSE é {_fmt_usd(rmse)}: "
+            "isso indica que a incerteza semanal é grande e que a previsão pontual sozinha não é suficiente para tomada de decisão.",
+            style_p,
+        )
+    )
+    story.append(Spacer(1, 6))
+    story.append(
+        Paragraph(
+            f"A calibração probabilística também está fraca: Coverage 80% = {_fmt_pct(cov80)} (ideal ~80%) "
+            f"e Coverage 90% = {_fmt_pct(cov90)} (ideal ~90%). "
+            "Isso sugere que os intervalos previstos estão <b>estreitos</b> (subestimando risco). "
+            f"PIT médio = {pit_mean:.3f} (ideal ~0,5) reforça a assimetria para resultados piores que o previsto.",
+            style_p,
+        )
+    )
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Impacto na estratégia", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "Quando Bias é negativo e Coverage fica muito abaixo do nominal, o efeito prático é:\n"
+            "<br/>- projeções de lucro tendem a estar infladas\n"
+            "<br/>- intervalos/quantis (p10/p90 etc.) subestimam perdas\n"
+            "<br/>- decisões que dependem de “p05/p10 positivo” ou de VaR estimado podem ficar excessivamente confiantes.",
+            style_p,
+        )
+    )
+    story.append(Spacer(1, 10))
+
+    if ba is not None and (not ba.empty) and {"scenario", "mean_week", "std_week", "sharpe_annual", "roi_on_stake", "fc_bias", "fc_mae", "fc_cov80"}.issubset(set(ba.columns)):
+        story.append(Paragraph("Antes vs depois (com correções)", styles["Heading3"]))
+        rows = [["cenário", "mean/sem", "std/sem", "Sharpe ann", "ROI/$", "Bias forecast", "MAE", "Cov80"]]
+        for _, r in ba.iterrows():
+            rows.append(
+                [
+                    str(r["scenario"]),
+                    f"{float(r['mean_week']):,.1f}",
+                    f"{float(r['std_week']):,.1f}",
+                    f"{float(r['sharpe_annual']):.3f}" if np.isfinite(float(r["sharpe_annual"])) else "—",
+                    f"{float(r['roi_on_stake']):.4f}" if np.isfinite(float(r["roi_on_stake"])) else "—",
+                    f"{float(r['fc_bias']):,.1f}" if np.isfinite(float(r["fc_bias"])) else "—",
+                    f"{float(r['fc_mae']):,.1f}" if np.isfinite(float(r["fc_mae"])) else "—",
+                    _fmt_pct(float(r["fc_cov80"])) if np.isfinite(float(r["fc_cov80"])) else "—",
+                ]
+            )
+        tt = Table(rows, colWidths=[2.0 * cm, 2.2 * cm, 2.2 * cm, 2.0 * cm, 1.6 * cm, 2.3 * cm, 1.8 * cm, 1.6 * cm])
+        tt.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.append(tt)
+        story.append(Spacer(1, 8))
+        story.append(
+            Paragraph(
+                "Leitura: após aplicar correções por calibração, o Bias/MAE/RMSE/CRPS tendem a melhorar (menos erro médio), "
+                "mas isso pode reduzir retorno OOS se a correção estiver “forte demais” para o tamanho de amostra. "
+                "O ponto correto é usar correções com <b>shrinkage</b>, janelas móveis e mínimos de observações por combinação.",
+                style_p,
+            )
+        )
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Recomendação objetiva", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "Eu recomendo manter duas visões em paralelo:\n"
+            "<br/>- <b>Visão de decisão</b>: usar a correção por combinação de forma conservadora e com limites (shrinkage + mínimo de observações).\n"
+            "<br/>- <b>Visão de reporte</b>: sempre reportar também um cenário “ajustado por Bias” e uma nota explícita sobre Coverage/PIT.\n"
+            "<br/><br/>"
+            "Se Coverage continuar muito abaixo do nominal, a próxima evolução deve ser uma <b>recalibração de dispersão</b> (widening dos quantis/intervalos), "
+            "porque hoje o problema não é só a média (Bias), mas principalmente a subestimação do risco.",
             style_p,
         )
     )

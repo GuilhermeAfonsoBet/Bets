@@ -36,6 +36,8 @@ WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
 COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
 FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
 FORECAST_CALIB_BY_RULE = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
+BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
+BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
 
 BANKROLL = 2300.0
 # mesmos limites do otimizador
@@ -226,6 +228,38 @@ def main() -> int:
             br = br.sort_values("bias_roi_shrunk").head(6)
             for _, rr in br.iterrows():
                 top_bias_rows.append([str(rr["rule_key"]), f"{float(rr['bias_roi_shrunk']):.5f}", str(int(rr.get('n_obs', 0)))])
+
+    # comparação antes vs depois (global e por combinação)
+    ba_global_rows = []
+    ba_rule_drop_rows = []
+    ba_rule_bias_rows = []
+    if BEFORE_AFTER_GLOBAL.exists():
+        bg = pd.read_csv(BEFORE_AFTER_GLOBAL)
+        if not bg.empty and {"scenario", "mean_week", "std_week", "sharpe_annual", "roi_on_stake", "fc_bias", "fc_mae", "fc_cov80"}.issubset(set(bg.columns)):
+            for _, r0 in bg.iterrows():
+                ba_global_rows.append(
+                    [
+                        str(r0["scenario"]),
+                        f"{float(r0['mean_week']):,.1f}",
+                        f"{float(r0['std_week']):,.1f}",
+                        f"{float(r0['sharpe_annual']):.3f}" if np.isfinite(float(r0["sharpe_annual"])) else "nan",
+                        f"{float(r0['roi_on_stake']):.4f}" if np.isfinite(float(r0["roi_on_stake"])) else "nan",
+                        f"{float(r0['fc_bias']):,.1f}",
+                        f"{float(r0['fc_mae']):,.1f}",
+                        f"{float(r0['fc_cov80'])*100:.1f}%",
+                    ]
+                )
+    if BEFORE_AFTER_RULE.exists():
+        brc = pd.read_csv(BEFORE_AFTER_RULE)
+        if not brc.empty:
+            if "delta_mean_week" in brc.columns:
+                show = brc.sort_values("delta_mean_week").head(6)
+                for _, rr in show.iterrows():
+                    ba_rule_drop_rows.append([str(rr["rule_key"]), f"{float(rr['mean_week_before']):,.1f}", f"{float(rr['mean_week_after']):,.1f}", f"{float(rr['delta_mean_week']):,.1f}"])
+            if "bias_roi_shrunk_after" in brc.columns:
+                show = brc.sort_values("bias_roi_shrunk_after").head(6)
+                for _, rr in show.iterrows():
+                    ba_rule_bias_rows.append([str(rr["rule_key"]), f"{float(rr['bias_roi_shrunk_after']):.5f}", str(int(rr.get("n_obs_after", 0)))])
 
     # stability of rules
     jac = jaccard_instability(wf_rules)
@@ -651,6 +685,66 @@ def main() -> int:
             )
         )
         story.append(tbr)
+
+    if ba_global_rows:
+        story.append(Spacer(1, 0.25 * cm))
+        story.append(Paragraph("<b>3.1.2 Comparação antes vs depois (calibração por combinação)</b>", styles["Heading3"]))
+        story.append(
+            Paragraph(
+                "Comparação do modelo global_bayes antes e depois de usar a calibração por combinação como correção conservadora (penaliza otimismo em ROI).",
+                styles["BodyText"],
+            )
+        )
+        tbg = Table(
+            [["cenário", "mean/sem", "std/sem", "Sharpe ann", "ROI/$", "Bias forecast", "MAE", "Cov80"]] + ba_global_rows,
+            colWidths=[2.0 * cm, 2.2 * cm, 2.2 * cm, 2.0 * cm, 1.6 * cm, 2.3 * cm, 1.8 * cm, 1.6 * cm],
+        )
+        tbg.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.append(tbg)
+
+        if ba_rule_drop_rows:
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph("<b>Maior queda de lucro médio semanal por combinação</b>", styles["BodyText"]))
+            tdrop = Table([["rule_key", "mean (antes)", "mean (depois)", "Δ"]] + ba_rule_drop_rows, colWidths=[4.2 * cm, 2.6 * cm, 2.6 * cm, 1.6 * cm])
+            tdrop.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ]
+                )
+            )
+            story.append(tdrop)
+
+        if ba_rule_bias_rows:
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph("<b>Combinações mais otimistas em ROI (bias shrunken)</b>", styles["BodyText"]))
+            tbias = Table([["rule_key", "bias_roi_shrunk", "n_obs"]] + ba_rule_bias_rows, colWidths=[4.2 * cm, 3.0 * cm, 1.6 * cm])
+            tbias.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ]
+                )
+            )
+            story.append(tbias)
 
     # weekly quantiles section
     story.append(Spacer(1, 0.3 * cm))
