@@ -216,9 +216,12 @@ def main() -> int:
         if "crps" in fc.columns:
             fc_crps = float(np.mean(fc["crps"].to_numpy(dtype=float)))
 
-    # Forecast: média prevista e correção de viés
+    # Forecast: médias previstas e correção de viés (PnL e stake)
     fc_pred_mean = float("nan")
     fc_p10 = fc_p50 = fc_p90 = float("nan")
+    fc_pred_stake = float("nan")
+    fc_stake_bias = float("nan")
+    fc_pred_stake_cal = float("nan")
     if FORECAST_CALIB.exists():
         try:
             fc0 = pd.read_csv(FORECAST_CALIB)
@@ -230,6 +233,11 @@ def main() -> int:
                 fc_p50 = float(np.mean(fc0["pred_p50"].to_numpy(dtype=float)))
             if (not fc0.empty) and ("pred_p90" in fc0.columns):
                 fc_p90 = float(np.mean(fc0["pred_p90"].to_numpy(dtype=float)))
+            if (not fc0.empty) and ("pred_stake_mean" in fc0.columns):
+                fc_pred_stake = float(np.mean(fc0["pred_stake_mean"].to_numpy(dtype=float)))
+            if (not fc0.empty) and {"stake_theoretical", "pred_stake_mean"}.issubset(set(fc0.columns)):
+                fc_stake_bias = float(np.mean((fc0["stake_theoretical"] - fc0["pred_stake_mean"]).to_numpy(dtype=float)))
+                fc_pred_stake_cal = float(fc_pred_stake + fc_stake_bias) if np.isfinite(fc_pred_stake) else float("nan")
         except Exception:
             fc_pred_mean = float("nan")
     # bias-corrected forecast mean = E[pred_mean + bias] = E[pred_mean] + bias
@@ -238,6 +246,8 @@ def main() -> int:
     exp_year_fc = float(fc_pred_mean * 52.0) if np.isfinite(fc_pred_mean) else float("nan")
     exp_month_fc_cal = float(fc_pred_mean_cal * 4.33) if np.isfinite(fc_pred_mean_cal) else float("nan")
     exp_year_fc_cal = float(fc_pred_mean_cal * 52.0) if np.isfinite(fc_pred_mean_cal) else float("nan")
+    roi_bank_week_fc_cal = float(fc_pred_mean_cal / BANKROLL) if np.isfinite(fc_pred_mean_cal) else float("nan")
+    roi_on_stake_fc_cal = float(fc_pred_mean_cal / fc_pred_stake_cal) if np.isfinite(fc_pred_stake_cal) and fc_pred_stake_cal > 0 else float("nan")
 
     # calibração por combinação (rule_key): vieses de ROI
     # Nota: o shrinkage Empirical Bayes pode colapsar para mu0 (tau2≈0). Por isso reportamos também o bias bruto.
@@ -687,31 +697,29 @@ def main() -> int:
 
     story.append(
         Paragraph(
-            "<b>Nota de leitura</b>: a correção por Bias ajusta apenas o <b>forecast</b> (expectativa prevista). "
-            "Ela não altera o <b>resultado OOS realizado</b> nem os quantis (p10/p90) — para isso seria necessária uma recalibração de dispersão.",
+            "<b>Nota de leitura</b>: este bloco 3.1A apresenta uma visão executiva <b>bias-corrected</b> do forecast "
+            "(expectativa prevista ajustada por Bias). Isso não altera nem substitui o resultado OOS realizado; "
+            "métricas de risco/realizado aparecem separadamente como auditoria.",
             styles["BodyText"],
         )
     )
 
-    # 3.1.A Realizado OOS (executivo)
+    # 3.1.A Executive forecast (bias-corrected)
     story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph("<b>3.1.A Realizado OOS (cap2)</b>", styles["BodyText"]))
-    realized_tbl = [
-        ["Métrica", "Valor"],
-        ["Semanas (WF OOS)", f"{wstats.get('n', 0)}"],
-        ["Lucro total", f"USD {profit_tot:,.1f}"],
-        ["Lucro médio semanal", f"USD {wstats.get('mean', float('nan')):,.1f}"],
-        ["Std semanal", f"USD {wstats.get('std', float('nan')):,.1f}"],
-        ["Sharpe anualizado", f"{wstats.get('sharpe_annual', float('nan')):.3f}"],
-        ["ROI por $ (turnover)", f"{roi_on_stake:.4f}"],
-        ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
-        ["Risco dia: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
-        ["Risco dia: VaR10%(PnL)", f"USD {var10:,.0f} (limite ≥ {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
-        ["Risco dia: P(PnL ≤ -25% banca)", f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)"],
-        ["α global (média / p10 / p50 / p90)", f"{alpha_mean:.3f} / {alpha_p10:.3f} / {alpha_p50:.3f} / {alpha_p90:.3f}"],
+    story.append(Paragraph("<b>3.1.A Resumo executivo (forecast bias-corrected)</b>", styles["BodyText"]))
+    exec_tbl = [
+        ["Métrica", "Valor (bias-corrected)"],
+        ["Forecast: média semanal corrigida", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
+        ["Forecast: lucro mensal corrigido", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
+        ["Forecast: lucro anual corrigido", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
+        ["Forecast: ROI banca/sem (corrigido)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
+        ["Forecast: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
+        ["Forecast: ROI por $ (corrigido)", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
+        ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
+        ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
     ]
-    t_real = Table(realized_tbl, colWidths=[7.5 * cm, 9.5 * cm])
-    t_real.setStyle(
+    t_exec = Table(exec_tbl, colWidths=[7.5 * cm, 9.5 * cm])
+    t_exec.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -722,11 +730,11 @@ def main() -> int:
             ]
         )
     )
-    story.append(t_real)
+    story.append(t_exec)
 
     # 3.1.B Forecast (sem vs com bias) — shift (location) apenas
     story.append(Spacer(1, 0.25 * cm))
-    story.append(Paragraph("<b>3.1.B Forecast semanal (sem vs com correção de Bias)</b>", styles["BodyText"]))
+    story.append(Paragraph("<b>3.1.B Detalhe do forecast (sem vs com correção de Bias)</b>", styles["BodyText"]))
     # shift dos quantis por Bias (assumindo correção aditiva)
     q10 = fc_p10
     q50 = fc_p50
@@ -756,18 +764,24 @@ def main() -> int:
     )
     story.append(t_fore)
 
-    # 3.1.C Calibração (incerteza)
+    # 3.1.C Realizado OOS (auditoria) + calibração
     story.append(Spacer(1, 0.25 * cm))
-    story.append(Paragraph("<b>3.1.C Qualidade do forecast (calibração)</b>", styles["BodyText"]))
-    calib_tbl = [
-        ["Métrica", "Valor"],
-        ["Coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
-        ["Coverage 90% (p05..p95)", f"{fc_cov90*100:.1f}%" if np.isfinite(fc_cov90) else "nan"],
-        ["PIT médio (ideal ~0,5)", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
-        ["CRPS médio (menor é melhor)", f"{fc_crps:,.1f}" if np.isfinite(fc_crps) else "nan"],
+    story.append(Paragraph("<b>3.1.C Auditoria: realizado OOS e risco (não corrigido por Bias)</b>", styles["BodyText"]))
+    aud_tbl = [
+        ["Métrica", "Valor (realizado OOS)"],
+        ["Semanas (WF OOS)", f"{wstats.get('n', 0)}"],
+        ["Lucro total (WF)", f"USD {profit_tot:,.1f}"],
+        ["Lucro médio semanal", f"USD {wstats.get('mean', float('nan')):,.1f}"],
+        ["Std semanal", f"USD {wstats.get('std', float('nan')):,.1f}"],
+        ["Sharpe anualizado", f"{wstats.get('sharpe_annual', float('nan')):.3f}"],
+        ["ROI por $ (turnover)", f"{roi_on_stake:.4f}"],
+        ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
+        ["Risco dia: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
+        ["Risco dia: VaR10%(PnL)", f"USD {var10:,.0f} (limite ≥ {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
+        ["Risco dia: P(PnL ≤ -25% banca)", f"{p_dd*100:.1f}% (limite ≤ {MAX_P_DAILY_DD*100:.0f}%)"],
     ]
-    t_cal = Table(calib_tbl, colWidths=[7.5 * cm, 9.5 * cm])
-    t_cal.setStyle(
+    t_aud = Table(aud_tbl, colWidths=[7.5 * cm, 9.5 * cm])
+    t_aud.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -778,7 +792,7 @@ def main() -> int:
             ]
         )
     )
-    story.append(t_cal)
+    story.append(t_aud)
 
     if top_bias_rows:
         story.append(Spacer(1, 0.25 * cm))
