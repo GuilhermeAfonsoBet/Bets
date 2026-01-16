@@ -18,6 +18,7 @@ Saída:
 from __future__ import annotations
 
 import math
+import json
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -28,6 +29,8 @@ import pandas as pd
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
+CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
+CALIB_FLOOR_SEXDOM = 0.005
 
 PORT_FIXED = OUT_DIR / "portfolio_pro_all.json"
 WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
@@ -390,6 +393,19 @@ def main() -> int:
     df_all["roi_cap2"] = np.minimum(df_all["roi_raw"].to_numpy(dtype=float), 2.0)
     df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
     df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+
+    # garantir coluna calibrada para Sex/Sáb/Dom se necessária (regras podem referenciar proba_cal_sexdom)
+    if "proba_cal_sexdom" not in df_all.columns:
+        df_all["proba_cal_sexdom"] = np.nan
+    if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
+        try:
+            calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x, y, left=float(y[0]), right=float(y[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
+        except Exception:
+            pass
 
     # only weeks evaluated in WF
     wf_weeks = set(wf_week["week"].astype(str).tolist())
