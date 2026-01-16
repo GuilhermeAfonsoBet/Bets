@@ -97,12 +97,22 @@ def _prepare_payload(df: pd.DataFrame, mode: str) -> pd.DataFrame:
 
     mode:
       - 'weekdays_cli': replica exatamente o `score_logit_weekdays_cli.preparar_payload`
+      - 'legacy_buggy': replica o parsing antigo (bugado) que removia '.' sempre
       - 'robust': coerção robusta (aceita ponto OU vírgula decimal sem destruir ponto decimal)
     """
     if mode == "weekdays_cli":
         return cli.preparar_payload(df)
+    if mode == "legacy_buggy":
+        out = df.copy()
+        out.columns = [__import__("re").sub(r"\s+", " ", str(c)).strip() for c in out.columns]
+        for col in cli.NUM_FEATURES:
+            if col in out.columns:
+                s = out[col].astype(str)
+                s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+                out[col] = pd.to_numeric(s, errors="coerce")
+        return out
     if mode != "robust":
-        raise ValueError("parse-mode inválido (use 'weekdays_cli' ou 'robust').")
+        raise ValueError("parse-mode inválido (use 'weekdays_cli', 'legacy_buggy' ou 'robust').")
 
     out = df.copy()
     # normaliza nomes de colunas
@@ -131,9 +141,14 @@ def main() -> int:
     ap.add_argument("--calib-floor", type=float, default=0.005)
     ap.add_argument(
         "--parse-mode",
-        choices=["weekdays_cli", "robust"],
+        choices=["weekdays_cli", "legacy_buggy", "robust"],
         default="weekdays_cli",
         help="Como coagir numéricos do payload (robust aceita ponto decimal).",
+    )
+    ap.add_argument(
+        "--compare-legacy",
+        action="store_true",
+        help="Também recalcula probas com parsing antigo (bugado) e compara com rf_prob.",
     )
     args = ap.parse_args()
 
@@ -141,8 +156,8 @@ def main() -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(base_csv, dtype=str)
-    df = _prepare_payload(df, mode=args.parse_mode)
+    df_raw = pd.read_csv(base_csv, dtype=str)
+    df = _prepare_payload(df_raw, mode=args.parse_mode)
 
     # filtro last N dias (se houver coluna de data)
     dt_col = _pick_dt_col(df)
@@ -181,6 +196,29 @@ def main() -> int:
     df["proba_cli"] = proba_cli
     df["proba_txt"] = df["proba_cli"].map(lambda x: (f"{float(x):.6f}" if pd.notna(x) else ""))
 
+    # Opcional: calcula proba com parsing antigo (bugado) para explicar divergências históricas
+    if args.compare_legacy:
+        df_legacy = _prepare_payload(df_raw.loc[df.index], mode="legacy_buggy")
+        df_legacy["dow_norm"] = df_legacy[cli.DOW_COL].apply(cli.normalize_dow)
+        proba_legacy = np.full(len(df_legacy), np.nan, dtype=float)
+        model_cache2: Dict[str, Any] = {}
+        for dow_norm, filename in cli.MODEL_FILENAMES.items():
+            m = (df_legacy["dow_norm"] == dow_norm).to_numpy()
+            if not m.any():
+                continue
+            if dow_norm not in model_cache2:
+                model_path = models_dir / filename
+                model = cli.patch_sklearn_compat(__import__("joblib").load(model_path))
+                model_cache2[dow_norm] = model
+            model = model_cache2[dow_norm]
+            X = df_legacy.loc[m, cli.NUM_FEATURES + cli.CAT_FEATURES]
+            p = model.predict_proba(X)[:, 1]
+            proba_legacy[m] = _clip_floor(p, floor)
+        df["proba_cli_legacy_buggy"] = proba_legacy
+        df["proba_txt_legacy_buggy"] = df["proba_cli_legacy_buggy"].map(
+            lambda x: (f"{float(x):.6f}" if pd.notna(x) else "")
+        )
+
     # rf_prob
     if "ApostaLive.rf_prob" not in df.columns:
         raise SystemExit("Coluna `ApostaLive.rf_prob` não encontrada na base.")
@@ -195,6 +233,13 @@ def main() -> int:
     g["abs_diff"] = (g["rf_prob"] - g["proba_cli"]).abs()
     g["match6"] = (np.round(g["rf_prob"], 6) == np.round(g["proba_cli"], 6)).astype(int)
 
+    if args.compare_legacy and "proba_cli_legacy_buggy" in g.columns:
+        g["abs_diff_legacy"] = (g["rf_prob"] - g["proba_cli_legacy_buggy"]).abs()
+        g["match6_legacy"] = (
+            np.round(g["rf_prob"], 6) == np.round(g["proba_cli_legacy_buggy"], 6)
+        ).astype(int)
+        g["closer_to_legacy"] = (g["abs_diff_legacy"] < g["abs_diff"]).astype(int)
+
     # por dia
     per_day = []
     for d0 in ["segunda-feira", "terca-feira", "quarta-feira"]:
@@ -202,16 +247,23 @@ def main() -> int:
         if gg.empty:
             continue
         corr = float(np.corrcoef(gg["rf_prob"], gg["proba_cli"])[0, 1]) if len(gg) >= 3 else float("nan")
-        per_day.append(
-            {
-                "dow_norm": d0,
-                "n": int(len(gg)),
-                "mae": float(gg["abs_diff"].mean()),
-                "p95_abs_diff": float(gg["abs_diff"].quantile(0.95)),
-                "corr": corr,
-                "match6_pct": float(100.0 * gg["match6"].mean()),
-            }
-        )
+        row = {
+            "dow_norm": d0,
+            "n": int(len(gg)),
+            "mae": float(gg["abs_diff"].mean()),
+            "p95_abs_diff": float(gg["abs_diff"].quantile(0.95)),
+            "corr": corr,
+            "match6_pct": float(100.0 * gg["match6"].mean()),
+        }
+        if args.compare_legacy and "abs_diff_legacy" in gg.columns:
+            row.update(
+                {
+                    "mae_legacy": float(gg["abs_diff_legacy"].mean()),
+                    "match6_legacy_pct": float(100.0 * gg["match6_legacy"].mean()),
+                    "pct_rows_closer_to_legacy": float(100.0 * gg["closer_to_legacy"].mean()),
+                }
+            )
+        per_day.append(row)
     per_day_df = pd.DataFrame(per_day).sort_values("dow_norm")
 
     # salvar CSV de mismatches (top 200)
@@ -226,8 +278,13 @@ def main() -> int:
             "rf_prob",
             "proba_cli",
             "proba_txt",
+            "proba_cli_legacy_buggy",
+            "proba_txt_legacy_buggy",
             "abs_diff",
             "match6",
+            "abs_diff_legacy",
+            "match6_legacy",
+            "closer_to_legacy",
         ]
         if c is not None and c in worst.columns
     ]
@@ -286,12 +343,25 @@ def main() -> int:
     md.append(f"- MAE |rf - cli|: **{float(g['abs_diff'].mean()):.6f}**\n")
     md.append(f"- P95 |rf - cli|: **{float(g['abs_diff'].quantile(0.95)):.6f}**\n")
     md.append(f"- % match exato (@6 casas): **{100.0*float(g['match6'].mean()):.2f}%**\n\n")
+    if args.compare_legacy and "abs_diff_legacy" in g.columns:
+        md.append("### Comparação com parsing antigo (bugado)\n")
+        md.append(f"- MAE |rf - legacy|: **{float(g['abs_diff_legacy'].mean()):.6f}**\n")
+        md.append(f"- % match exato legacy (@6 casas): **{100.0*float(g['match6_legacy'].mean()):.2f}%**\n")
+        md.append(
+            f"- % linhas em que legacy é MAIS perto do rf (|rf-legacy| < |rf-cli|): **{100.0*float(g['closer_to_legacy'].mean()):.2f}%**\n\n"
+        )
     md.append("### Por dia\n")
     for _, r in per_day_df.iterrows():
-        md.append(
+        line = (
             f"- **{r['dow_norm']}**: n={int(r['n'])}, corr={r['corr']:.3f}, "
-            f"MAE={r['mae']:.6f}, p95={r['p95_abs_diff']:.6f}, match6={r['match6_pct']:.2f}%\n"
+            f"MAE={r['mae']:.6f}, p95={r['p95_abs_diff']:.6f}, match6={r['match6_pct']:.2f}%"
         )
+        if args.compare_legacy and "mae_legacy" in r:
+            line += (
+                f" | legacy_MAE={r['mae_legacy']:.6f}, legacy_match6={r['match6_legacy_pct']:.2f}%, "
+                f"legacy_closer={r['pct_rows_closer_to_legacy']:.2f}%"
+            )
+        md.append(line + "\n")
     md.append("\n### Arquivos\n")
     md.append(f"- Mismatches (top 200): `{out_csv}`\n")
     if args.log_jsonl:
