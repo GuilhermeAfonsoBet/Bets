@@ -585,6 +585,15 @@ def main() -> int:
             styles["BodyText"],
         )
     )
+
+    # intervalo de dados e semana-alvo do portfólio (transparência operacional)
+    try:
+        _dt = pd.read_csv(SCORED, usecols=["BIA_ApostaUTC"], parse_dates=["BIA_ApostaUTC"])
+        data_min = _dt["BIA_ApostaUTC"].min()
+        data_max = _dt["BIA_ApostaUTC"].max()
+    except Exception:
+        data_min = data_max = pd.NaT
+
     # Regras da semana mais recente (garantidamente consistentes com o Anexo A):
     # sempre derivadas de WF_RULES (e não de um CSV separado).
     wf_rules["active"] = (wf_rules["status"] == "ok") & (wf_rules["stake_frac"] > 0)
@@ -593,6 +602,26 @@ def main() -> int:
     # persistir também como artefato auxiliar (para uso externo)
     cur_csv_path = OUT_DIR / "global_bayes_current_week_rules.csv"
     cur.to_csv(cur_csv_path, index=False)
+
+    # datas do intervalo da semana (W-SUN) e corte do treino (expanding window)
+    try:
+        last_start_s, last_end_s = last_week.split("/", 1)
+        last_start_dt = pd.to_datetime(last_start_s, errors="coerce")
+        last_end_dt = pd.to_datetime(last_end_s, errors="coerce")
+    except Exception:
+        last_start_dt = last_end_dt = pd.NaT
+
+    story.append(
+        Paragraph(
+            "<b>Datas (transparência)</b>: "
+            f"dataset `{SCORED.name}` cobre <b>{(data_min.date().isoformat() if pd.notna(data_min) else '—')}</b> "
+            f"até <b>{(data_max.date().isoformat() if pd.notna(data_max) else '—')}</b>. "
+            f"O portfólio abaixo se aplica à semana <b>{last_week}</b> (W-SUN). "
+            f"As regras desta semana foram estimadas usando somente dados <b>anteriores a {(last_start_dt.date().isoformat() if pd.notna(last_start_dt) else '—')}</b> "
+            "(expanding window) e então avaliadas nessa própria semana (OOS).",
+            styles["BodyText"],
+        )
+    )
 
     if cur.empty:
         story.append(Paragraph("Nenhuma combinação ativa na última semana do walk-forward.", styles["BodyText"]))
