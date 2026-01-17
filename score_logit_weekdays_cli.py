@@ -98,6 +98,17 @@ CAT_FEATURES = [
 
 DOW_COL = "Dia Semana Aposta (UTC)"
 
+# Coluna de ID da aposta (opcional no payload). Se existir, será logada.
+BET_ID_COL_CANDIDATES = [
+    "IDAposta",
+    "ID Aposta",
+    "ID_Aposta",
+    "betID",
+    "BetID",
+    "idAposta",
+    "id_aposta",
+]
+
 # Nomes dos arquivos de modelo (dentro de --models-dir)
 MODEL_FILENAMES = {
     # chaves são DOW normalizados (lowercase, sem acento)
@@ -154,6 +165,17 @@ def _payload_hash(row: pd.Series) -> str:
         parts.append(f"{c}={v}")
     s = "|".join(parts).encode("utf-8", errors="ignore")
     return hashlib.sha256(s).hexdigest()[:16]
+
+
+def get_bet_id(row: pd.Series):
+    for c in BET_ID_COL_CANDIDATES:
+        if c in row.index:
+            v = row.get(c)
+            if pd.isna(v):
+                return None
+            s = str(v).strip()
+            return s if s else None
+    return None
 
 
 def coerce_decimal_string(x):
@@ -236,6 +258,7 @@ def main():
 
     # Loop nas linhas do payload, na ordem
     for idx, row in df.iterrows():
+        bet_id = get_bet_id(row)
         dow_raw = row.get(DOW_COL, None)
         dow_norm = normalize_dow(dow_raw)
 
@@ -288,6 +311,7 @@ def main():
                 mstat = None
             log_entry = {
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "bet_id": bet_id,
                 "idx": int(idx),
                 "dia_semana_raw": (None if pd.isna(dow_raw) else str(dow_raw)),
                 "dia_semana_norm": dow_norm,

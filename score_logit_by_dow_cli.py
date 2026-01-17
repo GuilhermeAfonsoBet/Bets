@@ -62,8 +62,15 @@ def patch_sklearn_compat(est):
     for obj in _walk_estimators(est):
         # SimpleImputer: novas versões referenciam keep_empty_features
         try:
-            if isinstance(obj, SimpleImputer) and not hasattr(obj, "keep_empty_features"):
-                setattr(obj, "keep_empty_features", False)
+            if isinstance(obj, SimpleImputer):
+                if not hasattr(obj, "keep_empty_features"):
+                    setattr(obj, "keep_empty_features", False)
+                # algumas versões novas esperam _fill_dtype (modelos antigos têm _fit_dtype)
+                if not hasattr(obj, "_fill_dtype") and hasattr(obj, "_fit_dtype"):
+                    try:
+                        setattr(obj, "_fill_dtype", getattr(obj, "_fit_dtype"))
+                    except Exception:
+                        pass
         except Exception:
             pass
         # OneHotEncoder: 1.2+ usa sparse_output; alguns modelos antigos tinham sparse
@@ -97,6 +104,17 @@ CAT_COLS = [
     "Casa aposta vencedora",
 ]
 ALL_COLS = NUM_COLS + CAT_COLS
+
+# Coluna opcional de ID da aposta (para auditoria)
+BET_ID_COL_CANDIDATES = [
+    "IDAposta",
+    "ID Aposta",
+    "ID_Aposta",
+    "betID",
+    "BetID",
+    "idAposta",
+    "id_aposta",
+]
 
 ALIASES = {
     # % ↔︎ percent
@@ -201,6 +219,37 @@ def coerce_df_types(df: pd.DataFrame) -> pd.DataFrame:
     return df[ALL_COLS]
 
 
+def get_bet_id_from_raw(df_raw: pd.DataFrame) -> Optional[str]:
+    if df_raw is None or df_raw.empty:
+        return None
+    row = df_raw.iloc[0]
+    for c in BET_ID_COL_CANDIDATES:
+        if c in df_raw.columns:
+            v = row.get(c)
+            if pd.isna(v):
+                return None
+            s = str(v).strip()
+            return s if s else None
+    return None
+
+
+def resolve_model_path(models_dir: Path, subset: str) -> Path:
+    """
+    Resolve nome do arquivo de modelo no diretório.
+    Suporta variações comuns encontradas no operacional:
+      - model_logit_{subset}.joblib
+      - model_logit_prod_{subset}.joblib
+    """
+    candidates = [
+        models_dir / f"model_logit_{subset}.joblib",
+        models_dir / f"model_logit_prod_{subset}.joblib",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(" | ".join(str(p) for p in candidates))
+
+
 def read_one_record_from_csv(path: str) -> pd.DataFrame:
     # detecta delimitador olhando a 1ª linha
     with open(path, "r", encoding="utf-8") as f:
@@ -297,6 +346,8 @@ def main() -> int:
             if df_raw is None:
                 raise ValueError("Forneça --csvin OU --json/--jsonfile.")
 
+        bet_id = get_bet_id_from_raw(df_raw)
+
         # 2) Coerção de tipos/aliases
         df = coerce_df_types(df_raw.copy())
 
@@ -305,10 +356,7 @@ def main() -> int:
 
         # 4) Carregar modelo
         models_dir = Path(args.models_dir)
-        # nomes esperados:
-        model_path = models_dir / f"model_logit_{subset}.joblib"
-        if not model_path.exists():
-            raise FileNotFoundError(str(model_path))
+        model_path = resolve_model_path(models_dir, subset)
         pipe = load(model_path)
         pipe = patch_sklearn_compat(pipe)
 
@@ -343,6 +391,7 @@ def main() -> int:
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "ok",
             "version": version,
+            "bet_id": bet_id,
             "subset": subset,
             "weekday": wd_idx,
             "model_path": str(model_path),
@@ -389,6 +438,7 @@ def main() -> int:
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "status": "error",
             "version": "2025-10-18c",
+            "bet_id": locals().get("bet_id", None),
             "subset": locals().get("subset", None),
             "weekday": locals().get("wd_idx", None),
             "model_path": str(locals().get("model_path", "")),
