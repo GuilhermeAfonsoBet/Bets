@@ -30,7 +30,9 @@ import pandas as pd
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
+CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
 CALIB_FLOOR_SEXDOM = 0.005
+CALIB_FLOOR_SEGQUI = 0.005
 
 PORT_FIXED = OUT_DIR / "portfolio_pro_all.json"
 WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
@@ -76,6 +78,30 @@ def quantiles(a: np.ndarray, qs: List[float]) -> Dict[str, float]:
     for q, val in zip(qs, v):
         out[f"q{int(q*100):02d}"] = float(val)
     return out
+
+
+def _apply_isotonic_safe(p_raw: np.ndarray, calib_path: Path, floor: float) -> np.ndarray:
+    """
+    Aplica calibração isotônica (x/y em JSON) com extrapolação constante e piso (floor).
+    Se o calibrador estiver ausente/inválido, retorna p_raw com piso.
+    """
+    p = np.asarray(p_raw, dtype=float)
+    out = p.copy()
+    try:
+        if calib_path.exists():
+            calib = json.loads(calib_path.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            if x.size and y.size and x.size == y.size:
+                out = np.interp(out, x, y, left=float(y[0]), right=float(y[-1]))
+    except Exception:
+        out = p.copy()
+    out = np.maximum(out, float(floor))
+    return np.clip(out, 0.0, 1.0)
+
+
+def _fmt_or_dash(x: float, fmt: str) -> str:
+    return (fmt.format(x) if np.isfinite(x) else "—")
 
 
 def compute_weekly_stats(w: np.ndarray) -> Dict[str, float]:
@@ -398,21 +424,12 @@ def main() -> int:
     for c in ("proba_cal_segqui", "proba_cal_sexdom"):
         if c not in df_all.columns:
             df_all[c] = np.nan
-    try:
-        if "proba_raw_segqui" in df_all.columns and CALIB_SEGQUI.exists():
-            calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
-            x0 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
-            y0 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
-            p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
-            df_all["proba_cal_segqui"] = np.clip(np.maximum(np.interp(p_raw, x0, y0, left=float(y0[0]), right=float(y0[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
-        if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
-            calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
-            x1 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
-            y1 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
-            p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
-            df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x1, y1, left=float(y1[0]), right=float(y1[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
-    except Exception:
-        pass
+    if "proba_raw_segqui" in df_all.columns:
+        p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+        df_all["proba_cal_segqui"] = _apply_isotonic_safe(p_raw, CALIB_SEGQUI, floor=CALIB_FLOOR_SEGQUI)
+    if "proba_raw_sexdom" in df_all.columns:
+        p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+        df_all["proba_cal_sexdom"] = _apply_isotonic_safe(p_raw, CALIB_SEXDOM, floor=CALIB_FLOOR_SEXDOM)
 
     # only weeks evaluated in WF
     wf_weeks = set(wf_week["week"].astype(str).tolist())
@@ -602,21 +619,12 @@ def main() -> int:
         for c in ("proba_cal_segqui", "proba_cal_sexdom"):
             if c not in df_all.columns:
                 df_all[c] = np.nan
-        try:
-            if "proba_raw_segqui" in df_all.columns and CALIB_SEGQUI.exists():
-                calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
-                x0 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
-                y0 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
-                p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
-                df_all["proba_cal_segqui"] = np.clip(np.maximum(np.interp(p_raw, x0, y0, left=float(y0[0]), right=float(y0[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
-            if "proba_raw_sexdom" in df_all.columns and CALIB_SEXDOM.exists():
-                calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
-                x1 = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
-                y1 = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
-                p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
-                df_all["proba_cal_sexdom"] = np.clip(np.maximum(np.interp(p_raw, x1, y1, left=float(y1[0]), right=float(y1[-1])), CALIB_FLOOR_SEXDOM), 0.0, 1.0)
-        except Exception:
-            pass
+        if "proba_raw_segqui" in df_all.columns:
+            p_raw = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_segqui"] = _apply_isotonic_safe(p_raw, CALIB_SEGQUI, floor=CALIB_FLOOR_SEGQUI)
+        if "proba_raw_sexdom" in df_all.columns:
+            p_raw = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_sexdom"] = _apply_isotonic_safe(p_raw, CALIB_SEXDOM, floor=CALIB_FLOOR_SEXDOM)
         df_all["week_start"] = pd.to_datetime(df_all["week"].str.split("/").str[0])
         df_train_cur = df_all[df_all["week_start"] < last_start].copy()
         weeks_all_train = sorted(df_train_cur["week"].unique().tolist())
@@ -707,13 +715,13 @@ def main() -> int:
                     P(f"{cut:.2f}"),
                     P(f"{frac*100:.1f}%"),
                     P(f"{a:.3f}"),
-                    P(f"{met['mean_week_profit_trade']:.0f}" if np.isfinite(met["mean_week_profit_trade"]) else "nan"),
-                    P(f"{met['std_week_profit_trade']:.0f}" if np.isfinite(met["std_week_profit_trade"]) else "nan"),
-                    P(f"{met['pneg_week_trade']*100:.1f}%" if np.isfinite(met["pneg_week_trade"]) else "nan"),
-                    P(f"{met['roi_on_stake']:.3f}" if np.isfinite(met["roi_on_stake"]) else "nan"),
+                    P(_fmt_or_dash(float(met["mean_week_profit_trade"]), "{:,.0f}")),
+                    P(_fmt_or_dash(float(met["std_week_profit_trade"]), "{:,.0f}")),
+                    P((_fmt_or_dash(float(met["pneg_week_trade"]) * 100.0, "{:.1f}") + "%") if np.isfinite(met["pneg_week_trade"]) else "—"),
+                    P(_fmt_or_dash(float(met["roi_on_stake"]), "{:.3f}")),
                     P(str(int(met["trade_weeks"]))),
-                    P(f"{met['mean_week_stake_trade']:.0f}" if np.isfinite(met["mean_week_stake_trade"]) else "nan"),
-                    P(f"{met['mean_week_bets_trade']:.1f}" if np.isfinite(met["mean_week_bets_trade"]) else "nan"),
+                    P(_fmt_or_dash(float(met["mean_week_stake_trade"]), "{:,.0f}")),
+                    P(_fmt_or_dash(float(met["mean_week_bets_trade"]), "{:.1f}")),
                 ]
             )
 
