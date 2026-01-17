@@ -783,6 +783,144 @@ def main() -> int:
         )
     )
 
+    # ---------------------------------------------------------
+    # 2.B) Forward-looking: próxima semana (planejamento)
+    # ---------------------------------------------------------
+    story.append(Spacer(1, 0.35 * cm))
+    story.append(Paragraph("<b>2.B Portfólio sugerido para a próxima semana (forward-looking)</b>", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "Esta seção estima as regras para a <b>próxima semana</b> usando o mesmo otimizador do walk-forward, "
+            "mas treinando com todos os dados disponíveis até a data máxima do dataset. "
+            "É uma recomendação operacional 'pra frente' (não é OOS auditado ainda).",
+            styles["BodyText"],
+        )
+    )
+    # próxima semana após a semana corrente (W-SUN)
+    try:
+        next_start = (last_end_dt + pd.Timedelta(days=1)) if pd.notna(last_end_dt) else pd.NaT
+        next_end = (next_start + pd.Timedelta(days=6)) if pd.notna(next_start) else pd.NaT
+        next_week = f"{next_start.date().isoformat()}/{next_end.date().isoformat()}" if pd.notna(next_start) and pd.notna(next_end) else "—"
+    except Exception:
+        next_week = "—"
+
+    story.append(
+        Paragraph(
+            f"- Semana alvo (próxima): <b>{next_week}</b><br/>"
+            f"- Treino: dados até <b>{(data_max.date().isoformat() if pd.notna(data_max) else '—')}</b> (pode incluir semana parcial).",
+            styles["BodyText"],
+        )
+    )
+
+    # calcula regras "as-of now" usando o mesmo código do WF
+    try:
+        import evaluate_oos_walkforward_strategy as wf  # usa as mesmas funções/constantes
+
+        df_fwd = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
+        df_fwd["roi_raw"] = pd.to_numeric(df_fwd["ROI Real"], errors="coerce").astype(float)
+        df_fwd["roi_cap2"] = np.minimum(df_fwd["roi_raw"].to_numpy(dtype=float), 2.0)
+        df_fwd["roi_cap1"] = np.minimum(df_fwd["roi_raw"].to_numpy(dtype=float), 1.0)
+        df_fwd["house_cap"] = pd.to_numeric(df_fwd["house_cap"], errors="coerce").astype(float)
+        df_fwd["date"] = pd.to_datetime(df_fwd["BIA_ApostaUTC"]).dt.floor("D")
+        df_fwd["week"] = pd.to_datetime(df_fwd["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+
+        # garantir colunas calibradas (qui e fim de semana)
+        for c in ("proba_cal_segqui", "proba_cal_sexdom"):
+            if c not in df_fwd.columns:
+                df_fwd[c] = np.nan
+        if "proba_raw_segqui" in df_fwd.columns:
+            p_raw = pd.to_numeric(df_fwd["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df_fwd["proba_cal_segqui"] = _apply_isotonic_safe(p_raw, CALIB_SEGQUI, floor=CALIB_FLOOR_SEGQUI)
+        if "proba_raw_sexdom" in df_fwd.columns:
+            p_raw = pd.to_numeric(df_fwd["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+            df_fwd["proba_cal_sexdom"] = _apply_isotonic_safe(p_raw, CALIB_SEXDOM, floor=CALIB_FLOOR_SEXDOM)
+
+        # treino até data_max
+        if pd.notna(data_max):
+            df_fwd = df_fwd[pd.to_datetime(df_fwd["BIA_ApostaUTC"]) <= pd.to_datetime(data_max)].copy()
+
+        # map score_col por dia (alinhado ao operacional)
+        def score_col_for_dow(dow: str) -> str:
+            if dow == "segunda-feira":
+                return "proba_raw_segunda"
+            if dow == "terça-feira":
+                return "proba_raw_terca"
+            if dow == "quarta-feira":
+                return "proba_raw_quarta"
+            if dow == "quinta-feira":
+                return "proba_cal_segqui"
+            return "proba_cal_sexdom"  # sex/sáb/dom
+
+        rules_fwd: Dict[str, wf.Rule] = {}
+        for bt in ["FT", "FH"]:
+            for dow0 in ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]:
+                sc = score_col_for_dow(dow0)
+                x = df_fwd[(df_fwd["bet_type"] == bt) & (df_fwd["dow_pt"] == dow0)].copy()
+                if x.empty:
+                    rule = wf.Rule(bet_type=bt, dow=dow0, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
+                else:
+                    rule = wf.optimize_segment_train(x, sc, bayes_select=True, prev_rule=None, roi_bias_adj=0.0)
+                rules_fwd[f"{bt}|{dow0}"] = rule
+
+        alpha_fwd, _, _ = wf.find_alpha_global(df_fwd, rules_fwd)
+
+        rf_rows = [[P("<b>Tipo</b>"), P("<b>Dia</b>"), P("<b>Score</b>"), P("<b>Cutoff</b>"), P("<b>Stake</b>"), P("<b>α</b>"), P("<b>Status</b>")]]
+        for key, rule in rules_fwd.items():
+            if rule.status != "ok" or rule.stake_frac <= 0:
+                continue
+            rf_rows.append(
+                [
+                    P(rule.bet_type),
+                    P(rule.dow),
+                    P(rule.score_col),
+                    P(f"{float(rule.cutoff):.2f}"),
+                    P(f"{float(rule.stake_frac)*100:.1f}%"),
+                    P(f"{float(alpha_fwd):.3f}"),
+                    P(rule.status),
+                ]
+            )
+        if len(rf_rows) == 1:
+            story.append(Paragraph("Nenhum segmento ativo no forward-looking (tudo stake=0).", styles["BodyText"]))
+        else:
+            t_fwd = Table(rf_rows, colWidths=[1.0 * cm, 2.2 * cm, 3.0 * cm, 1.1 * cm, 1.2 * cm, 0.8 * cm, 1.6 * cm], repeatRows=1)
+            t_fwd.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ]
+                )
+            )
+            story.append(t_fwd)
+
+        # persistir artefato auxiliar
+        try:
+            out_fwd = OUT_DIR / "global_bayes_next_week_rules.csv"
+            out_rows = []
+            for k, rule in rules_fwd.items():
+                out_rows.append(
+                    {
+                        "test_week": next_week,
+                        "bet_type": rule.bet_type,
+                        "dow_pt": rule.dow,
+                        "score_col": rule.score_col,
+                        "cutoff": float(rule.cutoff),
+                        "stake_frac": float(rule.stake_frac),
+                        "alpha_global": float(alpha_fwd),
+                        "status": rule.status,
+                        "rule_key": k,
+                        "as_of_date": (data_max.date().isoformat() if pd.notna(data_max) else None),
+                    }
+                )
+            pd.DataFrame(out_rows).to_csv(out_fwd, index=False)
+        except Exception:
+            pass
+    except Exception as e:
+        story.append(Paragraph(f"Falha ao gerar portfólio forward-looking: {e}", styles["BodyText"]))
+
     # 3) metrics
     story.append(Spacer(1, 0.4 * cm))
     story.append(Paragraph("<b>3. Métricas estatísticas e de negócio</b>", styles["Heading2"]))
