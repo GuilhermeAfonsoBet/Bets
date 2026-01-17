@@ -1,0 +1,13 @@
+bet_id,dow,mode,payload_file,stdout_proba,cli_proba,diff,match6,cli_decision
+022283,sábado,by_dow,payload022283.csv,,0.408825,,0,False
+022285,sábado,by_dow,payload022285.csv,0.5,0.5,0.0,1,False
+022288,sábado,by_dow,payload022288.csv,0.09434,0.09434,0.0,1,False
+022290,sábado,by_dow,payload022290.csv,0.375,0.375,0.0,1,False
+022291,sábado,by_dow,payload022291.csv,0.375,0.375,0.0,1,False
+022296,sábado,by_dow,payload022296.csv,0.375,0.375,0.0,1,False
+022299,sábado,by_dow,payload022299.csv,0.375,0.375,0.0,1,False
+022301,sábado,by_dow,payload022301.csv,0.420711,0.420711,0.0,1,False
+022302,sábado,by_dow,payload022302.csv,0.375,0.375,0.0,1,False
+022303,sábado,by_dow,payload022303.csv,0.34685,0.34685,0.0,1,False
+022306,sábado,by_dow,payload022306.csv,0.35,0.35,0.0,1,False
+022307,sábado,by_dow,payload022307.csv,0.337415,0.337415,0.0,1,False
