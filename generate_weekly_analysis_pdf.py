@@ -40,6 +40,9 @@ SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 BANKROLL_BASE = 2300.0
 # banca “stake máximo (p95)” conforme relatório 17/01/2026
 BANKROLL_MAX_P95 = 63_205.0
+CALIB_FLOOR = 0.005
+CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
+CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,38 @@ def tbl(data: List[List[object]], col_widths=None) -> Table:
     return t
 
 
+def _apply_isotonic_from_json(p: np.ndarray, json_path: Path, floor: float) -> np.ndarray:
+    """
+    Aplica uma calibração isotonic (salva como {isotonic: {x:[], y:[]}}) via interpolação monotônica.
+    """
+    if not json_path.exists():
+        return np.clip(p.astype(float), floor, 1.0 - floor)
+    import json
+
+    obj = json.loads(json_path.read_text(encoding="utf-8"))
+    x = np.asarray(obj["isotonic"]["x"], dtype=float)
+    y = np.asarray(obj["isotonic"]["y"], dtype=float)
+    pp = p.astype(float)
+    out = np.interp(pp, x, y, left=y[0], right=y[-1])
+    return np.clip(out, floor, 1.0 - floor)
+
+
+def _roi_from_result_and_odds(result: object, odds: float) -> float:
+    if not np.isfinite(odds) or odds <= 1e-9:
+        return float("nan")
+    s = str(result).strip().lower()
+    if s == "win":
+        return float(odds - 1.0)
+    if s in {"lose", "loss"}:
+        return -1.0
+    if s in {"halfwin", "half win"}:
+        return float((odds - 1.0) / 2.0)
+    if s in {"halfloss", "halflose", "half loss", "half lose"}:
+        return -0.5
+    if s in {"push", "void", "refund", "cancelled", "canceled"}:
+        return 0.0
+    return float("nan")
+
 def _select_bets(
     df: pd.DataFrame, rules_week: pd.DataFrame, alpha: float, bankroll: float
 ) -> pd.DataFrame:
@@ -104,27 +139,70 @@ def _select_bets(
         if x.empty or score_col not in x.columns:
             continue
         score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
-        roi_raw = pd.to_numeric(x["ROI Real"], errors="coerce").to_numpy(dtype=float)
-        roi_cap2 = np.minimum(roi_raw, 2.0)
         cap = pd.to_numeric(x["house_cap"], errors="coerce").to_numpy(dtype=float)
         # Importante: a seleção NÃO depende de cap2 vs sem cap (apenas score e dados válidos).
         # cap2 só altera o PnL (truncando ROI Real em 2.0).
-        m = np.isfinite(score) & (score >= cutoff) & np.isfinite(roi_raw) & np.isfinite(cap)
+        # Obs: cap pode ser +inf (sem limite). Isso é válido e NÃO deve excluir a aposta.
+        m = np.isfinite(score) & (score >= cutoff) & (~np.isnan(cap)) & (cap > 0)
         if not np.any(m):
             continue
         x = x.iloc[np.where(m)[0]].copy()
         stake0 = float(bankroll) * stake_frac * float(alpha)
         x["stake_eff"] = np.minimum(stake0, pd.to_numeric(x["house_cap"], errors="coerce").to_numpy(dtype=float))
         x["score_used"] = pd.to_numeric(x[score_col], errors="coerce")
-        x["roi_raw"] = roi_raw[m]
-        x["roi_cap2"] = roi_cap2[m]
-        x["profit_raw"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_raw"].to_numpy(dtype=float)
-        x["profit_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_cap2"].to_numpy(dtype=float)
+        # ROI da planilha (diagnóstico)
+        x["roi_sheet"] = pd.to_numeric(x.get("ROI Real"), errors="coerce")
+        # ROI calculado via odds + resultado (mais confiável para \"sem cap\")
+        def _col(name: str) -> pd.Series:
+            return x[name] if name in x.columns else pd.Series(np.nan, index=x.index)
+
+        odds_series = pd.to_numeric(_col("Odd Aposta Realizada"), errors="coerce")
+        for nm in ["BetinAsia.got price", "BetinAsia.Odds", "RebelBetting.Odds", "Odd Indicada no RB"]:
+            odds_series = odds_series.combine_first(pd.to_numeric(_col(nm), errors="coerce"))
+        odds = odds_series.to_numpy(dtype=float)
+        res = x.get("RebelBetting.Result")
+        roi_calc = np.array([_roi_from_result_and_odds(r0, o0) for r0, o0 in zip(res, odds)], dtype=float)
+        # manter apenas apostas com ROI calculável (para não divergir da seleção OOS, que requer ROI finito)
+        keep = np.isfinite(roi_calc)
+        if not np.any(keep):
+            continue
+        x = x.iloc[np.where(keep)[0]].copy()
+        roi_calc = roi_calc[keep]
+        x["roi_calc"] = roi_calc
+        x["roi_calc_cap2"] = np.minimum(roi_calc, 2.0)
+        x["profit_calc"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_calc"].to_numpy(dtype=float)
+        x["profit_calc_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_calc_cap2"].to_numpy(dtype=float)
         x["rule_key"] = f"{bt}|{dow}"
-        rows.append(x[["week", "date", "stake_eff", "profit_raw", "profit_cap2", "rule_key", "score_used", "roi_raw", "roi_cap2"]])
+        rows.append(
+            x[
+                [
+                    "week",
+                    "date",
+                    "stake_eff",
+                    "rule_key",
+                    "score_used",
+                    "roi_sheet",
+                    "roi_calc",
+                    "roi_calc_cap2",
+                    "profit_calc",
+                    "profit_calc_cap2",
+                ]
+            ]
+        )
 
     return pd.concat(rows, axis=0, ignore_index=True) if rows else pd.DataFrame(
-        columns=["week", "date", "stake_eff", "profit_raw", "profit_cap2", "rule_key", "score_used", "roi_raw", "roi_cap2"]
+        columns=[
+            "week",
+            "date",
+            "stake_eff",
+            "rule_key",
+            "score_used",
+            "roi_sheet",
+            "roi_calc",
+            "roi_calc_cap2",
+            "profit_calc",
+            "profit_calc_cap2",
+        ]
     )
 
 
@@ -183,8 +261,8 @@ def _train_weekly_distribution_multi(
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     bets = _select_bets(df_train, rules_week=rules_week, alpha=alpha, bankroll=bankroll)
     return (
-        _weekly_dist_from_bets(bets, train_weeks=train_weeks, profit_col="profit_cap2"),
-        _weekly_dist_from_bets(bets, train_weeks=train_weeks, profit_col="profit_raw"),
+        _weekly_dist_from_bets(bets, train_weeks=train_weeks, profit_col="profit_calc_cap2"),
+        _weekly_dist_from_bets(bets, train_weeks=train_weeks, profit_col="profit_calc"),
     )
 
 
@@ -202,6 +280,19 @@ def main() -> int:
     df_all = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
     df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
     df_all["date"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.floor("D")
+    # criar colunas calibradas (proba_cal_*) para aplicar as regras do WF em qui/sex/sáb/dom
+    if "proba_cal_segqui" not in df_all.columns:
+        if "proba_raw_segqui" in df_all.columns:
+            pr = pd.to_numeric(df_all["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_segqui"] = _apply_isotonic_from_json(pr, CALIB_SEGQUI, floor=CALIB_FLOOR)
+        else:
+            df_all["proba_cal_segqui"] = np.nan
+    if "proba_cal_sexdom" not in df_all.columns:
+        if "proba_raw_sexdom" in df_all.columns:
+            pr = pd.to_numeric(df_all["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+            df_all["proba_cal_sexdom"] = _apply_isotonic_from_json(pr, CALIB_SEXDOM, floor=CALIB_FLOOR)
+        else:
+            df_all["proba_cal_sexdom"] = np.nan
 
     w = weekly[weekly["week"].astype(str) == ws.key].copy()
     if w.empty:
@@ -236,10 +327,10 @@ def main() -> int:
     df_train = df_all[df_all["week"].isin(train_weeks)].copy()
     df_test = df_all[df_all["week"] == ws.key].copy()
 
-    # realizado (teórico OOS) da semana: mesma seleção; cap2 só altera o PnL/ROI
+    # realizado (teórico OOS) da semana: mesma seleção; cap2 NÃO remove apostas (stake/n_bets iguais).
     bets_test = _select_bets(df_test, rules_week=r_act, alpha=alpha, bankroll=BANKROLL_BASE)
-    pnl_raw, stake_sel, n_bets_sel, roi_raw = _weekly_agg(bets_test, profit_col="profit_raw")
-    pnl_cap2, stake_sel2, n_bets_sel2, roi_cap2 = _weekly_agg(bets_test, profit_col="profit_cap2")
+    pnl_calc, stake_sel, n_bets_sel, roi_calc = _weekly_agg(bets_test, profit_col="profit_calc")
+    pnl_calc_cap2, _, _, roi_calc_cap2 = _weekly_agg(bets_test, profit_col="profit_calc_cap2")
     # sanity: stake e n_bets não devem variar entre cap2 e sem cap
     stake_sel = float(stake_sel)
     n_bets_sel = int(n_bets_sel)
@@ -255,13 +346,15 @@ def main() -> int:
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Resumo da performance (OOS global_bayes)", styles["Heading2"]))
+    cap2_official_pnl = float(w0.get("profit_cap2_usd", float("nan")))
+    cap2_official_stake = float(w0.get("stake_usd", float("nan")))
+    cap2_official_n = int(w0.get("n_bets", 0))
+    cap2_official_roi = float(w0.get("roi_on_stake_cap2", float("nan")))
     summary = [
         ["Métrica", "Valor"],
         ["alpha_global", f"{alpha:.3f}"],
-        ["Realizado (seleção): n_bets", f"{n_bets_sel}"],
-        ["Realizado (seleção): stake_usd", fmt_money(stake_sel)],
-        ["Realizado (ROI Real sem cap): profit_usd / ROI", f"{fmt_money(pnl_raw)} / {fmt_pct(roi_raw)}"],
-        ["Realizado (cap2): profit_cap2_usd / ROI_cap2", f"{fmt_money(pnl_cap2)} / {fmt_pct(roi_cap2)}"],
+        ["Realizado (cap2, oficial WF): n_bets / stake / PnL / ROI", f"{cap2_official_n} / {fmt_money(cap2_official_stake)} / {fmt_money(cap2_official_pnl)} / {fmt_pct(cap2_official_roi)}"],
+        ["Realizado (sem cap, via odds+resultado): n_bets / stake / PnL / ROI", f"{n_bets_sel} / {fmt_money(stake_sel)} / {fmt_money(pnl_calc)} / {fmt_pct(roi_calc)}"],
     ]
     story.append(tbl(summary, col_widths=[220, 260]))
     story.append(Spacer(1, 10))
@@ -271,22 +364,35 @@ def main() -> int:
         Paragraph(
             "<b>Definição (cap2)</b>: para reduzir a influência de poucos eventos com ROI muito alto (cauda pesada), "
             "o estudo usa uma versão capada do ROI: <b>ROI_cap2 = min(ROI_Real, 2.0)</b>. "
-            "Isso não altera quais apostas são feitas (a seleção é por score/cutoff), mas altera o PnL/ROI calculados "
+            "<b>Isso não remove apostas</b> (stake e n_bets ficam iguais). Ele só altera o PnL/ROI calculados "
             "para análise de risco/robustez (long-run).",
             styles["Normal"],
         )
     )
     if not bets_test.empty:
-        delta = pd.to_numeric(bets_test["profit_raw"], errors="coerce") - pd.to_numeric(bets_test["profit_cap2"], errors="coerce")
-        m = pd.to_numeric(bets_test["roi_raw"], errors="coerce") > 2.0
+        # Diferença cap2 vs sem cap usando ROI calculado (odds+resultado)
+        delta = pd.to_numeric(bets_test["profit_calc"], errors="coerce") - pd.to_numeric(bets_test["profit_calc_cap2"], errors="coerce")
+        m = pd.to_numeric(bets_test["roi_calc"], errors="coerce") > 2.0
         n_aff = int(np.sum(m.to_numpy(dtype=bool)))
         stake_aff = float(pd.to_numeric(bets_test.loc[m, "stake_eff"], errors="coerce").sum()) if n_aff > 0 else 0.0
         delta_sum = float(pd.to_numeric(delta, errors="coerce").sum()) if np.isfinite(delta).any() else 0.0
+
+        # Diagnóstico: ROI da planilha pode conter outliers incompatíveis com odds/resultados
+        roi_sheet = pd.to_numeric(bets_test["roi_sheet"], errors="coerce")
+        stake0 = pd.to_numeric(bets_test["stake_eff"], errors="coerce")
+        pnl_sheet = float((stake0 * roi_sheet).sum()) if np.isfinite(roi_sheet.to_numpy(float)).any() else float("nan")
+        pnl_sheet_cap2 = float((stake0 * np.minimum(roi_sheet.to_numpy(float), 2.0)).sum()) if np.isfinite(roi_sheet.to_numpy(float)).any() else float("nan")
+        n_sheet_gt2 = int(np.sum((roi_sheet.to_numpy(float) > 2.0) & np.isfinite(roi_sheet.to_numpy(float))))
         story.append(
             Paragraph(
-                f"<b>Nesta semana</b>: profit sem cap = <b>{fmt_money(pnl_raw)}</b> vs cap2 = <b>{fmt_money(pnl_cap2)}</b> "
-                f"(diferença explicada por cap2: <b>{fmt_money(delta_sum)}</b>). "
-                f"Apostas com ROI_Real&gt;2: <b>{n_aff}</b> (stake total nessas apostas: <b>{fmt_money(stake_aff)}</b>).",
+                f"<b>Nesta semana</b>:<br/>"
+                f"- Cap2 (oficial WF): <b>{fmt_money(cap2_official_pnl)}</b><br/>"
+                f"- Sem cap (via odds+resultado): <b>{fmt_money(pnl_calc)}</b><br/>"
+                f"- Diferença cap2 vs sem cap (via odds+resultado): <b>{fmt_money(delta_sum)}</b> "
+                f"(apostas com ROI&gt;2: <b>{n_aff}</b>, stake nessas apostas: <b>{fmt_money(stake_aff)}</b>).<br/>"
+                f"<br/><b>Diagnóstico (ROI Real da planilha)</b>: stake×ROI_Real gera sem cap = <b>{fmt_money(pnl_sheet)}</b> "
+                f"e cap2 = <b>{fmt_money(pnl_sheet_cap2)}</b> (n apostas com ROI_Real&gt;2: <b>{n_sheet_gt2}</b>). "
+                "Se aparecerem ROIs muito acima do compatível com as odds, isso indica dado/coluna incorreta para uso como ROI.",
                 styles["Normal"],
             )
         )
@@ -308,8 +414,8 @@ def main() -> int:
         tdata = [
             ["Métrica", "Valor"],
             ["Realizado OOS (PnL teórico no arquivo, cap2)", fmt_money(realized)],
-            ["Realizado (sem cap): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_raw)} / {fmt_money(stake_sel)} / {n_bets_sel} / {fmt_pct(roi_raw)}"],
-            ["Realizado (cap2): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_cap2)} / {fmt_money(stake_sel)} / {n_bets_sel} / {fmt_pct(roi_cap2)}"],
+            ["Realizado (cap2, oficial WF): PnL / stake / n_bets / ROI", f"{fmt_money(cap2_official_pnl)} / {fmt_money(cap2_official_stake)} / {cap2_official_n} / {fmt_pct(cap2_official_roi)}"],
+            ["Realizado (sem cap, via odds+resultado): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_calc)} / {fmt_money(stake_sel)} / {n_bets_sel} / {fmt_pct(roi_calc)}"],
             ["Previsto (média, sem correção)", fmt_money(pred_mean)],
             ["Previsto (p10 / p50 / p90)", f"{fmt_money(pred_p10)} / {fmt_money(pred_p50)} / {fmt_money(pred_p90)}"],
             ["Previsto (média, bias-adjusted on-line)", fmt_money(online)],
@@ -327,7 +433,7 @@ def main() -> int:
             ["Variante", "Realizado", "Esperado (mean)", "Esperado (p10/p50/p90)"],
             [
                 "cap2",
-                f"PnL {fmt_money(pnl_cap2)} | stake {fmt_money(stake_sel)} | n {n_bets_sel} | ROI {fmt_pct(roi_cap2)}",
+                f"PnL {fmt_money(cap2_official_pnl)} | stake {fmt_money(cap2_official_stake)} | n {cap2_official_n} | ROI {fmt_pct(cap2_official_roi)}",
                 f"PnL {fmt_money(dist_cap2['mean_pnl'])} | stake {fmt_money(dist_cap2['mean_stake'])} | n {dist_cap2['mean_n_bets']:.1f} | ROI {dist_cap2['mean_roi']:.4f}",
                 f"PnL {fmt_money(dist_cap2['p10_pnl'])}/{fmt_money(dist_cap2['p50_pnl'])}/{fmt_money(dist_cap2['p90_pnl'])} | "
                 f"stake {fmt_money(dist_cap2['p10_stake'])}/{fmt_money(dist_cap2['p50_stake'])}/{fmt_money(dist_cap2['p90_stake'])} | "
@@ -336,7 +442,7 @@ def main() -> int:
             ],
             [
                 "sem cap",
-                f"PnL {fmt_money(pnl_raw)} | stake {fmt_money(stake_sel)} | n {n_bets_sel} | ROI {fmt_pct(roi_raw)}",
+                f"PnL {fmt_money(pnl_calc)} | stake {fmt_money(stake_sel)} | n {n_bets_sel} | ROI {fmt_pct(roi_calc)}",
                 f"PnL {fmt_money(dist_raw['mean_pnl'])} | stake {fmt_money(dist_raw['mean_stake'])} | n {dist_raw['mean_n_bets']:.1f} | ROI {dist_raw['mean_roi']:.4f}",
                 f"PnL {fmt_money(dist_raw['p10_pnl'])}/{fmt_money(dist_raw['p50_pnl'])}/{fmt_money(dist_raw['p90_pnl'])} | "
                 f"stake {fmt_money(dist_raw['p10_stake'])}/{fmt_money(dist_raw['p50_stake'])}/{fmt_money(dist_raw['p90_stake'])} | "
@@ -344,7 +450,20 @@ def main() -> int:
                 f"ROI {dist_raw['p10_roi']:.4f}/{dist_raw['p50_roi']:.4f}/{dist_raw['p90_roi']:.4f}",
             ],
         ]
-        story.append(tbl(exp_tbl, col_widths=[55, 165, 140, 120]))
+        texp = Table(exp_tbl, colWidths=[50, 170, 135, 125], repeatRows=1)
+        texp.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("LEADING", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(texp)
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Score vs ROI (apenas apostas selecionadas na semana)", styles["Heading2"]))
@@ -352,7 +471,7 @@ def main() -> int:
         story.append(Paragraph("Nenhuma aposta selecionada na semana para análise score↔ROI.", styles["Normal"]))
     else:
         sc = pd.to_numeric(bets_test["score_used"], errors="coerce").to_numpy(float)
-        roi = pd.to_numeric(bets_test["roi_raw"], errors="coerce").to_numpy(float)
+        roi = pd.to_numeric(bets_test["roi_calc"], errors="coerce").to_numpy(float)
         ok = np.isfinite(sc) & np.isfinite(roi)
         if ok.sum() < 5:
             story.append(Paragraph("Amostra pequena demais para estatística estável.", styles["Normal"]))
@@ -460,25 +579,35 @@ def main() -> int:
     if d.empty:
         story.append(Paragraph("Sem dias registrados nessa semana (stake=0).", styles["Normal"]))
     else:
-        # reconstruir realizado diário sem cap a partir das apostas selecionadas
+        # cap2 diário oficial do WF + sem cap diário (via odds+resultado) reconstruído dos bets selecionados
+        d_cap2 = d[["date", "stake_usd", "profit_cap2_usd"]].copy()
         if not bets_test.empty:
-            d2 = bets_test.groupby("date", as_index=False).agg(
+            d_raw = bets_test.groupby("date", as_index=False).agg(
                 stake_usd=("stake_eff", "sum"),
-                profit_cap2_usd=("profit_cap2", "sum"),
-                profit_raw_usd=("profit_raw", "sum"),
+                profit_raw_usd=("profit_calc", "sum"),
             )
-            d2 = d2.sort_values("date")
-            d2["roi_cap2"] = 0.0
-            d2["roi_raw"] = 0.0
-            s = pd.to_numeric(d2["stake_usd"], errors="coerce").to_numpy(float)
-            pc2 = pd.to_numeric(d2["profit_cap2_usd"], errors="coerce").to_numpy(float)
-            pr = pd.to_numeric(d2["profit_raw_usd"], errors="coerce").to_numpy(float)
-            np.divide(pc2, s, out=d2["roi_cap2"].to_numpy(), where=(s > 0))
-            np.divide(pr, s, out=d2["roi_raw"].to_numpy(), where=(s > 0))
-            d2["cum_profit_cap2"] = pd.to_numeric(d2["profit_cap2_usd"], errors="coerce").cumsum()
-            d2["cum_profit_raw"] = pd.to_numeric(d2["profit_raw_usd"], errors="coerce").cumsum()
         else:
-            d2 = pd.DataFrame(columns=["date", "stake_usd", "profit_cap2_usd", "profit_raw_usd", "roi_cap2", "roi_raw", "cum_profit_cap2", "cum_profit_raw"])
+            d_raw = pd.DataFrame(columns=["date", "stake_usd", "profit_raw_usd"])
+
+        d2 = pd.merge(d_cap2, d_raw, on=["date"], how="outer", suffixes=("_cap2", "_raw")).sort_values("date")
+        # usar stake do WF (cap2) como referência; se faltar, cair no stake do raw
+        if "stake_usd_cap2" in d2.columns and "stake_usd_raw" in d2.columns:
+            d2["stake_usd"] = pd.to_numeric(d2["stake_usd_cap2"], errors="coerce").fillna(pd.to_numeric(d2["stake_usd_raw"], errors="coerce"))
+        elif "stake_usd_cap2" in d2.columns:
+            d2["stake_usd"] = pd.to_numeric(d2["stake_usd_cap2"], errors="coerce")
+        elif "stake_usd_raw" in d2.columns:
+            d2["stake_usd"] = pd.to_numeric(d2["stake_usd_raw"], errors="coerce")
+        else:
+            d2["stake_usd"] = 0.0
+        d2["profit_cap2_usd"] = pd.to_numeric(d2["profit_cap2_usd"], errors="coerce").fillna(0.0)
+        d2["profit_raw_usd"] = pd.to_numeric(d2["profit_raw_usd"], errors="coerce").fillna(0.0)
+        d2["roi_cap2"] = 0.0
+        d2["roi_raw"] = 0.0
+        s = pd.to_numeric(d2["stake_usd"], errors="coerce").to_numpy(float)
+        pc2 = pd.to_numeric(d2["profit_cap2_usd"], errors="coerce").to_numpy(float)
+        pr = pd.to_numeric(d2["profit_raw_usd"], errors="coerce").to_numpy(float)
+        np.divide(pc2, s, out=d2["roi_cap2"].to_numpy(), where=(s > 0))
+        np.divide(pr, s, out=d2["roi_raw"].to_numpy(), where=(s > 0))
 
         dd = [
             ["date", "stake", "PnL cap2", "PnL sem cap", "ROI cap2", "ROI sem cap"],
@@ -499,13 +628,13 @@ def main() -> int:
 
     story.append(Paragraph("Cenário: banca 63.205 (stake máximo p95 do relatório 17/01)", styles["Heading2"]))
     bets_test_max = _select_bets(df_test, rules_week=r_act, alpha=alpha, bankroll=BANKROLL_MAX_P95)
-    pnl_raw_m, stake_m, n_m, roi_raw_m = _weekly_agg(bets_test_max, profit_col="profit_raw")
-    pnl_cap2_m, stake_m2, n_m2, roi_cap2_m = _weekly_agg(bets_test_max, profit_col="profit_cap2")
+    pnl_calc_m, stake_m, n_m, roi_calc_m = _weekly_agg(bets_test_max, profit_col="profit_calc")
+    pnl_calc_cap2_m, _, _, roi_calc_cap2_m = _weekly_agg(bets_test_max, profit_col="profit_calc_cap2")
     dist_cap2_m, dist_raw_m = _train_weekly_distribution_multi(df_train, r_act, alpha=alpha, train_weeks=train_weeks, bankroll=BANKROLL_MAX_P95) if train_weeks else ({}, {})
     scen = [
         ["Métrica", "Valor"],
-        ["Realizado (sem cap): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_raw_m)} / {fmt_money(stake_m)} / {n_m} / {fmt_pct(roi_raw_m)}"],
-        ["Realizado (cap2): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_cap2_m)} / {fmt_money(stake_m)} / {n_m} / {fmt_pct(roi_cap2_m)}"],
+        ["Realizado (sem cap, via odds+resultado): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_calc_m)} / {fmt_money(stake_m)} / {n_m} / {fmt_pct(roi_calc_m)}"],
+        ["Realizado (cap2, via odds+resultado): PnL / stake / n_bets / ROI", f"{fmt_money(pnl_calc_cap2_m)} / {fmt_money(stake_m)} / {n_m} / {fmt_pct(roi_calc_cap2_m)}"],
     ]
     if dist_cap2_m:
         scen.append(["Esperado cap2 (mean PnL / stake / n_bets / ROI)", f"{fmt_money(dist_cap2_m['mean_pnl'])} / {fmt_money(dist_cap2_m['mean_stake'])} / {dist_cap2_m['mean_n_bets']:.1f} / {dist_cap2_m['mean_roi']:.4f}"])
