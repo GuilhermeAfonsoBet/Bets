@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import json
 import numpy as np
 import pandas as pd
 
@@ -32,9 +33,25 @@ SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
 WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
 
+CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
+CALIB_FLOOR_SEXDOM = 0.005
+CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
+CALIB_FLOOR_SEGQUI = 0.005
+
 BANKROLL = 2300.0
 SEED = 7
 MIN_TOTAL_OBS_FOR_SHRINK = 8
+
+
+def _apply_isotonic_vec(p: np.ndarray, x: np.ndarray, y: np.ndarray, floor: float | None) -> np.ndarray:
+    p = np.asarray(p, dtype=float)
+    if x.size and y.size and x.size == y.size:
+        out = np.interp(p, x, y, left=float(y[0]), right=float(y[-1]))
+    else:
+        out = p.copy()
+    if floor is not None:
+        out = np.maximum(out, float(floor))
+    return np.clip(out, 0.0, 1.0)
 
 
 def _empirical_bayes_shrink(means: np.ndarray, se2: np.ndarray) -> Tuple[float, float, np.ndarray]:
@@ -108,6 +125,31 @@ def main() -> int:
     df["roi_cap2"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 2.0)
     df["house_cap"] = pd.to_numeric(df["house_cap"], errors="coerce").astype(float)
     df["week"] = pd.to_datetime(df["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
+
+    # garantir colunas calibradas se regras referenciam proba_cal_*
+    if "proba_cal_sexdom" not in df.columns:
+        df["proba_cal_sexdom"] = np.nan
+    if "proba_raw_sexdom" in df.columns and CALIB_SEXDOM.exists():
+        try:
+            calib = json.loads(CALIB_SEXDOM.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
+            df["proba_cal_sexdom"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR_SEXDOM)
+        except Exception:
+            pass
+
+    if "proba_cal_segqui" not in df.columns:
+        df["proba_cal_segqui"] = np.nan
+    if "proba_raw_segqui" in df.columns and CALIB_SEGQUI.exists():
+        try:
+            calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df["proba_cal_segqui"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR_SEGQUI)
+        except Exception:
+            pass
 
     weeks_sorted = sorted(df["week"].unique().tolist())
     week_to_i = {w: i for i, w in enumerate(weeks_sorted)}

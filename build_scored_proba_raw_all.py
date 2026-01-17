@@ -30,7 +30,11 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
 
 
-EXCEL = "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_14.01.2026.xlsx"
+EXCEL_CANDIDATES = [
+    "/workspace/ResumoApostas_PBI_final_17.01.2026.xlsx",
+    "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_17.01.2026.xlsx",
+    "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_14.01.2026.xlsx",
+]
 SHEET = "ResumoApostas (2)"
 OUT = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 
@@ -145,7 +149,10 @@ def build_features_segqui_sexdom(df: pd.DataFrame) -> pd.DataFrame:
 def main() -> int:
     Path("/workspace/analysis_proba_raw").mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_excel(EXCEL, sheet_name=SHEET, engine="openpyxl")
+    excel = next((p for p in EXCEL_CANDIDATES if Path(p).exists()), None)
+    if excel is None:
+        raise FileNotFoundError("Nenhum arquivo Excel encontrado em: " + " | ".join(EXCEL_CANDIDATES))
+    df = pd.read_excel(excel, sheet_name=SHEET, engine="openpyxl")
     # filtra datas válidas
     df = df[pd.to_datetime(df["BIA_ApostaUTC"], errors="coerce") >= pd.Timestamp("2024-01-01")].copy()
     df = dedup_last(df)

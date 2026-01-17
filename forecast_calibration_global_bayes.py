@@ -32,6 +32,8 @@ OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
 CALIB_FLOOR_SEXDOM = 0.005
+CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
+CALIB_FLOOR_SEGQUI = 0.005
 
 RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
 WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
@@ -158,6 +160,19 @@ def main() -> int:
             y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
             p_raw = pd.to_numeric(df["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
             df["proba_cal_sexdom"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR_SEXDOM)
+        except Exception:
+            pass
+
+    # garantir coluna calibrada para Qui (regras podem referenciar proba_cal_segqui)
+    if "proba_cal_segqui" not in df.columns:
+        df["proba_cal_segqui"] = np.nan
+    if "proba_raw_segqui" in df.columns and CALIB_SEGQUI.exists():
+        try:
+            calib = json.loads(CALIB_SEGQUI.read_text(encoding="utf-8"))
+            x = np.asarray(calib.get("isotonic", {}).get("x", []), dtype=float)
+            y = np.asarray(calib.get("isotonic", {}).get("y", []), dtype=float)
+            p_raw = pd.to_numeric(df["proba_raw_segqui"], errors="coerce").to_numpy(dtype=float)
+            df["proba_cal_segqui"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR_SEGQUI)
         except Exception:
             pass
 

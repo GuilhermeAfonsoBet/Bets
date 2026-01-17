@@ -28,7 +28,7 @@ import pandas as pd
 import joblib
 
 
-EXCEL_PATH_DEFAULT = "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_14.01.2026.xlsx"
+EXCEL_PATH_DEFAULT = "/workspace/ResumoApostas_PBI_final_17.01.2026.xlsx"
 SHEET_NAME_DEFAULT = "ResumoApostas (2)"
 
 BANKROLL_DEFAULT = 2300.0
