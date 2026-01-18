@@ -85,6 +85,26 @@ def tbl(data: List[List[object]], col_widths=None) -> Table:
     return t
 
 
+def tbl_compact(data: List[List[object]], col_widths=None) -> Table:
+    """
+    Tabela compacta para evitar sobreposição de colunas.
+    """
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("LEADING", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    return t
+
+
 def _apply_isotonic_from_json(p: np.ndarray, json_path: Path, floor: float) -> np.ndarray:
     """
     Aplica uma calibração isotonic (salva como {isotonic: {x:[], y:[]}}) via interpolação monotônica.
@@ -357,7 +377,7 @@ def main() -> int:
         ["Realizado (cap2, oficial WF): n_bets / stake / PnL / ROI", f"{cap2_official_n} / {fmt_money(cap2_official_stake)} / {fmt_money(cap2_official_pnl)} / {fmt_pct(cap2_official_roi)}"],
         ["Realizado (sem cap, via odds+resultado): n_bets / stake / PnL / ROI", f"{n_bets_sel} / {fmt_money(stake_sel)} / {fmt_money(pnl_calc)} / {fmt_pct(roi_calc)}"],
     ]
-    story.append(tbl(summary, col_widths=[220, 260]))
+    story.append(tbl_compact(summary, col_widths=[235, 245]))
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Cap2: conceito e impacto na semana", styles["Heading2"]))
@@ -378,12 +398,12 @@ def main() -> int:
         stake_aff = float(pd.to_numeric(bets_test.loc[m, "stake_eff"], errors="coerce").sum()) if n_aff > 0 else 0.0
         delta_sum = float(pd.to_numeric(delta, errors="coerce").sum()) if np.isfinite(delta).any() else 0.0
 
-        # Diagnóstico: ROI da planilha pode conter outliers incompatíveis com odds/resultados
-        roi_sheet = pd.to_numeric(bets_test["roi_sheet"], errors="coerce")
-        stake0 = pd.to_numeric(bets_test["stake_eff"], errors="coerce")
-        pnl_sheet = float((stake0 * roi_sheet).sum()) if np.isfinite(roi_sheet.to_numpy(float)).any() else float("nan")
-        pnl_sheet_cap2 = float((stake0 * np.minimum(roi_sheet.to_numpy(float), 2.0)).sum()) if np.isfinite(roi_sheet.to_numpy(float)).any() else float("nan")
-        n_sheet_gt2 = int(np.sum((roi_sheet.to_numpy(float) > 2.0) & np.isfinite(roi_sheet.to_numpy(float))))
+        # Diagnóstico: ROI da planilha pode conter outliers incompatíveis com odds/resultados.
+        # Aqui mostramos apenas estatísticas simples (para não confundir com o ROI usado no estudo, que é via odds+resultado).
+        roi_sheet = pd.to_numeric(bets_test["roi_sheet"], errors="coerce").to_numpy(float)
+        n_sheet_fin = int(np.isfinite(roi_sheet).sum())
+        n_sheet_gt2 = int(np.sum((roi_sheet > 2.0) & np.isfinite(roi_sheet)))
+        p99_sheet = float(np.nanquantile(roi_sheet, 0.99)) if n_sheet_fin else float("nan")
         story.append(
             Paragraph(
                 f"<b>Nesta semana</b>:<br/>"
@@ -391,9 +411,9 @@ def main() -> int:
                 f"- Sem cap (via odds+resultado): <b>{fmt_money(pnl_calc)}</b><br/>"
                 f"- Diferença cap2 vs sem cap (via odds+resultado): <b>{fmt_money(delta_sum)}</b> "
                 f"(apostas com ROI&gt;2: <b>{n_aff}</b>, stake nessas apostas: <b>{fmt_money(stake_aff)}</b>).<br/>"
-                f"<br/><b>Diagnóstico (ROI Real da planilha)</b>: stake×ROI_Real gera sem cap = <b>{fmt_money(pnl_sheet)}</b> "
-                f"e cap2 = <b>{fmt_money(pnl_sheet_cap2)}</b> (n apostas com ROI_Real&gt;2: <b>{n_sheet_gt2}</b>). "
-                "Se aparecerem ROIs muito acima do compatível com as odds, isso indica dado/coluna incorreta para uso como ROI.",
+                f"<br/><b>Diagnóstico (ROI Real da planilha — não usado no estudo)</b>: "
+                f"n_finite={n_sheet_fin}, n(ROI&gt;2)={n_sheet_gt2}, p99={fmt_money(p99_sheet)}. "
+                "Valores muito altos aqui tendem a indicar que essa coluna não representa ROI por stake compatível com odds/resultados.",
                 styles["Normal"],
             )
         )
@@ -423,7 +443,7 @@ def main() -> int:
             ["Δ Realizado(cap2) - Previsto (média)", fmt_money(realized - pred_mean) if np.isfinite(realized) and np.isfinite(pred_mean) else "—"],
             ["Δ Realizado(cap2) - Previsto (média on-line)", fmt_money(realized - online) if np.isfinite(realized) and np.isfinite(online) else "—"],
         ]
-        story.append(tbl(tdata, col_widths=[220, 260]))
+        story.append(tbl_compact(tdata, col_widths=[235, 245]))
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Esperado vs realizado (histórico do treino aplicando as regras da semana)", styles["Heading2"]))
@@ -464,6 +484,8 @@ def main() -> int:
                 ]
             )
         )
+        # garantir layout compacto (sem colunas invadindo)
+        texp = tbl_compact(exp_tbl, col_widths=[52, 170, 120, 138])
         story.append(texp)
     story.append(Spacer(1, 10))
 
@@ -640,7 +662,7 @@ def main() -> int:
     if dist_cap2_m:
         scen.append(["Esperado cap2 (mean PnL / stake / n_bets / ROI)", f"{fmt_money(dist_cap2_m['mean_pnl'])} / {fmt_money(dist_cap2_m['mean_stake'])} / {dist_cap2_m['mean_n_bets']:.1f} / {dist_cap2_m['mean_roi']:.4f}"])
         scen.append(["Esperado sem cap (mean PnL / stake / n_bets / ROI)", f"{fmt_money(dist_raw_m['mean_pnl'])} / {fmt_money(dist_raw_m['mean_stake'])} / {dist_raw_m['mean_n_bets']:.1f} / {dist_raw_m['mean_roi']:.4f}"])
-    story.append(tbl(scen, col_widths=[220, 260]))
+    story.append(tbl_compact(scen, col_widths=[235, 245]))
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Segmentos ativos (regras aplicadas nessa semana)", styles["Heading2"]))

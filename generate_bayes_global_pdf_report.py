@@ -60,12 +60,12 @@ MIN_NONZERO_WEEKS = 6
 MIN_BETS_PER_BIN = 20
 MIN_BINS_FOR_STABILITY = 3
 
-# estabilidade de decisão (histerese)
-HYSTERESIS_ENABLED = False
+# estabilidade de decisão (histerese) — modo escolhido p10_p70
+HYSTERESIS_ENABLED = True
 HYST_P_SWITCH = 0.90
 
-# robustez de cutoff (sensibilidade local) — DESLIGADO por ora
-ROBUST_CUTOFF_ENABLED = False
+# robustez de cutoff (sensibilidade local) — modo escolhido p10_p70
+ROBUST_CUTOFF_ENABLED = True
 ROBUST_CUTOFF_DELTA = 0.02
 
 
@@ -210,7 +210,9 @@ def main() -> int:
     profit_tot = float(wf_week["profit_cap2_usd"].sum())
     roi_on_stake = float(profit_tot / stake_tot) if stake_tot > 0 else float("nan")
     mean_week = float(wstats.get("mean", float("nan")))
-    roi_bank_week = float(mean_week / BANKROLL) if np.isfinite(mean_week) else float("nan")
+    roi_bank_week = float(mean_week / BANKROLL) if np.isfinite(mean_week) else float("nan")  # inclui semanas sem trade
+    mean_week_traded = float(wstats_traded.get("mean", float("nan")))
+    roi_bank_week_traded = float(mean_week_traded / BANKROLL) if np.isfinite(mean_week_traded) else float("nan")
     exp_month = float(mean_week * 4.33) if np.isfinite(mean_week) else float("nan")
     exp_year = float(mean_week * 52.0) if np.isfinite(mean_week) else float("nan")
 
@@ -551,7 +553,7 @@ def main() -> int:
         ["Estabilidade de decisão (histerese)", f"habilitado={HYSTERESIS_ENABLED}; P(switch)≥{HYST_P_SWITCH:.2f}"],
         ["Robustez de cutoff", f"habilitado={ROBUST_CUTOFF_ENABLED}; vizinhança ±{ROBUST_CUTOFF_DELTA:.2f} (pior-caso)"],
         ["Walk-forward", "semanal, expanding window; mínimo global 10 semanas; mínimo por segmento 6 semanas"],
-        ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 80%; objetivo = p05(mean) − 0.001·p95(exposição diária)"],
+        ["Seleção Bayes (por candidato)", "Bayesian bootstrap semanal; exigir P(mean>0) ≥ 70%; objetivo = p10(mean) − 0.001·p95(exposição diária)"],
         ["α global", "busca binária em [0,1] para satisfazer constraints globais no treino do passo"],
     ]
     # wrap long strings
@@ -936,27 +938,28 @@ def main() -> int:
 
     story.append(
         Paragraph(
-            "<b>Nota de leitura</b>: este bloco 3.1A apresenta uma visão executiva <b>bias-corrected</b> do forecast "
-            "(expectativa prevista ajustada por Bias). Isso não altera nem substitui o resultado OOS realizado; "
-            "métricas de risco/realizado aparecem separadamente como auditoria.",
+            "<b>Nota de leitura</b>: os blocos 3.1A/3.1B tratam de <b>previstos</b> (forecast). "
+            "<b>Correção de Bias</b> ajusta a <b>expectativa prevista</b> (ex-post ou on-line); "
+            "isso <b>não</b> transforma previsão em realizado. "
+            "O <b>realizado OOS</b> (auditoria) aparece no bloco 3.1C.",
             styles["BodyText"],
         )
     )
 
     # 3.1.A Executive forecast (bias-corrected)
     story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph("<b>3.1.A Resumo executivo (forecast bias-corrected)</b>", styles["BodyText"]))
+    story.append(Paragraph("<b>3.1.A Resumo executivo (previsto com correção de Bias)</b>", styles["BodyText"]))
     exec_tbl = [
         ["Métrica", "Valor (bias-corrected)"],
-        ["Forecast: média semanal corrigida (on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "nan"],
-        ["Forecast: ROI banca/sem (corrigido, on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "nan"],
+        ["Previsto: média semanal (Bias on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "nan"],
+        ["Previsto: ROI banca/sem (Bias on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "nan"],
         ["— (referência) correção ex-post no período —", ""],
-        ["Forecast: média semanal corrigida (ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
-        ["Forecast: lucro mensal corrigido (ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
-        ["Forecast: lucro anual corrigido (ex-post)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
-        ["Forecast: ROI banca/sem (ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
-        ["Forecast: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
-        ["Forecast: ROI por $ (corrigido)", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
+        ["Previsto: média semanal (Bias ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
+        ["Previsto: lucro mensal (Bias ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
+        ["Previsto: lucro anual (Bias ex-post)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
+        ["Previsto: ROI banca/sem (Bias ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
+        ["Previsto: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
+        ["Previsto: ROI por $ (turnover) corrigido", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
         ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
         ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
     ]
@@ -976,7 +979,7 @@ def main() -> int:
 
     # 3.1.B Forecast (sem vs com bias) — shift (location) apenas
     story.append(Spacer(1, 0.25 * cm))
-    story.append(Paragraph("<b>3.1.B Detalhe do forecast (sem vs com correção de Bias)</b>", styles["BodyText"]))
+    story.append(Paragraph("<b>3.1.B Detalhe do previsto (sem vs com correção de Bias ex-post)</b>", styles["BodyText"]))
     # shift dos quantis por Bias (assumindo correção aditiva)
     q10 = fc_p10
     q50 = fc_p50
@@ -985,7 +988,7 @@ def main() -> int:
     q50_cal = float(q50 + fc_bias) if np.isfinite(q50) and np.isfinite(fc_bias) else float("nan")
     q90_cal = float(q90 + fc_bias) if np.isfinite(q90) and np.isfinite(fc_bias) else float("nan")
     fore_tbl = [
-        ["Métrica", "Sem correção", "Com correção (Bias)"],
+        ["Métrica", "Sem correção", "Com correção (Bias ex-post)"],
         ["Média prevista (E[pred_mean])", f"USD {fc_pred_mean:,.1f}" if np.isfinite(fc_pred_mean) else "nan", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
         ["Quantis (p10 / p50 / p90)", f"USD {q10:,.0f} / {q50:,.0f} / {q90:,.0f}" if np.all(np.isfinite([q10, q50, q90])) else "nan", f"USD {q10_cal:,.0f} / {q50_cal:,.0f} / {q90_cal:,.0f}" if np.all(np.isfinite([q10_cal, q50_cal, q90_cal])) else "nan"],
         ["Bias (y - pred)", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan", f"USD {fc_bias:,.1f}" if np.isfinite(fc_bias) else "nan"],
@@ -1008,15 +1011,18 @@ def main() -> int:
 
     # 3.1.C Realizado OOS (auditoria) + calibração
     story.append(Spacer(1, 0.25 * cm))
-    story.append(Paragraph("<b>3.1.C Auditoria: realizado OOS e risco (não corrigido por Bias)</b>", styles["BodyText"]))
+    story.append(Paragraph("<b>3.1.C Auditoria: realizado OOS e risco (sem correção de Bias)</b>", styles["BodyText"]))
     aud_tbl = [
         ["Métrica", "Valor (realizado OOS)"],
         ["Semanas (WF OOS)", f"{wstats.get('n', 0)}"],
         ["Lucro total (WF)", f"USD {profit_tot:,.1f}"],
         ["Lucro médio semanal", f"USD {wstats.get('mean', float('nan')):,.1f}"],
+        ["Lucro médio semanal (apenas semanas com trade)", f"USD {wstats_traded.get('mean', float('nan')):,.1f}"],
         ["Std semanal", f"USD {wstats.get('std', float('nan')):,.1f}"],
         ["Sharpe anualizado", f"{wstats.get('sharpe_annual', float('nan')):.3f}"],
-        ["ROI por $ (turnover)", f"{roi_on_stake:.4f}"],
+        ["ROI por $ (turnover) [PnL_total/Stake_total]", f"{roi_on_stake:.4f}"],
+        ["ROI banca/sem (inclui semanas sem trades)", f"{roi_bank_week*100:.2f}%"],
+        ["ROI banca/sem (apenas semanas com trade)", f"{roi_bank_week_traded*100:.2f}%"],
         ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
         ["Risco dia: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
         ["Risco dia: VaR10%(PnL)", f"USD {var10:,.0f} (limite ≥ {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
