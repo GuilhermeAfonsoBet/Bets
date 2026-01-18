@@ -109,6 +109,10 @@ ROBUST_CUTOFF_DELTA = 0.02  # 1 passo do grid, se habilitar no futuro
 HYSTERESIS_ENABLED = False
 HYST_P_SWITCH = 0.90  # se habilitar no futuro
 
+# Gating conservador adicional (experimentos):
+# Exigir que o quantil POST_Q_OBJ (p05 por default) do lucro semanal médio seja > 0.
+REQUIRE_POST_Q_OBJ_POS = False
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -320,6 +324,8 @@ def optimize_segment_train(
         if p_mean_pos < MIN_POST_P_MEAN_POS:
             return False, -np.inf, None
         q_obj = float(np.quantile(post_means, POST_Q_OBJ))
+        if REQUIRE_POST_Q_OBJ_POS and q_obj <= 0:
+            return False, -np.inf, None
         return True, float(q_obj - EXPOSURE_PENALTY * p95_exp), post_means
 
     best_obj = -np.inf
@@ -655,6 +661,7 @@ def main() -> int:
         bayes_select: bool,
         segment_calib: bool,
         disable_top_k: int = 0,
+        train_window_weeks: int | None = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         all_rules_rows = []
         weekly_rows = []
@@ -667,7 +674,11 @@ def main() -> int:
 
         for i in range(MIN_GLOBAL_TRAIN_WEEKS, len(weeks)):
             w_test = weeks[i]
-            train_weeks = weeks[:i]
+            if train_window_weeks is None:
+                train_weeks = weeks[:i]
+            else:
+                w = int(train_window_weeks)
+                train_weeks = weeks[max(0, i - w) : i]
 
             df_train = df[df["week"].isin(train_weeks)].copy()
             df_test = df[df["week"] == w_test].copy()
@@ -842,6 +853,7 @@ def main() -> int:
             bayes_select=bayes_select,
             segment_calib=SEGMENT_CALIB_ENABLED,
             disable_top_k=0,
+            train_window_weeks=None,
         )
 
         rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
@@ -979,6 +991,7 @@ def main() -> int:
                 bayes_select=True,
                 segment_calib=segment_calib,
                 disable_top_k=int(disable_top_k),
+                train_window_weeks=None,
             )
             rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
             weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
@@ -988,6 +1001,51 @@ def main() -> int:
             _summarize_mode(mode_name, weekly_df)
 
         pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
+
+    # ------------------------
+    # Experimentos adicionais (recência + gating + robustez)
+    # ------------------------
+    def _with_globals(**kwargs):
+        class _Ctx:
+            def __enter__(self0):
+                self0.prev = {
+                    "ROBUST_CUTOFF_ENABLED": globals().get("ROBUST_CUTOFF_ENABLED"),
+                    "HYSTERESIS_ENABLED": globals().get("HYSTERESIS_ENABLED"),
+                    "REQUIRE_POST_Q_OBJ_POS": globals().get("REQUIRE_POST_Q_OBJ_POS"),
+                }
+                for k, v in kwargs.items():
+                    globals()[k] = v
+                return self0
+
+            def __exit__(self0, exc_type, exc, tb):
+                for k, v in self0.prev.items():
+                    globals()[k] = v
+                return False
+
+        return _Ctx()
+
+    # 12 semanas rolling (mais peso no recente por construção)
+    for exp_name, win, robust, hyst, qpos in (
+        ("global_bayes_roll12", 12, False, False, False),
+        ("global_bayes_roll12_robust", 12, True, True, False),
+        ("global_bayes_roll12_robust_qpos", 12, True, True, True),
+    ):
+        with _with_globals(ROBUST_CUTOFF_ENABLED=bool(robust), HYSTERESIS_ENABLED=bool(hyst), REQUIRE_POST_Q_OBJ_POS=bool(qpos)):
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=int(win),
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
+
+    pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
 
     print(str(OUT_DIR / "oos_walkforward_global_strategy.md"))
     return 0
