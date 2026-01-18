@@ -118,6 +118,13 @@ REQUIRE_POST_Q_OBJ_POS = False
 POST_Q_GATE = 0.30
 REQUIRE_POST_Q_GATE_POS = False
 
+# Gating por house_cap (novo experimento):
+# - Otimiza também um cap máximo permitido (house_cap <= cap_max) por segmento.
+# - Intuição: se ROI médio degrada em stakes maiores, podemos restringir execução a caps menores.
+CAP_GATING_ENABLED = False
+CAP_QS = np.array([0.60, 0.80, 0.90])
+CAP_MIN_UNIQUE = 3  # se não houver diversidade de caps, não otimiza cap_max
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -176,6 +183,7 @@ class Rule:
     cutoff: float
     stake_frac: float
     status: str
+    cap_max: float = float("inf")  # house_cap máximo permitido (inf = sem restrição)
 
 
 def score_bin_ok(score_sel: np.ndarray, profit_sel: np.ndarray) -> Tuple[int, int, bool]:
@@ -252,12 +260,14 @@ def optimize_segment_train(
         rng = np.random.default_rng(SEED + 123 + hash((str(x["dow_pt"].iloc[0]), str(x["bet_type"].iloc[0]))) % 10_000)
         bb_weights = rng.dirichlet(np.ones(len(weeks_all)), size=BAYES_N)
 
-    def eval_obj_for_cutoff(stake_eff: np.ndarray, cutoff: float) -> Tuple[bool, float, np.ndarray | None]:
+    def eval_obj_for_cutoff(stake_eff: np.ndarray, cutoff: float, cap_max: float) -> Tuple[bool, float, np.ndarray | None]:
         """
         Avalia um cutoff fixo (stake_eff já definido pelo stake_frac).
         Retorna (ok, obj, post_means) onde post_means só existe no modo bayes_select.
         """
         m = np.isfinite(score) & (score >= float(cutoff)) & np.isfinite(roi2_adj)
+        if CAP_GATING_ENABLED and np.isfinite(float(cap_max)):
+            m = m & np.isfinite(cap) & (cap <= float(cap_max))
         if not np.any(m):
             return False, -np.inf, None
         if int(np.sum(m)) < MIN_SELECTED_BETS:
@@ -338,25 +348,25 @@ def optimize_segment_train(
         return True, float(q_obj - EXPOSURE_PENALTY * p95_exp), post_means
 
     best_obj = -np.inf
-    best = None
+    best = None  # (cutoff, stake_frac)
     best_post = None
 
+    # Passo 1 (sempre): otimiza cutoff+stake sem cap gating (cap_max=inf)
     for f in STAKE_FRACS:
         stake0 = BANKROLL * float(f)
         stake_eff = np.minimum(stake0, cap)
         for c in CUTOFFS:
-            ok0, obj0, post0 = eval_obj_for_cutoff(stake_eff, float(c))
+            ok0, obj0, post0 = eval_obj_for_cutoff(stake_eff, float(c), float("inf"))
             if not ok0:
                 continue
 
             obj_use = obj0
             if bayes_select and ROBUST_CUTOFF_ENABLED:
-                # pior caso em cutoff±delta (se vizinhos falham constraints, conta como -inf)
                 worst = obj0
                 for cc in (float(c) - ROBUST_CUTOFF_DELTA, float(c) + ROBUST_CUTOFF_DELTA):
                     if cc < float(CUTOFFS.min()) or cc > float(CUTOFFS.max()):
                         continue
-                    okn, objn, _ = eval_obj_for_cutoff(stake_eff, float(cc))
+                    okn, objn, _ = eval_obj_for_cutoff(stake_eff, float(cc), float("inf"))
                     if not okn:
                         worst = -np.inf
                         break
@@ -371,7 +381,42 @@ def optimize_segment_train(
                 best_post = post0
 
     if best is None:
-        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, status="no_candidate")
+        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, cap_max=float("inf"), status="no_candidate")
+
+    # Passo 2 (se habilitado): dado o melhor cutoff+stake, escolhe cap_max por grid de quantis (rápido).
+    best_cap = float("inf")
+    if CAP_GATING_ENABLED:
+        cap_ok = cap[np.isfinite(cap) & (cap > 0)]
+        cap_candidates = []
+        if cap_ok.size > 0:
+            qs = np.unique(np.quantile(cap_ok, CAP_QS))
+            qs = qs[np.isfinite(qs) & (qs > 0)]
+            if qs.size >= CAP_MIN_UNIQUE:
+                cap_candidates = [float(v) for v in qs.tolist()]
+        # avalia apenas caps finitos; inf já é o baseline (best_obj/best_post)
+        c_best, f_best = best
+        stake0 = BANKROLL * float(f_best)
+        stake_eff = np.minimum(stake0, cap)
+        for cap_max in sorted(set(cap_candidates)):
+            ok0, obj0, post0 = eval_obj_for_cutoff(stake_eff, float(c_best), float(cap_max))
+            if not ok0:
+                continue
+            obj_use = obj0
+            if bayes_select and ROBUST_CUTOFF_ENABLED:
+                worst = obj0
+                for cc in (float(c_best) - ROBUST_CUTOFF_DELTA, float(c_best) + ROBUST_CUTOFF_DELTA):
+                    if cc < float(CUTOFFS.min()) or cc > float(CUTOFFS.max()):
+                        continue
+                    okn, objn, _ = eval_obj_for_cutoff(stake_eff, float(cc), float(cap_max))
+                    if not okn:
+                        worst = -np.inf
+                        break
+                    worst = min(worst, objn)
+                obj_use = worst
+            if np.isfinite(obj_use) and float(obj_use) > float(best_obj):
+                best_obj = float(obj_use)
+                best_cap = float(cap_max)
+                best_post = post0
 
     # Histerese: comparar contra a regra anterior, se válida
     if HYSTERESIS_ENABLED and bayes_select and prev_rule is not None and prev_rule.status == "ok" and prev_rule.stake_frac > 0 and best_post is not None:
@@ -379,6 +424,8 @@ def optimize_segment_train(
         stake0_prev = BANKROLL * float(prev_rule.stake_frac)
         stake_eff_prev = np.minimum(stake0_prev, cap)
         mprev = np.isfinite(score) & (score >= float(prev_rule.cutoff)) & np.isfinite(roi2)
+        if CAP_GATING_ENABLED and np.isfinite(float(prev_rule.cap_max)):
+            mprev = mprev & np.isfinite(cap) & (cap <= float(prev_rule.cap_max))
         ok_prev = True
         if not np.any(mprev) or int(np.sum(mprev)) < MIN_SELECTED_BETS:
             ok_prev = False
@@ -399,9 +446,9 @@ def optimize_segment_train(
             post_prev = bb_weights @ w2_prev.astype(float)
             p_switch = float(np.mean(best_post > post_prev))
             if p_switch < HYST_P_SWITCH:
-                return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=float(prev_rule.cutoff), stake_frac=float(prev_rule.stake_frac), status="ok")
+                return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=float(prev_rule.cutoff), stake_frac=float(prev_rule.stake_frac), cap_max=float(prev_rule.cap_max), status="ok")
 
-    return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=best[0], stake_frac=best[1], status="ok")
+    return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=best[0], stake_frac=best[1], cap_max=float(best_cap), status="ok")
 
 
 def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
@@ -413,6 +460,9 @@ def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
         return x
     score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(dtype=float)
     m = np.isfinite(score) & (score >= rule.cutoff) & np.isfinite(x["roi_cap2"].to_numpy(dtype=float))
+    if np.isfinite(float(rule.cap_max)):
+        cap = x["house_cap"].to_numpy(dtype=float)
+        m = m & np.isfinite(cap) & (cap <= float(rule.cap_max))
     x = x.iloc[np.where(m)[0]].copy()
     if x.empty:
         return x
@@ -420,6 +470,7 @@ def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
     x["profit_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_cap2"].to_numpy(dtype=float)
     x["rule_cutoff"] = rule.cutoff
     x["rule_stake_frac"] = rule.stake_frac
+    x["rule_cap_max"] = float(rule.cap_max)
     x["rule_score_col"] = rule.score_col
     x["rule_status"] = rule.status
     x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
@@ -445,6 +496,9 @@ def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float
         score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(dtype=float)
         roi2 = x["roi_cap2"].to_numpy(dtype=float)
         m = np.isfinite(score) & (score >= rule.cutoff) & np.isfinite(roi2)
+        if np.isfinite(float(rule.cap_max)):
+            cap = x["house_cap"].to_numpy(dtype=float)
+            m = m & np.isfinite(cap) & (cap <= float(rule.cap_max))
         if not np.any(m):
             continue
         x = x.iloc[np.where(m)[0]].copy()
@@ -626,6 +680,12 @@ def bootstrap_ci_mean(x: np.ndarray, n_boot: int, seed: int) -> Tuple[float, flo
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only-mode", default="", help="Se preenchido, roda apenas este modo (ex.: global_bayes_roll12_robust_p10_p70_capgate)")
+    args = ap.parse_args()
+    only_mode = str(args.only_mode).strip()
     df = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
     df["house_cap"] = df["house_cap"].apply(safe_cap)
     df["week"] = week_key(df["BIA_ApostaUTC"])
@@ -754,6 +814,7 @@ def main() -> int:
                         "score_col": rule.score_col,
                         "cutoff": rule.cutoff,
                         "stake_frac": rule.stake_frac,
+                        "cap_max": float(rule.cap_max),
                         "alpha_global": float(alpha),
                         "status": rule.status,
                         "rule_key": key,
@@ -1068,6 +1129,8 @@ def main() -> int:
         ("global_bayes_roll12_robust_qpos", 12, True, True, True),
         ("global_bayes_roll12_robust_qgate30", 12, True, True, False),
     ):
+        if only_mode and exp_name != only_mode:
+            continue
         req_gate = (exp_name == "global_bayes_roll12_robust_qgate30")
         with _with_globals(
             ROBUST_CUTOFF_ENABLED=bool(robust),
@@ -1105,21 +1168,53 @@ def main() -> int:
         MIN_POST_P_MEAN_POS=0.70,
     ):
         exp_name = "global_bayes_roll12_robust_p10_p70"
-        rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
-            global_risk=True,
-            bayes_select=True,
-            segment_calib=False,
-            disable_top_k=0,
-            train_window_weeks=12,
-            regime_lookback_weeks=None,
-            regime_alpha_bad=1.0,
-        )
-        rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-        weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-        weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-        weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-        daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
-        _summarize_mode(exp_name, weekly_df)
+        if (not only_mode) or (only_mode == exp_name):
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=12,
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
+
+    # ------------------------
+    # Experimento: cap gating por segmento (otimiza também cap_max)
+    # ------------------------
+    with _with_globals(
+        ROBUST_CUTOFF_ENABLED=True,
+        HYSTERESIS_ENABLED=True,
+        REQUIRE_POST_Q_OBJ_POS=False,
+        REQUIRE_POST_Q_GATE_POS=False,
+        POST_Q_OBJ=0.10,
+        MIN_POST_P_MEAN_POS=0.70,
+        CAP_GATING_ENABLED=True,
+        BAYES_N=2000,
+    ):
+        exp_name = "global_bayes_roll12_robust_p10_p70_capgate"
+        if (not only_mode) or (only_mode == exp_name):
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=12,
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
 
     pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
 
@@ -1128,6 +1223,8 @@ def main() -> int:
         ("global_bayes_roll12_robust_regime4_off", 0.0),
         ("global_bayes_roll12_robust_regime4_half", 0.5),
     ):
+        if only_mode and exp_name != only_mode:
+            continue
         with _with_globals(ROBUST_CUTOFF_ENABLED=True, HYSTERESIS_ENABLED=True, REQUIRE_POST_Q_OBJ_POS=False, REQUIRE_POST_Q_GATE_POS=False):
             rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
                 global_risk=True,
