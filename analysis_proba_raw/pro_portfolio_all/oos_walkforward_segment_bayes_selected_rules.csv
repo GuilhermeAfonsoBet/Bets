@@ -74,7 +74,7 @@ test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,s
 2025-11-03/2025-11-09,15,FT,quarta-feira,proba_raw_quarta,0.13,0.01,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
 2025-11-03/2025-11-09,15,FT,quinta-feira,proba_cal_segqui,1.0,0.0,1.0,no_candidate,FT|quinta-feira,0.0,1.0,1.0
 2025-11-03/2025-11-09,15,FT,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sexta-feira,0.0,1.0,1.0
-2025-11-03/2025-11-09,15,FT,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sábado,0.0,1.0,1.0
+2025-11-03/2025-11-09,15,FT,sábado,proba_cal_sexdom,0.37,0.02,1.0,ok,FT|sábado,0.0,1.0,1.0
 2025-11-03/2025-11-09,15,FT,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|domingo,0.0,1.0,1.0
 2025-11-03/2025-11-09,15,FH,segunda-feira,proba_raw_segunda,1.0,0.0,1.0,too_few_weeks,FH|segunda-feira,0.0,1.0,1.0
 2025-11-03/2025-11-09,15,FH,terça-feira,proba_raw_terca,1.0,0.0,1.0,no_candidate,FH|terça-feira,0.0,1.0,1.0
@@ -127,7 +127,7 @@ test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,s
 2025-11-24/2025-11-30,18,FH,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|domingo,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FT,segunda-feira,proba_raw_segunda,0.19,0.01,1.0,ok,FT|segunda-feira,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FT,terça-feira,proba_raw_terca,1.0,0.0,1.0,no_candidate,FT|terça-feira,0.0,1.0,1.0
-2025-12-01/2025-12-07,19,FT,quarta-feira,proba_raw_quarta,0.43,0.06,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
+2025-12-01/2025-12-07,19,FT,quarta-feira,proba_raw_quarta,0.45,0.06,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FT,quinta-feira,proba_cal_segqui,1.0,0.0,1.0,no_candidate,FT|quinta-feira,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FT,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sexta-feira,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FT,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sábado,0.0,1.0,1.0
@@ -139,7 +139,7 @@ test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,s
 2025-12-01/2025-12-07,19,FH,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|sexta-feira,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FH,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|sábado,0.0,1.0,1.0
 2025-12-01/2025-12-07,19,FH,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|domingo,0.0,1.0,1.0
-2025-12-08/2025-12-14,20,FT,segunda-feira,proba_raw_segunda,0.19,0.02,1.0,ok,FT|segunda-feira,0.0,1.0,1.0
+2025-12-08/2025-12-14,20,FT,segunda-feira,proba_raw_segunda,0.19,0.01,1.0,ok,FT|segunda-feira,0.0,1.0,1.0
 2025-12-08/2025-12-14,20,FT,terça-feira,proba_raw_terca,1.0,0.0,1.0,no_candidate,FT|terça-feira,0.0,1.0,1.0
 2025-12-08/2025-12-14,20,FT,quarta-feira,proba_raw_quarta,0.55,0.07,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
 2025-12-08/2025-12-14,20,FT,quinta-feira,proba_cal_segqui,1.0,0.0,1.0,no_candidate,FT|quinta-feira,0.0,1.0,1.0
@@ -155,7 +155,7 @@ test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,s
 2025-12-08/2025-12-14,20,FH,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|domingo,0.0,1.0,1.0
 2025-12-15/2025-12-21,21,FT,segunda-feira,proba_raw_segunda,0.19,0.02,1.0,ok,FT|segunda-feira,0.0,1.0,1.0
 2025-12-15/2025-12-21,21,FT,terça-feira,proba_raw_terca,0.17,0.01,1.0,ok,FT|terça-feira,0.0,1.0,1.0
-2025-12-15/2025-12-21,21,FT,quarta-feira,proba_raw_quarta,0.45,0.07,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
+2025-12-15/2025-12-21,21,FT,quarta-feira,proba_raw_quarta,0.55,0.07,1.0,ok,FT|quarta-feira,0.0,1.0,1.0
 2025-12-15/2025-12-21,21,FT,quinta-feira,proba_cal_segqui,1.0,0.0,1.0,no_candidate,FT|quinta-feira,0.0,1.0,1.0
 2025-12-15/2025-12-21,21,FT,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sexta-feira,0.0,1.0,1.0
 2025-12-15/2025-12-21,21,FT,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sábado,0.0,1.0,1.0
