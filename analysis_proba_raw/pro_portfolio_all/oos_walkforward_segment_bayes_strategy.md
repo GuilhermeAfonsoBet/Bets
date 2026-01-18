@@ -4,19 +4,19 @@
 - **Modo segment**: constraints avaliadas por segmento (equivalente ao que já rodamos antes), α=1.
 
 ### Performance OOS (cap2) — portfólio agregado
-- **PnL semanal médio (bootstrap IC95%)**: **USD -73.7** (IC95% -228.7..69.5)
-- **Desvio padrão semanal**: USD 311.1
-- **P(semana < 0)**: 50.0%
+- **PnL semanal médio (bootstrap IC95%)**: **USD -53.2** (IC95% -215.4..102.2)
+- **Desvio padrão semanal**: USD 332.9
+- **P(semana < 0)**: 43.8%
 
 ### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)
-- **PnL semanal médio (bootstrap IC95%)**: **USD -98.3** (IC95% -300.4..89.8)
-- **Desvio padrão semanal**: USD 359.6
-- **P(semana < 0)**: 66.7%
-- **ROI on stake agregado (ponderado)**: -0.0577
+- **PnL semanal médio (bootstrap IC95%)**: **USD -71.0** (IC95% -285.0..136.0)
+- **Desvio padrão semanal**: USD 387.0
+- **P(semana < 0)**: 58.3%
+- **ROI on stake agregado (ponderado)**: -0.0381
 
 ### Risco no OOS (teste) — portfólio agregado
-- p80(soma stakes/dia) = USD 771 (limite=USD 1610)
-- VaR10%(PnL diário) = USD -265.9 (limite >= USD -575)
+- p80(soma stakes/dia) = USD 1030 (limite=USD 1610)
+- VaR10%(PnL diário) = USD -255.7 (limite >= USD -575)
 - P(PnL diário <= -25% banca) = 0.0% (limite <= 10%)
 
 ### Ajuste de stake global (α)
@@ -35,18 +35,18 @@
 - **FT | domingo**: active_rate=0.0%, ok_rate=0.0%, stake_frac_médio=0.00%, cutoff_médio=1.00
 - **FT | quarta-feira**: active_rate=68.8%, ok_rate=68.8%, stake_frac_médio=2.50%, cutoff_médio=0.62
 - **FT | quinta-feira**: active_rate=6.2%, ok_rate=6.2%, stake_frac_médio=0.06%, cutoff_médio=0.94
-- **FT | segunda-feira**: active_rate=50.0%, ok_rate=50.0%, stake_frac_médio=0.94%, cutoff_médio=0.59
+- **FT | segunda-feira**: active_rate=50.0%, ok_rate=50.0%, stake_frac_médio=1.00%, cutoff_médio=0.59
 - **FT | sexta-feira**: active_rate=0.0%, ok_rate=0.0%, stake_frac_médio=0.00%, cutoff_médio=1.00
-- **FT | sábado**: active_rate=6.2%, ok_rate=6.2%, stake_frac_médio=0.06%, cutoff_médio=0.96
+- **FT | sábado**: active_rate=12.5%, ok_rate=12.5%, stake_frac_médio=0.19%, cutoff_médio=0.92
 - **FT | terça-feira**: active_rate=31.2%, ok_rate=31.2%, stake_frac_médio=0.50%, cutoff_médio=0.75
 
 ### Segmentos mais estáveis no OOS (por lucro semanal)
 - CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_segment_bayes_segment_stability.csv`
-- **FT|terça-feira**: mean_week=21.7 (IC95% -7.6..53.5), P(semana>0)=25.0%
-- **FT|segunda-feira**: mean_week=8.5 (IC95% -39.2..47.5), P(semana>0)=37.5%
+- **FT|terça-feira**: mean_week=27.5 (IC95% 3.3..56.0), P(semana>0)=25.0%
+- **FT|segunda-feira**: mean_week=18.3 (IC95% -37.5..76.5), P(semana>0)=37.5%
 - **FH|quarta-feira**: mean_week=-5.0 (IC95% -15.1..0.0), P(semana>0)=0.0%
 - **FH|terça-feira**: mean_week=-5.6 (IC95% -12.9..0.0), P(semana>0)=0.0%
-- **FT|sábado**: mean_week=-10.8 (IC95% -32.4..0.0), P(semana>0)=0.0%
+- **FT|sábado**: mean_week=-5.8 (IC95% -32.4..14.9), P(semana>0)=6.2%
 - **FT|quinta-feira**: mean_week=-14.5 (IC95% -43.6..0.0), P(semana>0)=0.0%
 - **FH|quinta-feira**: mean_week=-17.6 (IC95% -78.6..22.6), P(semana>0)=31.2%
 - **FT|quarta-feira**: mean_week=-50.3 (IC95% -156.7..42.6), P(semana>0)=12.5%
