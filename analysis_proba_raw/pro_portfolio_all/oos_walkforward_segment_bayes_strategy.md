@@ -4,15 +4,15 @@
 - **Modo segment**: constraints avaliadas por segmento (equivalente ao que já rodamos antes), α=1.
 
 ### Performance OOS (cap2) — portfólio agregado
-- **PnL semanal médio (bootstrap IC95%)**: **USD -60.4** (IC95% -222.1..96.4)
-- **Desvio padrão semanal**: USD 332.2
+- **PnL semanal médio (bootstrap IC95%)**: **USD -58.2** (IC95% -219.9..98.0)
+- **Desvio padrão semanal**: USD 332.1
 - **P(semana < 0)**: 50.0%
 
 ### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)
-- **PnL semanal médio (bootstrap IC95%)**: **USD -80.5** (IC95% -292.2..127.4)
-- **Desvio padrão semanal**: USD 385.6
+- **PnL semanal médio (bootstrap IC95%)**: **USD -77.6** (IC95% -290.3..129.5)
+- **Desvio padrão semanal**: USD 385.7
 - **P(semana < 0)**: 66.7%
-- **ROI on stake agregado (ponderado)**: -0.0467
+- **ROI on stake agregado (ponderado)**: -0.0449
 
 ### Risco no OOS (teste) — portfólio agregado
 - p80(soma stakes/dia) = USD 778 (limite=USD 1610)
@@ -49,4 +49,4 @@
 - **FT|sábado**: mean_week=-10.8 (IC95% -32.4..0.0), P(semana>0)=0.0%
 - **FT|quinta-feira**: mean_week=-14.5 (IC95% -43.6..0.0), P(semana>0)=0.0%
 - **FH|quinta-feira**: mean_week=-17.6 (IC95% -78.6..22.6), P(semana>0)=31.2%
-- **FT|quarta-feira**: mean_week=-52.5 (IC95% -158.4..40.7), P(semana>0)=12.5%
+- **FT|quarta-feira**: mean_week=-50.3 (IC95% -156.7..42.6), P(semana>0)=12.5%
