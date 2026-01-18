@@ -4,19 +4,19 @@
 - **Modo global**: aplica um fator α (0..1) multiplicando todos os stakes para satisfazer constraints do portfólio agregado no treino de cada passo.
 
 ### Performance OOS (cap2) — portfólio agregado
-- **PnL semanal médio (bootstrap IC95%)**: **USD -59.0** (IC95% -219.8..95.7)
-- **Desvio padrão semanal**: USD 333.0
-- **P(semana < 0)**: 43.8%
+- **PnL semanal médio (bootstrap IC95%)**: **USD -60.4** (IC95% -220.9..93.5)
+- **Desvio padrão semanal**: USD 332.2
+- **P(semana < 0)**: 50.0%
 
 ### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)
-- **PnL semanal médio (bootstrap IC95%)**: **USD -78.7** (IC95% -293.1..127.6)
-- **Desvio padrão semanal**: USD 386.7
-- **P(semana < 0)**: 58.3%
-- **ROI on stake agregado (ponderado)**: -0.0420
+- **PnL semanal médio (bootstrap IC95%)**: **USD -80.5** (IC95% -293.8..124.5)
+- **Desvio padrão semanal**: USD 385.6
+- **P(semana < 0)**: 66.7%
+- **ROI on stake agregado (ponderado)**: -0.0467
 
 ### Risco no OOS (teste) — portfólio agregado
-- p80(soma stakes/dia) = USD 1033 (limite=USD 1610)
-- VaR10%(PnL diário) = USD -255.7 (limite >= USD -575)
+- p80(soma stakes/dia) = USD 778 (limite=USD 1610)
+- VaR10%(PnL diário) = USD -265.9 (limite >= USD -575)
 - P(PnL diário <= -25% banca) = 0.0% (limite <= 10%)
 
 ### Ajuste de stake global (α)
@@ -37,16 +37,16 @@
 - **FT | quinta-feira**: active_rate=6.2%, ok_rate=6.2%, stake_frac_médio=0.06%, cutoff_médio=0.94
 - **FT | segunda-feira**: active_rate=50.0%, ok_rate=50.0%, stake_frac_médio=1.00%, cutoff_médio=0.59
 - **FT | sexta-feira**: active_rate=0.0%, ok_rate=0.0%, stake_frac_médio=0.00%, cutoff_médio=1.00
-- **FT | sábado**: active_rate=12.5%, ok_rate=12.5%, stake_frac_médio=0.19%, cutoff_médio=0.92
+- **FT | sábado**: active_rate=6.2%, ok_rate=6.2%, stake_frac_médio=0.06%, cutoff_médio=0.96
 - **FT | terça-feira**: active_rate=31.2%, ok_rate=31.2%, stake_frac_médio=0.50%, cutoff_médio=0.75
 
 ### Segmentos mais estáveis no OOS (por lucro semanal)
 - CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_global_bayes_segment_stability.csv`
-- **FT|terça-feira**: mean_week=21.7 (IC95% -7.6..53.5), P(semana>0)=25.0%
+- **FT|terça-feira**: mean_week=27.5 (IC95% 3.3..56.0), P(semana>0)=25.0%
 - **FT|segunda-feira**: mean_week=18.3 (IC95% -37.5..76.5), P(semana>0)=37.5%
 - **FH|quarta-feira**: mean_week=-5.0 (IC95% -15.1..0.0), P(semana>0)=0.0%
 - **FH|terça-feira**: mean_week=-5.6 (IC95% -12.9..0.0), P(semana>0)=0.0%
-- **FT|sábado**: mean_week=-5.8 (IC95% -32.4..14.9), P(semana>0)=6.2%
+- **FT|sábado**: mean_week=-10.8 (IC95% -32.4..0.0), P(semana>0)=0.0%
 - **FT|quinta-feira**: mean_week=-14.5 (IC95% -43.6..0.0), P(semana>0)=0.0%
 - **FH|quinta-feira**: mean_week=-17.6 (IC95% -78.6..22.6), P(semana>0)=31.2%
-- **FT|quarta-feira**: mean_week=-50.3 (IC95% -156.7..42.6), P(semana>0)=12.5%
+- **FT|quarta-feira**: mean_week=-52.5 (IC95% -158.4..40.7), P(semana>0)=12.5%
