@@ -113,6 +113,11 @@ HYST_P_SWITCH = 0.90  # se habilitar no futuro
 # Exigir que o quantil POST_Q_OBJ (p05 por default) do lucro semanal médio seja > 0.
 REQUIRE_POST_Q_OBJ_POS = False
 
+# Gating alternativo (menos/more conservador) sem mexer no objetivo:
+# Exigir que o quantil POST_Q_GATE do lucro semanal médio posterior seja > 0.
+POST_Q_GATE = 0.30
+REQUIRE_POST_Q_GATE_POS = False
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -326,6 +331,10 @@ def optimize_segment_train(
         q_obj = float(np.quantile(post_means, POST_Q_OBJ))
         if REQUIRE_POST_Q_OBJ_POS and q_obj <= 0:
             return False, -np.inf, None
+        if REQUIRE_POST_Q_GATE_POS:
+            q_gate = float(np.quantile(post_means, POST_Q_GATE))
+            if q_gate <= 0:
+                return False, -np.inf, None
         return True, float(q_obj - EXPOSURE_PENALTY * p95_exp), post_means
 
     best_obj = -np.inf
@@ -1012,6 +1021,7 @@ def main() -> int:
                     "ROBUST_CUTOFF_ENABLED": globals().get("ROBUST_CUTOFF_ENABLED"),
                     "HYSTERESIS_ENABLED": globals().get("HYSTERESIS_ENABLED"),
                     "REQUIRE_POST_Q_OBJ_POS": globals().get("REQUIRE_POST_Q_OBJ_POS"),
+                    "REQUIRE_POST_Q_GATE_POS": globals().get("REQUIRE_POST_Q_GATE_POS"),
                 }
                 for k, v in kwargs.items():
                     globals()[k] = v
@@ -1029,8 +1039,15 @@ def main() -> int:
         ("global_bayes_roll12", 12, False, False, False),
         ("global_bayes_roll12_robust", 12, True, True, False),
         ("global_bayes_roll12_robust_qpos", 12, True, True, True),
+        ("global_bayes_roll12_robust_qgate30", 12, True, True, False),
     ):
-        with _with_globals(ROBUST_CUTOFF_ENABLED=bool(robust), HYSTERESIS_ENABLED=bool(hyst), REQUIRE_POST_Q_OBJ_POS=bool(qpos)):
+        req_gate = (exp_name == "global_bayes_roll12_robust_qgate30")
+        with _with_globals(
+            ROBUST_CUTOFF_ENABLED=bool(robust),
+            HYSTERESIS_ENABLED=bool(hyst),
+            REQUIRE_POST_Q_OBJ_POS=bool(qpos),
+            REQUIRE_POST_Q_GATE_POS=bool(req_gate),
+        ):
             rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
                 global_risk=True,
                 bayes_select=True,
