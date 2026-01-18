@@ -110,6 +110,52 @@ def dedup_last(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _roi_from_result_and_odds(result: object, odds: float) -> float:
+    """
+    ROI por stake (lucro/ stake), baseado em odds decimais e resultado.
+    Ex.: Win @2.10 => +1.10; Lose => -1.0; HalfWin => +(odds-1)/2; HalfLose => -0.5; Push/Void => 0.
+    """
+    if not np.isfinite(odds) or odds <= 1e-12:
+        return float("nan")
+    s = str(result).strip().lower()
+    if s == "win":
+        return float(odds - 1.0)
+    if s in {"lose", "loss"}:
+        return -1.0
+    if s in {"halfwin", "half win"}:
+        return float((odds - 1.0) / 2.0)
+    if s in {"halfloss", "halflose", "half loss", "half lose"}:
+        return -0.5
+    if s in {"push", "void", "refund", "cancelled", "canceled"}:
+        return 0.0
+    return float("nan")
+
+
+def compute_roi_calc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adiciona:
+    - roi_calc: ROI por aposta calculado via odds+resultado
+    - roi_calc_cap1 / roi_calc_cap2: versões capadas (para robustez)
+    """
+    out = df.copy()
+
+    def col(name: str) -> pd.Series:
+        return out[name] if name in out.columns else pd.Series(np.nan, index=out.index)
+
+    odds = pd.to_numeric(col("Odd Aposta Realizada"), errors="coerce")
+    for nm in ["BetinAsia.got price", "BetinAsia.Odds", "RebelBetting.Odds", "Odd Indicada no RB"]:
+        odds = odds.combine_first(pd.to_numeric(col(nm), errors="coerce"))
+    odds = odds.to_numpy(dtype=float)
+
+    res = col("RebelBetting.Result")
+    roi_calc = np.array([_roi_from_result_and_odds(r, o) for r, o in zip(res, odds)], dtype=float)
+
+    out["roi_calc"] = roi_calc
+    out["roi_calc_cap2"] = np.minimum(roi_calc, 2.0)
+    out["roi_calc_cap1"] = np.minimum(roi_calc, 1.0)
+    return out
+
+
 def build_features_weekday_models(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     out["Número de casas disponíveis no momento da aposta"] = df["ApostaLive.Número de casas disponíveis no momento da aposta"]
@@ -162,6 +208,7 @@ def main() -> int:
     df["dow_pt"] = dt.dt.weekday.map(lambda x: WEEKDAY_PT[int(x)] if pd.notna(x) else None)
     df["bet_is_fh"] = df["Tipo Aposta"].astype(str).str.lower().str.contains("first half")
     df["bet_type"] = np.where(df["bet_is_fh"], "FH", "FT")
+    df = compute_roi_calc(df)
 
     # load models
     m_seg = patch_sklearn_compat(joblib.load("/workspace/model_logit_segunda.joblib"))

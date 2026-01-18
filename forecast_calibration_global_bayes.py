@@ -145,7 +145,9 @@ def main() -> int:
     wf_week = pd.read_csv(WEEKLY)
 
     df = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
-    df["roi_raw"] = pd.to_numeric(df["ROI Real"], errors="coerce").astype(float)
+    if "roi_calc" not in df.columns:
+        raise KeyError("Coluna roi_calc ausente. Regerar scored_dedup_proba_raw_all.csv antes de rodar forecast calibration.")
+    df["roi_raw"] = pd.to_numeric(df["roi_calc"], errors="coerce").astype(float)
     df["roi_cap2"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 2.0)
     df["house_cap"] = pd.to_numeric(df["house_cap"], errors="coerce").astype(float)
     df["week"] = pd.to_datetime(df["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)

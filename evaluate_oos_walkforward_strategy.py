@@ -594,7 +594,10 @@ def main() -> int:
     df["house_cap"] = df["house_cap"].apply(safe_cap)
     df["week"] = week_key(df["BIA_ApostaUTC"])
     df["date"] = date_key(df["BIA_ApostaUTC"])
-    df["roi_raw"] = pd.to_numeric(df["ROI Real"], errors="coerce").astype(float)
+    # ROI: usar ROI calculado via odds+resultado (mais consistente que a coluna \"ROI Real\" da planilha)
+    if "roi_calc" not in df.columns:
+        raise KeyError("Coluna roi_calc ausente. Regerar /workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
+    df["roi_raw"] = pd.to_numeric(df["roi_calc"], errors="coerce").astype(float)
     df["roi_cap2"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 2.0)
     df["roi_cap1"] = np.minimum(df["roi_raw"].to_numpy(dtype=float), 1.0)
 

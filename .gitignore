@@ -1,3 +1,8 @@
+__pycache__/
+*.pyc
+
+# Large generated artifacts
+analysis_proba_raw/scored_dedup_proba_raw_all.csv
 analysis_proba_raw/**
 !analysis_proba_raw/pro_portfolio_all/
 !analysis_proba_raw/pro_portfolio_all/**
