@@ -1,0 +1,4 @@
+name,profit_cap2_total,stake_total,roi_total_cap2,weeks_total,weeks_with_stake,mean_weekly_cap2_nonzero,pneg_weeks_nonzero
+score_current,520.110735021889,21909.84670841694,0.02373867521501563,16,12,43.34256125182409,0.5
+score_prod_payload_logit_wf12,-344.345,7837.0,-0.043938369273956876,16,8,-43.043125,0.5
+score_prod_payload_region_logit_wf12,-295.8420000000002,8114.0,-0.03646068523539564,16,9,-32.871333333333354,0.6666666666666666
