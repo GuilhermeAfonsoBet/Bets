@@ -14,8 +14,8 @@ Obs:
 - O objetivo é avaliar se remover combinações "estruturalmente negativas" melhora o OOS.
 
 Saídas:
-- analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_weekly.csv
-- analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_summary.md
+- analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_<MODE>_weekly.csv
+- analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_<MODE>_summary.md
 """
 
 from __future__ import annotations
@@ -30,8 +30,10 @@ import pandas as pd
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
-WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
-WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
+# Modo do WF para usar como base (regras θ_t). Ex.: \"global_bayes_roll12_robust\".
+MODE = "global_bayes_roll12_robust"
+WF_RULES = OUT_DIR / f"oos_walkforward_{MODE}_selected_rules.csv"
+WF_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
 
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
 CALIB_FLOOR_SEXDOM = 0.005
@@ -263,18 +265,18 @@ def main() -> int:
             err_hist.setdefault(rk, []).append(err_roi)
 
     out = pd.DataFrame(out_rows)
-    out_path = OUT_DIR / "oos_postfilter_debiased_roi_weekly.csv"
+    out_path = OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_weekly.csv"
     out.to_csv(out_path, index=False)
 
     gates = pd.DataFrame(gate_rows)
-    gates.to_csv(OUT_DIR / "oos_postfilter_debiased_roi_gating.csv", index=False)
+    gates.to_csv(OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_gating.csv", index=False)
 
     # comparação vs OOS original
     base = wf_week[["week", "stake_usd", "profit_cap2_usd"]].copy()
     base = base.rename(columns={"stake_usd": "stake_base", "profit_cap2_usd": "pnl_base"})
     comp = base.merge(out[["week", "stake_usd", "profit_cap2_usd"]].rename(columns={"stake_usd": "stake_gate", "profit_cap2_usd": "pnl_gate"}), on="week", how="left")
     comp["delta_pnl"] = comp["pnl_gate"] - comp["pnl_base"]
-    comp.to_csv(OUT_DIR / "oos_postfilter_debiased_roi_comparison.csv", index=False)
+    comp.to_csv(OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_comparison.csv", index=False)
 
     def stats(x: np.ndarray) -> Tuple[float, float, float]:
         x = np.asarray(x, dtype=float)
@@ -292,13 +294,13 @@ def main() -> int:
     lines.append(f"- Baseline mean/sem={m0:.1f}, std={s0:.1f}, Sharpe_ann={sh0:.3f}\n")
     lines.append(f"- Gating   mean/sem={m1:.1f}, std={s1:.1f}, Sharpe_ann={sh1:.3f}\n\n")
     lines.append("Arquivos:\n")
-    lines.append("- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_weekly.csv`\n")
-    lines.append("- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_gating.csv`\n")
-    lines.append("- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_comparison.csv`\n")
-    (OUT_DIR / "oos_postfilter_debiased_roi_summary.md").write_text("".join(lines), encoding="utf-8")
+    lines.append(f"- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_{MODE}_weekly.csv`\n")
+    lines.append(f"- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_{MODE}_gating.csv`\n")
+    lines.append(f"- `analysis_proba_raw/pro_portfolio_all/oos_postfilter_debiased_roi_{MODE}_comparison.csv`\n")
+    (OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_summary.md").write_text("".join(lines), encoding="utf-8")
 
     print(str(out_path))
-    print(str(OUT_DIR / "oos_postfilter_debiased_roi_summary.md"))
+    print(str(OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_summary.md"))
     return 0
 
 

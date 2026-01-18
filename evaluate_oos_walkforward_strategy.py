@@ -671,6 +671,8 @@ def main() -> int:
         segment_calib: bool,
         disable_top_k: int = 0,
         train_window_weeks: int | None = None,
+        regime_lookback_weeks: int | None = None,
+        regime_alpha_bad: float = 1.0,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         all_rules_rows = []
         weekly_rows = []
@@ -726,6 +728,21 @@ def main() -> int:
             else:
                 alpha, m_at1, m_ata = 1.0, {"p80_exp": float("nan"), "daily_var10": float("nan"), "p_dd": float("nan"), "n_days": 0}, {"p80_exp": float("nan"), "daily_var10": float("nan"), "p_dd": float("nan"), "n_days": 0}
 
+            # Regime overlay (usa apenas passado): se o ROI recente do portfólio for negativo, reduzir alpha.
+            alpha_regime = 1.0
+            if regime_lookback_weeks is not None and int(regime_lookback_weeks) > 0:
+                tw = list(train_weeks)
+                recent = tw[-int(regime_lookback_weeks) :] if len(tw) else []
+                if recent:
+                    df_recent = df_train[df_train["week"].isin(recent)].copy()
+                    bets_recent = apply_rules_on_df(df_recent, rules, alpha=float(alpha))
+                    stake_r = float(bets_recent["stake_eff"].sum()) if not bets_recent.empty else 0.0
+                    pnl_r = float(bets_recent["profit_cap2"].sum()) if not bets_recent.empty else 0.0
+                    roi_r = float(pnl_r / stake_r) if stake_r > 0 else 0.0
+                    if roi_r < 0:
+                        alpha_regime = float(regime_alpha_bad)
+            alpha_use = float(alpha) * float(alpha_regime)
+
             # salvar regras daquela semana (com alpha)
             for key, rule in rules.items():
                 all_rules_rows.append(
@@ -741,6 +758,8 @@ def main() -> int:
                         "status": rule.status,
                         "rule_key": key,
                         "roi_bias_adj_used": float(roi_bias_adj_map.get(key, 0.0)) if (bayes_select and segment_calib) else 0.0,
+                        "alpha_regime": float(alpha_regime),
+                        "alpha_effective": float(alpha_use),
                     }
                 )
 
@@ -749,6 +768,8 @@ def main() -> int:
                     "week": w_test,
                     "train_weeks": len(train_weeks),
                     "alpha_global": float(alpha),
+                    "alpha_regime": float(alpha_regime),
+                    "alpha_effective": float(alpha_use),
                     "train_global_p80_exp_at1": float(m_at1.get("p80_exp", float("nan"))),
                     "train_global_var10_at1": float(m_at1.get("daily_var10", float("nan"))),
                     "train_global_p_dd_at1": float(m_at1.get("p_dd", float("nan"))),
@@ -760,7 +781,7 @@ def main() -> int:
             )
 
             # aplica no teste e agrega (usando alpha)
-            bets = apply_rules_on_df(df_test, rules, alpha=alpha)
+            bets = apply_rules_on_df(df_test, rules, alpha=alpha_use)
 
             stake_sum = float(bets["stake_eff"].sum()) if len(bets) else 0.0
             pnl_sum = float(bets["profit_cap2"].sum()) if len(bets) else 0.0
@@ -863,6 +884,8 @@ def main() -> int:
             segment_calib=SEGMENT_CALIB_ENABLED,
             disable_top_k=0,
             train_window_weeks=None,
+            regime_lookback_weeks=None,
+            regime_alpha_bad=1.0,
         )
 
         rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
@@ -1001,6 +1024,8 @@ def main() -> int:
                 segment_calib=segment_calib,
                 disable_top_k=int(disable_top_k),
                 train_window_weeks=None,
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
             )
             rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
             weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
@@ -1054,6 +1079,32 @@ def main() -> int:
                 segment_calib=False,
                 disable_top_k=0,
                 train_window_weeks=int(win),
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
+
+    pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
+
+    # Regime overlay: se ROI recente (últimas 4 semanas do treino) < 0, reduzir alpha.
+    for exp_name, alpha_bad in (
+        ("global_bayes_roll12_robust_regime4_off", 0.0),
+        ("global_bayes_roll12_robust_regime4_half", 0.5),
+    ):
+        with _with_globals(ROBUST_CUTOFF_ENABLED=True, HYSTERESIS_ENABLED=True, REQUIRE_POST_Q_OBJ_POS=False, REQUIRE_POST_Q_GATE_POS=False):
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=12,
+                regime_lookback_weeks=4,
+                regime_alpha_bad=float(alpha_bad),
             )
             rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
             weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
