@@ -93,6 +93,12 @@ SEGMENT_CALIB_ENABLED = False
 SEGMENT_CALIB_ONLY_PENALIZE = True
 SEGMENT_CALIB_MIN_TOTAL_OBS = 8  # mínimo de observações (somadas em todos segmentos) para ativar shrinkage
 
+# Experimentos (apenas para estudo): rodar modos adicionais sem sobrescrever baseline.
+BIAS_EXPERIMENTS_ENABLED = True
+BIAS_DISABLE_ENABLED = True
+BIAS_DISABLE_TOP_K = 2  # desliga os K segmentos com maior viés negativo
+BIAS_DISABLE_MIN_OBS_PER_SEG = 3  # só considera segmento para desligar se tiver >= este nº de observações históricas
+
 # (Removido a pedido do usuário): lower bound no p05 do PnL semanal.
 
 # Robustez do cutoff (sensibilidade) — DESLIGADO por ora.
@@ -501,6 +507,21 @@ def _segment_roi_bias_shrunk(roi_err_hist: Dict[str, List[float]]) -> Dict[str, 
     return out
 
 
+def _segment_roi_bias_raw_mean(
+    roi_err_hist: Dict[str, List[float]], min_obs_per_seg: int
+) -> Dict[str, float]:
+    """
+    Bias bruto por segmento: média(ROI_real - ROI_previsto) no histórico.
+    Usado apenas para escolher quais segmentos 'desligar' (evita arbitrariedade quando tau2~0).
+    """
+    out: Dict[str, float] = {}
+    for k, xs in roi_err_hist.items():
+        a = np.asarray([float(v) for v in xs if np.isfinite(float(v))], dtype=float)
+        if a.size < int(min_obs_per_seg):
+            continue
+        out[str(k)] = float(a.mean())
+    return out
+
 def _rule_weekly_roi_mean(df_train: pd.DataFrame, rule: Rule, train_weeks: List[str]) -> float:
     """
     ROI semanal médio no treino, incluindo semanas sem trade como ROI=0.
@@ -629,7 +650,12 @@ def main() -> int:
     if len(weeks) < (MIN_GLOBAL_TRAIN_WEEKS + 3):
         raise SystemExit(f"Poucas semanas no dataset: {len(weeks)}")
 
-    def run_walkforward(global_risk: bool, bayes_select: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def run_walkforward(
+        global_risk: bool,
+        bayes_select: bool,
+        segment_calib: bool,
+        disable_top_k: int = 0,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         all_rules_rows = []
         weekly_rows = []
         weekly_seg_rows = []
@@ -647,8 +673,14 @@ def main() -> int:
             df_test = df[df["week"] == w_test].copy()
 
             roi_bias_adj_map: Dict[str, float] = {}
-            if bayes_select and SEGMENT_CALIB_ENABLED:
+            if bayes_select and segment_calib:
                 roi_bias_adj_map = _segment_roi_bias_shrunk(seg_roi_err_hist)
+
+            disabled_keys: set[str] = set()
+            if bayes_select and segment_calib and int(disable_top_k) > 0:
+                bias_raw = _segment_roi_bias_raw_mean(seg_roi_err_hist, min_obs_per_seg=BIAS_DISABLE_MIN_OBS_PER_SEG)
+                worst = sorted(bias_raw.items(), key=lambda kv: kv[1])[: int(disable_top_k)]
+                disabled_keys = {k for k, _ in worst}
 
             # otimiza regras no treino (para cada segmento)
             rules: Dict[str, Rule] = {}
@@ -661,8 +693,11 @@ def main() -> int:
                     else:
                         prev = prev_rules.get(f"{bet_type}|{dow}")
                         rk = f"{bet_type}|{dow}"
-                        roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
-                        rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
+                        if rk in disabled_keys:
+                            rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="disabled_bias")
+                        else:
+                            roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
+                            rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
                     rules[f"{bet_type}|{dow}"] = rule
 
             # se pedir risco global, ajustar stakes por alpha
@@ -685,7 +720,7 @@ def main() -> int:
                         "alpha_global": float(alpha),
                         "status": rule.status,
                         "rule_key": key,
-                        "roi_bias_adj_used": float(roi_bias_adj_map.get(key, 0.0)) if (bayes_select and SEGMENT_CALIB_ENABLED) else 0.0,
+                        "roi_bias_adj_used": float(roi_bias_adj_map.get(key, 0.0)) if (bayes_select and segment_calib) else 0.0,
                     }
                 )
 
@@ -747,7 +782,7 @@ def main() -> int:
 
             # atualizar histórico de calibração por segmento (para próximos passos)
             # usa ROI previsto no treino (média semanal, incluindo semanas sem trade como 0) e ROI realizado no teste
-            if bayes_select and SEGMENT_CALIB_ENABLED:
+            if bayes_select and segment_calib:
                 for key, rule in rules.items():
                     if rule.status != "ok" or rule.stake_frac <= 0:
                         continue
@@ -773,10 +808,28 @@ def main() -> int:
             daily_df,
         )
 
+    results_summary_rows: List[Dict[str, float | int | str]] = []
+
+    def _summarize_mode(mode_name: str, weekly_df: pd.DataFrame) -> None:
+        stake_tot = float(weekly_df["stake_usd"].sum())
+        pnl_tot = float(weekly_df["profit_cap2_usd"].sum())
+        roi_tot = float(pnl_tot / stake_tot) if stake_tot > 0 else float("nan")
+        w_nonzero = weekly_df.loc[weekly_df["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(dtype=float)
+        results_summary_rows.append(
+            {
+                "mode": mode_name,
+                "weeks_total": int(len(weekly_df)),
+                "weeks_with_stake": int((weekly_df["stake_usd"] > 0).sum()),
+                "profit_cap2_total": pnl_tot,
+                "stake_total": stake_tot,
+                "roi_total_cap2": roi_tot,
+                "mean_weekly_cap2_nonzero": float(np.mean(w_nonzero)) if w_nonzero.size else float("nan"),
+                "pneg_weeks_nonzero": float((w_nonzero < 0).mean()) if w_nonzero.size else float("nan"),
+            }
+        )
+
     # ------------------------
-    # Rodar 2 modos:
-    #  - por segmento (alpha=1)
-    #  - com risco global (alpha ajustado)
+    # Baseline: 4 modos (como antes)
     # ------------------------
     for mode_name, global_risk, bayes_select in (
         ("segment_classic", False, False),
@@ -784,13 +837,19 @@ def main() -> int:
         ("segment_bayes", False, True),
         ("global_bayes", True, True),
     ):
-        rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(global_risk=global_risk, bayes_select=bayes_select)
+        rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+            global_risk=global_risk,
+            bayes_select=bayes_select,
+            segment_calib=SEGMENT_CALIB_ENABLED,
+            disable_top_k=0,
+        )
 
         rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
         weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
         weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
         weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
         daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_daily.csv", index=False)
+        _summarize_mode(mode_name, weekly_df)
 
         # resumo robusto
         w = weekly_df["profit_cap2_usd"].to_numpy(dtype=float)
@@ -904,6 +963,31 @@ def main() -> int:
                 )
 
         (OUT_DIR / f"oos_walkforward_{mode_name}_strategy.md").write_text("".join(lines), encoding="utf-8")
+
+    # ------------------------
+    # Experimentos: Portfolio Bayes Global com balanceamento por viés
+    # ------------------------
+    if BIAS_EXPERIMENTS_ENABLED:
+        for mode_name, segment_calib, disable_top_k in (
+            ("global_bayes_biaspen", True, 0),
+            ("global_bayes_biasdisable", True, BIAS_DISABLE_TOP_K if BIAS_DISABLE_ENABLED else 0),
+        ):
+            if mode_name.endswith("biasdisable") and not BIAS_DISABLE_ENABLED:
+                continue
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=segment_calib,
+                disable_top_k=int(disable_top_k),
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_daily.csv", index=False)
+            _summarize_mode(mode_name, weekly_df)
+
+        pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
 
     print(str(OUT_DIR / "oos_walkforward_global_strategy.md"))
     return 0
