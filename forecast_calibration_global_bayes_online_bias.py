@@ -40,17 +40,37 @@ import pandas as pd
 
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
-IN_CSV = OUT_DIR / "forecast_calibration_global_bayes.csv"
+def _safe_mode(s: str) -> str:
+    s = str(s).strip()
+    return "".join(ch for ch in s if ch.isalnum() or ch in {"_", "-"}).strip("_")
+
+
+def _paths_for_mode(mode: str) -> tuple[Path, Path, Path]:
+    m = _safe_mode(mode)
+    in_csv = OUT_DIR / f"forecast_calibration_{m}.csv"
+    out_csv = OUT_DIR / f"forecast_calibration_{m}_online_bias.csv"
+    out_md = OUT_DIR / f"forecast_calibration_{m}_online_bias.md"
+    return in_csv, out_csv, out_md
 
 # rolling window (semanas passadas) para estimar bias on-line
 BIAS_WINDOW = 8
 
 
 def main() -> int:
-    if not IN_CSV.exists():
-        raise SystemExit(f"Arquivo não encontrado: {IN_CSV}")
+    import argparse
 
-    df = pd.read_csv(IN_CSV)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="global_bayes", help="Prefixo do modo do WF (ex.: global_bayes_roll12_robust_p10_p70)")
+    ap.add_argument("--bias-window", type=int, default=BIAS_WINDOW, help="Janela (semanas passadas) para estimar bias on-line")
+    args = ap.parse_args()
+
+    in_csv, out_csv, out_md = _paths_for_mode(args.mode)
+    bias_window = int(args.bias_window)
+
+    if not in_csv.exists():
+        raise SystemExit(f"Arquivo não encontrado: {in_csv}")
+
+    df = pd.read_csv(in_csv)
     if df.empty:
         raise SystemExit("CSV de calibração está vazio.")
 
@@ -67,7 +87,7 @@ def main() -> int:
         if i == 0:
             bias[i] = 0.0
             continue
-        lo = max(0, i - int(BIAS_WINDOW))
+        lo = max(0, i - int(bias_window))
         hist = err[lo:i]
         hist = hist[np.isfinite(hist)]
         bias[i] = float(np.mean(hist)) if hist.size else 0.0
@@ -89,8 +109,7 @@ def main() -> int:
         if q in out.columns:
             out[f"{q}_bias_adj_online"] = out[q].to_numpy(dtype=float) + bias
 
-    out_path = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
-    out.to_csv(out_path, index=False)
+    out.to_csv(out_csv, index=False)
 
     # resumo md
     def _m(x: np.ndarray) -> float:
@@ -105,18 +124,19 @@ def main() -> int:
 
     lines = []
     lines.append("## Bias-adjusted on-line (walk-forward) — forecast de PnL semanal (global_bayes)\n\n")
-    lines.append(f"- Janela de bias (rolling): **{BIAS_WINDOW}** semanas passadas\n\n")
+    lines.append(f"- Modo: **{_safe_mode(args.mode)}**\n")
+    lines.append(f"- Janela de bias (rolling): **{bias_window}** semanas passadas\n\n")
     lines.append("### Métricas (OOS, por semana)\n")
     lines.append(f"- Bias (real - pred), modelo cru: **USD {bias_raw:,.1f}**\n")
     lines.append(f"- Bias (real - pred), bias-adjusted on-line: **USD {bias_adj:,.1f}**\n")
     lines.append(f"- MAE, modelo cru: **USD {mae_raw:,.1f}**\n")
     lines.append(f"- MAE, bias-adjusted on-line: **USD {mae_adj:,.1f}**\n\n")
     lines.append("### Arquivos\n")
-    lines.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/{out_path.name}`\n")
-    (OUT_DIR / "forecast_calibration_global_bayes_online_bias.md").write_text("".join(lines), encoding="utf-8")
+    lines.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/{out_csv.name}`\n")
+    out_md.write_text("".join(lines), encoding="utf-8")
 
-    print(str(out_path))
-    print(str(OUT_DIR / "forecast_calibration_global_bayes_online_bias.md"))
+    print(str(out_csv))
+    print(str(out_md))
     return 0
 
 

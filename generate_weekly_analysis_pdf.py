@@ -36,7 +36,7 @@ WF_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
 WF_DAILY = OUT_DIR / f"oos_walkforward_{MODE}_daily.csv"
 WF_RULES = OUT_DIR / f"oos_walkforward_{MODE}_selected_rules.csv"
 FC_WEEK = OUT_DIR / f"forecast_calibration_{MODE}.csv"
-FC_ONLINE = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
+FC_ONLINE = OUT_DIR / f"forecast_calibration_{MODE}_online_bias.csv"
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 BANKROLL_BASE = 2300.0
 # banca “stake máximo (p95)” conforme relatório 17/01/2026

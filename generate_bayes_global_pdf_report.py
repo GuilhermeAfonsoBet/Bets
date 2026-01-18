@@ -43,7 +43,7 @@ COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
 FORECAST_CALIB = OUT_DIR / f"forecast_calibration_{MODE}.csv"
 FORECAST_CALIB_BY_RULE = OUT_DIR / f"forecast_calibration_{MODE}_by_rule_summary.csv"
 FORECAST_CALIB_MAX = OUT_DIR / f"forecast_calibration_{MODE}_max.csv"
-FORECAST_CALIB_ONLINE = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
+FORECAST_CALIB_ONLINE = OUT_DIR / f"forecast_calibration_{MODE}_online_bias.csv"
 BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
 BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
 OOS_GATE_WEEKLY = OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_weekly.csv"
@@ -285,15 +285,20 @@ def main() -> int:
     # online bias-adjusted (walk-forward): usa apenas passado em cada semana
     fc_online_mean = float("nan")
     fc_online_roi_bank = float("nan")
+    fc_online_cov80 = float("nan")
     if FORECAST_CALIB_ONLINE.exists():
         try:
             fco = pd.read_csv(FORECAST_CALIB_ONLINE)
             if (not fco.empty) and ("pred_mean_bias_adj_online" in fco.columns):
                 fc_online_mean = float(np.mean(fco["pred_mean_bias_adj_online"].to_numpy(dtype=float)))
                 fc_online_roi_bank = float(fc_online_mean / BANKROLL) if np.isfinite(fc_online_mean) else float("nan")
+            # coverage 80% usando quantis shifted por bias_online
+            if (not fco.empty) and {"pnl_theoretical", "pred_p10_bias_adj_online", "pred_p90_bias_adj_online"}.issubset(set(fco.columns)):
+                fc_online_cov80 = float(np.mean((fco["pnl_theoretical"] >= fco["pred_p10_bias_adj_online"]) & (fco["pnl_theoretical"] <= fco["pred_p90_bias_adj_online"])))
         except Exception:
             fc_online_mean = float("nan")
             fc_online_roi_bank = float("nan")
+            fc_online_cov80 = float("nan")
 
     # calibração por combinação (rule_key): vieses de ROI
     # Nota: o shrinkage Empirical Bayes pode colapsar para mu0 (tau2≈0). Por isso reportamos também o bias bruto.
@@ -971,10 +976,25 @@ def main() -> int:
     # 3.1.A Executive forecast (bias-corrected)
     story.append(Spacer(1, 0.2 * cm))
     story.append(Paragraph("<b>3.1.A Resumo executivo (previsto com correção de Bias)</b>", styles["BodyText"]))
+    # giro “típico” para converter ROI/$ em ROI banca (evita ser puxado por semanas iniciais com stake=0)
+    stake_typ_last5 = float("nan")
+    turnover_typ_last5 = float("nan")
+    roi_bank_week_adj_typ_last5 = float("nan")
+    try:
+        wt = wf_week.loc[wf_week["stake_usd"] > 0].copy()
+        if len(wt) >= 1:
+            last5 = wt.tail(min(5, len(wt)))
+            stake_typ_last5 = float(np.mean(last5["stake_usd"].to_numpy(dtype=float)))
+            turnover_typ_last5 = float(stake_typ_last5 / BANKROLL) if BANKROLL > 0 else float("nan")
+            roi_bank_week_adj_typ_last5 = float(roi_on_stake * turnover_typ_last5) if np.isfinite(roi_on_stake) and np.isfinite(turnover_typ_last5) else float("nan")
+    except Exception:
+        pass
+    roi_bank_week_fc_cal_adj_typ_last5 = float(roi_on_stake_fc_cal * turnover_typ_last5) if np.isfinite(roi_on_stake_fc_cal) and np.isfinite(turnover_typ_last5) else float("nan")
     exec_tbl = [
         ["Métrica", "Valor (bias-corrected)"],
         ["Previsto: média semanal (Bias on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "nan"],
         ["Previsto: ROI banca/sem (Bias on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "nan"],
+        ["Calibração (Bias on-line): coverage 80% (p10..p90, shifted)", f"{fc_online_cov80*100:.1f}%" if np.isfinite(fc_online_cov80) else "—"],
         ["— (referência) correção ex-post no período —", ""],
         ["Previsto: média semanal (Bias ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
         ["Previsto: lucro mensal (Bias ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
@@ -982,6 +1002,7 @@ def main() -> int:
         ["Previsto: ROI banca/sem (Bias ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
         ["Previsto: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
         ["Previsto: ROI por $ (turnover) corrigido", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
+        ["Previsto: ROI banca/sem (ajustado por giro típico, últimas 5 semanas)", f"{roi_bank_week_fc_cal_adj_typ_last5*100:.2f}% (giro≈{turnover_typ_last5:.2f}×)" if np.isfinite(roi_bank_week_fc_cal_adj_typ_last5) else "—"],
         ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
         ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
     ]
@@ -1045,6 +1066,7 @@ def main() -> int:
         ["ROI por $ (turnover) [PnL_total/Stake_total]", f"{roi_on_stake:.4f}"],
         ["ROI banca/sem (inclui semanas sem trades)", f"{roi_bank_week*100:.2f}%"],
         ["ROI banca/sem (apenas semanas com trade)", f"{roi_bank_week_traded*100:.2f}%"],
+        ["ROI banca/sem (ajustado por giro típico, últimas 5 semanas)", f"{roi_bank_week_adj_typ_last5*100:.2f}% (giro≈{turnover_typ_last5:.2f}×; stake/sem≈USD {stake_typ_last5:,.0f})" if np.isfinite(roi_bank_week_adj_typ_last5) else "—"],
         ["P(semana<0)", f"{wstats.get('pneg', float('nan'))*100:.1f}%"],
         ["Risco dia: p80(stake/dia)", f"USD {p80_exp:,.0f} (limite {MAX_DAILY_EXPOSURE_FRAC_Q*BANKROLL:,.0f})"],
         ["Risco dia: VaR10%(PnL)", f"USD {var10:,.0f} (limite ≥ {-MAX_DAILY_DRAWDOWN_FRAC*BANKROLL:,.0f})"],
@@ -1304,11 +1326,20 @@ def main() -> int:
         )
     )
 
-    # Realizado (OOS) no cenário máximo e diagnóstico de eficiência vs escala
-    if not weekly_max.empty:
-        profit_max_tot = float(weekly_max["profit_max"].sum())
-        stake_max_tot = float(weekly_max["stake_max"].sum())
-        roi_max_on_stake = float(profit_max_tot / stake_max_tot) if stake_max_tot > 0 else float("nan")
+    # Realizado (OOS) no cenário máximo — usar o mesmo alvo do forecast_max para evitar inconsistências
+    profit_max_tot = stake_max_tot = roi_max_on_stake = float("nan")
+    if FORECAST_CALIB_MAX.exists():
+        try:
+            fcmax0 = pd.read_csv(FORECAST_CALIB_MAX)
+            if not fcmax0.empty and {"pnl_max_theoretical", "stake_max_theoretical"}.issubset(set(fcmax0.columns)):
+                profit_max_tot = float(np.sum(fcmax0["pnl_max_theoretical"].to_numpy(dtype=float)))
+                stake_max_tot = float(np.sum(fcmax0["stake_max_theoretical"].to_numpy(dtype=float)))
+                roi_max_on_stake = float(profit_max_tot / stake_max_tot) if stake_max_tot > 0 else float("nan")
+                max_week_stats = compute_weekly_stats(fcmax0["pnl_max_theoretical"].to_numpy(dtype=float))
+        except Exception:
+            pass
+
+    if np.isfinite(profit_max_tot):
         story.append(Spacer(1, 0.2 * cm))
         t_realmax = Table(
             [
