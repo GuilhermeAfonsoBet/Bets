@@ -1047,6 +1047,8 @@ def main() -> int:
                     "HYSTERESIS_ENABLED": globals().get("HYSTERESIS_ENABLED"),
                     "REQUIRE_POST_Q_OBJ_POS": globals().get("REQUIRE_POST_Q_OBJ_POS"),
                     "REQUIRE_POST_Q_GATE_POS": globals().get("REQUIRE_POST_Q_GATE_POS"),
+                    "POST_Q_OBJ": globals().get("POST_Q_OBJ"),
+                    "MIN_POST_P_MEAN_POS": globals().get("MIN_POST_P_MEAN_POS"),
                 }
                 for k, v in kwargs.items():
                     globals()[k] = v
@@ -1088,6 +1090,36 @@ def main() -> int:
             weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
             daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
+
+    pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
+
+    # ------------------------
+    # Modo escolhido (pedido): p10_p70 em cima de roll12 + robust + histerese
+    # ------------------------
+    with _with_globals(
+        ROBUST_CUTOFF_ENABLED=True,
+        HYSTERESIS_ENABLED=True,
+        REQUIRE_POST_Q_OBJ_POS=False,
+        REQUIRE_POST_Q_GATE_POS=False,
+        POST_Q_OBJ=0.10,
+        MIN_POST_P_MEAN_POS=0.70,
+    ):
+        exp_name = "global_bayes_roll12_robust_p10_p70"
+        rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+            global_risk=True,
+            bayes_select=True,
+            segment_calib=False,
+            disable_top_k=0,
+            train_window_weeks=12,
+            regime_lookback_weeks=None,
+            regime_alpha_bad=1.0,
+        )
+        rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+        weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+        weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+        weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+        daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+        _summarize_mode(exp_name, weekly_df)
 
     pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
 

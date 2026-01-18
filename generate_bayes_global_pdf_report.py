@@ -28,6 +28,7 @@ import pandas as pd
 
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
+MODE = "global_bayes_roll12_robust_p10_p70"
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
 CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
@@ -35,17 +36,17 @@ CALIB_FLOOR_SEXDOM = 0.005
 CALIB_FLOOR_SEGQUI = 0.005
 
 PORT_FIXED = OUT_DIR / "portfolio_pro_all.json"
-WF_WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
-WF_DAILY = OUT_DIR / "oos_walkforward_global_bayes_daily.csv"
-WF_RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
+WF_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
+WF_DAILY = OUT_DIR / f"oos_walkforward_{MODE}_daily.csv"
+WF_RULES = OUT_DIR / f"oos_walkforward_{MODE}_selected_rules.csv"
 COMPARISON = OUT_DIR / "portfolio_refined_global_bayes_full_comparison.csv"
-FORECAST_CALIB = OUT_DIR / "forecast_calibration_global_bayes.csv"
-FORECAST_CALIB_BY_RULE = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
-FORECAST_CALIB_MAX = OUT_DIR / "forecast_calibration_global_bayes_max.csv"
+FORECAST_CALIB = OUT_DIR / f"forecast_calibration_{MODE}.csv"
+FORECAST_CALIB_BY_RULE = OUT_DIR / f"forecast_calibration_{MODE}_by_rule_summary.csv"
+FORECAST_CALIB_MAX = OUT_DIR / f"forecast_calibration_{MODE}_max.csv"
 FORECAST_CALIB_ONLINE = OUT_DIR / "forecast_calibration_global_bayes_online_bias.csv"
 BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
 BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
-OOS_GATE_WEEKLY = OUT_DIR / "oos_postfilter_debiased_roi_weekly.csv"
+OOS_GATE_WEEKLY = OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_weekly.csv"
 
 BANKROLL = 2300.0
 # mesmos limites do otimizador
@@ -815,6 +816,13 @@ def main() -> int:
     # calcula regras "as-of now" usando o mesmo código do WF
     try:
         import evaluate_oos_walkforward_strategy as wf  # usa as mesmas funções/constantes
+        # alinhar hiperparâmetros ao modo escolhido (p10_p70)
+        wf.POST_Q_OBJ = 0.10
+        wf.MIN_POST_P_MEAN_POS = 0.70
+        wf.ROBUST_CUTOFF_ENABLED = True
+        wf.HYSTERESIS_ENABLED = True
+        wf.HYST_P_SWITCH = 0.90
+        wf.ROBUST_CUTOFF_DELTA = 0.02
 
         df_fwd = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
         df_fwd["roi_raw"] = pd.to_numeric(df_fwd["ROI Real"], errors="coerce").astype(float)

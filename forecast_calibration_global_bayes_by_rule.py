@@ -23,6 +23,7 @@ Saídas:
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -33,8 +34,19 @@ import json
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 
-RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
-WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
+def _safe_mode(s: str) -> str:
+    s = str(s).strip()
+    return "".join(ch for ch in s if ch.isalnum() or ch in {"_", "-"}).strip("_")
+
+
+def _paths_for_mode(mode: str) -> tuple[Path, Path, Path, Path, Path]:
+    m = _safe_mode(mode)
+    rules = OUT_DIR / f"oos_walkforward_{m}_selected_rules.csv"
+    weekly = OUT_DIR / f"oos_walkforward_{m}_weekly.csv"
+    out_csv = OUT_DIR / f"forecast_calibration_{m}_by_rule.csv"
+    out_sum = OUT_DIR / f"forecast_calibration_{m}_by_rule_summary.csv"
+    out_md = OUT_DIR / f"forecast_calibration_{m}_by_rule.md"
+    return rules, weekly, out_csv, out_sum, out_md
 
 BANKROLL = 2300.0
 N_DRAWS = 10_000
@@ -129,6 +141,11 @@ def _empirical_bayes_shrink(means: np.ndarray, se2: np.ndarray) -> Tuple[float, 
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="global_bayes", help="Prefixo do modo do WF (ex.: global_bayes_roll12_robust_p10_p70)")
+    args = ap.parse_args()
+
+    RULES, WEEKLY, out_path, sum_path, md_path = _paths_for_mode(args.mode)
     rules = pd.read_csv(RULES)
     wf_week = pd.read_csv(WEEKLY)
 
@@ -255,7 +272,6 @@ def main() -> int:
             )
 
     out = pd.DataFrame(out_rows)
-    out_path = OUT_DIR / "forecast_calibration_global_bayes_by_rule.csv"
     out.to_csv(out_path, index=False)
 
     # summary + shrinkage
@@ -324,7 +340,6 @@ def main() -> int:
         g["bias_pnl_shrunk_mu0"] = float("nan")
         g["bias_pnl_shrunk_tau2"] = float("nan")
 
-    sum_path = OUT_DIR / "forecast_calibration_global_bayes_by_rule_summary.csv"
     g.sort_values(["rule_key"]).to_csv(sum_path, index=False)
 
     # markdown report
@@ -343,10 +358,10 @@ def main() -> int:
     lines.append(f"- CSV (por semana e segmento): `analysis_proba_raw/pro_portfolio_all/{out_path.name}`\n")
     lines.append(f"- CSV (resumo + shrinkage): `analysis_proba_raw/pro_portfolio_all/{sum_path.name}`\n")
 
-    (OUT_DIR / "forecast_calibration_global_bayes_by_rule.md").write_text("".join(lines), encoding="utf-8")
+    md_path.write_text("".join(lines), encoding="utf-8")
     print(str(out_path))
     print(str(sum_path))
-    print(str(OUT_DIR / "forecast_calibration_global_bayes_by_rule.md"))
+    print(str(md_path))
     return 0
 
 

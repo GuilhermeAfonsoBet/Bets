@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 import json
 from pathlib import Path
+import argparse
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -35,8 +36,18 @@ CALIB_FLOOR_SEXDOM = 0.005
 CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
 CALIB_FLOOR_SEGQUI = 0.005
 
-RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
-WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
+def _safe_mode(s: str) -> str:
+    s = str(s).strip()
+    return "".join(ch for ch in s if ch.isalnum() or ch in {"_", "-"}).strip("_")
+
+
+def _paths_for_mode(mode: str) -> tuple[Path, Path, Path, Path]:
+    m = _safe_mode(mode)
+    rules = OUT_DIR / f"oos_walkforward_{m}_selected_rules.csv"
+    weekly = OUT_DIR / f"oos_walkforward_{m}_weekly.csv"
+    out_csv = OUT_DIR / f"forecast_calibration_{m}.csv"
+    out_md = OUT_DIR / f"forecast_calibration_{m}.md"
+    return rules, weekly, out_csv, out_md
 
 BANKROLL = 2300.0
 
@@ -141,6 +152,11 @@ def crps_from_sample(draws: np.ndarray, y: float) -> float:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="global_bayes", help="Prefixo do modo do WF (ex.: global_bayes_roll12_robust_p10_p70)")
+    args = ap.parse_args()
+
+    RULES, WEEKLY, OUT_CSV, OUT_MD = _paths_for_mode(args.mode)
     rules = pd.read_csv(RULES)
     wf_week = pd.read_csv(WEEKLY)
 
@@ -273,7 +289,7 @@ def main() -> int:
         )
 
     out = pd.DataFrame(out_rows)
-    out_path = OUT_DIR / "forecast_calibration_global_bayes.csv"
+    out_path = OUT_CSV
     out.to_csv(out_path, index=False)
 
     # aggregate diagnostics
@@ -321,9 +337,9 @@ def main() -> int:
     md.append(f"- CRPS médio (aprox): **{crps_mean:,.1f}** (menor é melhor)\n\n")
     md.append("### Arquivos\n")
     md.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/{out_path.name}`\n")
-    (OUT_DIR / "forecast_calibration_global_bayes.md").write_text("".join(md), encoding="utf-8")
+    OUT_MD.write_text("".join(md), encoding="utf-8")
     print(str(out_path))
-    print(str(OUT_DIR / "forecast_calibration_global_bayes.md"))
+    print(str(OUT_MD))
     return 0
 
 

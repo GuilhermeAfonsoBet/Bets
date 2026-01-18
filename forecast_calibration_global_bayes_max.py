@@ -18,6 +18,7 @@ Saídas:
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 from typing import List, Tuple
 
 import numpy as np
@@ -27,8 +28,18 @@ import json
 
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
-RULES = OUT_DIR / "oos_walkforward_global_bayes_selected_rules.csv"
-WEEKLY = OUT_DIR / "oos_walkforward_global_bayes_weekly.csv"
+def _safe_mode(s: str) -> str:
+    s = str(s).strip()
+    return "".join(ch for ch in s if ch.isalnum() or ch in {"_", "-"}).strip("_")
+
+
+def _paths_for_mode(mode: str) -> tuple[Path, Path, Path, Path]:
+    m = _safe_mode(mode)
+    rules = OUT_DIR / f"oos_walkforward_{m}_selected_rules.csv"
+    weekly = OUT_DIR / f"oos_walkforward_{m}_weekly.csv"
+    out_csv = OUT_DIR / f"forecast_calibration_{m}_max.csv"
+    out_md = OUT_DIR / f"forecast_calibration_{m}_max.md"
+    return rules, weekly, out_csv, out_md
 CALIB_SEXDOM = Path("/workspace/clv_calib_SexDom.json")
 CALIB_FLOOR_SEXDOM = 0.005
 CALIB_SEGQUI = Path("/workspace/clv_calib_SegQui.json")
@@ -111,6 +122,11 @@ def apply_rules_max(df: pd.DataFrame, rules_week: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="global_bayes", help="Prefixo do modo do WF (ex.: global_bayes_roll12_robust_p10_p70)")
+    args = ap.parse_args()
+
+    RULES, WEEKLY, OUT_CSV, OUT_MD = _paths_for_mode(args.mode)
     rules = pd.read_csv(RULES)
     wf_week = pd.read_csv(WEEKLY)
 
@@ -217,7 +233,7 @@ def main() -> int:
         )
 
     out = pd.DataFrame(out_rows)
-    out_path = OUT_DIR / "forecast_calibration_global_bayes_max.csv"
+    out_path = OUT_CSV
     out.to_csv(out_path, index=False)
 
     # summary md
@@ -234,9 +250,9 @@ def main() -> int:
     lines.append(f"- Bias (y - pred) (máx): **USD {bias:,.1f}**\n")
     lines.append(f"- E[pred_mean]+Bias (máx): **USD {pred_mean_cal:,.1f}**\n")
     lines.append(f"- Coverage 80% (p10..p90): **{cov80*100:.1f}%**\n")
-    (OUT_DIR / "forecast_calibration_global_bayes_max.md").write_text("".join(lines), encoding="utf-8")
+    OUT_MD.write_text("".join(lines), encoding="utf-8")
     print(str(out_path))
-    print(str(OUT_DIR / "forecast_calibration_global_bayes_max.md"))
+    print(str(OUT_MD))
     return 0
 
 
