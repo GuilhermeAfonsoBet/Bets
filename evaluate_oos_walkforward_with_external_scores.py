@@ -24,7 +24,7 @@ import evaluate_oos_walkforward_strategy as wf
 
 
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
-SCORES = Path("/workspace/analysis_proba_raw/pro_portfolio_all/scored_with_score_v1_wf12.csv")
+SCORES = Path("/workspace/analysis_proba_raw/pro_portfolio_all/scored_with_score_v1_payload_wf12.csv")
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 
 TRAIN_WINDOW_WEEKS = 12
@@ -137,18 +137,22 @@ def main() -> int:
     df = _ensure_calibrated_cols(df)
 
     scores = pd.read_csv(SCORES, parse_dates=["BIA_ApostaUTC"])
-    scores = scores[["ID Aposta", "score_v1_cls_logit_wf12", "score_v1_cls_hgb_wf12"]].copy()
+    scores = scores[["ID Aposta", "score_v1_payload_sgd_wf12", "score_v1_payload_region_sgd_wf12"]].copy()
     df = df.merge(scores, how="left", on="ID Aposta")
 
     wk_cur, sum_fn = _run_wf(df, wf.segment_score_col)
     sum_cur = sum_fn("score_current")
     wk_cur.to_csv(OUT_DIR / "oos_walkforward_score_current_p10_p70_weekly.csv", index=False)
 
-    wk_logit, sum_fn = _run_wf(df, lambda _dow: "score_v1_cls_logit_wf12")
-    sum_logit = sum_fn("score_v1_cls_logit_wf12")
-    wk_logit.to_csv(OUT_DIR / "oos_walkforward_scorev1_logit_wf12_p10_p70_weekly.csv", index=False)
+    wk_p, sum_fn = _run_wf(df, lambda _dow: "score_v1_payload_sgd_wf12")
+    sum_p = sum_fn("score_v1_payload_sgd_wf12")
+    wk_p.to_csv(OUT_DIR / "oos_walkforward_scorev1_payload_sgd_wf12_p10_p70_weekly.csv", index=False)
 
-    summary = pd.concat([sum_cur, sum_logit], axis=0, ignore_index=True)
+    wk_pr, sum_fn = _run_wf(df, lambda _dow: "score_v1_payload_region_sgd_wf12")
+    sum_pr = sum_fn("score_v1_payload_region_sgd_wf12")
+    wk_pr.to_csv(OUT_DIR / "oos_walkforward_scorev1_payload_region_sgd_wf12_p10_p70_weekly.csv", index=False)
+
+    summary = pd.concat([sum_cur, sum_p, sum_pr], axis=0, ignore_index=True)
     out_sum = OUT_DIR / "oos_walkforward_score_compare_wf12_p10_p70_summary.csv"
     summary.to_csv(out_sum, index=False)
     print(str(out_sum))
