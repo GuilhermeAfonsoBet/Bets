@@ -26,7 +26,7 @@ import pandas as pd
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 
@@ -360,6 +360,9 @@ def main() -> int:
     dist_cap2, dist_raw = _train_weekly_distribution_multi(df_train, r_act, alpha=alpha, train_weeks=train_weeks, bankroll=BANKROLL_BASE) if train_weeks else ({}, {})
 
     styles = getSampleStyleSheet()
+    style_small = ParagraphStyle("small", parent=styles["Normal"], fontSize=7, leading=8)
+    def Psmall(s: str) -> Paragraph:
+        return Paragraph(str(s), style_small)
     story = []
     story.append(Paragraph("Análise da Semana (12–18/01/2026)", styles["Title"]))
     story.append(Paragraph(f"Semana (W-SUN): <b>{ws.key}</b>", styles["Normal"]))
@@ -451,42 +454,37 @@ def main() -> int:
         story.append(Paragraph("Sem histórico suficiente de treino para estimar distribuição esperada.", styles["Normal"]))
     else:
         exp_tbl = [
-            ["Variante", "Realizado", "Esperado (mean)", "Esperado (p10/p50/p90)"],
+            [Psmall("<b>Variante</b>"), Psmall("<b>Realizado</b>"), Psmall("<b>Esperado (mean)</b>"), Psmall("<b>Esperado (p10/p50/p90)</b>")],
             [
-                "cap2",
-                f"PnL {fmt_money(cap2_official_pnl)} | stake {fmt_money(cap2_official_stake)} | n {cap2_official_n} | ROI {fmt_pct(cap2_official_roi)}",
-                f"PnL {fmt_money(dist_cap2['mean_pnl'])} | stake {fmt_money(dist_cap2['mean_stake'])} | n {dist_cap2['mean_n_bets']:.1f} | ROI {dist_cap2['mean_roi']:.4f}",
-                f"PnL {fmt_money(dist_cap2['p10_pnl'])}/{fmt_money(dist_cap2['p50_pnl'])}/{fmt_money(dist_cap2['p90_pnl'])} | "
-                f"stake {fmt_money(dist_cap2['p10_stake'])}/{fmt_money(dist_cap2['p50_stake'])}/{fmt_money(dist_cap2['p90_stake'])} | "
-                f"n {dist_cap2['p10_n_bets']:.1f}/{dist_cap2['p50_n_bets']:.1f}/{dist_cap2['p90_n_bets']:.1f} | "
-                f"ROI {dist_cap2['p10_roi']:.4f}/{dist_cap2['p50_roi']:.4f}/{dist_cap2['p90_roi']:.4f}",
+                Psmall("cap2"),
+                Psmall(
+                    f"PnL {fmt_money(cap2_official_pnl)}<br/>stake {fmt_money(cap2_official_stake)}<br/>n {cap2_official_n}<br/>ROI {fmt_pct(cap2_official_roi)}"
+                ),
+                Psmall(
+                    f"PnL {fmt_money(dist_cap2['mean_pnl'])}<br/>stake {fmt_money(dist_cap2['mean_stake'])}<br/>n {dist_cap2['mean_n_bets']:.1f}<br/>ROI {dist_cap2['mean_roi']:.4f}"
+                ),
+                Psmall(
+                    f"PnL {fmt_money(dist_cap2['p10_pnl'])}/{fmt_money(dist_cap2['p50_pnl'])}/{fmt_money(dist_cap2['p90_pnl'])}<br/>"
+                    f"stake {fmt_money(dist_cap2['p10_stake'])}/{fmt_money(dist_cap2['p50_stake'])}/{fmt_money(dist_cap2['p90_stake'])}<br/>"
+                    f"n {dist_cap2['p10_n_bets']:.1f}/{dist_cap2['p50_n_bets']:.1f}/{dist_cap2['p90_n_bets']:.1f}<br/>"
+                    f"ROI {dist_cap2['p10_roi']:.4f}/{dist_cap2['p50_roi']:.4f}/{dist_cap2['p90_roi']:.4f}"
+                ),
             ],
             [
-                "sem cap",
-                f"PnL {fmt_money(pnl_calc)} | stake {fmt_money(stake_sel)} | n {n_bets_sel} | ROI {fmt_pct(roi_calc)}",
-                f"PnL {fmt_money(dist_raw['mean_pnl'])} | stake {fmt_money(dist_raw['mean_stake'])} | n {dist_raw['mean_n_bets']:.1f} | ROI {dist_raw['mean_roi']:.4f}",
-                f"PnL {fmt_money(dist_raw['p10_pnl'])}/{fmt_money(dist_raw['p50_pnl'])}/{fmt_money(dist_raw['p90_pnl'])} | "
-                f"stake {fmt_money(dist_raw['p10_stake'])}/{fmt_money(dist_raw['p50_stake'])}/{fmt_money(dist_raw['p90_stake'])} | "
-                f"n {dist_raw['p10_n_bets']:.1f}/{dist_raw['p50_n_bets']:.1f}/{dist_raw['p90_n_bets']:.1f} | "
-                f"ROI {dist_raw['p10_roi']:.4f}/{dist_raw['p50_roi']:.4f}/{dist_raw['p90_roi']:.4f}",
+                Psmall("sem cap"),
+                Psmall(f"PnL {fmt_money(pnl_calc)}<br/>stake {fmt_money(stake_sel)}<br/>n {n_bets_sel}<br/>ROI {fmt_pct(roi_calc)}"),
+                Psmall(
+                    f"PnL {fmt_money(dist_raw['mean_pnl'])}<br/>stake {fmt_money(dist_raw['mean_stake'])}<br/>n {dist_raw['mean_n_bets']:.1f}<br/>ROI {dist_raw['mean_roi']:.4f}"
+                ),
+                Psmall(
+                    f"PnL {fmt_money(dist_raw['p10_pnl'])}/{fmt_money(dist_raw['p50_pnl'])}/{fmt_money(dist_raw['p90_pnl'])}<br/>"
+                    f"stake {fmt_money(dist_raw['p10_stake'])}/{fmt_money(dist_raw['p50_stake'])}/{fmt_money(dist_raw['p90_stake'])}<br/>"
+                    f"n {dist_raw['p10_n_bets']:.1f}/{dist_raw['p50_n_bets']:.1f}/{dist_raw['p90_n_bets']:.1f}<br/>"
+                    f"ROI {dist_raw['p10_roi']:.4f}/{dist_raw['p50_roi']:.4f}/{dist_raw['p90_roi']:.4f}"
+                ),
             ],
         ]
-        texp = Table(exp_tbl, colWidths=[50, 170, 135, 125], repeatRows=1)
-        texp.setStyle(
-            TableStyle(
-                [
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
-                    ("LEADING", (0, 0), (-1, -1), 8),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ]
-            )
-        )
-        # garantir layout compacto (sem colunas invadindo)
-        texp = tbl_compact(exp_tbl, col_widths=[52, 170, 120, 138])
-        story.append(texp)
+        story.append(tbl_compact(exp_tbl, col_widths=[45, 175, 125, 135]))
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("Score vs ROI (apenas apostas selecionadas na semana)", styles["Heading2"]))

@@ -418,7 +418,10 @@ def main() -> int:
     # - Calcula banca necessária para que stake0 = banca*stake_frac >= house_cap em (p95 e max).
     # -------------------------
     df_all = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
-    df_all["roi_raw"] = pd.to_numeric(df_all["ROI Real"], errors="coerce").astype(float)
+    # ROI correto (auditoria): usar roi_calc, não a coluna "ROI Real" da planilha.
+    if "roi_calc" not in df_all.columns:
+        raise KeyError("Coluna roi_calc ausente no scored_dedup_proba_raw_all.csv (regerar artefato).")
+    df_all["roi_raw"] = pd.to_numeric(df_all["roi_calc"], errors="coerce").astype(float)
     df_all["roi_cap2"] = np.minimum(df_all["roi_raw"].to_numpy(dtype=float), 2.0)
     df_all["house_cap"] = pd.to_numeric(df_all["house_cap"], errors="coerce").astype(float)
     df_all["week"] = pd.to_datetime(df_all["BIA_ApostaUTC"]).dt.to_period("W-SUN").astype(str)
@@ -440,6 +443,7 @@ def main() -> int:
 
     # build rules map per week
     max_rows = []
+    sel_bets_rows = []  # para análise de eficiência vs escala (por aposta selecionada)
     bank_reqs = []
     for wk, g in r.groupby("test_week", sort=False):
         wk = str(wk)
@@ -477,6 +481,22 @@ def main() -> int:
             profit_max = stake_eff_max * roi_sel
 
             max_rows.append({"week": wk, "rule_key": rk, "stake_cur": float(stake_eff_cur.sum()), "profit_cur": float(profit_cur.sum()), "stake_max": float(stake_eff_max.sum()), "profit_max": float(profit_max.sum())})
+            # detalhamento por aposta (apenas selecionadas) para estatística de eficiência/escala
+            try:
+                sel_bets_rows.append(
+                    pd.DataFrame(
+                        {
+                            "week": wk,
+                            "rule_key": rk,
+                            "house_cap": cap_sel.astype(float),
+                            "roi_cap2": roi_sel.astype(float),
+                            "stake_eff_cur": stake_eff_cur.astype(float),
+                            "stake_eff_max": stake_eff_max.astype(float),
+                        }
+                    )
+                )
+            except Exception:
+                pass
 
             # banca necessária para não limitar (alpha=1): banca >= house_cap / stake_frac
             # (ignorando α, pois em banca grande α tende a 1 e o limitante vira o cap)
@@ -493,6 +513,8 @@ def main() -> int:
     else:
         weekly_max = pd.DataFrame()
         max_week_stats = {"n": 0}
+
+    sel_bets = pd.concat(sel_bets_rows, axis=0, ignore_index=True) if sel_bets_rows else pd.DataFrame()
 
     if bank_reqs:
         bank_reqs = np.asarray(bank_reqs, dtype=float)
@@ -1159,6 +1181,35 @@ def main() -> int:
                 )
             )
 
+        # experimento: região como dimensão do portfólio (gating por região, OOS)
+        try:
+            rg_sum_path = OUT_DIR / "oos_walkforward_region_gating_summary.csv"
+            if rg_sum_path.exists():
+                rg = pd.read_csv(rg_sum_path)
+                if not rg.empty and {"name", "profit_cap2_total", "roi_total_cap2", "stake_total"}.issubset(set(rg.columns)):
+                    b = rg[rg["name"] == "baseline"].iloc[0] if bool((rg["name"] == "baseline").any()) else None
+                    g2 = rg[rg["name"] == "region_gating"].iloc[0] if bool((rg["name"] == "region_gating").any()) else None
+                    if b is not None and g2 is not None:
+                        story.append(Spacer(1, 0.25 * cm))
+                        story.append(Paragraph("<b>Experimento: usar região na otimização do portfólio (não no score)</b>", styles["Heading3"]))
+                        story.append(
+                            Paragraph(
+                                "Testamos um pós-filtro OOS por <b>região do evento</b>: em cada semana, estimamos no treino o ROI_cap2 médio por região "
+                                "(condicional ao segmento e ao cutoff) e desligamos regiões com média ≤ 0. "
+                                "<b>Resultado:</b> na amostra, o gating por região não melhorou o agregado.",
+                                styles["BodyText"],
+                            )
+                        )
+                        story.append(
+                            Paragraph(
+                                f"Baseline: lucro={float(b['profit_cap2_total']):,.1f}, stake={float(b['stake_total']):,.0f}, ROI/$={float(b['roi_total_cap2']):.4f}. "
+                                f"Região-gating: lucro={float(g2['profit_cap2_total']):,.1f}, stake={float(g2['stake_total']):,.0f}, ROI/$={float(g2['roi_total_cap2']):.4f}.",
+                                styles["BodyText"],
+                            )
+                        )
+        except Exception:
+            pass
+
     # weekly quantiles section
     story.append(Spacer(1, 0.3 * cm))
     story.append(
@@ -1252,6 +1303,72 @@ def main() -> int:
             styles["BodyText"],
         )
     )
+
+    # Realizado (OOS) no cenário máximo e diagnóstico de eficiência vs escala
+    if not weekly_max.empty:
+        profit_max_tot = float(weekly_max["profit_max"].sum())
+        stake_max_tot = float(weekly_max["stake_max"].sum())
+        roi_max_on_stake = float(profit_max_tot / stake_max_tot) if stake_max_tot > 0 else float("nan")
+        story.append(Spacer(1, 0.2 * cm))
+        t_realmax = Table(
+            [
+                ["Métrica", "Valor (realizado OOS, cap2)"],
+                ["Lucro total (stake_eff_max = house_cap)", f"USD {profit_max_tot:,.1f}"],
+                ["Lucro médio semanal", f"USD {max_week_stats.get('mean', float('nan')):,.1f}"],
+                ["Std semanal", f"USD {max_week_stats.get('std', float('nan')):,.1f}"],
+                ["Sharpe anualizado", f"{max_week_stats.get('sharpe_annual', float('nan')):.3f}"],
+                ["ROI por $ (turnover)", f"{roi_max_on_stake:.4f}" if np.isfinite(roi_max_on_stake) else "nan"],
+                ["P(semana<0)", f"{max_week_stats.get('pneg', float('nan'))*100:.1f}%"],
+            ],
+            colWidths=[7.5 * cm, 9.5 * cm],
+        )
+        t_realmax.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        story.append(t_realmax)
+
+        if not sel_bets.empty and {"house_cap", "roi_cap2", "stake_eff_max"}.issubset(set(sel_bets.columns)):
+            # binned ROI vs house_cap (proxy de escala)
+            sb = sel_bets.copy()
+            sb = sb[np.isfinite(sb["house_cap"]) & np.isfinite(sb["roi_cap2"]) & (sb["house_cap"] > 0)].copy()
+            story.append(Spacer(1, 0.15 * cm))
+            story.append(
+                Paragraph(
+                    "<b>Diagnóstico: perda de eficiência vs escala (proxy: house_cap)</b><br/>"
+                    "Abaixo, agrupamos apostas selecionadas (todas as semanas OOS) por quintis de <b>house_cap</b> "
+                    "e reportamos ROI_cap2 médio. Se o ROI cair sistematicamente em stakes maiores, isso indica perda de eficiência ao escalar.",
+                    styles["BodyText"],
+                )
+            )
+            if len(sb) >= 50:
+                try:
+                    q = np.quantile(sb["house_cap"].to_numpy(float), [0, 0.2, 0.4, 0.6, 0.8, 1.0])
+                    # bins
+                    rows = [["Quintil house_cap", "n", "house_cap médio", "ROI_cap2 médio"]]
+                    for i in range(5):
+                        lo, hi = float(q[i]), float(q[i + 1])
+                        m = (sb["house_cap"] >= lo) & (sb["house_cap"] <= hi) if i == 4 else ((sb["house_cap"] >= lo) & (sb["house_cap"] < hi))
+                        if not bool(np.any(m)):
+                            continue
+                        rows.append(
+                            [
+                                f"[{lo:,.0f}, {hi:,.0f}]",
+                                str(int(m.sum())),
+                                f"{float(sb.loc[m, 'house_cap'].mean()):,.0f}",
+                                f"{float(sb.loc[m, 'roi_cap2'].mean()):.4f}",
+                            ]
+                        )
+                    story.append(Table(rows, colWidths=[4.0 * cm, 1.0 * cm, 4.0 * cm, 4.0 * cm], style=TableStyle([("GRID",(0,0),(-1,-1),0.25,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"TOP")])))
+                except Exception:
+                    pass
     # A pedido: mostrar apenas números bias-corrected (forecast) para retornos do cenário máximo
     if FORECAST_CALIB_MAX.exists():
         fcmax = pd.read_csv(FORECAST_CALIB_MAX)
@@ -1430,10 +1547,55 @@ def main() -> int:
     story.append(Paragraph("<b>7. Análise de investimento (se fosse meu dinheiro)</b>", styles["Heading2"]))
     story.append(
         Paragraph(
-            "Com os dados atuais, eu trataria este portfólio como um ativo com evidência inicial de edge, mas ainda com incerteza material: "
-            "o IC95% do PnL semanal no walk-forward ainda cruza zero e o período OOS real (2026) é curto. "
-            "Eu investiria apenas com sizing conservador (fração pequena da banca alvo), operação monitorada (especialmente risco diário) e reotimização semanal, "
-            "até acumular mais semanas OOS para confirmar estabilidade.",
+            "A decisão de investimento aqui depende menos de ‘achar um ROI médio bonito’ e mais de <b>robustez</b>: "
+            "capacidade de manter resultado positivo quando (i) o regime muda, (ii) o sizing escala, e (iii) a execução encontra limites (house_cap).",
+            styles["BodyText"],
+        )
+    )
+    story.append(
+        Paragraph(
+            f"<b>Cenário banca USD {BANKROLL:,.0f}</b> (realizado OOS, cap2): "
+            f"Sharpe_ann≈<b>{wstats.get('sharpe_annual', float('nan')):.3f}</b>, "
+            f"ROI/$≈<b>{roi_on_stake:.4f}</b>, "
+            f"P(semana&lt;0)≈<b>{wstats.get('pneg', float('nan'))*100:.1f}%</b>. "
+            "Isso é um sinal de estratégia ‘razoável’ (não explosiva), mas ainda com semanas negativas frequentes.",
+            styles["BodyText"],
+        )
+    )
+    if not weekly_max.empty:
+        story.append(
+            Paragraph(
+                f"<b>Cenário escalado (stake_eff_max = house_cap)</b> (realizado OOS, cap2): "
+                f"Sharpe_ann≈<b>{max_week_stats.get('sharpe_annual', float('nan')):.3f}</b>, "
+                f"P(semana&lt;0)≈<b>{max_week_stats.get('pneg', float('nan'))*100:.1f}%</b>. "
+                "Este cenário é crítico: ele mostra o que acontece quando a banca deixa de ser o limitante e a execução passa a reponderar apostas por house_cap.",
+                styles["BodyText"],
+            )
+        )
+    story.append(
+        Paragraph(
+            "<b>Pontos fortes (o que me faria considerar investir)</b>:<br/>"
+            "1) Processo OOS walk-forward semanal (evita in-sample estático).<br/>"
+            "2) Constraints explícitas de risco diário e controle de exposição via α global (disciplina de risco).<br/>"
+            "3) Pipeline auditável (scores reprodutíveis e ROI calculado por odds+resultado).",
+            styles["BodyText"],
+        )
+    )
+    story.append(
+        Paragraph(
+            "<b>Pontos frágeis (o que pode matar o investimento)</b>:<br/>"
+            "1) <b>Escala</b>: ao escalar, o portfólio pode piorar porque bets de maior house_cap não necessariamente têm o mesmo edge (efeito de re-weight).<br/>"
+            "2) <b>Curto histórico OOS efetivo</b> (16 semanas): estabilidade ainda é incerta e overfitting residual é possível.<br/>"
+            "3) <b>Dependência operacional</b>: latência/qualidade do payload/execução e mudanças de mercado afetam diretamente o edge.",
+            styles["BodyText"],
+        )
+    )
+    story.append(
+        Paragraph(
+            "<b>Minha recomendação</b>: eu investiria <b>com restrições</b> — não como ‘gestora pronta’, mas como um ativo em fase de validação, "
+            "com capital inicial limitado, metas de evidência (mais semanas OOS), e gatilhos de desligamento (drawdown/instabilidade). "
+            "Para captação grande, eu exigiria: (i) demonstração de estabilidade por mais semanas OOS, (ii) evidência de que a escala não destrói o edge "
+            "ou um plano de execução/segmentação que controle essa perda, e (iii) governança de risco (limites e auditoria) formalizada.",
             styles["BodyText"],
         )
     )
