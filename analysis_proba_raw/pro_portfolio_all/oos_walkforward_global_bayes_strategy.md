@@ -4,18 +4,18 @@
 - **Modo global**: aplica um fator α (0..1) multiplicando todos os stakes para satisfazer constraints do portfólio agregado no treino de cada passo.
 
 ### Performance OOS (cap2) — portfólio agregado
-- **PnL semanal médio (bootstrap IC95%)**: **USD -53.2** (IC95% -214.1..100.5)
-- **Desvio padrão semanal**: USD 332.9
+- **PnL semanal médio (bootstrap IC95%)**: **USD -59.0** (IC95% -219.8..95.7)
+- **Desvio padrão semanal**: USD 333.0
 - **P(semana < 0)**: 43.8%
 
 ### Performance OOS (cap2) — excluindo semanas sem trades (stake=0)
-- **PnL semanal médio (bootstrap IC95%)**: **USD -71.0** (IC95% -286.3..135.3)
-- **Desvio padrão semanal**: USD 387.0
+- **PnL semanal médio (bootstrap IC95%)**: **USD -78.7** (IC95% -293.1..127.6)
+- **Desvio padrão semanal**: USD 386.7
 - **P(semana < 0)**: 58.3%
-- **ROI on stake agregado (ponderado)**: -0.0381
+- **ROI on stake agregado (ponderado)**: -0.0420
 
 ### Risco no OOS (teste) — portfólio agregado
-- p80(soma stakes/dia) = USD 1030 (limite=USD 1610)
+- p80(soma stakes/dia) = USD 1033 (limite=USD 1610)
 - VaR10%(PnL diário) = USD -255.7 (limite >= USD -575)
 - P(PnL diário <= -25% banca) = 0.0% (limite <= 10%)
 
@@ -42,7 +42,7 @@
 
 ### Segmentos mais estáveis no OOS (por lucro semanal)
 - CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_global_bayes_segment_stability.csv`
-- **FT|terça-feira**: mean_week=27.5 (IC95% 3.3..56.0), P(semana>0)=25.0%
+- **FT|terça-feira**: mean_week=21.7 (IC95% -7.6..53.5), P(semana>0)=25.0%
 - **FT|segunda-feira**: mean_week=18.3 (IC95% -37.5..76.5), P(semana>0)=37.5%
 - **FH|quarta-feira**: mean_week=-5.0 (IC95% -15.1..0.0), P(semana>0)=0.0%
 - **FH|terça-feira**: mean_week=-5.6 (IC95% -12.9..0.0), P(semana>0)=0.0%

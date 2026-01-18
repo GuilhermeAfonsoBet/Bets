@@ -196,7 +196,7 @@ test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,s
 2025-12-29/2026-01-04,23,FH,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|sábado,0.0
 2025-12-29/2026-01-04,23,FH,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|domingo,0.0
 2026-01-05/2026-01-11,24,FT,segunda-feira,proba_raw_segunda,0.19,0.03,1.0,ok,FT|segunda-feira,0.0
-2026-01-05/2026-01-11,24,FT,terça-feira,proba_raw_terca,0.17,0.02,1.0,ok,FT|terça-feira,0.0
+2026-01-05/2026-01-11,24,FT,terça-feira,proba_raw_terca,0.13,0.02,1.0,ok,FT|terça-feira,0.0
 2026-01-05/2026-01-11,24,FT,quarta-feira,proba_raw_quarta,0.57,0.01,1.0,ok,FT|quarta-feira,0.0
 2026-01-05/2026-01-11,24,FT,quinta-feira,proba_cal_segqui,1.0,0.0,1.0,no_candidate,FT|quinta-feira,0.0
 2026-01-05/2026-01-11,24,FT,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sexta-feira,0.0
