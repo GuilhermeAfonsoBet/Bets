@@ -1,0 +1,3 @@
+name,profit_cap2_total,stake_total,roi_total_cap2,weeks_total,weeks_with_stake,mean_weekly_cap2_nonzero,pneg_weeks_nonzero
+score_current,156.37256034469578,15271.1001085639,0.010239770496757035,8,8,19.546570043086973,0.625
+score_v1_hgb_foldwise,1085.2558891985416,40930.263754069805,0.026514754356808456,8,8,135.6569861498177,0.375
