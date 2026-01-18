@@ -12,6 +12,8 @@ analysis_proba_raw/pro_portfolio_all/scored_with_score_v1_*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_scorev1_*_wf12_*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_score_compare_wf12_*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_region_gating_*.csv
+analysis_proba_raw/pro_portfolio_all/stat_tests_*.csv
+analysis_proba_raw/pro_portfolio_all/stat_tests_*.md
 
 # artefato grande gerado localmente
 scored_dedup_proba_raw_all.csv
