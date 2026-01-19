@@ -1096,23 +1096,29 @@ def main() -> int:
     fc_online_roi_bank_adj_typ_last5 = float(fc_online_roi_on_stake * turnover_typ_last5) if np.isfinite(fc_online_roi_on_stake) and np.isfinite(turnover_typ_last5) else float("nan")
     fc_online_roi_bank_adj_typ_last1 = float(fc_online_roi_on_stake * turnover_typ_last1) if np.isfinite(fc_online_roi_on_stake) and np.isfinite(turnover_typ_last1) else float("nan")
     exec_tbl = [
-        ["Métrica", "Valor (bias-corrected)"],
-        ["Previsto: média semanal (Bias on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "nan"],
-        ["Previsto: stake/sem (Bias on-line)", f"USD {fc_online_stake_mean:,.0f}" if np.isfinite(fc_online_stake_mean) else "—"],
-        ["Previsto: ROI por $ (Bias on-line)", f"{fc_online_roi_on_stake:.4f}" if np.isfinite(fc_online_roi_on_stake) else "—"],
-        ["Previsto: ROI banca/sem (Bias on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "nan"],
-        ["Previsto: ROI banca/sem (Bias on-line, ajustado por giro)", P(f"{fc_online_roi_bank_adj_typ_last1*100:.2f}% (giro última semana≈{turnover_typ_last1:.2f}×)<br/>{fc_online_roi_bank_adj_typ_last5*100:.2f}% (giro últimas 5 semanas≈{turnover_typ_last5:.2f}×)") if np.isfinite(fc_online_roi_bank_adj_typ_last1) and np.isfinite(fc_online_roi_bank_adj_typ_last5) else "—"],
-        ["Calibração (Bias on-line): coverage 80% (p10..p90, shifted)", f"{fc_online_cov80*100:.1f}%" if np.isfinite(fc_online_cov80) else "—"],
+        ["Métrica", "Valor"],
+        ["— (alvo) Realizado teórico OOS (auditoria) —", ""],
+        ["Realizado teórico: média semanal", f"USD {wstats.get('mean', float('nan')):,.1f}"],
+        ["Realizado teórico: stake/sem (média, inclui sem trade)", f"USD {stake_tot / float(wstats.get('n', 1) or 1):,.0f}" if stake_tot > 0 else "—"],
+        ["Realizado teórico: ROI por $ (PnL_total/Stake_total)", f"{roi_on_stake:.4f}" if np.isfinite(roi_on_stake) else "—"],
+        ["Realizado teórico: ROI banca/sem", f"{roi_bank_week*100:.2f}%" if np.isfinite(roi_bank_week) else "—"],
+        ["— (modelo) Forecast com correção de Bias (on-line) —", ""],
+        ["Forecast: média semanal (Bias on-line)", f"USD {fc_online_mean:,.1f}" if np.isfinite(fc_online_mean) else "—"],
+        ["Forecast: stake/sem (Bias on-line)", f"USD {fc_online_stake_mean:,.0f}" if np.isfinite(fc_online_stake_mean) else "—"],
+        ["Forecast: ROI por $ (Bias on-line)", f"{fc_online_roi_on_stake:.4f}" if np.isfinite(fc_online_roi_on_stake) else "—"],
+        ["Forecast: ROI banca/sem (Bias on-line)", f"{fc_online_roi_bank*100:.2f}%" if np.isfinite(fc_online_roi_bank) else "—"],
+        ["Forecast: ROI banca/sem (Bias on-line, ajustado por giro)", P(f"{fc_online_roi_bank_adj_typ_last1*100:.2f}% (giro última semana≈{turnover_typ_last1:.2f}×)<br/>{fc_online_roi_bank_adj_typ_last5*100:.2f}% (giro últimas 5 semanas≈{turnover_typ_last5:.2f}×)") if np.isfinite(fc_online_roi_bank_adj_typ_last1) and np.isfinite(fc_online_roi_bank_adj_typ_last5) else "—"],
+        ["Calibração do forecast (Bias on-line): coverage 80% (p10..p90, shifted)", f"{fc_online_cov80*100:.1f}%" if np.isfinite(fc_online_cov80) else "—"],
         ["— (referência) correção ex-post no período —", ""],
-        ["Previsto: média semanal (Bias ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "nan"],
-        ["Previsto: lucro mensal (Bias ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "nan"],
-        ["Previsto: lucro anual (Bias ex-post)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "nan"],
-        ["Previsto: ROI banca/sem (Bias ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "nan"],
-        ["Previsto: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "nan"],
-        ["Previsto: ROI por $ (turnover) corrigido", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "nan"],
-        ["Previsto: ROI banca/sem (ex-post, ajustado por giro)", P(f"{roi_bank_week_fc_cal_adj_typ_last1*100:.2f}% (giro última semana≈{turnover_typ_last1:.2f}×)<br/>{roi_bank_week_fc_cal_adj_typ_last5*100:.2f}% (giro últimas 5 semanas≈{turnover_typ_last5:.2f}×)") if np.isfinite(roi_bank_week_fc_cal_adj_typ_last1) and np.isfinite(roi_bank_week_fc_cal_adj_typ_last5) else "—"],
-        ["Calibração: coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "nan"],
-        ["Calibração: PIT médio", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "nan"],
+        ["Forecast: média semanal (Bias ex-post)", f"USD {fc_pred_mean_cal:,.1f}" if np.isfinite(fc_pred_mean_cal) else "—"],
+        ["Forecast: lucro mensal (Bias ex-post)", f"USD {exp_month_fc_cal:,.0f}" if np.isfinite(exp_month_fc_cal) else "—"],
+        ["Forecast: lucro anual (Bias ex-post)", f"USD {exp_year_fc_cal:,.0f}" if np.isfinite(exp_year_fc_cal) else "—"],
+        ["Forecast: ROI banca/sem (Bias ex-post)", f"{roi_bank_week_fc_cal*100:.2f}%" if np.isfinite(roi_bank_week_fc_cal) else "—"],
+        ["Forecast: stake/sem (turnover) corrigido", f"USD {fc_pred_stake_cal:,.0f}" if np.isfinite(fc_pred_stake_cal) else "—"],
+        ["Forecast: ROI por $ (turnover) corrigido", f"{roi_on_stake_fc_cal:.4f}" if np.isfinite(roi_on_stake_fc_cal) else "—"],
+        ["Forecast: ROI banca/sem (ex-post, ajustado por giro)", P(f"{roi_bank_week_fc_cal_adj_typ_last1*100:.2f}% (giro última semana≈{turnover_typ_last1:.2f}×)<br/>{roi_bank_week_fc_cal_adj_typ_last5*100:.2f}% (giro últimas 5 semanas≈{turnover_typ_last5:.2f}×)") if np.isfinite(roi_bank_week_fc_cal_adj_typ_last1) and np.isfinite(roi_bank_week_fc_cal_adj_typ_last5) else "—"],
+        ["Calibração do forecast (sem Bias on-line): coverage 80% (p10..p90)", f"{fc_cov80*100:.1f}%" if np.isfinite(fc_cov80) else "—"],
+        ["Calibração do forecast: PIT médio (sem Bias on-line)", f"{fc_pit:.3f}" if np.isfinite(fc_pit) else "—"],
     ]
     t_exec = Table(exec_tbl, colWidths=[7.5 * cm, 9.5 * cm])
     t_exec.setStyle(
@@ -1718,19 +1724,33 @@ def main() -> int:
     story.append(
         Paragraph(
             "A tabela abaixo simula a estratégia OOS com diferentes níveis de banca (mantendo as mesmas regras) "
-            "e estima o <b>PnL médio semanal</b> por banca. "
+            "e estima o <b>PnL médio semanal</b> por banca, além do <b>ROI por $</b> (PnL_total/Stake_total) e do <b>turnover</b>. "
             "Além do ‘ponto 0’ (onde o PnL esperado cruza zero), o ponto mais importante aqui é o <b>pico de PnL</b> "
             "(banca que maximiza E[PnL/sem] na grade testada).",
             styles["BodyText"],
         )
     )
+    story.append(
+        Paragraph(
+            "<b>Nota (interpretação)</b>: E[PnL/sem] depende de ROI/$ e do giro (stake/sem). "
+            "No início do walk-forward o giro tende a ser menor (poucos segmentos aprovados), o que pode reduzir o PnL/sem mesmo com ROI/$ razoável. "
+            "Por isso reportamos explicitamente ROI/$ e stake/sem.",
+            styles["BodyText"],
+        )
+    )
+    story.append(
+        Paragraph(
+            "<b>p_boot vs p_perm</b>: <b>P_boot(mean&gt;0)</b> é a fração de reamostragens bootstrap em que a média semanal fica &gt;0 "
+            "(uma medida tipo ‘probabilidade bootstrap’, não um p-value clássico). "
+            "Já <b>p_perm(mean&gt;0)</b> é um p-value sob H0 via sign-flip (assume simetria). Eles podem divergir bastante em amostras pequenas/assimétricas.",
+            styles["BodyText"],
+        )
+    )
     try:
-        br_path = OUT_DIR / "stat_tests_scaling_breakpoint.csv"
+        br_path = OUT_DIR / "stat_tests_bankroll_scaling.csv"
         if br_path.exists():
             br = pd.read_csv(br_path)
-            if "compare_to" in br.columns:
-                br = br[br["compare_to"].isna()].copy()
-            need = {"bankroll", "mean_week", "ci95_lo", "ci95_hi", "p_perm_mean_gt0", "p_boot_mean_gt0"}
+            need = {"bankroll", "weeks", "weeks_with_stake", "stake_total", "pnl_total", "roi_on_stake", "mean_week", "boot_ci95_lo", "boot_ci95_hi", "p_perm_mean_gt0", "p_boot_mean_gt0"}
             if not br.empty and need.issubset(set(br.columns)):
                 br = br.sort_values("bankroll")
                 i_best = int(br["mean_week"].astype(float).to_numpy().argmax())
@@ -1738,22 +1758,44 @@ def main() -> int:
                 story.append(
                     Paragraph(
                         f"<b>Pico (na grade testada)</b>: banca≈USD {float(best['bankroll']):,.0f}, "
-                        f"E[PnL/sem]≈USD {float(best['mean_week']):,.1f} (IC95%≈[{float(best['ci95_lo']):,.0f}, {float(best['ci95_hi']):,.0f}]).",
+                        f"E[PnL/sem]≈USD {float(best['mean_week']):,.1f}, ROI/$≈{float(best['roi_on_stake']):.4f}.",
                         styles["BodyText"],
                     )
                 )
-                rows = [[P("<b>Banca (USD)</b>"), P("<b>E[PnL/sem]</b>"), P("<b>IC95%</b>"), P("<b>p_perm(mean&gt;0)</b>"), P("<b>P_boot(mean&gt;0)</b>")]]
+
+                rows = [[
+                    P("<b>Banca (USD)</b>"),
+                    P("<b>E[PnL/sem]</b>"),
+                    P("<b>IC95%</b>"),
+                    P("<b>ROI/$</b>"),
+                    P("<b>Stake/sem</b>"),
+                    P("<b>Turnover</b>"),
+                    P("<b>p_perm</b>"),
+                    P("<b>P_boot</b>"),
+                ]]
                 for _, r0 in br.iterrows():
+                    b = float(r0["bankroll"])
+                    weeks = float(r0["weeks"])
+                    stake_total = float(r0["stake_total"])
+                    stake_per_week = stake_total / weeks if weeks > 0 else float("nan")
+                    turnover = stake_per_week / b if (b > 0 and np.isfinite(stake_per_week)) else float("nan")
                     rows.append(
                         [
-                            f"{float(r0['bankroll']):,.0f}",
+                            f"{b:,.0f}",
                             f"{float(r0['mean_week']):,.1f}",
-                            f"[{float(r0['ci95_lo']):,.0f}, {float(r0['ci95_hi']):,.0f}]",
+                            f"[{float(r0['boot_ci95_lo']):,.0f}, {float(r0['boot_ci95_hi']):,.0f}]",
+                            f"{float(r0['roi_on_stake']):.4f}",
+                            f"{stake_per_week:,.0f}",
+                            f"{turnover:.2f}×" if np.isfinite(turnover) else "—",
                             f"{float(r0['p_perm_mean_gt0']):.3f}",
                             f"{float(r0['p_boot_mean_gt0']):.3f}",
                         ]
                     )
-                tbr = Table(rows, colWidths=[3.0 * cm, 3.2 * cm, 5.0 * cm, 2.5 * cm, 2.5 * cm], repeatRows=1)
+                tbr = Table(
+                    rows,
+                    colWidths=[2.3 * cm, 2.2 * cm, 3.4 * cm, 1.5 * cm, 1.8 * cm, 1.6 * cm, 1.3 * cm, 1.3 * cm],
+                    repeatRows=1,
+                )
                 tbr.setStyle(
                     TableStyle(
                         [
@@ -1767,7 +1809,7 @@ def main() -> int:
                 )
                 story.append(tbr)
         else:
-            story.append(Paragraph("Artefato de escala não encontrado (stat_tests_scaling_breakpoint.csv).", styles["BodyText"]))
+            story.append(Paragraph("Artefato de escala não encontrado (stat_tests_bankroll_scaling.csv).", styles["BodyText"]))
     except Exception as e:
         story.append(Paragraph(f"Falha ao montar curva de escala de banca: {e}", styles["BodyText"]))
 
