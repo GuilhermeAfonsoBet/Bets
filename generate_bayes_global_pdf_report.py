@@ -134,6 +134,88 @@ def compute_weekly_stats(w: np.ndarray) -> Dict[str, float]:
     }
 
 
+def _bootstrap_mean_ci(x: np.ndarray, n_boot: int = 8000, seed: int = 0) -> Tuple[float, float, float]:
+    """
+    Bootstrap da média para amostras pequenas.
+    Retorna (ci95_lo, ci95_hi, P_boot(mean>0)).
+    """
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(int(seed))
+    n = int(a.size)
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    m = a[idx].mean(axis=1)
+    lo = float(np.quantile(m, 0.025))
+    hi = float(np.quantile(m, 0.975))
+    p_gt0 = float(np.mean(m > 0))
+    return lo, hi, p_gt0
+
+
+def _signflip_perm_p_mean_gt0(x: np.ndarray, n_perm: int = 20000, seed: int = 0) -> float:
+    """
+    Permutação por sign-flip (H0: média=0 e simetria) — p-value (um lado) para mean>0.
+    """
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan")
+    rng = np.random.default_rng(int(seed))
+    mu_obs = float(np.mean(a))
+    signs = rng.choice(np.array([-1.0, 1.0], dtype=float), size=(int(n_perm), int(a.size)))
+    mu_perm = np.mean(signs * a[None, :], axis=1)
+    return float((1.0 + np.sum(mu_perm >= mu_obs)) / (1.0 + float(n_perm)))
+
+
+def _signflip_perm_p_mean_lt0(x: np.ndarray, n_perm: int = 20000, seed: int = 0) -> float:
+    """
+    Permutação por sign-flip — p-value (um lado) para mean<0.
+    """
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan")
+    rng = np.random.default_rng(int(seed))
+    mu_obs = float(np.mean(a))
+    signs = rng.choice(np.array([-1.0, 1.0], dtype=float), size=(int(n_perm), int(a.size)))
+    mu_perm = np.mean(signs * a[None, :], axis=1)
+    return float((1.0 + np.sum(mu_perm <= mu_obs)) / (1.0 + float(n_perm)))
+
+
+def _spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
+    xs = pd.Series(np.asarray(x, dtype=float))
+    ys = pd.Series(np.asarray(y, dtype=float))
+    m = np.isfinite(xs.to_numpy(dtype=float)) & np.isfinite(ys.to_numpy(dtype=float))
+    if int(np.sum(m)) < 3:
+        return float("nan")
+    rx = xs[m].rank(method="average").to_numpy(dtype=float)
+    ry = ys[m].rank(method="average").to_numpy(dtype=float)
+    c = np.corrcoef(rx, ry)
+    return float(c[0, 1])
+
+
+def _perm_p_spearman_abs(x: np.ndarray, y: np.ndarray, n_perm: int = 5000, seed: int = 0) -> float:
+    """
+    p-value (bicaudal) para |rho| via permutação embaralhando y.
+    """
+    xs = np.asarray(x, dtype=float)
+    ys = np.asarray(y, dtype=float)
+    m = np.isfinite(xs) & np.isfinite(ys)
+    xs = xs[m]
+    ys = ys[m]
+    if xs.size < 3:
+        return float("nan")
+    rho_obs = abs(_spearman_rho(xs, ys))
+    rng = np.random.default_rng(int(seed))
+    cnt = 0
+    for _ in range(int(n_perm)):
+        yp = rng.permutation(ys)
+        if abs(_spearman_rho(xs, yp)) >= rho_obs:
+            cnt += 1
+    return float((1.0 + cnt) / (1.0 + float(n_perm)))
+
+
 def jaccard_instability(rules_df: pd.DataFrame) -> Dict[str, float]:
     r = rules_df.copy()
     r["active"] = (r["status"] == "ok") & (r["stake_frac"] > 0)
@@ -206,6 +288,11 @@ def main() -> int:
     # condicional: apenas semanas com trades (stake>0)
     w_traded = wf_week.loc[wf_week["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(dtype=float)
     wstats_traded = compute_weekly_stats(w_traded)
+    # testes formais: edge (banca 2,3k)
+    w_ci_lo, w_ci_hi, w_pboot = _bootstrap_mean_ci(w, n_boot=8000, seed=0)
+    w_pperm = _signflip_perm_p_mean_gt0(w, n_perm=20000, seed=0)
+    wt_ci_lo, wt_ci_hi, wt_pboot = _bootstrap_mean_ci(w_traded, n_boot=8000, seed=1)
+    wt_pperm = _signflip_perm_p_mean_gt0(w_traded, n_perm=20000, seed=1)
     stake_tot = float(wf_week["stake_usd"].sum())
     profit_tot = float(wf_week["profit_cap2_usd"].sum())
     roi_on_stake = float(profit_tot / stake_tot) if stake_tot > 0 else float("nan")
@@ -1107,6 +1194,50 @@ def main() -> int:
     )
     story.append(t_aud)
 
+    # 3.1.D Testes formais de edge (banca 2,3k)
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph("<b>3.1.D Testes formais de edge (banca USD 2.300)</b>", styles["BodyText"]))
+    story.append(
+        Paragraph(
+            "A amostra OOS tem poucas semanas; por isso, além do Sharpe e dos quantis, reportamos testes formais "
+            "baseados em (i) <b>bootstrap</b> da média e (ii) <b>sign-flip permutation</b> (H0: média=0, simetria) "
+            "para E[PnL/sem] > 0.",
+            styles["BodyText"],
+        )
+    )
+    t_edge = Table(
+        [
+            ["Amostra", "E[PnL/sem]", "IC95% (bootstrap)", "P_boot(mean>0)", "p_perm(mean>0)"],
+            [
+                "Todas as semanas (inclui stake=0)",
+                f"USD {wstats.get('mean', float('nan')):,.1f}",
+                f"[{w_ci_lo:,.0f}, {w_ci_hi:,.0f}]",
+                f"{w_pboot:.3f}" if np.isfinite(w_pboot) else "—",
+                f"{w_pperm:.3f}" if np.isfinite(w_pperm) else "—",
+            ],
+            [
+                "Apenas semanas com trade (stake>0)",
+                f"USD {wstats_traded.get('mean', float('nan')):,.1f}",
+                f"[{wt_ci_lo:,.0f}, {wt_ci_hi:,.0f}]",
+                f"{wt_pboot:.3f}" if np.isfinite(wt_pboot) else "—",
+                f"{wt_pperm:.3f}" if np.isfinite(wt_pperm) else "—",
+            ],
+        ],
+        colWidths=[4.5 * cm, 3.2 * cm, 4.3 * cm, 2.2 * cm, 2.2 * cm],
+    )
+    t_edge.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+    story.append(t_edge)
+
     if top_bias_rows:
         story.append(Spacer(1, 0.25 * cm))
         story.append(Paragraph("<b>3.1.1 Calibração por combinação (ROI bias shrunken)</b>", styles["Heading3"]))
@@ -1444,6 +1575,23 @@ def main() -> int:
                     story.append(Table(rows, colWidths=[4.0 * cm, 1.0 * cm, 4.0 * cm, 4.0 * cm], style=TableStyle([("GRID",(0,0),(-1,-1),0.25,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"TOP")])))
                 except Exception:
                     pass
+
+            # teste formal: ROI vs stake máximo (house_cap)
+            try:
+                if len(sb) >= 30:
+                    xcap = sb["house_cap"].to_numpy(dtype=float)
+                    yroi = sb["roi_cap2"].to_numpy(dtype=float)
+                    rho = _spearman_rho(np.log1p(xcap), yroi)
+                    p_perm = _perm_p_spearman_abs(np.log1p(xcap), yroi, n_perm=5000, seed=2)
+                    story.append(
+                        Paragraph(
+                            f"<b>Teste formal (ROI vs stake máximo)</b>: Spearman(ROI_cap2, log(1+house_cap)) "
+                            f"ρ={rho:.3f}, p_perm(bicaudal)={p_perm:.3f} (permutações=5000).",
+                            styles["BodyText"],
+                        )
+                    )
+            except Exception:
+                pass
     # A pedido: mostrar apenas números bias-corrected (forecast) para retornos do cenário máximo
     if FORECAST_CALIB_MAX.exists():
         fcmax = pd.read_csv(FORECAST_CALIB_MAX)
@@ -1525,10 +1673,103 @@ def main() -> int:
                 )
             )
             story.append(tmax)
+
+            # teste formal: cenário max (variância vs modelo) — erro médio do forecast Bias on-line
+            try:
+                y = fcmax["pnl_max_theoretical"].to_numpy(dtype=float) if "pnl_max_theoretical" in fcmax.columns else np.array([])
+                mu = fcmax["pred_mean"].to_numpy(dtype=float) if "pred_mean" in fcmax.columns else np.array([])
+                if y.size and mu.size and (y.size == mu.size):
+                    err = y - mu
+                    bias_online = np.zeros(err.size, dtype=float)
+                    for i in range(err.size):
+                        if i == 0:
+                            bias_online[i] = 0.0
+                        else:
+                            lo = max(0, i - 8)
+                            hist = err[lo:i]
+                            hist = hist[np.isfinite(hist)]
+                            bias_online[i] = float(np.mean(hist)) if hist.size else 0.0
+                    mu_adj = mu + bias_online
+                    e_online = y - mu_adj
+                    if "stake_max_theoretical" in fcmax.columns:
+                        sm = fcmax["stake_max_theoretical"].to_numpy(dtype=float)
+                        e_online = e_online[np.isfinite(sm) & (sm > 0)]
+                    ci_lo, ci_hi, _ = _bootstrap_mean_ci(e_online, n_boot=8000, seed=3)
+                    p_lt0 = _signflip_perm_p_mean_lt0(e_online, n_perm=20000, seed=3)
+                    story.append(
+                        Paragraph(
+                            f"<b>Teste formal (máx): erro médio do forecast (Bias on-line)</b>: "
+                            f"E[erro]=USD {float(np.mean(e_online)):,.0f} (IC95%≈[{ci_lo:,.0f}, {ci_hi:,.0f}]), "
+                            f"p_perm(mean&lt;0)={p_lt0:.3f}. "
+                            "Leitura: p pequeno sugere desalinhamento sistemático (não só variância); p grande sugere alta variância/amostra pequena.",
+                            styles["BodyText"],
+                        )
+                    )
+            except Exception:
+                pass
         else:
             story.append(Paragraph("Não foi possível calcular o cenário de operação máxima (arquivo de calibração vazio).", styles["BodyText"]))
     else:
         story.append(Paragraph("Não foi possível calcular o cenário de operação máxima (arquivo de calibração não encontrado).", styles["BodyText"]))
+
+    # 3.4 Curva PnL vs banca (inclui pico de PnL)
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph("<b>3.4 Escala: PnL semanal vs banca (inclui pico)</b>", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "A tabela abaixo simula a estratégia OOS com diferentes níveis de banca (mantendo as mesmas regras) "
+            "e estima o <b>PnL médio semanal</b> por banca. "
+            "Além do ‘ponto 0’ (onde o PnL esperado cruza zero), o ponto mais importante aqui é o <b>pico de PnL</b> "
+            "(banca que maximiza E[PnL/sem] na grade testada).",
+            styles["BodyText"],
+        )
+    )
+    try:
+        br_path = OUT_DIR / "stat_tests_scaling_breakpoint.csv"
+        if br_path.exists():
+            br = pd.read_csv(br_path)
+            if "compare_to" in br.columns:
+                br = br[br["compare_to"].isna()].copy()
+            need = {"bankroll", "mean_week", "ci95_lo", "ci95_hi", "p_perm_mean_gt0", "p_boot_mean_gt0"}
+            if not br.empty and need.issubset(set(br.columns)):
+                br = br.sort_values("bankroll")
+                i_best = int(br["mean_week"].astype(float).to_numpy().argmax())
+                best = br.iloc[i_best]
+                story.append(
+                    Paragraph(
+                        f"<b>Pico (na grade testada)</b>: banca≈USD {float(best['bankroll']):,.0f}, "
+                        f"E[PnL/sem]≈USD {float(best['mean_week']):,.1f} (IC95%≈[{float(best['ci95_lo']):,.0f}, {float(best['ci95_hi']):,.0f}]).",
+                        styles["BodyText"],
+                    )
+                )
+                rows = [[P("<b>Banca (USD)</b>"), P("<b>E[PnL/sem]</b>"), P("<b>IC95%</b>"), P("<b>p_perm(mean&gt;0)</b>"), P("<b>P_boot(mean&gt;0)</b>")]]
+                for _, r0 in br.iterrows():
+                    rows.append(
+                        [
+                            f"{float(r0['bankroll']):,.0f}",
+                            f"{float(r0['mean_week']):,.1f}",
+                            f"[{float(r0['ci95_lo']):,.0f}, {float(r0['ci95_hi']):,.0f}]",
+                            f"{float(r0['p_perm_mean_gt0']):.3f}",
+                            f"{float(r0['p_boot_mean_gt0']):.3f}",
+                        ]
+                    )
+                tbr = Table(rows, colWidths=[3.0 * cm, 3.2 * cm, 5.0 * cm, 2.5 * cm, 2.5 * cm], repeatRows=1)
+                tbr.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 7),
+                        ]
+                    )
+                )
+                story.append(tbr)
+        else:
+            story.append(Paragraph("Artefato de escala não encontrado (stat_tests_scaling_breakpoint.csv).", styles["BodyText"]))
+    except Exception as e:
+        story.append(Paragraph(f"Falha ao montar curva de escala de banca: {e}", styles["BodyText"]))
 
     story.append(PageBreak())
 
