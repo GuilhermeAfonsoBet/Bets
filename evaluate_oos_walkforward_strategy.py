@@ -125,6 +125,12 @@ CAP_GATING_ENABLED = False
 CAP_QS = np.array([0.60, 0.80, 0.90])
 CAP_MIN_UNIQUE = 3  # se não houver diversidade de caps, não otimiza cap_max
 
+# Dimensão adicional por faixa de house_cap (stake máximo como feature de seleção):
+# Em vez de apenas "cap_max" (monotônico), criamos segmentos separados por bins de house_cap
+# e otimizamos cutoff/stake_frac por (DoW x Tipo x cap_bin).
+CAP_BIN_ENABLED = False
+CAP_BIN_QS = np.array([0.33, 0.66])  # bins: (0..q33], (q33..q66], (q66..inf)
+
 # Alternativa (mais robusta contra overfit): cap_max fixo por segmento.
 # - Escolhe cap_max uma única vez por segmento quando houver dados suficientes (usando apenas passado),
 #   e mantém esse cap_max fixo no restante do walk-forward.
@@ -190,6 +196,7 @@ class Rule:
     cutoff: float
     stake_frac: float
     status: str
+    cap_bin: int = -1  # -1 = sem bin (segmento padrão); 0..K-1 quando CAP_BIN_ENABLED
     cap_max: float = float("inf")  # house_cap máximo permitido (inf = sem restrição)
 
 
@@ -247,7 +254,10 @@ def optimize_segment_train(
     """
     weeks_all = sorted(x["week"].unique().tolist())
     if len(weeks_all) < MIN_SEG_TRAIN_WEEKS:
-        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, status="too_few_weeks")
+        cap_bin_val = int(x["cap_bin"].iloc[0]) if ("cap_bin" in x.columns and CAP_BIN_ENABLED) else -1
+        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, status="too_few_weeks", cap_bin=cap_bin_val)
+
+    cap_bin_val = int(x["cap_bin"].iloc[0]) if ("cap_bin" in x.columns and CAP_BIN_ENABLED) else -1
 
     score = pd.to_numeric(x[score_col], errors="coerce").to_numpy(dtype=float)
     roi2 = x["roi_cap2"].to_numpy(dtype=float)
@@ -388,7 +398,7 @@ def optimize_segment_train(
                 best_post = post0
 
     if best is None:
-        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, cap_max=float("inf"), status="no_candidate")
+        return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=1.0, stake_frac=0.0, cap_bin=cap_bin_val, cap_max=float("inf"), status="no_candidate")
 
     # Passo 2 (se habilitado): dado o melhor cutoff+stake, escolhe cap_max por grid de quantis (rápido).
     best_cap = float("inf")
@@ -453,9 +463,9 @@ def optimize_segment_train(
             post_prev = bb_weights @ w2_prev.astype(float)
             p_switch = float(np.mean(best_post > post_prev))
             if p_switch < HYST_P_SWITCH:
-                return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=float(prev_rule.cutoff), stake_frac=float(prev_rule.stake_frac), cap_max=float(prev_rule.cap_max), status="ok")
+                return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=float(prev_rule.cutoff), stake_frac=float(prev_rule.stake_frac), status="ok", cap_bin=int(prev_rule.cap_bin), cap_max=float(prev_rule.cap_max))
 
-    return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=best[0], stake_frac=best[1], cap_max=float(best_cap), status="ok")
+    return Rule(bet_type=str(x["bet_type"].iloc[0]), dow=str(x["dow_pt"].iloc[0]), score_col=score_col, cutoff=best[0], stake_frac=best[1], status="ok", cap_bin=cap_bin_val, cap_max=float(best_cap))
 
 
 def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
@@ -463,6 +473,8 @@ def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
         return df_week.iloc[:0].copy()
     stake0 = BANKROLL * rule.stake_frac
     x = df_week[(df_week["dow_pt"] == rule.dow) & (df_week["bet_type"] == rule.bet_type)].copy()
+    if rule.cap_bin is not None and int(rule.cap_bin) >= 0 and "cap_bin" in x.columns:
+        x = x[x["cap_bin"] == int(rule.cap_bin)].copy()
     if x.empty:
         return x
     score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(dtype=float)
@@ -477,10 +489,14 @@ def apply_rule_on_week(df_week: pd.DataFrame, rule: Rule) -> pd.DataFrame:
     x["profit_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_cap2"].to_numpy(dtype=float)
     x["rule_cutoff"] = rule.cutoff
     x["rule_stake_frac"] = rule.stake_frac
+    x["rule_cap_bin"] = int(rule.cap_bin) if rule.cap_bin is not None else -1
     x["rule_cap_max"] = float(rule.cap_max)
     x["rule_score_col"] = rule.score_col
     x["rule_status"] = rule.status
-    x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
+    if rule.cap_bin is not None and int(rule.cap_bin) >= 0:
+        x["rule_key"] = f"{rule.bet_type}|{rule.dow}|cap{int(rule.cap_bin)}"
+    else:
+        x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
     return x
 
 
@@ -498,6 +514,8 @@ def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float
         if stake0 <= 0:
             continue
         x = df_any[(df_any["dow_pt"] == rule.dow) & (df_any["bet_type"] == rule.bet_type)].copy()
+        if rule.cap_bin is not None and int(rule.cap_bin) >= 0 and "cap_bin" in x.columns:
+            x = x[x["cap_bin"] == int(rule.cap_bin)].copy()
         if x.empty:
             continue
         score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(dtype=float)
@@ -511,7 +529,10 @@ def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float
         x = x.iloc[np.where(m)[0]].copy()
         x["stake_eff"] = np.minimum(stake0, x["house_cap"].to_numpy(dtype=float))
         x["profit_cap2"] = x["stake_eff"].to_numpy(dtype=float) * x["roi_cap2"].to_numpy(dtype=float)
-        x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
+        if rule.cap_bin is not None and int(rule.cap_bin) >= 0:
+            x["rule_key"] = f"{rule.bet_type}|{rule.dow}|cap{int(rule.cap_bin)}"
+        else:
+            x["rule_key"] = f"{rule.bet_type}|{rule.dow}"
         rows.append(x[["date", "week", "stake_eff", "profit_cap2", "rule_key"]])
     if not rows:
         return df_any.iloc[:0].copy()
@@ -736,10 +757,21 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     import argparse
 
+    global BANKROLL
     ap = argparse.ArgumentParser()
     ap.add_argument("--only-mode", default="", help="Se preenchido, roda apenas este modo (ex.: global_bayes_roll12_robust_p10_p70_capgate)")
+    ap.add_argument("--bankroll", default=BANKROLL, type=float, help="Banca (USD) usada no sizing e nas constraints.")
+    ap.add_argument("--out-suffix", default="", help="Sufixo opcional para nomes de saída (evita sobrescrever artefatos). Ex.: _b5000")
     args = ap.parse_args()
     only_mode = str(args.only_mode).strip()
+    out_suffix = str(args.out_suffix).strip()
+    # aplicar banca via global (funções usam BANKROLL em runtime)
+    try:
+        BANKROLL = float(args.bankroll)
+    except Exception:
+        BANKROLL = float(BANKROLL)
+    if (not out_suffix) and (abs(float(BANKROLL) - 2300.0) > 1e-9):
+        out_suffix = f"_b{int(round(BANKROLL))}"
     df = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
     df["house_cap"] = df["house_cap"].apply(safe_cap)
     df["week"] = week_key(df["BIA_ApostaUTC"])
@@ -774,6 +806,21 @@ def main() -> int:
             df["proba_cal_sexdom"] = _apply_isotonic_vec(p_raw, x=x, y=y, floor=CALIB_FLOOR)
         except Exception:
             pass
+
+    # cap_bin (stake máximo como feature) — bins fixos globais (auditável) a partir de quantis do dataset.
+    # Criamos sempre a coluna; CAP_BIN_ENABLED decide se ela entra como dimensão do portfólio.
+    cap_ok = pd.to_numeric(df["house_cap"], errors="coerce").to_numpy(dtype=float)
+    cap_ok = cap_ok[np.isfinite(cap_ok) & (cap_ok > 0)]
+    if cap_ok.size:
+        qs = np.quantile(cap_ok, CAP_BIN_QS)
+        qs = np.asarray(qs, dtype=float)
+        qs = qs[np.isfinite(qs)]
+        qs = np.unique(qs)
+        edges = [0.0] + [float(v) for v in qs.tolist()] + [float("inf")]
+    else:
+        edges = [0.0, float("inf")]
+    df["cap_bin"] = pd.cut(df["house_cap"].to_numpy(dtype=float), bins=edges, labels=False, include_lowest=True, right=True)
+    df["cap_bin"] = pd.to_numeric(df["cap_bin"], errors="coerce").fillna(-1).astype(int)
 
     weeks = sorted(df["week"].unique().tolist())
     if len(weeks) < (MIN_GLOBAL_TRAIN_WEEKS + 3):
@@ -824,59 +871,68 @@ def main() -> int:
             for bet_type in ("FT", "FH"):
                 for dow in WEEKDAY_PT:
                     sc = segment_score_col(dow)
-                    x = df_train[(df_train["dow_pt"] == dow) & (df_train["bet_type"] == bet_type)].copy()
-                    if x.empty:
-                        rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data")
-                    else:
-                        prev = prev_rules.get(f"{bet_type}|{dow}")
-                        rk = f"{bet_type}|{dow}"
-                        if rk in disabled_keys:
-                            rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="disabled_bias")
+                    x0 = df_train[(df_train["dow_pt"] == dow) & (df_train["bet_type"] == bet_type)].copy()
+                    # quando CAP_BIN_ENABLED, iteramos por cap_bin (stake máximo como feature de seleção)
+                    cap_bins = sorted([int(v) for v in pd.Series(x0["cap_bin"]).dropna().unique().tolist()]) if (CAP_BIN_ENABLED and ("cap_bin" in x0.columns)) else [-1]
+                    if not cap_bins:
+                        cap_bins = [-1]
+                    for cap_bin in cap_bins:
+                        if int(cap_bin) >= 0:
+                            x = x0[x0["cap_bin"] == int(cap_bin)].copy()
                         else:
-                            roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
-                            # cap_max fixo por segmento (escolhido uma vez e mantido)
-                            cap_fixed = fixed_cap_by_key.get(rk) if CAP_FIXED_PER_SEGMENT_ENABLED else None
-                            if cap_fixed is not None and np.isfinite(float(cap_fixed)):
-                                x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_fixed))].copy()
+                            x = x0
+                        rk = f"{bet_type}|{dow}|cap{int(cap_bin)}" if int(cap_bin) >= 0 else f"{bet_type}|{dow}"
+                        if x.empty:
+                            rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="no_data", cap_bin=int(cap_bin))
+                        else:
+                            prev = prev_rules.get(rk)
+                            if rk in disabled_keys:
+                                rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="disabled_bias", cap_bin=int(cap_bin))
                             else:
-                                x_use = x
+                                roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
+                                # cap_max fixo por segmento (escolhido uma vez e mantido)
+                                cap_fixed = fixed_cap_by_key.get(rk) if CAP_FIXED_PER_SEGMENT_ENABLED else None
+                                if cap_fixed is not None and np.isfinite(float(cap_fixed)):
+                                    x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_fixed))].copy()
+                                else:
+                                    x_use = x
 
-                            # se ainda não temos cap fixo, tentamos escolhê-lo UMA vez (em treino) testando poucos candidatos
-                            if CAP_FIXED_PER_SEGMENT_ENABLED and (rk not in fixed_cap_by_key):
-                                score0 = pd.to_numeric(x["house_cap"], errors="coerce").to_numpy(float)
-                                # só tenta se há volume suficiente
-                                if int(np.sum(np.isfinite(score0) & (score0 > 0))) >= CAP_FIXED_MIN_TRAIN_BETS:
-                                    weeks_all = sorted(x["week"].unique().tolist())
-                                    best_cap = float("inf")
-                                    best_obj = -np.inf
-                                    best_rule = None
-                                    for cap_cand in _cap_candidates_from_x(x["house_cap"].to_numpy(float)):
-                                        if np.isfinite(cap_cand):
-                                            xx = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_cand))].copy()
-                                        else:
-                                            xx = x
-                                        # exige diversidade temporal mínima
-                                        nonzero_weeks = int(xx["week"].nunique())
-                                        if nonzero_weeks < CAP_FIXED_MIN_NONZERO_WEEKS:
-                                            continue
-                                        rr = optimize_segment_train(xx, sc, bayes_select=bayes_select, prev_rule=None, roi_bias_adj=roi_adj)
-                                        if rr.status != "ok" or rr.stake_frac <= 0:
-                                            continue
-                                        # define cap no rule apenas para avaliação do objetivo
-                                        rr = Rule(bet_type=rr.bet_type, dow=rr.dow, score_col=rr.score_col, cutoff=rr.cutoff, stake_frac=rr.stake_frac, status=rr.status, cap_max=float(cap_cand))
-                                        obj, _pp = _cap_select_obj_p10(xx, rr, weeks_all=weeks_all, seed=SEED + 991 + hash(rk) % 10_000)
-                                        if obj > best_obj:
-                                            best_obj = float(obj)
-                                            best_cap = float(cap_cand)
-                                            best_rule = rr
-                                    fixed_cap_by_key[rk] = float(best_cap)
-                                    if best_rule is not None and np.isfinite(best_cap):
-                                        x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(best_cap))].copy()
+                                # se ainda não temos cap fixo, tentamos escolhê-lo UMA vez (em treino) testando poucos candidatos
+                                if CAP_FIXED_PER_SEGMENT_ENABLED and (rk not in fixed_cap_by_key):
+                                    score0 = pd.to_numeric(x["house_cap"], errors="coerce").to_numpy(float)
+                                    # só tenta se há volume suficiente
+                                    if int(np.sum(np.isfinite(score0) & (score0 > 0))) >= CAP_FIXED_MIN_TRAIN_BETS:
+                                        weeks_all = sorted(x["week"].unique().tolist())
+                                        best_cap = float("inf")
+                                        best_obj = -np.inf
+                                        best_rule = None
+                                        for cap_cand in _cap_candidates_from_x(x["house_cap"].to_numpy(float)):
+                                            if np.isfinite(cap_cand):
+                                                xx = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_cand))].copy()
+                                            else:
+                                                xx = x
+                                            # exige diversidade temporal mínima
+                                            nonzero_weeks = int(xx["week"].nunique())
+                                            if nonzero_weeks < CAP_FIXED_MIN_NONZERO_WEEKS:
+                                                continue
+                                            rr = optimize_segment_train(xx, sc, bayes_select=bayes_select, prev_rule=None, roi_bias_adj=roi_adj)
+                                            if rr.status != "ok" or rr.stake_frac <= 0:
+                                                continue
+                                            # define cap no rule apenas para avaliação do objetivo
+                                            rr = Rule(bet_type=rr.bet_type, dow=rr.dow, score_col=rr.score_col, cutoff=rr.cutoff, stake_frac=rr.stake_frac, status=rr.status, cap_bin=int(cap_bin), cap_max=float(cap_cand))
+                                            obj, _pp = _cap_select_obj_p10(xx, rr, weeks_all=weeks_all, seed=SEED + 991 + hash(rk) % 10_000)
+                                            if obj > best_obj:
+                                                best_obj = float(obj)
+                                                best_cap = float(cap_cand)
+                                                best_rule = rr
+                                        fixed_cap_by_key[rk] = float(best_cap)
+                                        if best_rule is not None and np.isfinite(best_cap):
+                                            x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(best_cap))].copy()
 
-                            rule0 = optimize_segment_train(x_use, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
-                            cap_final = float(fixed_cap_by_key.get(rk, float("inf"))) if CAP_FIXED_PER_SEGMENT_ENABLED else float("inf")
-                            rule = Rule(bet_type=rule0.bet_type, dow=rule0.dow, score_col=rule0.score_col, cutoff=rule0.cutoff, stake_frac=rule0.stake_frac, status=rule0.status, cap_max=cap_final)
-                    rules[f"{bet_type}|{dow}"] = rule
+                                rule0 = optimize_segment_train(x_use, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
+                                cap_final = float(fixed_cap_by_key.get(rk, float("inf"))) if CAP_FIXED_PER_SEGMENT_ENABLED else float("inf")
+                                rule = Rule(bet_type=rule0.bet_type, dow=rule0.dow, score_col=rule0.score_col, cutoff=rule0.cutoff, stake_frac=rule0.stake_frac, status=rule0.status, cap_bin=int(cap_bin), cap_max=cap_final)
+                        rules[rk] = rule
 
             # se pedir risco global, ajustar stakes por alpha
             if global_risk:
@@ -1035,6 +1091,8 @@ def main() -> int:
         ("segment_bayes", False, True),
         ("global_bayes", True, True),
     ):
+        if only_mode and (only_mode != mode_name):
+            continue
         rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
             global_risk=global_risk,
             bayes_select=bayes_select,
@@ -1045,11 +1103,11 @@ def main() -> int:
             regime_alpha_bad=1.0,
         )
 
-        rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
-        weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
-        weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
-        weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
-        daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_daily.csv", index=False)
+        rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_selected_rules.csv", index=False)
+        weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_weekly.csv", index=False)
+        weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_weekly_by_segment.csv", index=False)
+        weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_train_global_metrics.csv", index=False)
+        daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_daily.csv", index=False)
         _summarize_mode(mode_name, weekly_df)
 
         # resumo robusto
@@ -1110,7 +1168,7 @@ def main() -> int:
             pnegw = float(np.mean(v < 0))
             seg_rows.append({"rule_key": rk, "mean_week_profit": m, "ci95_lo": lo, "ci95_hi": hi, "p_week_pos": ppos, "p_week_neg": pnegw})
         seg_stab = pd.DataFrame(seg_rows).sort_values("mean_week_profit", ascending=False) if seg_rows else pd.DataFrame()
-        seg_stab.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_segment_stability.csv", index=False)
+        seg_stab.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_segment_stability.csv", index=False)
 
         lines: List[str] = []
         lines.append(f"## OOS walk-forward ({mode_name}) — estratégia completa\n")
@@ -1146,7 +1204,7 @@ def main() -> int:
         lines.append(f"- α médio={a_mean:.3f}; p10={a_p10:.3f}; p50={a_p50:.3f}; p90={a_p90:.3f}; P(α<1)={a_lt1*100:.1f}%\n")
 
         lines.append("\n### Estabilidade OOS da decisão por segmento (frequência de ativação)\n")
-        lines.append(f"- Arquivo regras: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}_selected_rules.csv`\n\n")
+        lines.append(f"- Arquivo regras: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}{out_suffix}_selected_rules.csv`\n\n")
         for _, r in act.iterrows():
             lines.append(
                 f"- **{r['bet_type']} | {r['dow_pt']}**: active_rate={r['active_rate']*100:.1f}%, ok_rate={r['ok_rate']*100:.1f}%, "
@@ -1155,7 +1213,7 @@ def main() -> int:
 
         if not seg_stab.empty:
             lines.append("\n### Segmentos mais estáveis no OOS (por lucro semanal)\n")
-            lines.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}_segment_stability.csv`\n")
+            lines.append(f"- CSV: `analysis_proba_raw/pro_portfolio_all/oos_walkforward_{mode_name}{out_suffix}_segment_stability.csv`\n")
             top = seg_stab.head(8)
             for _, rr in top.iterrows():
                 lines.append(
@@ -1163,7 +1221,7 @@ def main() -> int:
                     f"P(semana>0)={rr['p_week_pos']*100:.1f}%\n"
                 )
 
-        (OUT_DIR / f"oos_walkforward_{mode_name}_strategy.md").write_text("".join(lines), encoding="utf-8")
+        (OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_strategy.md").write_text("".join(lines), encoding="utf-8")
 
     # ------------------------
     # Experimentos: Portfolio Bayes Global com balanceamento por viés
@@ -1175,6 +1233,8 @@ def main() -> int:
         ):
             if mode_name.endswith("biasdisable") and not BIAS_DISABLE_ENABLED:
                 continue
+            if only_mode and (only_mode != mode_name):
+                continue
             rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
                 global_risk=True,
                 bayes_select=True,
@@ -1184,14 +1244,15 @@ def main() -> int:
                 regime_lookback_weeks=None,
                 regime_alpha_bad=1.0,
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{mode_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(mode_name, weekly_df)
 
-        pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
+        # Evitar sobrescrever o baseline quando rodamos com --only-mode/--out-suffix.
+        pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / f"bias_balance_experiment_summary{out_suffix}.csv", index=False)
 
     # ------------------------
     # Experimentos adicionais (recência + gating + robustez)
@@ -1218,6 +1279,35 @@ def main() -> int:
 
         return _Ctx()
 
+    # ------------------------
+    # Experimento: stake máximo como feature (cap_bin) — Bayes global (roll12 robust p10_p70)
+    # ------------------------
+    exp_name = "global_bayes_roll12_robust_p10_p70_capbin3"
+    if only_mode == exp_name:
+        # forçar robust/hysteresis e ligar cap_bin
+        with _with_globals(
+            POST_Q_OBJ=0.10,
+            MIN_POST_P_MEAN_POS=0.70,
+            ROBUST_CUTOFF_ENABLED=True,
+            HYSTERESIS_ENABLED=True,
+            CAP_BIN_ENABLED=True,
+        ):
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=12,
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
+
     # 12 semanas rolling (mais peso no recente por construção)
     for exp_name, win, robust, hyst, qpos in (
         ("global_bayes_roll12", 12, False, False, False),
@@ -1243,11 +1333,11 @@ def main() -> int:
                 regime_lookback_weeks=None,
                 regime_alpha_bad=1.0,
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
 
     pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
@@ -1274,11 +1364,11 @@ def main() -> int:
                 regime_lookback_weeks=None,
                 regime_alpha_bad=1.0,
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
 
     # ------------------------
@@ -1305,11 +1395,11 @@ def main() -> int:
                 regime_lookback_weeks=None,
                 regime_alpha_bad=1.0,
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
 
     # ------------------------
@@ -1336,11 +1426,11 @@ def main() -> int:
                 regime_lookback_weeks=None,
                 regime_alpha_bad=1.0,
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
 
     pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)
@@ -1362,11 +1452,11 @@ def main() -> int:
                 regime_lookback_weeks=4,
                 regime_alpha_bad=float(alpha_bad),
             )
-            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
-            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
-            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
-            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
-            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}{out_suffix}_daily.csv", index=False)
             _summarize_mode(exp_name, weekly_df)
 
     pd.DataFrame(results_summary_rows).to_csv(OUT_DIR / "bias_balance_experiment_summary.csv", index=False)

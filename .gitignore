@@ -18,5 +18,12 @@ analysis_proba_raw/pro_portfolio_all/stat_tests_scaling_breakpoint.*
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_housecap_capfixed*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_global_bayes_roll12_robust_p10_p70_capfixed_*.csv
 
+# Experimentos por faixa de banca / cap_bin (artefatos grandes gerados localmente)
+analysis_proba_raw/pro_portfolio_all/oos_walkforward_*_b*.csv
+analysis_proba_raw/pro_portfolio_all/oos_walkforward_*_b*.md
+analysis_proba_raw/pro_portfolio_all/oos_walkforward_*capbin*.csv
+analysis_proba_raw/pro_portfolio_all/oos_walkforward_*capbin*.md
+analysis_proba_raw/pro_portfolio_all/bias_balance_experiment_summary_b*.csv
+
 # artefato grande gerado localmente
 scored_dedup_proba_raw_all.csv
