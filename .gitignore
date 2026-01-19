@@ -14,6 +14,7 @@ analysis_proba_raw/pro_portfolio_all/oos_walkforward_score_compare_wf12_*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_region_gating_*.csv
 analysis_proba_raw/pro_portfolio_all/stat_tests_*.csv
 analysis_proba_raw/pro_portfolio_all/stat_tests_*.md
+analysis_proba_raw/pro_portfolio_all/stat_tests_scaling_breakpoint.*
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_housecap_capfixed*.csv
 analysis_proba_raw/pro_portfolio_all/oos_walkforward_global_bayes_roll12_robust_p10_p70_capfixed_*.csv
 
