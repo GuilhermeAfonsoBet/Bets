@@ -231,6 +231,9 @@ def main():
     parser.add_argument("--cutoff", required=True, type=float)
     parser.add_argument("--calib-floor", required=False, type=float, default=0.0)
     parser.add_argument("--logfile", required=False)
+    # Compatibilidade com PAD legado: por padrão, imprimir apenas 1 linha (último registro do payload).
+    # Use --stdout-all-rows para imprimir todas as linhas (modo auditoria).
+    parser.add_argument("--stdout-all-rows", action="store_true", help="Imprime proba/decision para todas as linhas do CSV (padrão: apenas última linha).")
 
     args = parser.parse_args()
 
@@ -328,11 +331,19 @@ def main():
     if logfile_handle is not None:
         logfile_handle.close()
 
-    # Imprime CSV no stdout
+    # Imprime CSV no stdout.
+    # IMPORTANTE (PAD): formato legado é exatamente 2 linhas:
+    #   proba,decision
+    #   <proba>,<decision>
     out = sys.stdout
     out.write("proba,decision\n")
-    for p, d in zip(probas, decisions):
-        out.write(f"{p:.6f},{d}\n")
+    if args.stdout_all_rows:
+        for p, d in zip(probas, decisions):
+            out.write(f"{p:.6f},{d}\n")
+    else:
+        # legado: só o último registro
+        if probas:
+            out.write(f"{float(probas[-1]):.6f},{int(decisions[-1])}\n")
 
 
 if __name__ == "__main__":
