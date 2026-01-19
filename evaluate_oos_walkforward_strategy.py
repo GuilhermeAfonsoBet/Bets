@@ -125,6 +125,13 @@ CAP_GATING_ENABLED = False
 CAP_QS = np.array([0.60, 0.80, 0.90])
 CAP_MIN_UNIQUE = 3  # se não houver diversidade de caps, não otimiza cap_max
 
+# Alternativa (mais robusta contra overfit): cap_max fixo por segmento.
+# - Escolhe cap_max uma única vez por segmento quando houver dados suficientes (usando apenas passado),
+#   e mantém esse cap_max fixo no restante do walk-forward.
+CAP_FIXED_PER_SEGMENT_ENABLED = False
+CAP_FIXED_MIN_TRAIN_BETS = 60
+CAP_FIXED_MIN_NONZERO_WEEKS = 6
+
 N_BOOT = 20_000
 SEED = 7
 
@@ -511,6 +518,53 @@ def apply_rules_on_df(df_any: pd.DataFrame, rules: Dict[str, Rule], alpha: float
     return pd.concat(rows, axis=0, ignore_index=True)
 
 
+def _cap_candidates_from_x(cap: np.ndarray) -> List[float]:
+    cap_ok = np.asarray(cap, dtype=float)
+    cap_ok = cap_ok[np.isfinite(cap_ok) & (cap_ok > 0)]
+    out = [float("inf")]
+    if cap_ok.size:
+        qs = np.unique(np.quantile(cap_ok, CAP_QS))
+        qs = qs[np.isfinite(qs) & (qs > 0)]
+        out += [float(v) for v in qs.tolist()]
+    return sorted(set(out))
+
+
+def _cap_select_obj_p10(
+    x: pd.DataFrame, rule: Rule, weeks_all: List[str], seed: int
+) -> Tuple[float, float]:
+    """
+    Objetivo simples para escolher cap_max em treino:
+    - posterior p10 do lucro semanal médio (cap2) via Bayesian bootstrap em semanas.
+    - retorna (obj, p_mean_pos)
+    """
+    if x.empty or rule.status != "ok" or rule.stake_frac <= 0:
+        return -np.inf, 0.0
+    score = pd.to_numeric(x[rule.score_col], errors="coerce").to_numpy(float)
+    roi2 = x["roi_cap2"].to_numpy(float)
+    wk = x["week"].to_numpy()
+    cap = x["house_cap"].to_numpy(float)
+    m = np.isfinite(score) & (score >= float(rule.cutoff)) & np.isfinite(roi2) & np.isfinite(cap) & (cap > 0)
+    if not np.any(m):
+        return -np.inf, 0.0
+    stake0 = BANKROLL * float(rule.stake_frac)
+    stake_eff = np.minimum(stake0, cap[m])
+    pnl = stake_eff * roi2[m]
+    w2 = (
+        pd.Series(pnl, index=wk[m])
+        .groupby(level=0)
+        .sum()
+        .reindex(weeks_all, fill_value=0.0)
+        .to_numpy(float)
+    )
+    rng = np.random.default_rng(seed)
+    bb = rng.dirichlet(np.ones(len(weeks_all)), size=int(BAYES_N))
+    post = bb @ w2.astype(float)
+    ppos = float(np.mean(post > 0))
+    if ppos < MIN_POST_P_MEAN_POS:
+        return -np.inf, ppos
+    return float(np.quantile(post, POST_Q_OBJ)), ppos
+
+
 def _empirical_bayes_shrink(means: np.ndarray, se2: np.ndarray) -> Tuple[float, float, np.ndarray]:
     """
     Shrinkage Empirical Bayes para estimar um efeito por grupo:
@@ -740,6 +794,7 @@ def main() -> int:
         weekly_global_rows = []
         daily_rows = []
         prev_rules: Dict[str, Rule] = {}
+        fixed_cap_by_key: Dict[str, float] = {}
         # histórico de calibração por segmento (só usa passado)
         seg_roi_err_hist: Dict[str, List[float]] = {}
 
@@ -779,7 +834,48 @@ def main() -> int:
                             rule = Rule(bet_type=bet_type, dow=dow, score_col=sc, cutoff=1.0, stake_frac=0.0, status="disabled_bias")
                         else:
                             roi_adj = float(roi_bias_adj_map.get(rk, 0.0))
-                            rule = optimize_segment_train(x, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
+                            # cap_max fixo por segmento (escolhido uma vez e mantido)
+                            cap_fixed = fixed_cap_by_key.get(rk) if CAP_FIXED_PER_SEGMENT_ENABLED else None
+                            if cap_fixed is not None and np.isfinite(float(cap_fixed)):
+                                x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_fixed))].copy()
+                            else:
+                                x_use = x
+
+                            # se ainda não temos cap fixo, tentamos escolhê-lo UMA vez (em treino) testando poucos candidatos
+                            if CAP_FIXED_PER_SEGMENT_ENABLED and (rk not in fixed_cap_by_key):
+                                score0 = pd.to_numeric(x["house_cap"], errors="coerce").to_numpy(float)
+                                # só tenta se há volume suficiente
+                                if int(np.sum(np.isfinite(score0) & (score0 > 0))) >= CAP_FIXED_MIN_TRAIN_BETS:
+                                    weeks_all = sorted(x["week"].unique().tolist())
+                                    best_cap = float("inf")
+                                    best_obj = -np.inf
+                                    best_rule = None
+                                    for cap_cand in _cap_candidates_from_x(x["house_cap"].to_numpy(float)):
+                                        if np.isfinite(cap_cand):
+                                            xx = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(cap_cand))].copy()
+                                        else:
+                                            xx = x
+                                        # exige diversidade temporal mínima
+                                        nonzero_weeks = int(xx["week"].nunique())
+                                        if nonzero_weeks < CAP_FIXED_MIN_NONZERO_WEEKS:
+                                            continue
+                                        rr = optimize_segment_train(xx, sc, bayes_select=bayes_select, prev_rule=None, roi_bias_adj=roi_adj)
+                                        if rr.status != "ok" or rr.stake_frac <= 0:
+                                            continue
+                                        # define cap no rule apenas para avaliação do objetivo
+                                        rr = Rule(bet_type=rr.bet_type, dow=rr.dow, score_col=rr.score_col, cutoff=rr.cutoff, stake_frac=rr.stake_frac, status=rr.status, cap_max=float(cap_cand))
+                                        obj, _pp = _cap_select_obj_p10(xx, rr, weeks_all=weeks_all, seed=SEED + 991 + hash(rk) % 10_000)
+                                        if obj > best_obj:
+                                            best_obj = float(obj)
+                                            best_cap = float(cap_cand)
+                                            best_rule = rr
+                                    fixed_cap_by_key[rk] = float(best_cap)
+                                    if best_rule is not None and np.isfinite(best_cap):
+                                        x_use = x[np.isfinite(x["house_cap"]) & (x["house_cap"] <= float(best_cap))].copy()
+
+                            rule0 = optimize_segment_train(x_use, sc, bayes_select=bayes_select, prev_rule=prev, roi_bias_adj=roi_adj)
+                            cap_final = float(fixed_cap_by_key.get(rk, float("inf"))) if CAP_FIXED_PER_SEGMENT_ENABLED else float("inf")
+                            rule = Rule(bet_type=rule0.bet_type, dow=rule0.dow, score_col=rule0.score_col, cutoff=rule0.cutoff, stake_frac=rule0.stake_frac, status=rule0.status, cap_max=cap_final)
                     rules[f"{bet_type}|{dow}"] = rule
 
             # se pedir risco global, ajustar stakes por alpha
@@ -1199,7 +1295,38 @@ def main() -> int:
         BAYES_N=2000,
     ):
         exp_name = "global_bayes_roll12_robust_p10_p70_capgate"
-        if (not only_mode) or (only_mode == exp_name):
+        if only_mode == exp_name:
+            rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
+                global_risk=True,
+                bayes_select=True,
+                segment_calib=False,
+                disable_top_k=0,
+                train_window_weeks=12,
+                regime_lookback_weeks=None,
+                regime_alpha_bad=1.0,
+            )
+            rules_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_selected_rules.csv", index=False)
+            weekly_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly.csv", index=False)
+            weekly_seg_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_weekly_by_segment.csv", index=False)
+            weekly_global_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_train_global_metrics.csv", index=False)
+            daily_df.to_csv(OUT_DIR / f"oos_walkforward_{exp_name}_daily.csv", index=False)
+            _summarize_mode(exp_name, weekly_df)
+
+    # ------------------------
+    # Experimento: cap_max fixo por segmento (escolhe uma vez e mantém)
+    # ------------------------
+    with _with_globals(
+        ROBUST_CUTOFF_ENABLED=True,
+        HYSTERESIS_ENABLED=True,
+        REQUIRE_POST_Q_OBJ_POS=False,
+        REQUIRE_POST_Q_GATE_POS=False,
+        POST_Q_OBJ=0.10,
+        MIN_POST_P_MEAN_POS=0.70,
+        CAP_FIXED_PER_SEGMENT_ENABLED=True,
+        BAYES_N=2000,
+    ):
+        exp_name = "global_bayes_roll12_robust_p10_p70_capfixed"
+        if only_mode == exp_name:
             rules_df, weekly_df, weekly_seg_df, weekly_global_df, daily_df = run_walkforward(
                 global_risk=True,
                 bayes_select=True,
