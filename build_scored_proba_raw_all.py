@@ -31,6 +31,7 @@ from sklearn.preprocessing import OneHotEncoder
 
 
 EXCEL_CANDIDATES = [
+    "/workspace/ResumoApostas_PBI_final_20.01.2026.xlsx",
     "/workspace/ResumoApostas_PBI_final_17.01.2026.xlsx",
     "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_17.01.2026.xlsx",
     "/workspace/main_snapshot_latest/ResumoApostas_PBI_final_14.01.2026.xlsx",
