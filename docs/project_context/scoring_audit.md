@@ -59,6 +59,10 @@ proba,decision
 0.123456,False
 ```
 
+Observação importante (compatibilidade com PAD):
+- `score_logit_weekdays_cli.py` imprime por padrão **apenas 1 linha** (último registro do CSV), para manter compatibilidade com fluxos PAD que assumem 2 linhas.
+- Para auditoria (payload multi-linha), use `--stdout-all-rows`.
+
 ---
 
 ### C) Persistência no Excel (PAD)
@@ -119,6 +123,27 @@ Verificações:
 - usar a mesma lógica de scoring no estudo (coluna correta por dia)
 - garantir que o estudo usa `proba_cal` no weekend e `raw+clip` nos weekdays
 - confirmar qual lógica foi usada na quinta-feira para o período analisado
+
+---
+
+## Auditoria de consistência “Excel ↔ logs” (por bet_id)
+Quando o Excel está atualizado e o CLI está logando `bet_id`, a checagem mais forte é:
+
+1) Ler o Excel `ResumoApostas_PBI_final_*.xlsx` (sheet `ResumoApostas (2)`), obter:
+   - `ID Aposta` (bet_id)
+   - `ApostaLive.rf_prob` (probabilidade gravada)
+   - `BIA_ApostaUTC`
+
+2) Ler o JSONL do dia:
+   - weekdays: `scoring_weekdays.jsonl`
+   - by_dow: `scoring.jsonl`
+
+3) Fazer join por `bet_id` e calcular:
+   - `match6 = round(rf_prob,6) == round(proba_log,6)`
+   - `MAE = mean(|rf_prob - proba_log|)`
+
+Regra prática:
+- Esperado em produção (com versões alinhadas): **match6 ≈ 100%**.
 
 ---
 

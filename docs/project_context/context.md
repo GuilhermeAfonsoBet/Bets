@@ -35,6 +35,24 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
 - Auditoria “artefatos RPA” (payload%betID% + stdout.csv):
   - Para os exemplos enviados (sábado / SexDom), o match entre **stdout capturado** e **reexecução do CLI** foi **100%** para todos os casos com stdout disponível.
 
+### Atualizações recentes (Jan/2026)
+- **Consistência real “Excel ↔ logs” (últimos dias)**:
+  - Com a planilha `ResumoApostas_PBI_final_20.01.2026.xlsx` e os logs atualizados (`scoring_weekdays.jsonl`),
+    foi possível fazer join por `bet_id` e validar que:
+    - **2026-01-19 (segunda)**: match6 = **100%** (Excel `ApostaLive.rf_prob` vs `scoring_weekdays.jsonl`)
+    - **2026-01-20 (terça)**: match6 = **100%**
+  - Isso confirma que, quando o Excel está preenchido e o log tem `bet_id`, o processo é auditável e consistente.
+
+- **Compatibilidade do stdout com PAD (weekdays)**:
+  - `score_logit_weekdays_cli.py` voltou a emitir por padrão exatamente o formato legado (2 linhas):
+    `proba,decision` + **apenas a última linha do payload**.
+  - Para auditoria, existe `--stdout-all-rows` para imprimir todas as linhas do CSV.
+
+- **Evolução do motor WF (experimentos de escala e stake máximo)**:
+  - `evaluate_oos_walkforward_strategy.py` ganhou:
+    - `--bankroll` e `--out-suffix` para rodar walk-forward reotimizando por faixa de banca sem sobrescrever artefatos.
+    - modo experimental `cap_bin` (house_cap como dimensão do segmento) para testar “stake máximo como feature de decisão”.
+
 ### Como o operacional deve funcionar (contrato)
 1) PAD gera `payload%betID%.csv` com header e 1 linha.
 2) PAD executa o CLI correto para o dia:
@@ -58,4 +76,10 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
     - reproduzir o score a partir do payload,
     - validar se o Excel gravou o mesmo valor do stdout,
     - validar se o modelo/script usado é o esperado (via `model_path` no JSONL).
+
+- **Recomendação prática**:
+  - Tratar `ApostaLive.rf_prob` como “valor auditável” apenas quando:
+    - estiver em [0,1],
+    - houver `bet_id` no log do CLI no mesmo dia,
+    - e o join por `bet_id` bater em 6 casas (match6 ~ 100%).
 
