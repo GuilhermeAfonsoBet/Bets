@@ -162,7 +162,9 @@ def build_features_weekday_models(df: pd.DataFrame) -> pd.DataFrame:
     out["Número de casas disponíveis no momento da aposta"] = df["ApostaLive.Número de casas disponíveis no momento da aposta"]
     out["Dif percent maior odd e segunda maior"] = df["ApostaLive.Dif % maior odd e segunda maior"]
     out["Dif percent maior odd e odd mediana"] = df["ApostaLive.Dif % maior odd e odd mediana"]
-    out["Dif Odds RB E BIA"] = df["Dif Odds RB & BIA"]
+    # IMPORTANT: `Dif Odds RB & BIA` na planilha pode usar BetinAsia.got price (ex-post) como proxy de BIA.
+    # Para emular o operacional (payload), recalculamos esse campo via Aux1 (maior odd) / 1000.
+    out["Dif Odds RB E BIA"] = df["Dif Odds RB & BIA_op_sim"]
     out["MinutesToMatchStart"] = df["RebelBetting.MinutesToMatchStart"]
     out["TempoApostas.Tempo total bot"] = df["TempoApostas.Tempo total bot"]
     out["Subtipo da Aposta"] = df["Subtipo da Aposta"]
@@ -183,7 +185,8 @@ def build_features_segqui_sexdom(df: pd.DataFrame) -> pd.DataFrame:
     out["Número de casas disponíveis no momento da aposta"] = df["ApostaLive.Número de casas disponíveis no momento da aposta"]
     out["Dif % maior odd e segunda maior"] = df["ApostaLive.Dif % maior odd e segunda maior"]
     out["Dif % maior odd e odd mediana"] = df["ApostaLive.Dif % maior odd e odd mediana"]
-    out["Dif Odds RB & BIA"] = df["Dif Odds RB & BIA"]
+    # idem weekdays: usar versão op_sim (sem got price ex-post)
+    out["Dif Odds RB & BIA"] = df["Dif Odds RB & BIA_op_sim"]
     out["MinutesToMatchStart"] = df["RebelBetting.MinutesToMatchStart"]
     out["TempoApostas.Tempo total bot"] = df["TempoApostas.Tempo total bot"]
     dt = pd.to_datetime(df["BIA_ApostaUTC"], errors="coerce")
@@ -191,6 +194,33 @@ def build_features_segqui_sexdom(df: pd.DataFrame) -> pd.DataFrame:
     out["Turno Aposta (UTC)"] = dt.apply(lambda x: infer_turno_utc(x) if pd.notna(x) else None)
     out["Casa aposta vencedora"] = df["ApostaLive.Casa aposta vencedora"]
     return out
+
+
+def compute_dif_odds_rb_bia_op_sim(df: pd.DataFrame) -> pd.Series:
+    """
+    Recalcula `Dif Odds RB & BIA` para emular o operacional (payload).
+
+    Definição (observada no operacional):
+      Odd_RB  := RebelBetting.Odds (fallback: Odd Indicada no RB)
+      Odd_BIA := ApostaLive.Aux1 - maior odd / 1000 (com tolerância a já estar em escala decimal)
+      Dif     := (Odd_RB - Odd_BIA) / Odd_RB
+
+    Observação: evita usar `BetinAsia.got price` (ex-post).
+    """
+    # odd RB
+    odd_rb = pd.to_numeric(df.get("RebelBetting.Odds"), errors="coerce")
+    odd_rb = odd_rb.combine_first(pd.to_numeric(df.get("Odd Indicada no RB"), errors="coerce"))
+    odd_rb = odd_rb.astype(float)
+
+    # odd BIA proxy: Aux1 / 1000
+    aux1 = pd.to_numeric(df.get("ApostaLive.Aux1 - maior odd"), errors="coerce").astype(float)
+    # heurística de escala: se Aux1 > 10, interpretamos como milésimos (ex.: 1665 -> 1.665)
+    odd_bia = np.where(np.isfinite(aux1.to_numpy(float)) & (aux1.to_numpy(float) > 10.0), aux1.to_numpy(float) / 1000.0, aux1.to_numpy(float))
+    odd_bia = pd.Series(odd_bia, index=df.index, dtype=float)
+
+    dif = (odd_rb - odd_bia) / odd_rb
+    dif = dif.where(np.isfinite(dif) & np.isfinite(odd_rb) & (odd_rb > 1e-12), np.nan)
+    return dif.astype(float)
 
 
 def main() -> int:
@@ -210,6 +240,8 @@ def main() -> int:
     df["bet_is_fh"] = df["Tipo Aposta"].astype(str).str.lower().str.contains("first half")
     df["bet_type"] = np.where(df["bet_is_fh"], "FH", "FT")
     df = compute_roi_calc(df)
+    # Recalcular Dif Odds para emular o operacional (sem got price ex-post).
+    df["Dif Odds RB & BIA_op_sim"] = compute_dif_odds_rb_bia_op_sim(df)
 
     # load models
     m_seg = patch_sklearn_compat(joblib.load("/workspace/model_logit_segunda.joblib"))
