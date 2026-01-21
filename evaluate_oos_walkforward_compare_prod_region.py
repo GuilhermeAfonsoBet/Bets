@@ -137,19 +137,31 @@ def main() -> int:
     df = _ensure_calibrated_cols(df)
 
     sc = pd.read_csv(SCORES, parse_dates=["BIA_ApostaUTC"])
-    sc = sc[["ID Aposta", "score_prod_payload_logit_wf12", "score_prod_payload_region_logit_wf12"]].copy()
+    sc = sc[
+        [
+            "ID Aposta",
+            "score_prod_payload_logit_wf12",
+            "score_prod_payload_region_logit_wf12",
+            "score_prod_payload_logit_notempo_wf12",
+            "score_prod_payload_region_logit_notempo_wf12",
+        ]
+    ].copy()
     df = df.merge(sc, how="left", on="ID Aposta")
 
     wk_cur, s_cur = _run_wf(df, "score_current")
     wk_p, s_p = _run_wf(df, "score_prod_payload_logit_wf12")
     wk_pr, s_pr = _run_wf(df, "score_prod_payload_region_logit_wf12")
+    wk_p0, s_p0 = _run_wf(df, "score_prod_payload_logit_notempo_wf12")
+    wk_pr0, s_pr0 = _run_wf(df, "score_prod_payload_region_logit_notempo_wf12")
 
     out_sum = OUT_DIR / "oos_walkforward_score_compare_prod_region_wf12_p10_p70_summary.csv"
-    pd.concat([s_cur, s_p, s_pr], axis=0, ignore_index=True).to_csv(out_sum, index=False)
+    pd.concat([s_cur, s_p, s_pr, s_p0, s_pr0], axis=0, ignore_index=True).to_csv(out_sum, index=False)
 
     wk_cur.to_csv(OUT_DIR / "oos_walkforward_score_current_p10_p70_weekly.csv", index=False)
     wk_p.to_csv(OUT_DIR / "oos_walkforward_score_prod_payload_logit_wf12_p10_p70_weekly.csv", index=False)
     wk_pr.to_csv(OUT_DIR / "oos_walkforward_score_prod_payload_region_logit_wf12_p10_p70_weekly.csv", index=False)
+    wk_p0.to_csv(OUT_DIR / "oos_walkforward_score_prod_payload_logit_notempo_wf12_p10_p70_weekly.csv", index=False)
+    wk_pr0.to_csv(OUT_DIR / "oos_walkforward_score_prod_payload_region_logit_notempo_wf12_p10_p70_weekly.csv", index=False)
 
     print(str(out_sum))
     return 0

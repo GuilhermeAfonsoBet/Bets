@@ -82,7 +82,7 @@ def infer_region(text: str) -> str:
     return "desconhecida"
 
 
-def build_payload_features(df: pd.DataFrame, with_region: bool) -> pd.DataFrame:
+def build_payload_features(df: pd.DataFrame, with_region: bool, with_tempo_bot: bool) -> pd.DataFrame:
     """
     Replica o schema do payload do CLI:
     NUM:
@@ -107,7 +107,8 @@ def build_payload_features(df: pd.DataFrame, with_region: bool) -> pd.DataFrame:
     X["Dif % maior odd e odd mediana"] = pd.to_numeric(df.get("ApostaLive.Dif % maior odd e odd mediana"), errors="coerce")
     X["Dif Odds RB & BIA"] = pd.to_numeric(df.get("Dif Odds RB & BIA"), errors="coerce")
     X["MinutesToMatchStart"] = pd.to_numeric(df.get("RebelBetting.MinutesToMatchStart"), errors="coerce")
-    X["TempoApostas.Tempo total bot"] = pd.to_numeric(df.get("TempoApostas.Tempo total bot"), errors="coerce")
+    if with_tempo_bot:
+        X["TempoApostas.Tempo total bot"] = pd.to_numeric(df.get("TempoApostas.Tempo total bot"), errors="coerce")
 
     X["Subtipo da Aposta"] = df.get("Subtipo da Aposta", pd.Series("missing", index=df.index)).astype("string").fillna("missing")
     X["Dia Semana Aposta (UTC)"] = df.get("dow_pt", pd.Series("missing", index=df.index)).astype("string").fillna("missing")
@@ -158,6 +159,8 @@ def main() -> int:
     weeks = sorted(df["week"].unique().tolist())
     s_payload = np.full(len(df), np.nan, dtype=float)
     s_payload_region = np.full(len(df), np.nan, dtype=float)
+    s_payload_notempo = np.full(len(df), np.nan, dtype=float)
+    s_payload_region_notempo = np.full(len(df), np.nan, dtype=float)
 
     # começamos em i>=4 para ter alguma história; o treino é a janela de até 12 semanas anteriores.
     for i in range(4, len(weeks)):
@@ -177,15 +180,26 @@ def main() -> int:
         if len(np.unique(y)) < 2:
             continue
 
-        Xtr = build_payload_features(tr.loc[ok].copy(), with_region=False)
-        Xte = build_payload_features(te.copy(), with_region=False)
+        Xtr = build_payload_features(tr.loc[ok].copy(), with_region=False, with_tempo_bot=True)
+        Xte = build_payload_features(te.copy(), with_region=False, with_tempo_bot=True)
         p = fit_predict_prod_logit(Xtr, y, Xte)
         s_payload[df.index.get_indexer(te_idx)] = p
 
-        Xtr2 = build_payload_features(tr.loc[ok].copy(), with_region=True)
-        Xte2 = build_payload_features(te.copy(), with_region=True)
+        Xtr2 = build_payload_features(tr.loc[ok].copy(), with_region=True, with_tempo_bot=True)
+        Xte2 = build_payload_features(te.copy(), with_region=True, with_tempo_bot=True)
         p2 = fit_predict_prod_logit(Xtr2, y, Xte2)
         s_payload_region[df.index.get_indexer(te_idx)] = p2
+
+        # Variante sem `TempoApostas.Tempo total bot`
+        Xtr3 = build_payload_features(tr.loc[ok].copy(), with_region=False, with_tempo_bot=False)
+        Xte3 = build_payload_features(te.copy(), with_region=False, with_tempo_bot=False)
+        p3 = fit_predict_prod_logit(Xtr3, y, Xte3)
+        s_payload_notempo[df.index.get_indexer(te_idx)] = p3
+
+        Xtr4 = build_payload_features(tr.loc[ok].copy(), with_region=True, with_tempo_bot=False)
+        Xte4 = build_payload_features(te.copy(), with_region=True, with_tempo_bot=False)
+        p4 = fit_predict_prod_logit(Xtr4, y, Xte4)
+        s_payload_region_notempo[df.index.get_indexer(te_idx)] = p4
 
     out = pd.DataFrame(
         {
@@ -194,6 +208,8 @@ def main() -> int:
             "week": df["week"],
             "score_prod_payload_logit_wf12": s_payload,
             "score_prod_payload_region_logit_wf12": s_payload_region,
+            "score_prod_payload_logit_notempo_wf12": s_payload_notempo,
+            "score_prod_payload_region_logit_notempo_wf12": s_payload_region_notempo,
         }
     )
     out.to_csv(OUT, index=False)
