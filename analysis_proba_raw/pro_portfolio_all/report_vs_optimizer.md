@@ -5,7 +5,7 @@
 ### Global
 - **Baseline realizado**: mean/sem=192.9, Sharpe_ann=2.786, ROI/$=0.0464
 - **Reporte (baseline)**: forecast mean=394.0; forecast corrigido=192.9
-- **Otimizador (versão atual, novo OOS)**: mean/sem=248.7, Sharpe_ann=3.554, ROI/$=0.0725
+- **Otimizador (versão atual, novo OOS)**: mean/sem=-53.2, Sharpe_ann=-1.153, ROI/$=-0.0381
 
 ### Principais diferenças
 - Reporte ajustado altera apenas expectativas/projeções; não muda o realizado OOS.
