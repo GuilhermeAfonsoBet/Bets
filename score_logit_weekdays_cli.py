@@ -272,6 +272,14 @@ def preparar_payload(df: pd.DataFrame) -> pd.DataFrame:
     if "Subtipo da Aposta" in df.columns:
         df["Subtipo da Aposta"] = df["Subtipo da Aposta"].apply(normalize_subtipo_aposta)
 
+    # IGNORAR `TempoApostas.Tempo total bot`:
+    # Essa variável se mostrou instável e não será mais usada na escoragem.
+    # Mantemos a coluna (para compatibilidade com o modelo/pipeline), mas forçamos NaN
+    # para que o imputador trate como ausente.
+    if "TempoApostas.Tempo total bot" not in df.columns:
+        df["TempoApostas.Tempo total bot"] = np.nan
+    df["TempoApostas.Tempo total bot"] = np.nan
+
     return df
 
 

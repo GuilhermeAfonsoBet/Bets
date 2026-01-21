@@ -215,6 +215,10 @@ def coerce_df_types(df: pd.DataFrame) -> pd.DataFrame:
     # normalização de categóricas sensíveis (o modelo usa OneHotEncoder)
     if "Subtipo da Aposta" in df.columns:
         df["Subtipo da Aposta"] = df["Subtipo da Aposta"].apply(normalize_subtipo_aposta)
+    # IGNORAR `TempoApostas.Tempo total bot` (mantém coluna por compatibilidade, mas força NaN)
+    if "TempoApostas.Tempo total bot" not in df.columns:
+        df["TempoApostas.Tempo total bot"] = np.nan
+    df["TempoApostas.Tempo total bot"] = np.nan
     # categóricas: string, substitui NaN por "missing"
     for c in CAT_COLS:
         df[c] = df[c].astype("string").fillna("missing")
