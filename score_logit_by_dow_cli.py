@@ -212,11 +212,52 @@ def coerce_df_types(df: pd.DataFrame) -> pd.DataFrame:
     # numéricas
     for c in NUM_COLS:
         df[c] = df[c].apply(coerce_decimal_string)
+    # normalização de categóricas sensíveis (o modelo usa OneHotEncoder)
+    if "Subtipo da Aposta" in df.columns:
+        df["Subtipo da Aposta"] = df["Subtipo da Aposta"].apply(normalize_subtipo_aposta)
     # categóricas: string, substitui NaN por "missing"
     for c in CAT_COLS:
         df[c] = df[c].astype("string").fillna("missing")
     # mantém apenas o que precisamos, na ordem
     return df[ALL_COLS]
+
+
+def normalize_subtipo_aposta(x: Any) -> str:
+    """
+    Normaliza `Subtipo da Aposta` para casar com as categorias usadas no treino.
+
+    Os modelos (via OneHotEncoder) são sensíveis à string exata. No treino, é comum
+    ver valores como '+0,75', '-0,5', '+1,25' e inteiros como '-1', '0', '1' (sem '+').
+    No operacional/payload às vezes aparece '0.75' (ponto) e sem sinal.
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "missing"
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return "missing"
+
+    s0 = "".join(s.split())
+    # já canônico (mantém)
+    if "," in s0:
+        # se não tem sinal e é decimal, pode vir como '0,75' (sem '+'); melhor canonicalizar via parse
+        if not (s0.startswith("+") or s0.startswith("-")) and ("," in s0):
+            pass
+        else:
+            return s0
+
+    # parse: aceita vírgula ou ponto como decimal
+    v = coerce_decimal_string(s0.replace(",", ".")) if "," in s0 and "." in s0 else coerce_decimal_string(s0)
+    if not isinstance(v, (int, float)) or not np.isfinite(v):
+        return s0
+
+    # inteiros: sem '+' para positivos
+    if abs(float(v) - int(round(float(v)))) < 1e-12:
+        return str(int(round(float(v))))
+
+    sign = "+" if float(v) > 0 else "-"
+    mag = round(abs(float(v)), 2)
+    mag_str = f"{mag:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+    return f"{sign}{mag_str}"
 
 
 def get_bet_id_from_raw(df_raw: pd.DataFrame) -> Optional[str]:

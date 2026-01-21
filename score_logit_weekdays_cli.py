@@ -211,6 +211,53 @@ def coerce_decimal_string(x):
         return np.nan
 
 
+def normalize_subtipo_aposta(x) -> str:
+    """
+    Normaliza `Subtipo da Aposta` para casar com as categorias usadas no treino.
+
+    Observação importante: os modelos foram treinados com valores em PT-BR e, em muitos
+    casos, com sinal explícito, por exemplo: '+0,75', '-0,5', '+1,25', além de inteiros
+    sem sinal ('-1', '-2', '0', '1').
+
+    O operacional/payload às vezes envia variações como '0.75'/'-0.75' (ponto decimal) ou
+    sem sinal. Como o modelo usa OneHotEncoder, essas variações viram categorias
+    desconhecidas e mudam o score. Esta função converte para o formato canônico.
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "missing"
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none", "null"}:
+        return "missing"
+
+    # Já está no formato canônico (ex.: '+0,75', '-0,5', '0', '1', '-2')
+    # Mantém como está (apenas remove espaços redundantes).
+    s0 = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"[+-]?\d+(,\d+)?", s0):
+        # Se houver decimal e não houver sinal, pode ser ambíguo; lidamos abaixo via parse.
+        if "," in s0 and not (s0.startswith("+") or s0.startswith("-")):
+            pass
+        else:
+            return s0
+
+    # Parse robusto para float aceitando vírgula/ponto
+    v = coerce_decimal_string(s0.replace(",", ".")) if "," in s0 and "." in s0 else coerce_decimal_string(s0)
+    if not np.isfinite(v):
+        return s0  # fallback: mantém string original
+
+    # Inteiros: no treino aparecem sem sinal para positivos (ex.: '1') e com '-' para negativos.
+    if abs(v - int(round(v))) < 1e-12:
+        return str(int(round(v)))
+
+    # Decimais: no treino aparecem com sinal explícito (+/-) e vírgula decimal.
+    sign = "+" if v > 0 else "-"
+    mag = abs(float(v))
+    # limita precisão (evita '0,7500000001')
+    mag = round(mag, 2)
+    mag_str = f"{mag:.2f}".rstrip("0").rstrip(".")
+    mag_str = mag_str.replace(".", ",")
+    return f"{sign}{mag_str}"
+
+
 def preparar_payload(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
@@ -220,6 +267,10 @@ def preparar_payload(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             # aplica coerção robusta em qualquer dtype (string/object/num)
             df[col] = df[col].apply(coerce_decimal_string)
+
+    # normaliza Subtipo para casar com o treino (OneHotEncoder é sensível a string exata)
+    if "Subtipo da Aposta" in df.columns:
+        df["Subtipo da Aposta"] = df["Subtipo da Aposta"].apply(normalize_subtipo_aposta)
 
     return df
 
