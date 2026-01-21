@@ -48,6 +48,22 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
     `proba,decision` + **apenas a última linha do payload**.
   - Para auditoria, existe `--stdout-all-rows` para imprimir todas as linhas do CSV.
 
+- **Alinhamento “pipeline ↔ operacional” (feature `Dif Odds RB & BIA`)**:
+  - `BetinAsia.got price` é **ex-post** e não pode ser usado para decidir no operacional.
+  - O pipeline de estudo foi ajustado para calcular `Dif Odds RB & BIA` de forma **operacional-like** (op_sim), usando:
+    - `Odd_RB := RebelBetting.Odds` (fallback `Odd Indicada no RB`)
+    - `Odd_BIA := ApostaLive.Aux1 - maior odd / 1000` (quando `Aux1 > 10`, assume milésimos)
+  - Isso garante que o score do estudo não dependa de informação que só existe após a execução.
+
+- **Execução (slippage) — diagnóstico e impacto no portfólio**:
+  - Medimos o slippage como \(\\Delta odd = got\\_price - Aux1/1000\\).
+  - No dataset, `got price` aparece em ~16% das apostas (ex-post), então a análise de execução tem cobertura parcial.
+  - No portfólio OOS (`global_bayes_roll12_robust_p10_p70`), o slippage histórico estimado adicionou aproximadamente:
+    - **ΔPnL ≈ +USD 54** no período OOS (cap2)
+    - **ΔROI/$ ≈ +0,00216** sobre o stake do portfólio
+    - Cobertura por stake (apostas com got+aux): **~22%**
+  - Leitura: o efeito foi pequeno e levemente positivo; o slippage deve ser monitorado como risco operacional, não como feature de decisão.
+
 - **Evolução do motor WF (experimentos de escala e stake máximo)**:
   - `evaluate_oos_walkforward_strategy.py` ganhou:
     - `--bankroll` e `--out-suffix` para rodar walk-forward reotimizando por faixa de banca sem sobrescrever artefatos.

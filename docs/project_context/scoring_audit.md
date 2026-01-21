@@ -26,7 +26,7 @@ Schema dos modelos (weekdays e by_dow):
   - `Dif percent maior odd e odd mediana` (ou alias com `%`)
   - `Dif Odds RB E BIA` (ou alias com `&`)
   - `MinutesToMatchStart`
-  - `TempoApostas.Tempo total bot`
+  - `TempoApostas.Tempo total bot` *(pode vir no payload, mas atualmente é **ignorado** pelo CLI; mantido apenas por compatibilidade do schema)*
 - Categóricas:
   - `Subtipo da Aposta`
   - `Dia Semana Aposta (UTC)`
@@ -58,6 +58,11 @@ Saída do CLI (stdout):
 proba,decision
 0.123456,False
 ```
+
+Observações importantes (alinhamento de features):
+- **`Subtipo da Aposta`**: o CLI normaliza automaticamente formatos comuns (ex.: `0.75` → `+0,75`) para casar com as categorias do treino (OneHotEncoder é sensível à string exata).
+- **`TempoApostas.Tempo total bot`**: por decisão de robustez, o CLI força essa variável para `NaN` e ela não influencia mais o score.
+- **`Dif Odds RB & BIA`**: para o estudo/pipeline (offline) manter aderência ao operacional, evitamos usar `BetinAsia.got price` (ex-post) e recalculamos via proxy ex-ante (`ApostaLive.Aux1 - maior odd` / 1000 quando em milésimos).
 
 Observação importante (compatibilidade com PAD):
 - `score_logit_weekdays_cli.py` imprime por padrão **apenas 1 linha** (último registro do CSV), para manter compatibilidade com fluxos PAD que assumem 2 linhas.
