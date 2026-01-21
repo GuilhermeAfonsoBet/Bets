@@ -48,6 +48,10 @@ BEFORE_AFTER_GLOBAL = OUT_DIR / "before_after_global_comparison.csv"
 BEFORE_AFTER_RULE = OUT_DIR / "before_after_rule_comparison.csv"
 OOS_GATE_WEEKLY = OUT_DIR / f"oos_postfilter_debiased_roi_{MODE}_weekly.csv"
 
+# Slippage (execução): impacto estimado no portfólio OOS
+SLIPPAGE_PORT_SUMMARY = OUT_DIR / "slippage_portfolio_impact_summary.csv"
+SLIPPAGE_PORT_WEEKLY = OUT_DIR / "slippage_portfolio_impact_weekly.csv"
+
 BANKROLL = 2300.0
 # mesmos limites do otimizador
 MAX_DAILY_EXPOSURE_FRAC_Q = 0.70
@@ -907,6 +911,14 @@ def main() -> int:
             styles["BodyText"],
         )
     )
+    story.append(
+        Paragraph(
+            "<b>Nota (alinhamento operacional)</b>: no pipeline de score, a feature <b>Dif Odds RB & BIA</b> "
+            "é calculada de forma <i>operacional-like</i> (sem usar <i>BetinAsia.got price</i>, que é ex-post). "
+            "Em vez disso, usamos o proxy ex-ante observado no payload: <b>ApostaLive.Aux1 - maior odd</b> (÷1000 quando em milésimos).",
+            styles["BodyText"],
+        )
+    )
 
     # ---------------------------------------------------------
     # 2.B) Forward-looking: próxima semana (planejamento)
@@ -949,7 +961,8 @@ def main() -> int:
         wf.ROBUST_CUTOFF_DELTA = 0.02
 
         df_fwd = pd.read_csv(SCORED, parse_dates=["BIA_ApostaUTC"])
-        df_fwd["roi_raw"] = pd.to_numeric(df_fwd["ROI Real"], errors="coerce").astype(float)
+        # IMPORTANTE: usar ROI calculado (roi_calc), não a coluna ROI Real da planilha (inconsistente).
+        df_fwd["roi_raw"] = pd.to_numeric(df_fwd["roi_calc"], errors="coerce").astype(float)
         df_fwd["roi_cap2"] = np.minimum(df_fwd["roi_raw"].to_numpy(dtype=float), 2.0)
         df_fwd["roi_cap1"] = np.minimum(df_fwd["roi_raw"].to_numpy(dtype=float), 1.0)
         df_fwd["house_cap"] = pd.to_numeric(df_fwd["house_cap"], errors="coerce").astype(float)
@@ -1812,6 +1825,85 @@ def main() -> int:
             story.append(Paragraph("Artefato de escala não encontrado (stat_tests_bankroll_scaling.csv).", styles["BodyText"]))
     except Exception as e:
         story.append(Paragraph(f"Falha ao montar curva de escala de banca: {e}", styles["BodyText"]))
+
+    # 3.5 Slippage (execução): got price vs Aux1 (impacto no portfólio)
+    story.append(Spacer(1, 0.35 * cm))
+    story.append(Paragraph("<b>3.5 Execução: slippage (got price vs Aux1) — impacto no portfólio</b>", styles["Heading3"]))
+    story.append(
+        Paragraph(
+            "Nesta seção medimos a discrepância entre a odd proxy ex-ante usada no operacional "
+            "(<b>ApostaLive.Aux1 - maior odd</b>, em milésimos) e a odd ex-post registrada "
+            "(<b>BetinAsia.got price</b>). Em seguida estimamos o impacto histórico dessa diferença "
+            "no <b>PnL do portfólio OOS</b> (apenas nas apostas que a estratégia teria executado).",
+            styles["BodyText"],
+        )
+    )
+    try:
+        if SLIPPAGE_PORT_SUMMARY.exists():
+            s = pd.read_csv(SLIPPAGE_PORT_SUMMARY)
+            if not s.empty:
+                r = s.iloc[0].to_dict()
+                stake_total = float(r.get("stake_total", float("nan")))
+                stake_cov = float(r.get("stake_covered", float("nan")))
+                cov_pct = float(r.get("stake_covered_pct", float("nan")))
+                d_pnl = float(r.get("delta_profit_cap2_total", float("nan")))
+                d_roi = float(r.get("delta_roi_on_stake_cap2", float("nan")))
+                stake_pw = float(r.get("stake_per_week_when_active", float("nan")))
+                d_week = float(r.get("exp_delta_profit_cap2_per_week", float("nan")))
+
+                story.append(
+                    Paragraph(
+                        f"<b>Resumo (OOS, cap2)</b>: ΔPnL (got−aux)≈USD {d_pnl:,.1f}, "
+                        f"ΔROI/$≈{d_roi:.4f}. Cobertura (stake com got+aux)≈{cov_pct*100:.1f}% "
+                        f"(USD {stake_cov:,.0f} de USD {stake_total:,.0f}). "
+                        f"Impacto esperado por semana (na amostra OOS): ≈USD {d_week:,.1f} "
+                        f"(stake/sem quando ativo≈USD {stake_pw:,.0f}).",
+                        styles["BodyText"],
+                    )
+                )
+
+                # tabela semanal (top 8 piores/melhores por delta_profit)
+                if SLIPPAGE_PORT_WEEKLY.exists():
+                    wk = pd.read_csv(SLIPPAGE_PORT_WEEKLY)
+                    need = {"week", "stake_total", "stake_covered", "delta_profit_cap2", "delta_roi_on_stake_cap2_all"}
+                    if not wk.empty and need.issubset(set(wk.columns)):
+                        wk = wk.copy()
+                        wk["delta_profit_cap2"] = pd.to_numeric(wk["delta_profit_cap2"], errors="coerce").astype(float)
+                        wk["stake_total"] = pd.to_numeric(wk["stake_total"], errors="coerce").astype(float)
+                        wk = wk[np.isfinite(wk["delta_profit_cap2"]) & (wk["stake_total"] > 0)].copy()
+                        if not wk.empty:
+                            worst = wk.sort_values("delta_profit_cap2").head(6)
+                            best = wk.sort_values("delta_profit_cap2").tail(6)
+                            rows = [[P("<b>Semana</b>"), P("<b>Stake</b>"), P("<b>Stake c/ cobertura</b>"), P("<b>ΔPnL cap2</b>"), P("<b>ΔROI/$</b>")]]
+                            for _, rr in pd.concat([worst, best], axis=0).iterrows():
+                                rows.append(
+                                    [
+                                        P(str(rr["week"])),
+                                        P(f"{float(rr['stake_total']):,.0f}"),
+                                        P(f"{float(rr['stake_covered']):,.0f}" if np.isfinite(float(rr["stake_covered"])) else "—"),
+                                        P(f"{float(rr['delta_profit_cap2']):,.2f}"),
+                                        P(f"{float(rr['delta_roi_on_stake_cap2_all']):.4f}" if np.isfinite(float(rr["delta_roi_on_stake_cap2_all"])) else "—"),
+                                    ]
+                                )
+                            t = Table(rows, colWidths=[4.0 * cm, 3.0 * cm, 3.0 * cm, 3.0 * cm, 2.6 * cm], repeatRows=1)
+                            t.setStyle(
+                                TableStyle(
+                                    [
+                                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                        ("FONTSIZE", (0, 0), (-1, -1), 7),
+                                    ]
+                                )
+                            )
+                            story.append(Spacer(1, 0.15 * cm))
+                            story.append(Paragraph("<b>Amostra semanal (pior→melhor ΔPnL)</b>", styles["BodyText"]))
+                            story.append(t)
+        else:
+            story.append(Paragraph("Artefato de slippage não encontrado (slippage_portfolio_impact_summary.csv).", styles["BodyText"]))
+    except Exception as e:
+        story.append(Paragraph(f"Falha ao montar seção de slippage: {e}", styles["BodyText"]))
 
     story.append(PageBreak())
 
