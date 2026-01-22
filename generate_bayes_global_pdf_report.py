@@ -1923,20 +1923,47 @@ def main() -> int:
                         wk["stake_total"] = pd.to_numeric(wk["stake_total"], errors="coerce").astype(float)
                         wk = wk[np.isfinite(wk["delta_profit_cap2"]) & (wk["stake_total"] > 0)].copy()
                         if not wk.empty:
+                            # ΔPnL / PnL total (impacto percentual): usa o PnL cap2 OOS da semana (baseline do relatório)
+                            try:
+                                if WF_WEEKLY.exists():
+                                    wf_w = pd.read_csv(WF_WEEKLY, usecols=["week", "profit_cap2_usd"])
+                                    wf_w["profit_cap2_usd"] = pd.to_numeric(wf_w["profit_cap2_usd"], errors="coerce").astype(float)
+                                    wk = wk.merge(wf_w, on="week", how="left")
+                                else:
+                                    wk["profit_cap2_usd"] = float("nan")
+                            except Exception:
+                                wk["profit_cap2_usd"] = float("nan")
+                            wk["delta_pnl_over_pnl"] = wk["delta_profit_cap2"] / wk["profit_cap2_usd"]
+
                             worst = wk.sort_values("delta_profit_cap2").head(6)
                             best = wk.sort_values("delta_profit_cap2").tail(6)
-                            rows = [[P("<b>Semana</b>"), P("<b>Stake</b>"), P("<b>Stake c/ cobertura</b>"), P("<b>ΔPnL cap2</b>"), P("<b>ΔROI/$</b>")]]
+                            rows = [
+                                [
+                                    P("<b>Semana</b>"),
+                                    P("<b>Stake</b>"),
+                                    P("<b>Stake c/ cobertura</b>"),
+                                    P("<b>ΔPnL cap2</b>"),
+                                    P("<b>ΔPnL / PnL</b>"),
+                                    P("<b>ΔROI/$</b>"),
+                                ]
+                            ]
                             for _, rr in pd.concat([worst, best], axis=0).iterrows():
+                                pct = float(rr.get("delta_pnl_over_pnl", float("nan")))
+                                pnl_base = float(rr.get("profit_cap2_usd", float("nan")))
+                                pct_txt = "—"
+                                if np.isfinite(pct) and np.isfinite(pnl_base) and abs(pnl_base) > 1e-9:
+                                    pct_txt = f"{pct*100.0:+.1f}%"
                                 rows.append(
                                     [
                                         P(str(rr["week"])),
                                         P(f"{float(rr['stake_total']):,.0f}"),
                                         P(f"{float(rr['stake_covered']):,.0f}" if np.isfinite(float(rr["stake_covered"])) else "—"),
                                         P(f"{float(rr['delta_profit_cap2']):,.2f}"),
+                                        P(pct_txt),
                                         P(f"{float(rr['delta_roi_on_stake_cap2_all']):.4f}" if np.isfinite(float(rr["delta_roi_on_stake_cap2_all"])) else "—"),
                                     ]
                                 )
-                            t = Table(rows, colWidths=[4.0 * cm, 3.0 * cm, 3.0 * cm, 3.0 * cm, 2.6 * cm], repeatRows=1)
+                            t = Table(rows, colWidths=[3.7 * cm, 2.6 * cm, 2.8 * cm, 2.4 * cm, 2.2 * cm, 2.1 * cm], repeatRows=1)
                             t.setStyle(
                                 TableStyle(
                                     [
