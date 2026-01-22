@@ -37,7 +37,7 @@ def _rng(seed: int = 7) -> np.random.Generator:
     return np.random.default_rng(seed)
 
 
-def bootstrap_mean_ci(x: np.ndarray, n_boot: int = 20000, seed: int = 7) -> Tuple[float, float, float]:
+def bootstrap_mean_ci(x: np.ndarray, n_boot: int = 20000, seed: int = 7) -> Tuple[float, float, float, float]:
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -45,7 +45,8 @@ def bootstrap_mean_ci(x: np.ndarray, n_boot: int = 20000, seed: int = 7) -> Tupl
     r = _rng(seed)
     idx = r.integers(0, x.size, size=(n_boot, x.size))
     means = np.mean(x[idx], axis=1)
-    return float(np.mean(x)), float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+    # também retornamos P_boot(mean>0)
+    return float(np.mean(x)), float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975)), float(np.mean(means > 0))
 
 
 def sign_test_pos(x: np.ndarray) -> Tuple[int, int, float]:
@@ -224,7 +225,7 @@ def bankroll_curve(df: pd.DataFrame, rules: pd.DataFrame, weeks: List[str], bank
             continue
         stake = np.array([s for s, _ in wk_rows], float)
         pnl = np.array([p for _, p in wk_rows], float)
-        mean, lo, hi = bootstrap_mean_ci(pnl, n_boot=20000, seed=7)
+        mean, lo, hi, p_boot = bootstrap_mean_ci(pnl, n_boot=20000, seed=7)
         _, p_perm = signflip_permutation_pvalue_mean(pnl, n_perm=50000, seed=7)
         k, n, p_sign = sign_test_pos(pnl)
         out_rows.append(
@@ -239,6 +240,7 @@ def bankroll_curve(df: pd.DataFrame, rules: pd.DataFrame, weeks: List[str], bank
                 "boot_ci95_lo": float(lo),
                 "boot_ci95_hi": float(hi),
                 "p_perm_mean_gt0": float(p_perm),
+                "p_boot_mean_gt0": float(p_boot),
                 "sign_k_pos": int(k),
                 "sign_n": int(n),
                 "p_sign_pos": float(p_sign),
@@ -256,13 +258,13 @@ def main() -> int:
     stake = wf_week["stake_usd"].to_numpy(float)
 
     # Edge tests (inclui semanas sem trade = 0)
-    mean_w, lo_w, hi_w = bootstrap_mean_ci(w, n_boot=50000, seed=7)
+    mean_w, lo_w, hi_w, pboot_w = bootstrap_mean_ci(w, n_boot=50000, seed=7)
     obs_w, p_perm_w = signflip_permutation_pvalue_mean(w, n_perm=80000, seed=7)
     k_w, n_w, p_sign_w = sign_test_pos(w)
 
     # Condicional: apenas semanas com stake>0
     w_tr = wf_week.loc[wf_week["stake_usd"] > 0, "profit_cap2_usd"].to_numpy(float)
-    mean_tr, lo_tr, hi_tr = bootstrap_mean_ci(w_tr, n_boot=50000, seed=7)
+    mean_tr, lo_tr, hi_tr, pboot_tr = bootstrap_mean_ci(w_tr, n_boot=50000, seed=7)
     obs_tr, p_perm_tr = signflip_permutation_pvalue_mean(w_tr, n_perm=80000, seed=7)
     k_tr, n_tr, p_sign_tr = sign_test_pos(w_tr)
 
@@ -272,7 +274,7 @@ def main() -> int:
     mu_max = fcmax["pred_mean"].to_numpy(float)
     mu_max_online = online_bias_adjust(mu_max, y_max, window=8)
     err_max_online = y_max - mu_max_online
-    mean_e, lo_e, hi_e = bootstrap_mean_ci(err_max_online, n_boot=50000, seed=7)
+    mean_e, lo_e, hi_e, pboot_e = bootstrap_mean_ci(err_max_online, n_boot=50000, seed=7)
     # aqui testamos se erro médio é <0 (viés otimista); usamos signflip em -erro para H1: mean(-err)>0
     _, p_perm_e = signflip_permutation_pvalue_mean(-err_max_online, n_perm=80000, seed=7)
     k_e, n_e, p_sign_e = sign_test_pos(-err_max_online)  # “sucessos” = err<0
