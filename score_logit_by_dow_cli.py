@@ -425,11 +425,12 @@ def main() -> int:
                 proba_iso = proba_raw
                 proba_cal = proba_raw
 
-        decision = bool(proba_cal >= float(args.cutoff))
+        decision = int(proba_cal >= float(args.cutoff))
 
         # 7) Output CSV único (stdout)
         print("proba,decision")
-        print(f"{proba_cal:.6f},{str(decision)}")
+        # IMPORTANTE (PAD): manter exatamente 2 linhas (header + 1 linha de valores)
+        print(f"{proba_cal:.6f},{decision}")
 
         # 8) Log JSONL
         payload = {
@@ -458,7 +459,7 @@ def main() -> int:
     except Exception as e:
         # saída CSV "vazia" porém bem-formada (0 e False) para o PAD não quebrar
         print("proba,decision")
-        print("0.000000,False")
+        print("0.000000,0")
 
         tb = None
         if args.debug:
