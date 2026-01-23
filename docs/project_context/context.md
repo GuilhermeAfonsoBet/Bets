@@ -95,6 +95,20 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
     - `--bankroll` e `--out-suffix` para rodar walk-forward reotimizando por faixa de banca sem sobrescrever artefatos.
     - modo experimental `cap_bin` (house_cap como dimensão do segmento) para testar “stake máximo como feature de decisão”.
 
+- **Região (localidade) — estudo ex-ante (Jan/2026)**:
+  - Contexto: `BetinAsia.event info competition name` é **ex-post** (só existe em parte das apostas executadas). Para estudar região sem vazamento, precisamos de um proxy **ex-ante**.
+  - Abordagem usada:
+    - Treinamos um classificador de região usando como “rótulo” uma heurística aplicada ao `competition name` (quando existe),
+      mas usando como features **apenas** texto ex-ante: `Evento`, `Time Home`, `Time Away`, `RebelBetting.Bookmaker`.
+    - Geramos `region_exante_pred.csv` com `region_pred` e uma confiança `region_pred_pmax` e aplicamos limiar (ex.: pmax>=0.70) para evitar ruído.
+  - Resultado OOS (gating por região, sem mexer no score):
+    - `oos_walkforward_region_gating_exantepred_summary.csv`: região-gating ficou **ligeiramente melhor** que o baseline no OOS completo, quando usamos o modelo ex-ante + limiar de confiança.
+  - Resultado exploratório (modo fast, segmentando portfólio por DoW×Tipo×Região):
+    - Em “fast mode” (últimas 8 semanas + Bayes barato + mínimos de evidência), a segmentação completa por região foi **instável/sensível ao limiar**:
+      - com limiar alto (pmax>=0.85), a região vira “desconhecida” e o resultado colapsa para o baseline;
+      - com limiar intermediário (pmax>=0.75) e thresholds mais altos, o portfólio por região ficou **pior que o baseline**, apesar de ainda positivo.
+  - Leitura: região parece mais promissora como **gating/filtragem** (ou feature no score) do que como dimensão direta do portfólio (alto risco de overfit/escassez por segmento).
+
 ### Como o operacional deve funcionar (contrato)
 1) PAD gera `payload%betID%.csv` com header e 1 linha.
 2) PAD executa o CLI correto para o dia:
