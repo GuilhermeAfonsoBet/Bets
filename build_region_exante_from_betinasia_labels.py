@@ -32,6 +32,7 @@ import pandas as pd
 
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
 OUT = Path("/workspace/analysis_proba_raw/pro_portfolio_all/region_exante_pred.csv")
+EVENTNAME_MAP = Path("/workspace/analysis_proba_raw/pro_portfolio_all/eventname_by_id_from_excel_17.01.2026.csv")
 
 
 def infer_region_from_competition(text: str) -> str:
@@ -232,6 +233,14 @@ def main() -> int:
         ],
     )
 
+    # Opcional: enriquecer features ex-ante com RebelBetting.EventName vindo do Excel original.
+    # Importante: fazemos merge 1:1 por ID Aposta (dataset já é deduplicado por ID Aposta).
+    if EVENTNAME_MAP.exists():
+        em = pd.read_csv(EVENTNAME_MAP, usecols=["ID Aposta", "RebelBetting.EventName"])
+        df = df.merge(em, how="left", on="ID Aposta", validate="one_to_one")
+    else:
+        df["RebelBetting.EventName"] = ""
+
     comp = df["BetinAsia.event info competition name"].astype(str)
     has_label = ~comp.str.lower().isin(["nan", "none", "null", ""])
     df["region_label"] = "desconhecida"
@@ -244,6 +253,8 @@ def main() -> int:
         + df["Time Away"].map(_text)
         + " | "
         + df["Evento"].map(_text)
+        + " | rb_event="
+        + df.get("RebelBetting.EventName", "").map(_text)
         + " | bk="
         + df["RebelBetting.Bookmaker"].map(_text)
     )
