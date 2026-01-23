@@ -56,7 +56,7 @@ O PAD chama o CLI correto para o dia:
 Saída do CLI (stdout):
 ```
 proba,decision
-0.123456,False
+0.123456,0
 ```
 
 Observações importantes (alinhamento de features):
@@ -128,6 +128,28 @@ Verificações:
 - usar a mesma lógica de scoring no estudo (coluna correta por dia)
 - garantir que o estudo usa `proba_cal` no weekend e `raw+clip` nos weekdays
 - confirmar qual lógica foi usada na quinta-feira para o período analisado
+
+### Caso 4: “Tenho payloads e logs, quero provar 1:1”
+Checklist recomendada (por amostragem ou full day):
+- **payload → CLI vs log (operacional)**:
+  - weekdays (Seg–Qua): `payload%betID%.csv` → `score_logit_weekdays_cli.py` → comparar com `scoring_weekdays.jsonl` (join por `bet_id`)
+  - SegQui/SexDom: `payload%betID%.csv` → `score_logit_by_dow_cli.py` → comparar com `scoring.jsonl` (join por `bet_id`)
+- **payload_hash** (quando disponível): recomputar hash após `preparar_payload()` e comparar com `payload_hash` no JSONL.
+- **Campos que precisam bater**:
+  - `proba` (weekdays) / `proba_cal` (SegQui/SexDom), `decision`, `model_path`, `calibration_file` (quando aplicável)
+
+Exemplos reais já auditados no repo (Jan/2026):
+- 21/01/2026 (quarta/weekday): `payload → CLI → log` bateu 100% (match@6dec) na amostra disponível.
+- 22/01/2026 (quinta/SegQui): `payload → CLI → log` bateu 100% (match@6dec) no dia inteiro (n=40).
+
+---
+
+## Nota: Slippage (got price vs Aux1) — interpretação da cobertura
+Quando analisamos slippage (execução), a cobertura é parcial porque `BetinAsia.got price` não aparece em todas as apostas.
+- Um ΔPnL semanal “alto” pode ocorrer mesmo com `stake_covered` baixo se **1 aposta coberta** tiver grande diferença de odds e resultado Win/HalfWin.
+- Por isso, além de ΔPnL, é recomendado olhar também:
+  - **ΔPnL / PnL total** (impacto percentual na semana)
+  - `stake_covered` e nº de apostas cobertas na semana
 
 ---
 

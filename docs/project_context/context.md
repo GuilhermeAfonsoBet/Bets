@@ -64,6 +64,32 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
     - Cobertura por stake (apostas com got+aux): **~22%**
   - Leitura: o efeito foi pequeno e levemente positivo; o slippage deve ser monitorado como risco operacional, não como feature de decisão.
 
+- **Auditoria operacional (payload → CLI → log) — 21/01 e 22/01/2026**:
+  - Foram adicionados ao repo (branch `main`) os ZIPs:
+    - `payloads 21.01-22.01.zip` (amostra de payloads)
+    - `payloads_22.01.26.zip` (payloads completos de 22/01/26)
+  - Resultados confirmados:
+    - **21/01/2026 (quarta / weekdays)**: na interseção disponível (n=12), `payload → score_logit_weekdays_cli.py` bateu com `scoring_weekdays.jsonl` em **100% (match@6dec)** e `payload_hash` bateu **100%**.
+    - **22/01/2026 (quinta / SegQui)**: (n=40) `payload → score_logit_by_dow_cli.py` bateu com `scoring.jsonl` em **100%** para:
+      - `proba_cal` (calibrado; equivalente ao `proba_cal_segqui` do portfólio)
+      - `proba_raw` (diagnóstico adicional via `--skip-calib`)
+      - `decision`
+  - Artefatos gerados:
+    - `analysis_proba_raw/pro_portfolio_all/audit_payload_cli_vs_log_2026-01-21_sample.csv`
+    - `analysis_proba_raw/pro_portfolio_all/audit_payload_cli_vs_log_2026-01-22_segqui.csv`
+
+- **Minipipeline (payload → “pipeline do estudo”) — 21/01 e 22/01/2026**:
+  - Como o dataset completo do estudo (`scored_dedup_proba_raw_all.csv`) está limitado até **2026-01-20**, foi criado um dataset mínimo a partir dos payloads para auditar alinhamento do “pipeline” nesses dias.
+  - Script reprodutível:
+    - `build_minipipeline_payloads_2026_01_21_22.py`
+  - Saída:
+    - `analysis_proba_raw/pro_portfolio_all/minipipeline_payload_scores_2026-01-21_22.csv`
+  - Resultado: `match@6dec` **100%** para 21/01 (n=12) e 22/01 (n=40), comparando com os logs.
+
+- **Slippage (seção 3.5 do relatório) — semana 19–25/01/2026**:
+  - O ΔPnL cap2 semanal alto (**+47,56**) está **correto** e veio de **1 única aposta coberta** (stake coberto=92) onde houve grande diferença entre `got price` e `Aux1/1000`.
+  - O relatório `Relatorio_BayesGlobal_Mesa_Profissional_2026-01-22.pdf` foi atualizado para incluir na tabela semanal a métrica **ΔPnL / PnL** (impacto percentual do slippage sobre o PnL cap2 semanal do OOS).
+
 - **Evolução do motor WF (experimentos de escala e stake máximo)**:
   - `evaluate_oos_walkforward_strategy.py` ganhou:
     - `--bankroll` e `--out-suffix` para rodar walk-forward reotimizando por faixa de banca sem sobrescrever artefatos.
