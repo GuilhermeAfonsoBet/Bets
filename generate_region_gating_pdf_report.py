@@ -31,6 +31,15 @@ BASELINE_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
 GATING_WEEKLY = OUT_DIR / "oos_walkforward_region_gating_exantepred_blockbad_weekly.csv"
 GATING_SUMMARY = OUT_DIR / "oos_walkforward_region_gating_exantepred_blockbad_summary.csv"
 
+# Upstaking por região (experimentos OOS)
+UPSTAKE_WEEKLY = OUT_DIR / "oos_walkforward_region_upstake_exantepred_weekly.csv"
+UPSTAKE_SUMMARY = OUT_DIR / "oos_walkforward_region_upstake_exantepred_summary.csv"
+UPSTAKE_MULT = OUT_DIR / "oos_walkforward_region_upstake_exantepred_multipliers.csv"
+
+UPSTAKE_BB_WEEKLY = OUT_DIR / "oos_walkforward_region_blockbad_upstake_exantepred_weekly.csv"
+UPSTAKE_BB_SUMMARY = OUT_DIR / "oos_walkforward_region_blockbad_upstake_exantepred_summary.csv"
+UPSTAKE_BB_MULT = OUT_DIR / "oos_walkforward_region_blockbad_upstake_exantepred_multipliers.csv"
+
 COMPARE_WEEKLY = OUT_DIR / "compare_region_gating_blockbad_vs_baseline_weekly.csv"
 BLOCKED = OUT_DIR / "oos_walkforward_region_gating_exantepred_blockbad_blocked_regions.csv"
 BLOCKED_SUMMARY = OUT_DIR / "region_gating_blockbad_blocked_regions_summary.csv"
@@ -214,6 +223,10 @@ def main() -> int:
     gate = pd.read_csv(GATING_WEEKLY)
     cmp = pd.read_csv(COMPARE_WEEKLY)
 
+    # upstake artifacts (opcionais; se ausentes, apenas omitimos a seção)
+    up_sum = pd.read_csv(UPSTAKE_SUMMARY) if UPSTAKE_SUMMARY.exists() else pd.DataFrame()
+    up_bb_sum = pd.read_csv(UPSTAKE_BB_SUMMARY) if UPSTAKE_BB_SUMMARY.exists() else pd.DataFrame()
+
     # estatística em semanas com stake (baseline ou gating)
     cmp["stake_usd_base"] = pd.to_numeric(cmp["stake_usd_base"], errors="coerce")
     cmp["stake_usd_gate"] = pd.to_numeric(cmp["stake_usd_gate"], errors="coerce")
@@ -391,6 +404,78 @@ def main() -> int:
     story.append(P("- Calcular região <b>deterministicamente</b> a partir de `EventName` (mesma lógica do estudo)."))
     story.append(P("- Usar gating <b>conservador</b> (block-bad), evitando allow-list agressiva que pode zerar semanas inteiras."))
     story.append(P("- Monitorar métricas semanalmente: ΔPnL, ΔStake, regiões bloqueadas por segmento, e refazer os testes de estabilidade conforme o histórico aumenta."))
+
+    # 9) Upstaking por região (novos achados)
+    story.append(PageBreak())
+    story.append(Paragraph("<b>9) Extensão: upstaking por região</b>", styles["Heading2"]))
+    story.append(
+        P(
+            "Além do gating (bloquear regiões ruins), testamos um experimento OOS de <b>upstaking por região</b>: "
+            "mantém as mesmas regras do baseline, mas aplica um multiplicador de stake por região, estimado no treino "
+            "(conservador, com clipping). Também testamos a combinação <b>block-bad + upstaking</b>."
+        )
+    )
+
+    # tabela comparativa (baseline vs upstake vs blockbad vs blockbad+upstake)
+    def _row_from_weekly(name: str, dfw: pd.DataFrame) -> List:
+        if dfw is None or dfw.empty:
+            return [P(name), P("—"), P("—"), P("—"), P("—")]
+        stake = float(pd.to_numeric(dfw["stake_usd"], errors="coerce").sum())
+        pnl = float(pd.to_numeric(dfw["profit_cap2_usd"], errors="coerce").sum())
+        weeks_with = int((pd.to_numeric(dfw["stake_usd"], errors="coerce") > 0).sum())
+        roi = pnl / stake if stake > 0 else float("nan")
+        return [P(name), P(_fmt_money(pnl)), P(_fmt_money(stake)), P(f"{roi:.5f}" if np.isfinite(roi) else "—"), P(str(weeks_with))]
+
+    rows = [[P("<b>Variante</b>"), P("<b>PnL cap2</b>"), P("<b>Stake</b>"), P("<b>ROI/$</b>"), P("<b>Semanas ativas</b>")]]
+    rows.append(_row_from_weekly("Baseline", base))
+    rows.append(_row_from_weekly("Gating (block-bad)", gate))
+    if UPSTAKE_WEEKLY.exists():
+        rows.append(_row_from_weekly("Upstaking por região", pd.read_csv(UPSTAKE_WEEKLY)))
+    else:
+        rows.append([P("Upstaking por região"), P("—"), P("—"), P("—"), P("—")])
+    if UPSTAKE_BB_WEEKLY.exists():
+        rows.append(_row_from_weekly("Block-bad + upstaking", pd.read_csv(UPSTAKE_BB_WEEKLY)))
+    else:
+        rows.append([P("Block-bad + upstaking"), P("—"), P("—"), P("—"), P("—")])
+
+    t = Table(rows, colWidths=[4.0 * cm, 3.0 * cm, 3.0 * cm, 2.2 * cm, 2.5 * cm], repeatRows=1)
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey), ("FONTSIZE", (0, 0), (-1, -1), 8)]))
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(t)
+    story.append(Spacer(1, 0.2 * cm))
+
+    # notas interpretativas
+    story.append(
+        P(
+            "<b>Leitura</b>: neste histórico, o gating block-bad continua sendo o melhor no agregado. "
+            "O upstaking por região melhora o baseline, mas ao combinar com block-bad o resultado ficou abaixo do block-bad sozinho — "
+            "o que sugere que a maior parte do ganho vem de <b>remover regiões ruins</b>, e que o upstaking adiciona risco de overfit/ruído "
+            "ou interage com as constraints (alpha) de forma não linear."
+        )
+    )
+
+    # mostrar onde upstake mexe (disponível via multipliers)
+    if UPSTAKE_MULT.exists():
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(P("<b>Exemplo (multiplicadores aprendidos no treino)</b>: valores tipicamente próximos de 1, com clipping em [0,80; 1,20]."))
+        try:
+            mm = pd.read_csv(UPSTAKE_MULT)
+            # manter só regiões com n>=MIN_N (já vem no arquivo) e mostrar top mudanças |mult-1|
+            mm["multiplier"] = pd.to_numeric(mm["multiplier"], errors="coerce")
+            mm["n"] = pd.to_numeric(mm["n"], errors="coerce")
+            mm = mm[np.isfinite(mm["multiplier"])].copy()
+            mm["abs_dev"] = (mm["multiplier"] - 1.0).abs()
+            mm = mm.sort_values("abs_dev", ascending=False).head(12)
+            if not mm.empty:
+                rows2 = [[P("<b>Semana</b>"), P("<b>Segmento</b>"), P("<b>Região</b>"), P("<b>n</b>"), P("<b>mult</b>")]]
+                for _, r in mm.iterrows():
+                    rows2.append([P(str(r.get("week", ""))), P(str(r.get("rule_key", ""))), P(str(r.get("region", ""))), P(str(int(r.get("n", 0))) if np.isfinite(float(r.get("n", 0))) else "—"), P(f"{float(r.get('multiplier')):.3f}")])
+                tt = Table(rows2, colWidths=[3.4 * cm, 4.0 * cm, 3.0 * cm, 1.3 * cm, 1.6 * cm], repeatRows=1)
+                tt.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey), ("FONTSIZE", (0, 0), (-1, -1), 7)]))
+                story.append(Spacer(1, 0.15 * cm))
+                story.append(tt)
+        except Exception:
+            story.append(P("Falha ao carregar tabela de multiplicadores."))
 
     doc.build(story)
     print(str(out_pdf))
