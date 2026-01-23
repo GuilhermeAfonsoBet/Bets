@@ -1,0 +1,3 @@
+name,weeks_total,weeks_with_stake,stake_total,profit_cap2_total,roi_total_cap2,last_weeks,train_window_weeks,pmax_min,bayes_n,min_selected_bets,min_bets_per_bin,min_seg_train_weeks
+baseline_fast,8,5,5673.0,536.5915,0.0945869028732593,8,12,0.75,1200,15,60,8
+regionseg_fast,8,6,6181.0,408.29600000000005,0.06605662514156287,8,12,0.75,1200,15,60,8
