@@ -34,6 +34,11 @@ WF_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
 TRAIN_WINDOW_WEEKS = 12
 MIN_N_PER_REGION = 20
 REGION_PRED_MIN_PMAX = 0.70  # abaixo disso, tratamos como 'desconhecida' (evita gating por ruído)
+# Gating conservador:
+# Em vez de "permitir apenas regiões com mean_roi>0" (que pode zerar semanas inteiras),
+# usamos uma lógica de BLOQUEIO: só exclui regiões com evidência de ROI ruim.
+BLOCK_BAD_REGIONS_ONLY = True
+BAD_MEAN_ROI_TH = -0.02  # bloqueia apenas se mean(roi_cap2) <= este valor (com n>=MIN_N_PER_REGION)
 
 
 def infer_region(text: str) -> str:
@@ -141,8 +146,8 @@ def main() -> int:
         if df_test.empty:
             continue
 
-        # monta gating por segmento (rule_key) -> allowed regions
-        allow_by_rule: Dict[str, Set[str]] = {}
+        # monta gating por segmento (rule_key) -> conjunto de regiões a bloquear
+        block_by_rule: Dict[str, Set[str]] = {}
         for _, rr in g.iterrows():
             if str(rr.get("status", "")) != "ok":
                 continue
@@ -165,11 +170,19 @@ def main() -> int:
                 continue
             xt = pd.DataFrame({"region": reg[m], "roi": roi2[m]})
             by = xt.groupby("region", as_index=False).agg(n=("roi", "size"), mean_roi=("roi", "mean"))
-            allow = set(by.loc[(by["n"] >= MIN_N_PER_REGION) & (by["mean_roi"] > 0), "region"].astype(str).tolist())
-            # se ficou vazio (muito restritivo), não gateia esse segmento (mantém tudo)
-            if allow:
-                allow_by_rule[rk] = allow
-                out_gate_rows.append({"week": wk, "rule_key": rk, "allowed_regions": ",".join(sorted(allow)), "n_regions": int(len(allow))})
+            if BLOCK_BAD_REGIONS_ONLY:
+                block = set(by.loc[(by["n"] >= MIN_N_PER_REGION) & (by["mean_roi"] <= BAD_MEAN_ROI_TH), "region"].astype(str).tolist())
+                if block:
+                    block_by_rule[rk] = block
+                    out_gate_rows.append({"week": wk, "rule_key": rk, "blocked_regions": ",".join(sorted(block)), "n_regions": int(len(block))})
+            else:
+                # modo antigo (mais agressivo): permitir apenas regiões com mean_roi>0
+                allow = set(by.loc[(by["n"] >= MIN_N_PER_REGION) & (by["mean_roi"] > 0), "region"].astype(str).tolist())
+                if allow:
+                    # armazenamos como "blocked" vazio e tratamos na aplicação via allow-list abaixo
+                    # (mantém compatibilidade com estrutura de saída)
+                    out_gate_rows.append({"week": wk, "rule_key": rk, "blocked_regions": "", "n_regions": int(len(allow))})
+                    block_by_rule[rk] = set()  # sentinel
 
         # aplica regras + gating
         bets = []
@@ -194,9 +207,10 @@ def main() -> int:
             reg = x["region_evt"].astype(str).to_numpy()
 
             m = np.isfinite(score) & (score >= cutoff) & np.isfinite(roi2) & np.isfinite(cap) & (cap > 0)
-            if rk in allow_by_rule:
-                allow = allow_by_rule[rk]
-                m = m & np.isin(reg, list(allow))
+            if rk in block_by_rule and BLOCK_BAD_REGIONS_ONLY:
+                block = block_by_rule[rk]
+                if block:
+                    m = m & (~np.isin(reg, list(block)))
             if not np.any(m):
                 continue
             stake0 = wf.BANKROLL * stake_frac * float(alpha)
@@ -229,8 +243,10 @@ def main() -> int:
     out_gate = pd.DataFrame(out_gate_rows)
 
     suffix = "exantepred" if REGION_PRED.exists() else "heuristic"
+    if BLOCK_BAD_REGIONS_ONLY:
+        suffix = f"{suffix}_blockbad"
     out_week_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_weekly.csv"
-    out_gate_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_allowed_regions.csv"
+    out_gate_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_blocked_regions.csv"
     out_week.to_csv(out_week_path, index=False)
     out_gate.to_csv(out_gate_path, index=False)
 
