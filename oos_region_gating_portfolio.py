@@ -27,11 +27,13 @@ import evaluate_oos_walkforward_strategy as wf
 OUT_DIR = Path("/workspace/analysis_proba_raw/pro_portfolio_all")
 MODE = "global_bayes_roll12_robust_p10_p70"
 SCORED = Path("/workspace/analysis_proba_raw/scored_dedup_proba_raw_all.csv")
+REGION_PRED = OUT_DIR / "region_exante_pred.csv"
 WF_RULES = OUT_DIR / f"oos_walkforward_{MODE}_selected_rules.csv"
 WF_WEEKLY = OUT_DIR / f"oos_walkforward_{MODE}_weekly.csv"
 
 TRAIN_WINDOW_WEEKS = 12
 MIN_N_PER_REGION = 20
+REGION_PRED_MIN_PMAX = 0.70  # abaixo disso, tratamos como 'desconhecida' (evita gating por ruído)
 
 
 def infer_region(text: str) -> str:
@@ -102,10 +104,21 @@ def main() -> int:
             floor=wf.CALIB_FLOOR,
         )
 
-    comp = df.get("BetinAsia.event info competition name", pd.Series("", index=df.index)).astype(str)
-    ev = df.get("Evento", pd.Series("", index=df.index)).astype(str)
-    txt = (comp.fillna("") + " | " + ev.fillna("")).astype(str)
-    df["region_evt"] = txt.apply(infer_region).astype(str)
+    # Região do evento:
+    # - Preferência: usar predição "ex-ante" (treinada offline) para ter cobertura ~100% sem depender do BetinAsia.
+    # - Fallback: heurística simples (pode ter muita 'desconhecida' se Evento não contiver país/competição).
+    if REGION_PRED.exists():
+        r = pd.read_csv(REGION_PRED, usecols=["ID Aposta", "region_pred", "region_pred_pmax"])
+        r = r.rename(columns={"region_pred": "region_evt"})
+        df = df.merge(r, how="left", on="ID Aposta")
+        df["region_pred_pmax"] = pd.to_numeric(df.get("region_pred_pmax"), errors="coerce").astype(float)
+        df["region_evt"] = df["region_evt"].astype("string").fillna("desconhecida").astype(str)
+        # baixa confiança => não usar como split/gating (vira desconhecida)
+        low = ~np.isfinite(df["region_pred_pmax"].to_numpy(float)) | (df["region_pred_pmax"].to_numpy(float) < float(REGION_PRED_MIN_PMAX))
+        df.loc[low, "region_evt"] = "desconhecida"
+    else:
+        ev = df.get("Evento", pd.Series("", index=df.index)).astype(str)
+        df["region_evt"] = ev.fillna("").astype(str).apply(infer_region).astype(str)
 
     rules = pd.read_csv(WF_RULES)
     weekly_base = pd.read_csv(WF_WEEKLY)
@@ -215,8 +228,9 @@ def main() -> int:
     out_week = pd.DataFrame(out_week_rows)
     out_gate = pd.DataFrame(out_gate_rows)
 
-    out_week_path = OUT_DIR / "oos_walkforward_region_gating_weekly.csv"
-    out_gate_path = OUT_DIR / "oos_walkforward_region_gating_allowed_regions.csv"
+    suffix = "exantepred" if REGION_PRED.exists() else "heuristic"
+    out_week_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_weekly.csv"
+    out_gate_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_allowed_regions.csv"
     out_week.to_csv(out_week_path, index=False)
     out_gate.to_csv(out_gate_path, index=False)
 
@@ -234,7 +248,7 @@ def main() -> int:
             {"name": "region_gating", "profit_cap2_total": pnl_g, "stake_total": stake_g, "roi_total_cap2": pnl_g / stake_g if stake_g > 0 else np.nan, "weeks": int(len(out_week)), "weeks_with_stake": int((out_week["stake_usd"] > 0).sum())},
         ]
     )
-    summ_path = OUT_DIR / "oos_walkforward_region_gating_summary.csv"
+    summ_path = OUT_DIR / f"oos_walkforward_region_gating_{suffix}_summary.csv"
     summ.to_csv(summ_path, index=False)
 
     print(str(summ_path))
