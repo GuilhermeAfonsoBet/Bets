@@ -23,6 +23,8 @@ Teste formal aqui é sobre o **erro** (y - mu_online) no cenário max.
 
 CSV: `stat_tests_bankroll_scaling.csv`
 
+CSV (sensibilidade, exclui última semana): `stat_tests_bankroll_scaling_excl_lastweek.csv`
+
 ### 4) ROI maior em stakes menores (teste formal)
 Usamos apostas selecionadas no cenário max e testamos associação monotônica entre ROI_cap2 e log(1+house_cap).
 - Spearman rho=-0.021, p_perm(two-sided)=0.6221

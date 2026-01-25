@@ -306,6 +306,13 @@ def main() -> int:
     curve_path = OUT_DIR / "stat_tests_bankroll_scaling.csv"
     curve.to_csv(curve_path, index=False)
 
+    # Sensibilidade: excluir a última semana OOS (muito útil quando o relatório é gerado com semana corrente parcial)
+    curve_excl_path = OUT_DIR / "stat_tests_bankroll_scaling_excl_lastweek.csv"
+    if len(weeks) >= 2:
+        weeks_excl = weeks[:-1]
+        curve_excl = bankroll_curve(df=df, rules=rules, weeks=weeks_excl, bankroll_grid=bankroll_grid)
+        curve_excl.to_csv(curve_excl_path, index=False)
+
     # decide max bankroll “estatisticamente confiável” sob critério p_perm_mean_gt0<0.05
     b_ok = curve[np.isfinite(curve["p_perm_mean_gt0"]) & (curve["p_perm_mean_gt0"] < 0.05)]
     b_max_ok = float(b_ok["bankroll"].max()) if not b_ok.empty else float("nan")
@@ -333,6 +340,8 @@ def main() -> int:
     md.append(f"- Critério (simples): p_perm(mean_week>0)<0.05 na curva de banca.\n")
     md.append(f"- Maior banca que passou no grid: {b_max_ok if np.isfinite(b_max_ok) else '—'}\n\n")
     md.append(f"CSV: `{curve_path.name}`\n\n")
+    if curve_excl_path.exists():
+        md.append(f"CSV (sensibilidade, exclui última semana): `{curve_excl_path.name}`\n\n")
 
     md.append("### 4) ROI maior em stakes menores (teste formal)\n")
     md.append("Usamos apostas selecionadas no cenário max e testamos associação monotônica entre ROI_cap2 e log(1+house_cap).\n")

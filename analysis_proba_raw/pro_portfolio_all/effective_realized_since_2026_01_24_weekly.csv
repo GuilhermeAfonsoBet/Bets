@@ -1,0 +1,2 @@
+week,n_selected,n_executed,fill_rate_n,stake_intended_usd,stake_executed_usd,fill_rate_stake,pnl_theory_intended_usd,pnl_effective_usd,roi_theory,roi_effective,delta_pnl_total_usd,delta_pnl_on_exec_stake_usd,avg_odds_slippage_real_minus_rb
+2026-01-19/2026-01-25,11,11,1.0,253.0,209.0,0.8260869565217391,-49.7145,-9.5,-0.1965,-0.045454545454545456,40.2145,31.5685,

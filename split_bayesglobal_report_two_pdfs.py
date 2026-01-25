@@ -16,9 +16,31 @@ Heurística robusta:
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+
+def _cover_pdf_bytes(title: str, lines: list[str]) -> bytes:
+    """
+    Gera um PDF simples (capa/introdução) em memória.
+    """
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2.0 * cm, rightMargin=2.0 * cm, topMargin=2.0 * cm, bottomMargin=2.0 * cm)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
+    story.append(Spacer(1, 0.4 * cm))
+    for ln in lines:
+        story.append(Paragraph(ln, styles["BodyText"]))
+        story.append(Spacer(1, 0.2 * cm))
+    doc.build(story)
+    return buf.getvalue()
 
 
 def main() -> int:
@@ -35,33 +57,60 @@ def main() -> int:
     r = PdfReader(str(inp))
     n = len(r.pages)
 
-    needles = [
-        "2. Portfólio otimizado",
-        "2.B Portfólio sugerido para a próxima semana",
-        "3.1.C Auditoria",
-        "Tabela — PnL semanal OOS",
-        "Tabela - PnL semanal OOS",
+    # Regras de split robustas:
+    # - Operacional = tudo antes do início da seção 3 (inclui capa + seção 2.*).
+    # - Estrutural  = seção 3 em diante (começa com header 3., evitando "tabelas quebradas" no início).
+    idx3 = None
+    needles_3 = [
+        "3. Métricas estatísticas e de negócio",
+        "3. Métricas",
+        "3. M\u00e9tricas",
     ]
-
-    selected = set()
     for i in range(n):
         try:
             txt = (r.pages[i].extract_text() or "").replace("\u00a0", " ")
         except Exception:
             txt = ""
-        if any(s in txt for s in needles):
-            selected.add(i)
+        if any(s in txt for s in needles_3):
+            idx3 = i
+            break
+    if idx3 is None:
+        # fallback conservador: se não achou o header da seção 3, mantém split antigo (capa + páginas “alvo”)
+        idx3 = max(1, n)
 
-    # sempre incluir capa no operacional
-    selected.add(0)
+    # Capa/introdução própria em cada PDF
+    # tenta inferir data do nome do arquivo (padrão ..._YYYY-MM-DD.pdf)
+    stem = inp.stem
+    asof = stem.split("_")[-1] if stem.split("_")[-1].count("-") == 2 else "—"
+
+    weekly_cover = PdfReader(BytesIO(_cover_pdf_bytes(
+        title=f"Relatório Bayes Global — Semanal (Operacional) — {asof}",
+        lines=[
+            "Conteúdo: portfólio da semana vigente, recomendação forward-looking (próxima semana) e blocos operacionais.",
+            "Nota: este PDF é gerado a partir do relatório completo, mas com uma capa/introdução própria para leitura operacional.",
+        ],
+    )))
+    struct_cover = PdfReader(BytesIO(_cover_pdf_bytes(
+        title=f"Relatório Bayes Global — Estrutural — {asof}",
+        lines=[
+            "Conteúdo: análises estruturais (estatística, calibração, risco, escala, slippage e diagnósticos).",
+            "Este PDF começa na Seção 3 (Métricas) para evitar páginas iniciando no meio de tabelas.",
+            "Exclui: detalhamento operacional da semana e portfólio forward-looking (que ficam no PDF Semanal).",
+        ],
+    )))
 
     weekly = PdfWriter()
     struct = PdfWriter()
-    for i in range(n):
-        if i in selected:
-            weekly.add_page(r.pages[i])
-        else:
-            struct.add_page(r.pages[i])
+
+    # adicionar capas
+    weekly.add_page(weekly_cover.pages[0])
+    struct.add_page(struct_cover.pages[0])
+
+    # copiar páginas do relatório completo
+    for i in range(0, idx3):
+        weekly.add_page(r.pages[i])
+    for i in range(idx3, n):
+        struct.add_page(r.pages[i])
 
     out_weekly = Path(args.out_weekly)
     out_struct = Path(args.out_struct)
@@ -75,7 +124,7 @@ def main() -> int:
 
     print(str(out_weekly))
     print(str(out_struct))
-    print(f"selected_pages_operational={sorted(selected)} total_pages={n}")
+    print(f"split_idx3={idx3} total_pages_full={n}")
     return 0
 
 
