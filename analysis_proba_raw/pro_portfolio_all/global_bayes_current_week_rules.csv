@@ -1,6 +1,6 @@
 test_week,train_weeks,bet_type,dow_pt,score_col,cutoff,stake_frac,cap_max,alpha_global,status,rule_key,roi_bias_adj_used,alpha_regime,alpha_effective,active
 2026-01-19/2026-01-25,12,FT,segunda-feira,proba_raw_segunda,0.23,0.04,inf,1.0,ok,FT|segunda-feira,0.0,1.0,1.0,True
-2026-01-19/2026-01-25,12,FT,terça-feira,proba_raw_terca,0.29,0.03,inf,1.0,ok,FT|terça-feira,0.0,1.0,1.0,True
+2026-01-19/2026-01-25,12,FT,terça-feira,proba_raw_terca,0.15,0.02,inf,1.0,ok,FT|terça-feira,0.0,1.0,1.0,True
 2026-01-19/2026-01-25,12,FT,sexta-feira,proba_cal_sexdom,0.05,0.01,inf,1.0,ok,FT|sexta-feira,0.0,1.0,1.0,True
 2026-01-19/2026-01-25,12,FH,quarta-feira,proba_raw_quarta,0.05,0.01,inf,1.0,ok,FH|quarta-feira,0.0,1.0,1.0,True
 2026-01-19/2026-01-25,12,FH,sábado,proba_cal_sexdom,0.05,0.01,inf,1.0,ok,FH|sábado,0.0,1.0,1.0,True
