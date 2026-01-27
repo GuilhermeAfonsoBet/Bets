@@ -139,3 +139,38 @@ O portfólio/estratégia usa thresholds de score por segmento (dia da semana × 
     - houver `bet_id` no log do CLI no mesmo dia,
     - e o join por `bet_id` bater em 6 casas (match6 ~ 100%).
 
+---
+
+## Atualizações adicionais (25–27/01/2026) — relatórios e início de operação real
+
+### Correções no `Relatorio_BayesGlobal_Estrutural_2026-01-25.pdf`
+- **ROI/$ (forecast vs realizado) aparecendo igual**:
+  - Diagnóstico: em parte por **arredondamento** (4 casas) e em parte por uma tabela “ex-post” que **reconcilia médias por construção**.
+  - Ajuste: o relatório passou a imprimir ROI/$ com **5 casas** e incluiu explicitamente **Δ ROI/$ (Forecast on-line − Realizado teórico)**.
+  - O bloco “ex-post” foi reclassificado como **diagnóstico/reconciliação** para não ser interpretado como forecast.
+
+- **Seção 3.3 (Forecast máx) com sobreposição de colunas**:
+  - Ajuste de layout (wrap/`Paragraph`, `colWidths`, fonte menor) e remoção do ROI/$ “ex-post corrigido” no máx (evita igualdade mecânica com realizado).
+
+### Mudança relevante no estudo de escala de banca (3.4) — análise profunda + verificação
+- A curva de banca (`stat_tests_bankroll_scaling.csv`) é **muito sensível à última semana OOS** quando ela tem volume/house_cap altos.
+- Foi adicionada uma análise de sensibilidade **excluindo a última semana**:
+  - `analysis_proba_raw/pro_portfolio_all/stat_tests_bankroll_scaling_excl_lastweek.csv`
+- Leitura prática:
+  - “Sem degradação” pode aparecer quando a **última semana** puxa a curva para cima.
+  - Sem a última semana, a curva pode voltar a mostrar **degradação** em bancas maiores.
+
+### Split do relatório em “Semanal” vs “Estrutural” (qualidade de leitura)
+- O split foi ajustado para:
+  - **Estrutural** começar na **Seção 3** e incluir **capa/introdução própria** (evita PDF começando no meio de tabela).
+  - **Semanal** conter seções operacionais (2.*) e também ter capa/introdução própria.
+
+### Nova dimensão de métricas: “realizado efetivo” (execução) — desde 24/01/2026
+- Como a operação real começou em **24/01/2026**, foi criada uma camada de análise com:
+  - **fill-rate** por número de apostas (selecionadas vs executadas)
+  - **fill-rate por stake** (stake pretendido vs stake executado)
+  - **PnL efetivo** e **ROI/$ efetivo** (usando stake/odds realizados)
+  - **ΔPnL total** (efetivo − teórico) e um ΔPnL “em stake executado” (isolando sizing)
+- Artefato semanal gerado:
+  - `analysis_proba_raw/pro_portfolio_all/effective_realized_since_2026_01_24_weekly.csv`
+

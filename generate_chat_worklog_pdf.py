@@ -79,8 +79,8 @@ def main() -> int:
     story.append(Paragraph("<b>3) Auditoria de consistência (Excel ↔ logs)</b>", styles["Heading2"]))
     story.append(
         P(
-            "Com `ResumoApostas_PBI_final_20.01.2026.xlsx` e `scoring_weekdays.jsonl` atualizados, foi feito join por `bet_id` "
-            "e verificado match por arredondamento a 6 casas.",
+            "Com o Excel atualizado e os JSONLs de scoring contendo `bet_id`, foi feito join por `bet_id` "
+            "e verificado match por arredondamento a 6 casas (match@6dec).",
             styles,
         )
     )
@@ -121,9 +121,30 @@ def main() -> int:
             styles,
         )
     )
+    story.append(
+        P(
+            "<b>Correções (25–27/01/2026)</b>: "
+            "(i) ajuste do bloco de ROI/$ para evitar igualdade enganosa entre forecast e realizado (arredondamento + reconciliação ex-post por construção), "
+            "(ii) conserto de layout em tabelas (ex.: cenário máx) para evitar sobreposição, "
+            "(iii) split do PDF em <b>Semanal</b> vs <b>Estrutural</b> com capa/introdução própria.",
+            styles,
+        )
+    )
 
     story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph("<b>5) Walk-forward / estratégia</b>", styles["Heading2"]))
+    story.append(Paragraph("<b>5) Escala de banca: mudança aparente e sensibilidade</b>", styles["Heading2"]))
+    story.append(
+        P(
+            "A curva `stat_tests_bankroll_scaling.csv` é sensível à composição das semanas OOS; "
+            "quando a última semana tem grande volume/house_cap, pode 'puxar' a curva e aparentar não degradação com banca maior. "
+            "Foi adicionado um artefato de sensibilidade excluindo a última semana: "
+            "`stat_tests_bankroll_scaling_excl_lastweek.csv`.",
+            styles,
+        )
+    )
+
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph("<b>6) Walk-forward / estratégia</b>", styles["Heading2"]))
     story.append(
         P(
             "A estratégia atual (p10_p70) otimiza por segmento (DoW×FT/FH) em walk-forward usando seleção Bayesiana "
@@ -140,7 +161,18 @@ def main() -> int:
     )
 
     story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph("<b>6) Estado atual e próximos passos</b>", styles["Heading2"]))
+    story.append(Paragraph("<b>7) Operação real: métricas de realizado efetivo (desde 24/01/2026)</b>", styles["Heading2"]))
+    story.append(
+        P(
+            "A partir de 24/01/2026 (início de operação real), foi adicionada uma camada de relatório para "
+            "<b>realizado efetivo</b> (execução): fill-rate (N e stake), PnL efetivo, ROI/$ efetivo e deltas vs teórico. "
+            "Artefato semanal: `effective_realized_since_2026_01_24_weekly.csv`.",
+            styles,
+        )
+    )
+
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph("<b>8) Estado atual e próximos passos</b>", styles["Heading2"]))
     story.append(
         P(
             "Próximos passos recomendados: (i) manter rotina diária de auditoria Excel↔logs por `bet_id`, "
