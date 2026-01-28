@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Scraper principal do BetinAsia.
+Scraper do BetinAsia (BLACK).
 
-IMPORTANTE: Este é um TEMPLATE que precisará ser adaptado
-após analisar a estrutura real do site BetinAsia.
-
-Os seletores CSS (.classe, #id) são EXEMPLOS e devem ser
-substituídos pelos seletores reais após inspecionar o HTML.
+Baseado na análise do HTML real do site em Janeiro/2026.
 """
 
 import asyncio
+import re
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-from datetime import datetime, timezone
-from typing import Optional, List
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict
 from loguru import logger
 from dateutil import parser as date_parser
 
@@ -22,7 +19,7 @@ from config import settings
 
 class BetinAsiaScraper:
     """
-    Scraper assíncrono para BetinAsia.
+    Scraper assíncrono para BetinAsia (versão BLACK).
     
     Uso:
         async with BetinAsiaScraper() as scraper:
@@ -30,7 +27,42 @@ class BetinAsiaScraper:
             matches = await scraper.scrape_league("England Premier League")
     """
     
-    BASE_URL = "https://www.betinasia.com"
+    # URLs do site
+    BASE_URL = "https://black.betinasia.com"
+    LOGIN_URL = f"{BASE_URL}/login"
+    SPORTSBOOK_URL = f"{BASE_URL}/sportsbook"
+    FOOTBALL_URL = f"{BASE_URL}/sportsbook/football"
+    
+    # Mapeamento de ligas para códigos de URL
+    # Formato: /sportsbook/football/XE/{codigo}
+    LEAGUE_CODES = {
+        "England Premier League": "XE/1",
+        "England Championship": "XE/2",
+        "England FA Cup": "XE/132",
+        "Germany Bundesliga": "XE/9",
+        "Germany 2. Bundesliga": "XE/10",
+        "Spain La Liga": "XE/11",
+        "Spain Segunda": "XE/12",
+        "Italy Serie A": "XE/13",
+        "Italy Serie B": "XE/14",
+        "France Ligue 1": "XE/15",
+        "France Ligue 2": "XE/16",
+        "Netherlands Eredivisie": "XE/17",
+        "Portugal Primeira Liga": "XE/19",
+        "Belgium Pro League": "XE/21",
+        "Turkey Super Lig": "XE/26",
+        "Brazil Serie A": "XE/31",
+        "Argentina Primera Division": "XE/32",
+        "UEFA Champions League": "XE/5",
+        "UEFA Europa League": "XE/6",
+    }
+    
+    # Bookmakers conhecidos
+    KNOWN_BOOKMAKERS = [
+        "3et", "bdaq", "bf", "isn", "mbook", 
+        "molly", "pinn88", "pin88", "pinnacle",
+        "sbo", "sharp", "sing2"
+    ]
     
     def __init__(
         self,
@@ -42,7 +74,6 @@ class BetinAsiaScraper:
         
         Args:
             headless: Se True, browser roda sem interface gráfica.
-                      None = usa valor do settings.
             slow_mo: Milissegundos de delay entre ações (útil para debug).
         """
         self.headless = headless if headless is not None else settings.browser_headless
@@ -71,7 +102,7 @@ class BetinAsiaScraper:
             slow_mo=self.slow_mo,
         )
         
-        # Cria contexto com configurações de browser real
+        # Contexto com configurações de browser real
         self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=(
@@ -79,14 +110,12 @@ class BetinAsiaScraper:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            locale="en-US",
-            timezone_id="Asia/Singapore",
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
         )
         
         self._page = await self._context.new_page()
-        
-        # Timeout padrão para operações
-        self._page.set_default_timeout(30000)  # 30 segundos
+        self._page.set_default_timeout(30000)
         
         logger.info("Browser iniciado com sucesso")
         
@@ -123,52 +152,97 @@ class BetinAsiaScraper:
         logger.info("Tentando fazer login no BetinAsia...")
         
         try:
-            # =====================================================
-            # ATENÇÃO: Os seletores abaixo são EXEMPLOS!
-            # Você precisará inspecionar o site real e ajustar.
-            # =====================================================
-            
             # Navega para página de login
-            await self._page.goto(f"{self.BASE_URL}/Account/Login")
+            await self._page.goto(self.LOGIN_URL)
+            await self._page.wait_for_load_state("networkidle")
             
-            # Aguarda campo de usuário
-            # AJUSTAR SELETOR: Inspecionar o HTML real do BetinAsia
-            await self._page.wait_for_selector(
-                "input[name='Username'], input#Username, input[type='text']",
-                timeout=15000
-            )
+            # Aguarda os campos de login aparecerem
+            # O site usa inputs dentro de um form
+            await self._page.wait_for_selector("input", timeout=15000)
+            
+            # Encontra os campos de input
+            # Primeiro input é username, segundo é password
+            inputs = await self._page.query_selector_all("input")
+            
+            if len(inputs) < 2:
+                logger.error("Não encontrou campos de login suficientes")
+                await self.take_screenshot("login_error_fields.png")
+                return False
+            
+            # Preenche username (primeiro input de texto)
+            username_input = None
+            password_input = None
+            
+            for inp in inputs:
+                input_type = await inp.get_attribute("type")
+                if input_type == "password":
+                    password_input = inp
+                elif input_type in ["text", "email", None]:
+                    if username_input is None:
+                        username_input = inp
+                        
+            if not username_input or not password_input:
+                logger.error("Não identificou campos de usuário/senha")
+                await self.take_screenshot("login_error_inputs.png")
+                return False
             
             # Preenche credenciais
-            # AJUSTAR SELETORES conforme o site real
-            await self._page.fill("input[name='Username']", username)
-            await self._page.fill("input[name='Password']", password)
+            await username_input.fill(username)
+            await self._page.wait_for_timeout(500)
+            await password_input.fill(password)
+            await self._page.wait_for_timeout(500)
             
             # Clica no botão de login
-            # AJUSTAR SELETOR conforme o site real
-            await self._page.click("button[type='submit'], input[type='submit']")
-            
-            # Aguarda redirecionamento / elemento que indica login OK
-            # AJUSTAR: verificar qual elemento aparece após login
-            await self._page.wait_for_url(
-                f"{self.BASE_URL}/**",
-                timeout=20000
+            # Procura por botão com texto "Iniciar Sessão" ou similar
+            login_button = await self._page.query_selector(
+                "button:has-text('Iniciar'), button:has-text('Login'), "
+                "button:has-text('Entrar'), button[type='submit']"
             )
             
-            # Verifica se realmente logou (procura elemento de usuário logado)
-            # AJUSTAR conforme o site real
-            # Exemplo: await self._page.wait_for_selector(".user-menu", timeout=5000)
+            if login_button:
+                await login_button.click()
+            else:
+                # Tenta pressionar Enter
+                await password_input.press("Enter")
+                
+            # Aguarda redirecionamento
+            await self._page.wait_for_timeout(3000)
             
-            self._logged_in = True
-            logger.success("Login realizado com sucesso!")
-            return True
+            # Verifica se logou (URL mudou ou apareceu elemento de usuário logado)
+            current_url = self._page.url
             
+            if "login" not in current_url.lower():
+                self._logged_in = True
+                logger.success("Login realizado com sucesso!")
+                return True
+            else:
+                # Verifica se há mensagem de erro
+                error_el = await self._page.query_selector(
+                    ".error, .alert-danger, [class*='error']"
+                )
+                if error_el:
+                    error_text = await error_el.inner_text()
+                    logger.error(f"Erro no login: {error_text}")
+                else:
+                    logger.error("Login falhou - ainda na página de login")
+                    
+                await self.take_screenshot("login_failed.png")
+                return False
+                
         except Exception as e:
-            logger.error(f"Falha no login: {e}")
+            logger.error(f"Exceção no login: {e}")
+            await self.take_screenshot("login_exception.png")
+            return False
             
-            # Tira screenshot para debug
-            await self._page.screenshot(path="login_error.png")
-            logger.info("Screenshot salvo em login_error.png")
-            
+    async def navigate_to_football(self) -> bool:
+        """Navega para a seção de futebol."""
+        try:
+            await self._page.goto(self.FOOTBALL_URL)
+            await self._page.wait_for_load_state("networkidle")
+            await self._page.wait_for_timeout(2000)
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao navegar para futebol: {e}")
             return False
             
     async def scrape_league(self, league_name: str) -> List[MatchData]:
@@ -190,94 +264,179 @@ class BetinAsiaScraper:
         matches = []
         
         try:
-            # =====================================================
-            # ATENÇÃO: Este código é um TEMPLATE!
-            # A estrutura real do BetinAsia pode ser diferente.
-            # Você precisará inspecionar o site e ajustar.
-            # =====================================================
+            # Obtém o código da liga
+            league_code = self.LEAGUE_CODES.get(league_name)
             
-            # Navega para a página de odds de futebol
-            # AJUSTAR URL conforme o site real
-            await self._page.goto(f"{self.BASE_URL}/Odds/Football")
-            
-            # Aguarda carregamento
-            await self._page.wait_for_load_state("networkidle")
-            
-            # Encontra e clica na liga
-            # AJUSTAR SELETOR conforme o site real
-            league_selector = f"text={league_name}"
-            
-            try:
-                await self._page.click(league_selector, timeout=5000)
-            except:
-                logger.warning(f"Liga não encontrada: {league_name}")
-                return []
+            if not league_code:
+                logger.warning(f"Liga não mapeada: {league_name}")
+                # Tenta navegar pelo menu
+                return await self._scrape_league_by_menu(league_name)
                 
-            # Aguarda carregamento das partidas
-            await self._page.wait_for_timeout(2000)  # Espera 2 segundos
+            # Navega para a página da liga
+            league_url = f"{self.FOOTBALL_URL}/{league_code}"
+            await self._page.goto(league_url)
+            await self._page.wait_for_load_state("networkidle")
+            await self._page.wait_for_timeout(2000)
             
-            # Encontra todas as partidas
-            # AJUSTAR SELETOR conforme o site real
-            match_elements = await self._page.query_selector_all(".match-row, .event-row")
+            # Encontra os jogos na página
+            matches = await self._parse_league_page(league_name)
             
-            logger.info(f"Encontradas {len(match_elements)} partidas")
-            
-            for match_el in match_elements:
-                try:
-                    match_data = await self._parse_match(match_el, league_name)
-                    if match_data:
-                        matches.append(match_data)
-                except Exception as e:
-                    logger.warning(f"Erro ao parsear partida: {e}")
-                    continue
-                    
-            logger.info(f"Scrape concluído: {len(matches)} partidas processadas")
+            logger.info(f"Scrape concluído: {len(matches)} partidas encontradas")
             
         except Exception as e:
             logger.error(f"Erro ao fazer scrape da liga {league_name}: {e}")
-            await self._page.screenshot(path=f"scrape_error_{league_name}.png")
+            await self.take_screenshot(f"scrape_error_{league_name.replace(' ', '_')}.png")
             
         return matches
-    
-    async def _parse_match(self, match_el, league_name: str) -> Optional[MatchData]:
-        """
-        Extrai dados de uma partida.
         
-        NOTA: Os seletores são EXEMPLOS e devem ser ajustados.
+    async def _scrape_league_by_menu(self, league_name: str) -> List[MatchData]:
+        """
+        Tenta encontrar a liga pelo menu lateral.
         """
         try:
-            # =====================================================
-            # AJUSTAR TODOS OS SELETORES ABAIXO
-            # Inspecione o HTML real do BetinAsia
-            # =====================================================
+            await self.navigate_to_football()
             
-            # ID da partida
-            match_id = await match_el.get_attribute("data-match-id")
-            if not match_id:
-                match_id = await match_el.get_attribute("data-event-id")
-            if not match_id:
-                # Gera ID único se não encontrar
-                match_id = f"match_{datetime.now().timestamp()}"
+            # Procura link da liga no menu
+            league_link = await self._page.query_selector(f"a:has-text('{league_name}')")
             
-            # Times
-            home_team_el = await match_el.query_selector(".home-team, .team-home")
-            away_team_el = await match_el.query_selector(".away-team, .team-away")
+            if league_link:
+                await league_link.click()
+                await self._page.wait_for_load_state("networkidle")
+                await self._page.wait_for_timeout(2000)
+                return await self._parse_league_page(league_name)
+            else:
+                logger.warning(f"Liga não encontrada no menu: {league_name}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Erro ao buscar liga por menu: {e}")
+            return []
             
-            home_team = await home_team_el.inner_text() if home_team_el else "Unknown Home"
-            away_team = await away_team_el.inner_text() if away_team_el else "Unknown Away"
+    async def _parse_league_page(self, league_name: str) -> List[MatchData]:
+        """
+        Parseia a página de uma liga e extrai os jogos.
+        """
+        matches = []
+        
+        try:
+            # O site mostra jogos em linhas/cards
+            # Cada jogo tem: data/hora, times, odds
             
-            # Limpa nomes
-            home_team = home_team.strip()
-            away_team = away_team.strip()
+            # Tenta encontrar elementos de jogo por diferentes seletores
+            # Os jogos aparecem como linhas clicáveis
             
-            # Horário de início
-            kickoff_el = await match_el.query_selector(".kickoff, .match-time, .event-time")
-            kickoff_str = await kickoff_el.inner_text() if kickoff_el else ""
-            kickoff_time = self._parse_kickoff_time(kickoff_str)
+            # Procura por links que levam a jogos individuais
+            # Padrão de URL: /sportsbook/football/XE/1/2026-01-31,22,94
+            game_links = await self._page.query_selector_all(
+                "a[href*='/sportsbook/football/'][href*=',']"
+            )
             
+            logger.info(f"Encontrados {len(game_links)} links de jogos")
+            
+            # Para cada jogo, extrai informações básicas da lista
+            # E depois navega para a página do jogo para pegar odds detalhadas
+            
+            game_urls = []
+            for link in game_links:
+                href = await link.get_attribute("href")
+                if href and "," in href:  # URLs de jogos têm vírgula
+                    full_url = f"{self.BASE_URL}{href}" if href.startswith("/") else href
+                    if full_url not in game_urls:
+                        game_urls.append(full_url)
+                        
+            logger.info(f"URLs únicas de jogos: {len(game_urls)}")
+            
+            # Limita para não sobrecarregar (ajuste conforme necessário)
+            max_games = 20
+            for i, game_url in enumerate(game_urls[:max_games]):
+                try:
+                    match_data = await self._scrape_single_match(game_url, league_name)
+                    if match_data:
+                        matches.append(match_data)
+                        logger.debug(f"  [{i+1}/{min(len(game_urls), max_games)}] {match_data}")
+                        
+                    # Delay entre jogos para não sobrecarregar
+                    await self._page.wait_for_timeout(1000)
+                    
+                except Exception as e:
+                    logger.warning(f"Erro ao processar jogo {game_url}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Erro ao parsear página da liga: {e}")
+            
+        return matches
+        
+    async def _scrape_single_match(self, match_url: str, league_name: str) -> Optional[MatchData]:
+        """
+        Faz scrape de um jogo individual.
+        Navega para a página do jogo e extrai odds detalhadas.
+        """
+        try:
+            # Navega para a página do jogo
+            await self._page.goto(match_url)
+            await self._page.wait_for_load_state("networkidle")
+            await self._page.wait_for_timeout(1500)
+            
+            # Extrai informações da página
+            page_text = await self._page.inner_text("body")
+            
+            # Tenta extrair times do título/header
+            # O formato típico é "Time1 vs Time2" ou "Time1 - Time2"
+            
+            # Procura por elementos que contenham os nomes dos times
+            home_team = "Unknown Home"
+            away_team = "Unknown Away"
+            
+            # Tenta encontrar pelo padrão de URL
+            # URL: /sportsbook/football/XE/1/2026-01-31,22,94
+            match = re.search(r'/(\d{4}-\d{2}-\d{2}),(\d+),(\d+)', match_url)
+            match_id = f"match_{match.group(2)}_{match.group(3)}" if match else f"match_{hash(match_url)}"
+            
+            # Tenta extrair data do URL
+            if match:
+                date_str = match.group(1)
+                kickoff_time = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            else:
+                kickoff_time = datetime.now(timezone.utc) + timedelta(hours=2)
+                
+            # Tenta encontrar nomes dos times na página
+            # Procura por elementos grandes/destacados com nomes
+            team_elements = await self._page.query_selector_all(
+                "[class*='team'], [class*='Team'], h1, h2, h3"
+            )
+            
+            team_names = []
+            for el in team_elements:
+                text = await el.inner_text()
+                text = text.strip()
+                if text and len(text) > 2 and len(text) < 50:
+                    if not any(x in text.lower() for x in ['handicap', 'total', 'gol', 'over', 'under', 'odds']):
+                        team_names.append(text)
+                        
+            # Remove duplicatas mantendo ordem
+            seen = set()
+            unique_teams = []
+            for t in team_names:
+                if t not in seen:
+                    seen.add(t)
+                    unique_teams.append(t)
+                    
+            if len(unique_teams) >= 2:
+                home_team = unique_teams[0]
+                away_team = unique_teams[1]
+            elif len(unique_teams) == 1:
+                # Tenta separar por "vs" ou "-"
+                if " vs " in unique_teams[0]:
+                    parts = unique_teams[0].split(" vs ")
+                    home_team, away_team = parts[0].strip(), parts[1].strip()
+                elif " - " in unique_teams[0]:
+                    parts = unique_teams[0].split(" - ")
+                    home_team, away_team = parts[0].strip(), parts[1].strip()
+                    
             # Cria objeto da partida
             match_data = MatchData(
-                match_id=str(match_id),
+                match_id=match_id,
                 league=league_name,
                 home_team=home_team,
                 away_team=away_team,
@@ -285,180 +444,201 @@ class BetinAsiaScraper:
             )
             
             # Extrai odds de Asian Handicap
-            # AJUSTAR: encontrar a seção de AH no HTML
-            ah_section = await match_el.query_selector(".asian-handicap, .ah-odds, .handicap")
+            match_data.ah_lines = await self._extract_ah_odds()
             
-            if ah_section:
-                match_data.ah_lines = await self._parse_ah_odds(ah_section)
-            else:
-                # Tenta parsear diretamente do elemento da partida
-                match_data.ah_lines = await self._parse_ah_odds(match_el)
-                
             return match_data
             
         except Exception as e:
-            logger.warning(f"Erro ao parsear partida: {e}")
+            logger.warning(f"Erro ao processar jogo individual: {e}")
             return None
             
-    async def _parse_ah_odds(self, container) -> dict[str, AHLine]:
+    async def _extract_ah_odds(self) -> Dict[str, AHLine]:
         """
-        Extrai todas as linhas de AH e odds.
+        Extrai odds de Asian Handicap da página do jogo.
         
-        NOTA: Esta é a parte mais complexa e depende
-        totalmente da estrutura do HTML do BetinAsia.
+        A página mostra uma tabela com:
+        - Linhas de handicap (-1.25, -1, -0.75, etc.)
+        - Para cada linha: odds Home e Away
+        - Tabela de comparação entre bookmakers
         """
         ah_lines = {}
         
         try:
-            # =====================================================
-            # ESTE É O CÓDIGO QUE MAIS PRECISA DE AJUSTE
-            # A estrutura real pode ser completamente diferente
-            # =====================================================
+            # Primeiro, tenta encontrar a seção de Handicap Asiático
+            # Procura por texto "Handicap Asiático" ou similar
             
-            # Encontra todas as linhas de handicap
-            # AJUSTAR SELETOR
-            line_rows = await container.query_selector_all(".ah-line, .handicap-row, .odds-row")
+            ah_section = await self._page.query_selector(
+                "text=Handicap Asiático, text=Asian Handicap, "
+                "[class*='handicap'], [class*='Handicap']"
+            )
             
-            for row in line_rows:
-                try:
-                    # Valor da linha (ex: +0.5, -0.75)
-                    line_el = await row.query_selector(".line-value, .handicap-value")
-                    if not line_el:
-                        continue
-                        
-                    line_str = await line_el.inner_text()
-                    line_str = line_str.strip()
+            if not ah_section:
+                logger.debug("Seção de Handicap Asiático não encontrada")
+                return ah_lines
+                
+            # Procura por linhas de handicap
+            # Formato típico: linha (-1.25), Home (odds), Away (odds)
+            
+            # Tenta extrair pelo padrão de texto na página
+            page_text = await self._page.inner_text("body")
+            
+            # Regex para encontrar linhas de handicap
+            # Padrão: número com sinal (ex: -1.25, +0.5, -0.75)
+            # Seguido de "Home" e valor, "Away" e valor
+            
+            handicap_pattern = r'([+-]?\d+(?:[.,]\d+)?)\s*Home\s*(\d+[.,]\d+)\s*Away\s*(\d+[.,]\d+)'
+            matches = re.findall(handicap_pattern, page_text, re.IGNORECASE)
+            
+            for match in matches:
+                line_str = match[0].replace(",", ".")
+                home_odds = float(match[1].replace(",", "."))
+                away_odds = float(match[2].replace(",", "."))
+                
+                # Normaliza o formato da linha
+                if not line_str.startswith(("+", "-")):
+                    line_str = f"+{line_str}" if float(line_str) >= 0 else line_str
                     
-                    if not line_str:
-                        continue
-                        
-                    ah_line = AHLine(line=line_str)
-                    
-                    # Encontra odds de cada bookmaker
-                    # AJUSTAR SELETOR
-                    bk_cells = await row.query_selector_all(".bookmaker-cell, .odds-cell")
-                    
-                    for cell in bk_cells:
-                        try:
-                            # Nome do bookmaker
-                            bk_name = await cell.get_attribute("data-bookmaker")
-                            if not bk_name:
-                                bk_name = await cell.get_attribute("data-bk")
-                            if not bk_name:
-                                continue
-                                
-                            # Odds
-                            home_odds_el = await cell.query_selector(".home-odds, .odds-home")
-                            away_odds_el = await cell.query_selector(".away-odds, .odds-away")
-                            
-                            if home_odds_el and away_odds_el:
-                                home_odds_text = await home_odds_el.inner_text()
-                                away_odds_text = await away_odds_el.inner_text()
-                                
-                                home_odds = self._parse_odds(home_odds_text)
-                                away_odds = self._parse_odds(away_odds_text)
-                                
-                                if home_odds and away_odds:
-                                    ah_line.bookmaker_odds[bk_name] = BookmakerOdds(
-                                        bookmaker=bk_name,
-                                        home_odds=home_odds,
-                                        away_odds=away_odds,
-                                    )
-                                    
-                        except Exception as e:
-                            continue
-                            
-                    # Só adiciona se tem pelo menos 1 bookmaker
-                    if ah_line.num_bookmakers > 0:
-                        ah_lines[line_str] = ah_line
-                        
-                except Exception as e:
-                    continue
+                ah_line = AHLine(line=line_str)
+                
+                # Por enquanto, não temos bookmaker específico
+                # Usamos "best" como placeholder
+                ah_line.bookmaker_odds["best"] = BookmakerOdds(
+                    bookmaker="best",
+                    home_odds=home_odds,
+                    away_odds=away_odds,
+                )
+                
+                ah_lines[line_str] = ah_line
+                
+            # Tenta também extrair da tabela de bookmakers
+            # A tabela mostra cada bookmaker com suas odds
+            bookmaker_odds = await self._extract_bookmaker_table()
+            
+            # Mescla com as linhas encontradas
+            for bk_name, bk_data in bookmaker_odds.items():
+                for line_str, odds in bk_data.items():
+                    if line_str not in ah_lines:
+                        ah_lines[line_str] = AHLine(line=line_str)
+                    ah_lines[line_str].bookmaker_odds[bk_name] = odds
                     
         except Exception as e:
-            logger.warning(f"Erro ao parsear odds AH: {e}")
+            logger.warning(f"Erro ao extrair odds AH: {e}")
             
         return ah_lines
-    
-    def _parse_kickoff_time(self, kickoff_str: str) -> datetime:
-        """Converte string de horário para datetime."""
-        try:
-            # Tenta parsear automaticamente
-            dt = date_parser.parse(kickoff_str)
-            
-            # Se não tem timezone, assume UTC
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-                
-            return dt
-            
-        except:
-            # Fallback: retorna hora atual + 2 horas
-            return datetime.now(timezone.utc)
-    
-    def _parse_odds(self, odds_str: str) -> Optional[float]:
-        """Converte string de odds para float."""
-        try:
-            # Remove espaços e caracteres especiais
-            odds_str = odds_str.strip()
-            
-            # Substitui vírgula por ponto
-            odds_str = odds_str.replace(",", ".")
-            
-            # Remove caracteres não numéricos (exceto ponto)
-            import re
-            odds_str = re.sub(r"[^\d.]", "", odds_str)
-            
-            return float(odds_str)
-            
-        except:
-            return None
-            
-    async def take_screenshot(self, filename: str = "screenshot.png"):
-        """Tira screenshot da página atual (útil para debug)."""
-        await self._page.screenshot(path=filename)
-        logger.info(f"Screenshot salvo em {filename}")
         
+    async def _extract_bookmaker_table(self) -> Dict[str, Dict[str, BookmakerOdds]]:
+        """
+        Extrai odds da tabela de comparação entre bookmakers.
+        
+        A tabela mostra:
+        - Coluna de bookmakers (3et, bdaq, bf, isn, mbook, molly, pinn88, sbo, sharp, sing2)
+        - Colunas de odds (TOTAL, MÉDIA, MELHOR ou valores específicos)
+        """
+        result = {}
+        
+        try:
+            # Procura elementos que contenham nomes de bookmakers conhecidos
+            for bk_name in self.KNOWN_BOOKMAKERS:
+                bk_elements = await self._page.query_selector_all(f"text={bk_name}")
+                
+                for bk_el in bk_elements:
+                    try:
+                        # Tenta encontrar odds próximas ao nome do bookmaker
+                        parent = await bk_el.evaluate_handle("el => el.parentElement")
+                        parent_text = await parent.inner_text()
+                        
+                        # Procura por números decimais (odds)
+                        odds_pattern = r'(\d+[.,]\d{2,3})'
+                        odds_found = re.findall(odds_pattern, parent_text)
+                        
+                        if len(odds_found) >= 2:
+                            home_odds = float(odds_found[0].replace(",", "."))
+                            away_odds = float(odds_found[1].replace(",", "."))
+                            
+                            if bk_name not in result:
+                                result[bk_name] = {}
+                                
+                            # Usa "main" como linha padrão se não identificada
+                            result[bk_name]["main"] = BookmakerOdds(
+                                bookmaker=bk_name,
+                                home_odds=home_odds,
+                                away_odds=away_odds,
+                            )
+                            
+                    except:
+                        continue
+                        
+        except Exception as e:
+            logger.debug(f"Erro ao extrair tabela de bookmakers: {e}")
+            
+        return result
+        
+    async def take_screenshot(self, filename: str = "screenshot.png"):
+        """Tira screenshot da página atual."""
+        try:
+            await self._page.screenshot(path=filename)
+            logger.info(f"Screenshot salvo: {filename}")
+        except Exception as e:
+            logger.warning(f"Erro ao salvar screenshot: {e}")
+            
     async def get_page_html(self) -> str:
-        """Retorna o HTML da página atual (útil para debug)."""
+        """Retorna o HTML da página atual."""
         return await self._page.content()
+        
+    async def get_page_text(self) -> str:
+        """Retorna o texto da página atual."""
+        return await self._page.inner_text("body")
 
 
 # =====================================================
-# SCRIPT DE TESTE DE CONEXÃO
+# FUNÇÃO DE TESTE
 # =====================================================
 
-async def test_connection():
-    """Testa a conexão com o BetinAsia."""
+async def test_scraper():
+    """Testa o scraper com login e scrape de uma liga."""
     print("\n" + "="*60)
-    print("TESTE DE CONEXÃO COM BETINASIA")
+    print("TESTE DO SCRAPER BETINASIA")
     print("="*60 + "\n")
     
-    async with BetinAsiaScraper(headless=False, slow_mo=100) as scraper:
-        print("1. Browser iniciado com sucesso")
+    async with BetinAsiaScraper(headless=False, slow_mo=500) as scraper:
+        print("1. Browser iniciado")
         
-        # Tenta fazer login
+        # Login
         success = await scraper.login()
         
-        if success:
-            print("2. Login realizado com sucesso!")
-            print("\n   PRÓXIMOS PASSOS:")
-            print("   - Abra o navegador que apareceu")
-            print("   - Navegue até uma página com odds")
-            print("   - Pressione F12 para abrir DevTools")
-            print("   - Inspecione os elementos (classes, IDs)")
-            print("   - Anote os seletores CSS")
-            print("\n   Pressione Enter para fechar...")
-            input()
-        else:
-            print("2. FALHA no login")
-            print("   Verifique:")
-            print("   - Credenciais no arquivo .env")
-            print("   - Seletores no método login()")
-            print("\n   Screenshot salvo em login_error.png")
+        if not success:
+            print("❌ Falha no login")
+            print("   Verifique as credenciais no arquivo .env")
+            return
             
-    print("\nTeste finalizado.")
+        print("2. ✅ Login OK")
+        
+        # Navega para futebol
+        await scraper.navigate_to_football()
+        print("3. ✅ Navegou para futebol")
+        
+        # Tira screenshot
+        await scraper.take_screenshot("test_football.png")
+        print("4. Screenshot salvo: test_football.png")
+        
+        # Tenta scrape da Premier League
+        print("\n5. Iniciando scrape da Premier League...")
+        matches = await scraper.scrape_league("England Premier League")
+        
+        print(f"\n   Encontradas {len(matches)} partidas:")
+        for m in matches[:5]:  # Mostra apenas 5
+            print(f"   - {m.home_team} vs {m.away_team}")
+            for line, ah in m.ah_lines.items():
+                print(f"     {line}: {ah.num_bookmakers} bookmakers")
+                
+        print("\n" + "="*60)
+        print("Teste concluído!")
+        print("="*60)
+        
+        # Mantém browser aberto para inspeção
+        print("\nPressione Enter para fechar o browser...")
+        input()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_connection())
+    asyncio.run(test_scraper())
