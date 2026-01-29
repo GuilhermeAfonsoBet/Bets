@@ -770,12 +770,14 @@ class BetinAsiaScraper:
     ) -> Dict[str, dict]:
         """
         Clica em uma odds específica e extrai os bookmakers do painel.
+        
+        IMPORTANTE: O clique deve ser no elemento PAI (DIV), não no SPAN de texto.
+        O SPAN contém o texto da odds, mas o DIV pai é o elemento clicável.
         """
         bookmakers = {}
         
         try:
-            # Encontra e clica na odds
-            # Usa texto exato para evitar matches parciais
+            # Encontra elementos com a odds
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
             
             logger.debug(f"Buscando odds '{odds_str}' ({side}): {len(elements)} elementos encontrados")
@@ -788,11 +790,14 @@ class BetinAsiaScraper:
                         await el.scroll_into_view_if_needed()
                         await self._page.wait_for_timeout(300)
                         
-                        # Depois verifica o bounding box
+                        # Verifica o bounding box
                         box = await el.bounding_box()
                         if box and box['width'] > 20 and box['height'] > 10:
-                            logger.debug(f"  Elemento [{i}]: clicando (y={box['y']:.0f})")
-                            await el.click()
+                            logger.debug(f"  Elemento [{i}]: clicando no PARENT (y={box['y']:.0f})")
+                            
+                            # IMPORTANTE: Clica no elemento PAI (DIV), não no SPAN
+                            parent = await el.evaluate_handle("el => el.parentElement")
+                            await parent.click()
                             await self._page.wait_for_timeout(1500)
                             clicked = True
                             break
