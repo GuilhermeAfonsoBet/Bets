@@ -782,13 +782,13 @@ class BetinAsiaScraper:
             for el in elements:
                 try:
                     if await el.is_visible():
+                        # Primeiro faz scroll para o elemento
+                        await el.scroll_into_view_if_needed()
+                        await self._page.wait_for_timeout(300)
+                        
+                        # Depois verifica o bounding box
                         box = await el.bounding_box()
-                        # Verifica se o elemento está na área visível (y > 0)
-                        # e tem tamanho mínimo
-                        if box and box['width'] > 20 and box['height'] > 10 and box['y'] > 0:
-                            # Scroll para garantir que está visível
-                            await el.scroll_into_view_if_needed()
-                            await self._page.wait_for_timeout(300)
+                        if box and box['width'] > 20 and box['height'] > 10:
                             await el.click()
                             await self._page.wait_for_timeout(1500)
                             clicked = True
