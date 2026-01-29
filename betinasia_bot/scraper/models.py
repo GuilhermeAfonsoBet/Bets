@@ -75,15 +75,15 @@ class AHLine:
     
     def get_dif_best_second_home(self) -> float:
         """Diferença percentual entre melhor e segunda melhor odd (home)."""
-        odds = sorted(self.home_odds_list, reverse=True)
-        if len(odds) < 2:
+        odds = [o for o in sorted(self.home_odds_list, reverse=True) if o > 0]
+        if len(odds) < 2 or odds[1] == 0:
             return 0.0
         return (odds[0] - odds[1]) / odds[1] * 100
     
     def get_dif_best_second_away(self) -> float:
         """Diferença percentual entre melhor e segunda melhor odd (away)."""
-        odds = sorted(self.away_odds_list, reverse=True)
-        if len(odds) < 2:
+        odds = [o for o in sorted(self.away_odds_list, reverse=True) if o > 0]
+        if len(odds) < 2 or odds[1] == 0:
             return 0.0
         return (odds[0] - odds[1]) / odds[1] * 100
     
