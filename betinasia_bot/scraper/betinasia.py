@@ -310,6 +310,46 @@ class BetinAsiaScraper:
             logger.error(f"Erro ao navegar para futebol: {e}")
             return False
             
+    async def _expand_ah_section(self):
+        """
+        Expande a seção de Handicap Asiático clicando em 'Mostrar todas as linhas'.
+        """
+        try:
+            # Procura pelo botão "Mostrar todas as linhas" na seção de AH
+            # Pode aparecer como texto ou como botão
+            expand_buttons = await self._page.query_selector_all(
+                "text=Mostrar todas as linhas, text=Show all lines, "
+                "text=Mostrar todas, text=Ver todas"
+            )
+            
+            for button in expand_buttons:
+                try:
+                    # Verifica se está visível
+                    if await button.is_visible():
+                        await button.click()
+                        await self._page.wait_for_timeout(800)
+                        logger.debug("Expandiu seção 'Mostrar todas as linhas'")
+                except:
+                    continue
+                    
+            # Também tenta clicar em qualquer seta/chevron de expansão na seção de AH
+            # Procura por elementos expansíveis próximos ao texto "Handicap Asiático"
+            ah_section = await self._page.query_selector("text=Handicap Asiático")
+            if ah_section:
+                # Tenta clicar no elemento pai ou irmão que pode ser um botão de expansão
+                parent = await ah_section.evaluate_handle("el => el.closest('div')")
+                if parent:
+                    expand_icon = await parent.query_selector("[class*='expand'], [class*='chevron'], [class*='arrow']")
+                    if expand_icon:
+                        try:
+                            await expand_icon.click()
+                            await self._page.wait_for_timeout(800)
+                        except:
+                            pass
+                            
+        except Exception as e:
+            logger.debug(f"Erro ao expandir seção AH: {e}")
+    
     async def _expand_game_list(self):
         """
         Expande a lista de jogos clicando em 'Mostrar mais' e fazendo scroll.
@@ -588,6 +628,9 @@ class BetinAsiaScraper:
         ah_lines = {}
         
         try:
+            # Primeiro, expande a seção de Handicap Asiático clicando em "Mostrar todas as linhas"
+            await self._expand_ah_section()
+            
             page_text = await self._page.inner_text("body")
             
             # Procura pela seção de Handicap Asiático
