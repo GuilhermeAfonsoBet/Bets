@@ -641,21 +641,34 @@ class BetinAsiaScraper:
                 return ah_lines
             
             # IMPORTANTE: Isola apenas a seção de Handicap Asiático
-            # Procura entre "Handicap Asiático" e a próxima seção (como "Total De Gols")
+            # Procura entre "Handicap Asiático" e a próxima seção
             ah_section_text = ""
             
-            # Divide por seções conhecidas
-            sections = re.split(r'(Handicap Asiático|Total De Gols|Resultado Exato|1 X 2|Escanteios)', page_text)
+            # Encontra posição de "Handicap Asiático"
+            ah_start = page_text.find("Handicap Asiático")
+            if ah_start == -1:
+                ah_start = page_text.find("Asian Handicap")
             
-            for i, section in enumerate(sections):
-                if "Handicap Asiático" in section:
-                    # Pega o texto após "Handicap Asiático" até a próxima seção
-                    if i + 1 < len(sections):
-                        ah_section_text = sections[i + 1]
-                        break
+            if ah_start == -1:
+                logger.debug("Seção Handicap Asiático não encontrada")
+                return ah_lines
             
-            if not ah_section_text:
-                logger.debug("Não conseguiu isolar seção de Handicap Asiático")
+            # Texto a partir de "Handicap Asiático"
+            text_from_ah = page_text[ah_start:]
+            
+            # Encontra onde termina a seção (próxima seção)
+            end_markers = ["Total De Gols", "Resultado Exato", "Escanteios", "1 X 2 E", "Chance Dupla", "Ambas Equipes"]
+            ah_end = len(text_from_ah)
+            
+            for marker in end_markers:
+                pos = text_from_ah.find(marker)
+                if pos > 50 and pos < ah_end:  # Deve estar após algum conteúdo
+                    ah_end = pos
+            
+            ah_section_text = text_from_ah[:ah_end]
+            
+            if len(ah_section_text) < 50:
+                logger.debug("Seção de Handicap Asiático muito curta")
                 return ah_lines
             
             # Agora extrai as linhas de AH apenas desta seção
