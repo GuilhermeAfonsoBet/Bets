@@ -312,40 +312,30 @@ class BetinAsiaScraper:
             
     async def _expand_ah_section(self):
         """
-        Expande a seção de Handicap Asiático clicando em 'Mostrar todas as linhas'.
+        Expande a seção de Handicap Asiático clicando em 'Show all lines'.
         """
         try:
-            # Procura pelo botão "Mostrar todas as linhas" na seção de AH
-            # Pode aparecer como texto ou como botão
-            expand_buttons = await self._page.query_selector_all(
-                "text=Mostrar todas as linhas, text=Show all lines, "
-                "text=Mostrar todas, text=Ver todas"
-            )
-            
-            for button in expand_buttons:
-                try:
-                    # Verifica se está visível
-                    if await button.is_visible():
-                        await button.click()
-                        await self._page.wait_for_timeout(800)
-                        logger.debug("Expandiu seção 'Mostrar todas as linhas'")
-                except:
-                    continue
-                    
-            # Também tenta clicar em qualquer seta/chevron de expansão na seção de AH
-            # Procura por elementos expansíveis próximos ao texto "Handicap Asiático"
-            ah_section = await self._page.query_selector("text=Handicap Asiático")
-            if ah_section:
-                # Tenta clicar no elemento pai ou irmão que pode ser um botão de expansão
-                parent = await ah_section.evaluate_handle("el => el.closest('div')")
-                if parent:
-                    expand_icon = await parent.query_selector("[class*='expand'], [class*='chevron'], [class*='arrow']")
-                    if expand_icon:
-                        try:
-                            await expand_icon.click()
-                            await self._page.wait_for_timeout(800)
-                        except:
-                            pass
+            # Procura pelo botão "Show all lines" ou "Mostrar todas as linhas"
+            # Clica em TODOS os botões encontrados (pode haver vários)
+            for _ in range(3):  # Tenta até 3 vezes
+                expand_buttons = await self._page.query_selector_all(
+                    "text=Show all lines, text=Mostrar todas as linhas, "
+                    "text=Show all, text=Mostrar todas"
+                )
+                
+                clicked = False
+                for button in expand_buttons:
+                    try:
+                        if await button.is_visible():
+                            await button.click()
+                            await self._page.wait_for_timeout(500)
+                            clicked = True
+                            logger.debug("Clicou em 'Show all lines'")
+                    except:
+                        continue
+                
+                if not clicked:
+                    break
                             
         except Exception as e:
             logger.debug(f"Erro ao expandir seção AH: {e}")
@@ -631,9 +621,9 @@ class BetinAsiaScraper:
             # Extrai o texto da página
             page_text = await self._page.inner_text("body")
             
-            # Verifica se a seção existe
-            if "Handicap Asiático" not in page_text:
-                logger.debug("Seção Handicap Asiático não encontrada")
+            # Verifica se a seção existe (pode estar em inglês ou português)
+            if "Asian Handicap" not in page_text and "Handicap Asiático" not in page_text:
+                logger.debug("Seção Asian Handicap não encontrada")
                 return ah_lines
             
             # Handicaps válidos são múltiplos de 0.25 entre -10 e +10
