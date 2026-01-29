@@ -709,7 +709,8 @@ class BetinAsiaScraper:
                     if capture_bookmakers:
                         bookmaker_odds = await self._capture_bookmaker_odds(
                             home_odds_str=match[1],
-                            away_odds_str=match[2]
+                            away_odds_str=match[2],
+                            handicap=formatted_line
                         )
                         ah_line.bookmaker_odds.update(bookmaker_odds)
                     
@@ -729,21 +730,24 @@ class BetinAsiaScraper:
     async def _capture_bookmaker_odds(
         self, 
         home_odds_str: str, 
-        away_odds_str: str
+        away_odds_str: str,
+        handicap: str = ""
     ) -> Dict[str, BookmakerOdds]:
         """
         Captura odds de bookmakers individuais clicando nas odds.
         
         Clica na odds de Home e Away para abrir o painel com todos os bookmakers.
+        O parâmetro handicap ajuda a identificar o elemento correto quando há
+        múltiplos elementos com a mesma odds (ex: mesma odds em AH e 1X2).
         """
         bookmaker_odds = {}
         
         try:
             # Captura odds de HOME
-            home_bks = await self._click_and_extract_bookmakers(home_odds_str, "home")
+            home_bks = await self._click_and_extract_bookmakers(home_odds_str, "home", handicap)
             
             # Captura odds de AWAY
-            away_bks = await self._click_and_extract_bookmakers(away_odds_str, "away")
+            away_bks = await self._click_and_extract_bookmakers(away_odds_str, "away", handicap)
             
             # Combina os resultados
             all_bookmakers = set(home_bks.keys()) | set(away_bks.keys())
@@ -766,14 +770,15 @@ class BetinAsiaScraper:
     async def _click_and_extract_bookmakers(
         self, 
         odds_str: str, 
-        side: str
+        side: str,
+        handicap: str = ""
     ) -> Dict[str, dict]:
         """
         Clica em uma odds específica e extrai os bookmakers do painel.
         
         IMPORTANTE: O clique deve ser no elemento PAI (DIV), não no SPAN de texto.
         Quando há múltiplos elementos com a mesma odds (ex: mesma odds em AH e 1X2),
-        tenta todos até encontrar um que abra o painel de bookmakers.
+        prioriza elementos cujo contexto contenha o handicap esperado.
         """
         bookmakers = {}
         
@@ -781,10 +786,41 @@ class BetinAsiaScraper:
             # Encontra elementos com a odds
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
             
-            logger.debug(f"Buscando odds '{odds_str}' ({side}): {len(elements)} elementos encontrados")
+            logger.debug(f"Buscando odds '{odds_str}' ({side}, AH {handicap}): {len(elements)} elementos encontrados")
+            
+            # Se temos handicap e múltiplos elementos, filtra/prioriza pelo contexto
+            elements_with_context = []
+            for el in elements:
+                try:
+                    # Obtém o contexto do elemento (texto do avô)
+                    context = await el.evaluate(
+                        "el => (el.parentElement?.parentElement?.textContent || '').substring(0, 100).toLowerCase()"
+                    )
+                    elements_with_context.append((el, context))
+                except:
+                    elements_with_context.append((el, ""))
+            
+            # Se há handicap, ordena para priorizar elementos que contêm o handicap no contexto
+            if handicap and len(elements_with_context) > 1:
+                # Normaliza handicap para busca (ex: "-0.5" -> ["0.5", "-0.5", "−0.5"])
+                handicap_clean = handicap.lstrip('+').replace(',', '.')
+                
+                def context_priority(item):
+                    el, context = item
+                    # Prioridade 1: contexto contém o handicap exato
+                    if handicap_clean in context or handicap in context:
+                        return 0
+                    # Prioridade 2: contexto contém "home" e "away" (indica seção AH, não 1X2)
+                    if "home" in context and "away" in context and "draw" not in context:
+                        return 1
+                    # Prioridade 3: outros
+                    return 2
+                
+                elements_with_context.sort(key=context_priority)
+                logger.debug(f"  Elementos reordenados por contexto (handicap={handicap})")
             
             # Tenta cada elemento até encontrar um que abra o painel com bookmakers
-            for i, el in enumerate(elements):
+            for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
                         # Primeiro faz scroll para o elemento
@@ -794,7 +830,9 @@ class BetinAsiaScraper:
                         # Verifica o bounding box
                         box = await el.bounding_box()
                         if box and box['width'] > 20 and box['height'] > 10:
-                            logger.debug(f"  Elemento [{i}]: clicando no PARENT (y={box['y']:.0f})")
+                            # Log com contexto resumido
+                            context_short = context[:40].replace('\n', ' ') if context else 'N/A'
+                            logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, contexto='{context_short}...'")
                             
                             # Clica no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
