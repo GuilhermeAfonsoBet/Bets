@@ -394,3 +394,22 @@ class Database:
             )
             session.add(league)
             await session.commit()
+
+
+# ==========================================
+# FUNÇÃO DE INICIALIZAÇÃO
+# ==========================================
+
+async def init_db(database_url: str = None):
+    """
+    Inicializa o banco de dados criando todas as tabelas.
+    
+    Uso:
+        import asyncio
+        from storage.database import init_db
+        asyncio.run(init_db())
+    """
+    db = Database(database_url)
+    await db.connect()
+    await db.close()
+    logger.info("Banco de dados inicializado com sucesso!")
