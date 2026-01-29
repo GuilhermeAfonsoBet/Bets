@@ -3,6 +3,7 @@
 Scraper do BetinAsia (BLACK).
 
 Baseado na análise do HTML real do site em Janeiro/2026.
+Atualizado com lógica de expansão de linhas AH e captura de bookmakers.
 """
 
 import asyncio
@@ -59,11 +60,11 @@ class BetinAsiaScraper:
         "UEFA Europa League": "XE/6",
     }
     
-    # Bookmakers conhecidos
+    # Bookmakers conhecidos (nomes podem ter 'e' no final: 3ete, pin88e)
     KNOWN_BOOKMAKERS = [
-        "3et", "bdaq", "bf", "isn", "mbook", 
-        "molly", "pinn88", "pin88", "pinnacle",
-        "sbo", "sharp", "sing2"
+        "3et", "4casters", "bdaq", "bf", "ibc", "ipm",
+        "isn", "mbook", "molly", "pin88", "pinnacle",
+        "sbo", "sharp", "sing"
     ]
     
     def __init__(
@@ -221,43 +222,27 @@ class BetinAsiaScraper:
             # O site usa inputs dentro de um form
             await self._page.wait_for_selector("input", timeout=15000)
             
-            # Encontra os campos de input
-            # Primeiro input é username, segundo é password
-            inputs = await self._page.query_selector_all("input")
+            # Preenche APENAS o primeiro input de texto (username)
+            # O site tem múltiplos inputs, precisamos ser específicos
+            text_inputs = await self._page.query_selector_all("input[type='text']")
+            password_input = await self._page.query_selector("input[type='password']")
             
-            if len(inputs) < 2:
-                logger.error("Não encontrou campos de login suficientes")
+            if not text_inputs or not password_input:
+                logger.error("Não encontrou campos de login")
                 await self.take_screenshot("login_error_fields.png")
                 return False
             
-            # Preenche username (primeiro input de texto)
-            username_input = None
-            password_input = None
-            
-            for inp in inputs:
-                input_type = await inp.get_attribute("type")
-                if input_type == "password":
-                    password_input = inp
-                elif input_type in ["text", "email", None]:
-                    if username_input is None:
-                        username_input = inp
-                        
-            if not username_input or not password_input:
-                logger.error("Não identificou campos de usuário/senha")
-                await self.take_screenshot("login_error_inputs.png")
-                return False
-            
             # Preenche credenciais
-            await username_input.fill(username)
+            await text_inputs[0].fill(username)  # Primeiro input de texto = username
             await self._page.wait_for_timeout(500)
             await password_input.fill(password)
             await self._page.wait_for_timeout(500)
             
-            # Clica no botão de login
-            # Procura por botão com texto "Iniciar Sessão" ou similar
+            # Clica no botão de login (texto "Log In")
             login_button = await self._page.query_selector(
-                "button:has-text('Iniciar'), button:has-text('Login'), "
-                "button:has-text('Entrar'), button[type='submit']"
+                "button:has-text('Log In'), button:has-text('Iniciar'), "
+                "button:has-text('Login'), button:has-text('Entrar'), "
+                "button[type='submit']"
             )
             
             if login_button:
@@ -313,29 +298,39 @@ class BetinAsiaScraper:
     async def _expand_ah_section(self):
         """
         Expande a seção de Handicap Asiático clicando em 'Show all lines'.
+        Aguarda carregamento completo e clica múltiplas vezes se necessário.
         """
         try:
-            # Procura pelo botão "Show all lines" ou "Mostrar todas as linhas"
-            # Clica em TODOS os botões encontrados (pode haver vários)
-            for _ in range(3):  # Tenta até 3 vezes
+            # Aguarda carregamento inicial
+            await self._page.wait_for_load_state("networkidle")
+            await self._page.wait_for_timeout(2000)
+            
+            # Clica em TODOS os botões "Show all lines" até não haver mais
+            for attempt in range(5):
                 expand_buttons = await self._page.query_selector_all(
-                    "text=Show all lines, text=Mostrar todas as linhas, "
-                    "text=Show all, text=Mostrar todas"
+                    "text=Show all lines, text=Mostrar todas as linhas"
                 )
                 
-                clicked = False
+                visible_buttons = []
                 for button in expand_buttons:
                     try:
                         if await button.is_visible():
-                            await button.click()
-                            await self._page.wait_for_timeout(500)
-                            clicked = True
-                            logger.debug("Clicou em 'Show all lines'")
+                            visible_buttons.append(button)
                     except:
                         continue
                 
-                if not clicked:
+                if not visible_buttons:
+                    logger.debug(f"Expansão completa após {attempt} tentativas")
                     break
+                
+                for button in visible_buttons:
+                    try:
+                        await button.scroll_into_view_if_needed()
+                        await button.click()
+                        await self._page.wait_for_timeout(1500)
+                        logger.debug("Clicou em 'Show all lines'")
+                    except:
+                        continue
                             
         except Exception as e:
             logger.debug(f"Erro ao expandir seção AH: {e}")
@@ -501,16 +496,26 @@ class BetinAsiaScraper:
             
         return matches
         
-    async def _scrape_single_match(self, match_url: str, league_name: str) -> Optional[MatchData]:
+    async def _scrape_single_match(
+        self, 
+        match_url: str, 
+        league_name: str,
+        capture_bookmakers: bool = False
+    ) -> Optional[MatchData]:
         """
         Faz scrape de um jogo individual.
         Navega para a página do jogo e extrai odds detalhadas.
+        
+        Args:
+            match_url: URL completa do jogo
+            league_name: Nome da liga
+            capture_bookmakers: Se True, captura odds de cada bookmaker (mais lento)
         """
         try:
             # Navega para a página do jogo
             await self._page.goto(match_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(2000)
+            await self._page.wait_for_timeout(3000)  # Aumentado para garantir carregamento
             
             # Extrai informações da página
             page_text = await self._page.inner_text("body")
@@ -527,50 +532,34 @@ class BetinAsiaScraper:
                 match_id = f"match_{hash(match_url)}"
                 kickoff_time = datetime.now(timezone.utc) + timedelta(hours=2)
             
-            # Extrai nomes dos times
-            # Formato: "Brighton & Hove Albion FC Vs. Everton" ou similar
+            # Extrai nomes dos times usando padrão "Time1 Vs. Time2"
             home_team = "Unknown Home"
             away_team = "Unknown Away"
             
-            # Divide o texto em linhas para análise
-            lines = page_text.split('\n')
+            # Padrão mais específico para evitar capturar menu
+            # Procura: "Nome do Time Vs. Nome do Time" (com letra maiúscula)
+            teams_pattern = r'([A-Z][A-Za-z0-9\s&\.\-\']+?)\s+Vs\.\s+([A-Z][A-Za-z0-9\s&\.\-\']+?)(?:\n|$)'
+            teams_match = re.search(teams_pattern, page_text)
             
-            # Procura pela linha que contém "Vs." ou "vs"
-            for i, line in enumerate(lines):
-                line = line.strip()
-                if ' Vs. ' in line or ' vs ' in line or ' VS ' in line:
-                    # Separa os times
-                    if ' Vs. ' in line:
+            if teams_match:
+                home_team = teams_match.group(1).strip()
+                away_team = teams_match.group(2).strip()
+            else:
+                # Fallback: procura em linhas individuais
+                lines = page_text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if ' Vs. ' in line and len(line) < 150:
                         parts = line.split(' Vs. ')
-                    elif ' vs ' in line:
-                        parts = line.split(' vs ')
-                    else:
-                        parts = line.split(' VS ')
-                    
-                    if len(parts) == 2:
-                        home_team = parts[0].strip()
-                        away_team = parts[1].strip()
-                        
-                        # Limita tamanho e limpa
-                        home_team = home_team[-100:] if len(home_team) > 100 else home_team
-                        away_team = away_team[:100] if len(away_team) > 100 else away_team
-                        
-                        # Valida se parecem nomes de times
-                        if len(home_team) > 2 and len(away_team) > 2:
-                            if len(home_team) < 80 and len(away_team) < 80:
-                                break
-            
-            # Se ainda não encontrou, tenta pelo título da página
-            if home_team == "Unknown Home":
-                # Procura padrão no título: "Time1 Vs. Time2"
-                title_pattern = r'([A-Z][A-Za-z\s&\.\-\']{2,40})\s+Vs\.\s+([A-Z][A-Za-z\s&\.\-\']{2,40})'
-                title_match = re.search(title_pattern, page_text[:2000])
-                if title_match:
-                    home_team = title_match.group(1).strip()
-                    away_team = title_match.group(2).strip()
+                        if len(parts) == 2:
+                            home_team = parts[0].strip()
+                            away_team = parts[1].strip()
+                            # Valida se parecem nomes de times (não menu)
+                            if len(home_team) > 2 and len(away_team) > 2:
+                                if not any(x in home_team.lower() for x in ['football', 'tennis', 'live', 'top']):
+                                    break
             
             # Extrai horário se disponível
-            # Formato: "12:00" seguido de data
             time_pattern = r'(\d{2}:\d{2})\s*\n\s*(\d{2}/\d{2}/\d{4})'
             time_match = re.search(time_pattern, page_text)
             if time_match and url_match:
@@ -595,7 +584,7 @@ class BetinAsiaScraper:
             )
             
             # Extrai odds de Asian Handicap
-            match_data.ah_lines = await self._extract_ah_odds()
+            match_data.ah_lines = await self._extract_ah_odds(capture_bookmakers=capture_bookmakers)
             
             if match_data.ah_lines:
                 logger.debug(f"Jogo: {home_team} vs {away_team} - {len(match_data.ah_lines)} linhas AH")
@@ -606,10 +595,16 @@ class BetinAsiaScraper:
             logger.warning(f"Erro ao processar jogo individual: {e}")
             return None
             
-    async def _extract_ah_odds(self) -> Dict[str, AHLine]:
+    async def _extract_ah_odds(self, capture_bookmakers: bool = False) -> Dict[str, AHLine]:
         """
         Extrai odds de Asian Handicap da página do jogo.
-        Usa abordagem baseada em padrão de texto estruturado.
+        
+        Args:
+            capture_bookmakers: Se True, clica em cada odds para capturar 
+                               odds individuais de cada bookmaker.
+        
+        Returns:
+            Dict com linhas de AH e suas odds.
         """
         ah_lines = {}
         
@@ -621,39 +616,43 @@ class BetinAsiaScraper:
             # Extrai o texto da página
             page_text = await self._page.inner_text("body")
             
-            # Verifica se a seção existe (pode estar em inglês ou português)
+            # Verifica se a seção existe
             if "Asian Handicap" not in page_text and "Handicap Asiático" not in page_text:
                 logger.debug("Seção Asian Handicap não encontrada")
                 return ah_lines
             
-            # Handicaps válidos são múltiplos de 0.25 entre -10 e +10
-            valid_handicaps = set()
-            for i in range(-40, 41):  # -10 a +10 em incrementos de 0.25
-                valid_handicaps.add(i * 0.25)
+            # Encontra seção Asian Handicap (termina antes de Asian Total ou Correct Score)
+            ah_section_match = re.search(
+                r'Asian Handicap\n(.+?)(?=\nAsian Total|\nCorrect Score|\nShow all lines\nAsian)',
+                page_text, 
+                re.DOTALL
+            )
             
-            # Usa regex para encontrar padrão: HANDICAP Home ODDS Away ODDS
-            # Padrão mais flexível que captura a estrutura do site
-            # Formato no texto: "-0,75\nHome\n2.205\nAway\n1.775"
+            if not ah_section_match:
+                logger.debug("Não conseguiu isolar seção Asian Handicap")
+                # Tenta extrair do texto completo
+                ah_text = page_text
+            else:
+                ah_text = ah_section_match.group(1)
             
-            # Primeiro, encontra todas as ocorrências de handicaps válidos seguidos de Home/Away
-            pattern = r'([+-]?\d+[,.]?\d*)\s*\n\s*Home\s*\n\s*(\d+[,.]\d+)\s*\n\s*Away\s*\n\s*(\d+[,.]\d+)'
-            
-            matches = re.findall(pattern, page_text)
+            # Padrão: HANDICAP\nHome\nODDS\nAway\nODDS
+            pattern = r'([+-]?\d+[,.]?\d*)\s*\nHome\s*\n(\d+[,.]\d+)\s*\nAway\s*\n(\d+[,.]\d+)'
+            matches = re.findall(pattern, ah_text)
             
             for match in matches:
                 try:
                     handicap_str = match[0].replace(",", ".")
                     handicap_value = float(handicap_str)
                     
-                    # Verifica se é um handicap válido
-                    if handicap_value not in valid_handicaps:
+                    # Verifica se é handicap válido (múltiplo de 0.25, entre -10 e +10)
+                    if handicap_value % 0.25 != 0 or abs(handicap_value) > 10:
                         continue
                     
                     home_odds = float(match[1].replace(",", "."))
                     away_odds = float(match[2].replace(",", "."))
                     
                     # Valida odds
-                    if not (1.01 <= home_odds <= 50 and 1.01 <= away_odds <= 50):
+                    if not (1.01 <= home_odds <= 100 and 1.01 <= away_odds <= 100):
                         continue
                     
                     # Formata linha
@@ -664,18 +663,32 @@ class BetinAsiaScraper:
                     else:
                         formatted_line = f"{handicap_value:.2f}".rstrip('0').rstrip('.')
                     
-                    # Evita duplicatas (pode ter o mesmo handicap em seções diferentes)
-                    if formatted_line not in ah_lines:
-                        ah_line = AHLine(line=formatted_line)
-                        ah_line.bookmaker_odds["best"] = BookmakerOdds(
-                            bookmaker="best",
-                            home_odds=home_odds,
-                            away_odds=away_odds,
+                    # Evita duplicatas
+                    if formatted_line in ah_lines:
+                        continue
+                    
+                    # Cria objeto AHLine
+                    ah_line = AHLine(line=formatted_line)
+                    
+                    # Adiciona "best" como bookmaker padrão
+                    ah_line.bookmaker_odds["best"] = BookmakerOdds(
+                        bookmaker="best",
+                        home_odds=home_odds,
+                        away_odds=away_odds,
+                    )
+                    
+                    # Se solicitado, captura odds de cada bookmaker
+                    if capture_bookmakers:
+                        bookmaker_odds = await self._capture_bookmaker_odds(
+                            home_odds_str=match[1],
+                            away_odds_str=match[2]
                         )
-                        ah_lines[formatted_line] = ah_line
-                        logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f}")
+                        ah_line.bookmaker_odds.update(bookmaker_odds)
+                    
+                    ah_lines[formatted_line] = ah_line
+                    logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f} ({len(ah_line.bookmaker_odds)} bks)")
                         
-                except (ValueError, IndexError):
+                except (ValueError, IndexError) as e:
                     continue
             
             logger.info(f"Extraídas {len(ah_lines)} linhas de AH")
@@ -684,6 +697,132 @@ class BetinAsiaScraper:
             logger.warning(f"Erro ao extrair odds AH: {e}")
             
         return ah_lines
+    
+    async def _capture_bookmaker_odds(
+        self, 
+        home_odds_str: str, 
+        away_odds_str: str
+    ) -> Dict[str, BookmakerOdds]:
+        """
+        Captura odds de bookmakers individuais clicando nas odds.
+        
+        Clica na odds de Home e Away para abrir o painel com todos os bookmakers.
+        """
+        bookmaker_odds = {}
+        
+        try:
+            # Captura odds de HOME
+            home_bks = await self._click_and_extract_bookmakers(home_odds_str, "home")
+            
+            # Captura odds de AWAY
+            away_bks = await self._click_and_extract_bookmakers(away_odds_str, "away")
+            
+            # Combina os resultados
+            all_bookmakers = set(home_bks.keys()) | set(away_bks.keys())
+            
+            for bk_name in all_bookmakers:
+                home_data = home_bks.get(bk_name, {})
+                away_data = away_bks.get(bk_name, {})
+                
+                bookmaker_odds[bk_name] = BookmakerOdds(
+                    bookmaker=bk_name,
+                    home_odds=home_data.get("odds", 0.0),
+                    away_odds=away_data.get("odds", 0.0),
+                )
+                
+        except Exception as e:
+            logger.debug(f"Erro ao capturar bookmakers: {e}")
+            
+        return bookmaker_odds
+    
+    async def _click_and_extract_bookmakers(
+        self, 
+        odds_str: str, 
+        side: str
+    ) -> Dict[str, dict]:
+        """
+        Clica em uma odds específica e extrai os bookmakers do painel.
+        """
+        bookmakers = {}
+        
+        try:
+            # Encontra e clica na odds
+            elements = await self._page.query_selector_all(f"text=/{odds_str}/")
+            
+            clicked = False
+            for el in elements:
+                try:
+                    if await el.is_visible():
+                        box = await el.bounding_box()
+                        if box and box['width'] > 20:
+                            await el.click()
+                            await self._page.wait_for_timeout(1500)
+                            clicked = True
+                            break
+                except:
+                    continue
+            
+            if not clicked:
+                return bookmakers
+            
+            # Extrai bookmakers do texto
+            panel_text = await self._page.inner_text("body")
+            bookmakers = self._extract_bookmakers_from_text(panel_text)
+            
+            # Fecha o painel
+            await self._page.keyboard.press("Escape")
+            await self._page.wait_for_timeout(500)
+            
+        except Exception as e:
+            logger.debug(f"Erro ao clicar em odds {side}: {e}")
+            
+        return bookmakers
+    
+    def _extract_bookmakers_from_text(self, text: str) -> Dict[str, dict]:
+        """
+        Extrai bookmakers e suas odds do texto do painel.
+        
+        O painel mostra:
+        bookmaker_name
+        odds
+        $limit
+        """
+        bookmakers = {}
+        lines = text.split("\n")
+        
+        for i, line in enumerate(lines):
+            line_clean = line.strip().lower()
+            
+            # Remove 'e' do final (3ete -> 3et, pin88e -> pin88)
+            if line_clean.endswith("e"):
+                line_clean_no_e = line_clean[:-1]
+                if line_clean_no_e in self.KNOWN_BOOKMAKERS:
+                    line_clean = line_clean_no_e
+            
+            # Verifica se é um bookmaker conhecido
+            if line_clean in self.KNOWN_BOOKMAKERS:
+                if i + 1 < len(lines):
+                    try:
+                        odds_str = lines[i + 1].strip().replace(",", ".")
+                        odds = float(odds_str)
+                        
+                        # Próxima linha pode ser o limite
+                        limit = 0.0
+                        if i + 2 < len(lines):
+                            limit_str = lines[i + 2].strip()
+                            if limit_str.startswith("$"):
+                                limit = float(limit_str.replace("$", "").replace(",", ""))
+                        
+                        # Evita duplicatas (pega a primeira ocorrência)
+                        if line_clean not in bookmakers:
+                            bookmakers[line_clean] = {
+                                "odds": odds,
+                                "limit": limit
+                            }
+                    except (ValueError, IndexError):
+                        pass
+        
+        return bookmakers
         
     async def _extract_bookmaker_table(self) -> Dict[str, Dict[str, BookmakerOdds]]:
         """
