@@ -782,6 +782,33 @@ class BetinAsiaScraper:
         """
         bookmakers = {}
         
+        def normalize_handicap(h: str) -> str:
+            """Normaliza handicap removendo sinais e convertendo vírgula para ponto."""
+            return h.lstrip('+').lstrip('-').replace(',', '.').replace('−', '')
+        
+        def handicap_matches_context(handicap: str, context: str) -> bool:
+            """Verifica se o handicap está presente no contexto (com variações de formato)."""
+            if not handicap:
+                return False
+            
+            # Normaliza o contexto (vírgula -> ponto)
+            context_normalized = context.replace(',', '.')
+            
+            # Variações do handicap para buscar
+            h_clean = handicap.lstrip('+')  # Remove + inicial se houver
+            h_with_comma = h_clean.replace('.', ',')  # -0.5 -> -0,5
+            h_no_sign = h_clean.lstrip('-')  # -0.5 -> 0.5
+            h_no_sign_comma = h_no_sign.replace('.', ',')  # 0.5 -> 0,5
+            
+            # Verifica se alguma variação está no contexto
+            # Importante: deve estar no início do contexto (ex: "-0.5home" ou "-0,5home")
+            for variant in [h_clean, h_with_comma]:
+                # Busca por padrão que indica início da linha AH (handicap seguido de "home")
+                if f"{variant}home" in context or f"{variant}home" in context_normalized:
+                    return True
+            
+            return False
+        
         try:
             # Encontra elementos com a odds
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
@@ -802,18 +829,15 @@ class BetinAsiaScraper:
             
             # Se há handicap, ordena para priorizar elementos que contêm o handicap no contexto
             if handicap and len(elements_with_context) > 1:
-                # Normaliza handicap para busca (ex: "-0.5" -> ["0.5", "-0.5", "−0.5"])
-                handicap_clean = handicap.lstrip('+').replace(',', '.')
-                
                 def context_priority(item):
                     el, context = item
-                    # Prioridade 1: contexto contém o handicap exato
-                    if handicap_clean in context or handicap in context:
+                    # Prioridade 1: contexto contém o handicap exato (início da linha AH)
+                    if handicap_matches_context(handicap, context):
                         return 0
-                    # Prioridade 2: contexto contém "home" e "away" (indica seção AH, não 1X2)
+                    # Prioridade 2: contexto contém "home" e "away" sem "draw" (seção AH genérica)
                     if "home" in context and "away" in context and "draw" not in context:
                         return 1
-                    # Prioridade 3: outros
+                    # Prioridade 3: outros (provavelmente 1X2 ou outro mercado)
                     return 2
                 
                 elements_with_context.sort(key=context_priority)
@@ -823,8 +847,12 @@ class BetinAsiaScraper:
             for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
-                        # Primeiro faz scroll para o elemento
+                        # Scroll agressivo: primeiro scroll normal, depois via JavaScript
                         await el.scroll_into_view_if_needed()
+                        await self._page.wait_for_timeout(200)
+                        
+                        # Scroll adicional via JavaScript para garantir visibilidade
+                        await el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
                         await self._page.wait_for_timeout(300)
                         
                         # Verifica o bounding box
@@ -832,9 +860,10 @@ class BetinAsiaScraper:
                         if box and box['width'] > 20 and box['height'] > 10:
                             # Log com contexto resumido
                             context_short = context[:40].replace('\n', ' ') if context else 'N/A'
-                            logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, contexto='{context_short}...'")
+                            is_correct = handicap_matches_context(handicap, context)
+                            logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            # Clica no elemento PAI (DIV)
+                            # Tenta clicar no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
                             await self._page.wait_for_timeout(1500)
@@ -842,6 +871,14 @@ class BetinAsiaScraper:
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            # Se não encontrou, tenta clique via JavaScript no próprio elemento
+                            if len(bookmakers) == 0:
+                                logger.debug(f"  Elemento [{i}]: tentando clique via JavaScript...")
+                                await el.evaluate("el => el.parentElement.click()")
+                                await self._page.wait_for_timeout(1500)
+                                panel_text = await self._page.inner_text("body")
+                                bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
                             logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
                             
