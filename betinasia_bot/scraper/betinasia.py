@@ -873,6 +873,32 @@ class BetinAsiaScraper:
                     except (ValueError, IndexError):
                         pass
         
+        # Se não encontrou bookmakers pelo método estruturado,
+        # tenta método alternativo buscando padrões diferentes
+        if len(bookmakers) == 0:
+            text_lower = text.lower()
+            lines = text.split("\n")
+            
+            # Método 2: busca bookmaker seguido de número em qualquer formato
+            import re
+            for i, line in enumerate(lines):
+                line_clean = line.strip().lower().rstrip("e")
+                if line_clean in self.KNOWN_BOOKMAKERS:
+                    # Procura odds nas próximas linhas
+                    for j in range(1, 4):
+                        if i + j < len(lines):
+                            next_line = lines[i + j].strip()
+                            # Tenta extrair número
+                            match = re.match(r'^(\d+[.,]\d+)$', next_line)
+                            if match:
+                                try:
+                                    odds = float(match.group(1).replace(",", "."))
+                                    if line_clean not in bookmakers:
+                                        bookmakers[line_clean] = {"odds": odds, "limit": 0.0}
+                                        break
+                                except:
+                                    pass
+        
         return bookmakers
         
     async def _extract_bookmaker_table(self) -> Dict[str, Dict[str, BookmakerOdds]]:
