@@ -7,6 +7,8 @@ Baseado na análise do HTML real do site em Janeiro/2026.
 
 import asyncio
 import re
+import os
+import json
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
@@ -68,6 +70,7 @@ class BetinAsiaScraper:
         self,
         headless: bool = None,
         slow_mo: int = 0,
+        session_file: str = "betinasia_session.json",
     ):
         """
         Inicializa o scraper.
@@ -75,9 +78,11 @@ class BetinAsiaScraper:
         Args:
             headless: Se True, browser roda sem interface gráfica.
             slow_mo: Milissegundos de delay entre ações (útil para debug).
+            session_file: Arquivo para salvar/carregar sessão (cookies).
         """
         self.headless = headless if headless is not None else settings.browser_headless
         self.slow_mo = slow_mo
+        self.session_file = session_file
         
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -93,7 +98,7 @@ class BetinAsiaScraper:
         await self.close()
         
     async def start(self):
-        """Inicia o browser."""
+        """Inicia o browser e carrega sessão salva se existir."""
         logger.info("Iniciando browser...")
         
         self._playwright = await async_playwright().start()
@@ -102,22 +107,72 @@ class BetinAsiaScraper:
             slow_mo=self.slow_mo,
         )
         
+        # Verifica se existe sessão salva
+        storage_state = None
+        if os.path.exists(self.session_file):
+            try:
+                # Verifica se a sessão não é muito antiga (24 horas)
+                file_age = datetime.now().timestamp() - os.path.getmtime(self.session_file)
+                if file_age < 86400:  # 24 horas em segundos
+                    storage_state = self.session_file
+                    logger.info("Carregando sessão salva...")
+                else:
+                    logger.info("Sessão expirada (>24h), será feito novo login")
+                    os.remove(self.session_file)
+            except Exception as e:
+                logger.warning(f"Erro ao verificar sessão: {e}")
+        
         # Contexto com configurações de browser real
-        self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
+        context_options = {
+            "viewport": {"width": 1920, "height": 1080},
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
-        )
+            "locale": "pt-BR",
+            "timezone_id": "America/Sao_Paulo",
+        }
+        
+        # Carrega sessão salva se existir
+        if storage_state:
+            context_options["storage_state"] = storage_state
+            
+        self._context = await self._browser.new_context(**context_options)
         
         self._page = await self._context.new_page()
         self._page.set_default_timeout(30000)
         
         logger.info("Browser iniciado com sucesso")
+        
+    async def save_session(self):
+        """Salva a sessão atual (cookies) para reutilização."""
+        try:
+            await self._context.storage_state(path=self.session_file)
+            logger.info(f"Sessão salva em: {self.session_file}")
+        except Exception as e:
+            logger.warning(f"Erro ao salvar sessão: {e}")
+            
+    async def is_session_valid(self) -> bool:
+        """Verifica se a sessão atual ainda é válida."""
+        try:
+            # Navega para uma página que requer login
+            await self._page.goto(self.SPORTSBOOK_URL, timeout=15000)
+            await self._page.wait_for_load_state("networkidle")
+            
+            # Se redirecionou para login, sessão expirou
+            current_url = self._page.url
+            if "login" in current_url.lower():
+                logger.info("Sessão expirada, necessário novo login")
+                return False
+                
+            logger.info("Sessão válida!")
+            self._logged_in = True
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Erro ao verificar sessão: {e}")
+            return False
         
     async def close(self):
         """Fecha o browser."""
@@ -135,17 +190,28 @@ class BetinAsiaScraper:
         self,
         username: str = None,
         password: str = None,
+        force: bool = False,
     ) -> bool:
         """
         Faz login no BetinAsia.
         
+        Primeiro verifica se já existe sessão válida salva.
+        Só faz login se necessário.
+        
         Args:
             username: Usuário (usa settings se não fornecido)
             password: Senha (usa settings se não fornecido)
+            force: Se True, força novo login mesmo com sessão válida
             
         Returns:
             True se login bem-sucedido
         """
+        # Verifica se já está logado com sessão salva
+        if not force and os.path.exists(self.session_file):
+            if await self.is_session_valid():
+                logger.info("Usando sessão existente - não precisa fazer login")
+                return True
+        
         username = username or settings.betinasia_username
         password = password or settings.betinasia_password
         
@@ -214,6 +280,10 @@ class BetinAsiaScraper:
             if "login" not in current_url.lower():
                 self._logged_in = True
                 logger.success("Login realizado com sucesso!")
+                
+                # Salva a sessão para reutilização futura
+                await self.save_session()
+                
                 return True
             else:
                 # Verifica se há mensagem de erro
@@ -326,12 +396,10 @@ class BetinAsiaScraper:
             # Os jogos aparecem como linhas clicáveis
             
             # Procura por links que levam a jogos individuais
-            # Padrão de URL: /sportsbook/football/XE/1/2026-01-31,22,94
-            game_links = await self._page.query_selector_all(
-                "a[href*='/sportsbook/football/'][href*=',']"
-            )
+            # Padrão de URL: /sportsbook/football/XE/1/2026-01-31,22,94?origin=sportsbook
+            game_links = await self._page.query_selector_all("a")
             
-            logger.info(f"Encontrados {len(game_links)} links de jogos")
+            logger.info(f"Buscando links de jogos em {len(game_links)} links totais")
             
             # Para cada jogo, extrai informações básicas da lista
             # E depois navega para a página do jogo para pegar odds detalhadas
@@ -339,8 +407,11 @@ class BetinAsiaScraper:
             game_urls = []
             for link in game_links:
                 href = await link.get_attribute("href")
-                if href and "," in href:  # URLs de jogos têm vírgula
-                    full_url = f"{self.BASE_URL}{href}" if href.startswith("/") else href
+                # URLs de jogos têm vírgula e são de futebol
+                if href and "/sportsbook/football/" in href and "," in href:
+                    # Remove query string para comparação
+                    base_url = href.split("?")[0]
+                    full_url = f"{self.BASE_URL}{base_url}" if base_url.startswith("/") else base_url
                     if full_url not in game_urls:
                         game_urls.append(full_url)
                         
