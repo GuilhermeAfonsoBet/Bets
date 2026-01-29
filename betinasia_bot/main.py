@@ -120,79 +120,101 @@ async def run_collection_mode(db: Database, cache: OddsCache):
     logger.info("Apostas NÃO serão executadas")
     logger.info("=" * 60)
     
-    # Lista de ligas para coletar
+    # Lista de ligas para coletar (principais ligas europeias)
     leagues = [
-        # Tier 1
+        # Tier 1 - Ligas principais
         "England Premier League",
         "Germany Bundesliga",
         "Spain La Liga",
         "Italy Serie A",
-        # Tier 2
+        "France Ligue 1",
+        # Tier 2 - Ligas secundárias
         "England Championship",
+        "Germany 2. Bundesliga",
+        "Spain Segunda",
+        "Italy Serie B",
+        "France Ligue 2",
         "Netherlands Eredivisie",
+        "Portugal Primeira Liga",
+        # Tier 3 - Competições europeias
+        "UEFA Champions League",
+        "UEFA Europa League",
     ]
     
-    async with BetinAsiaScraper() as scraper:
-        # Login
+    # Intervalo entre ciclos (em segundos)
+    CYCLE_INTERVAL = 120  # 2 minutos
+    LEAGUE_INTERVAL = 10   # 10 segundos entre ligas
+    
+    scraper = None
+    
+    try:
+        scraper = BetinAsiaScraper()
+        await scraper.start()
+        
+        # Login inicial
         if not await scraper.login():
             logger.error("Falha no login. Encerrando.")
             return
-            
+        
+        cycle_count = 0
+        
         while True:
-            try:
-                for league in leagues:
-                    try:
-                        matches = await scraper.scrape_league(league)
-                        
-                        for match in matches:
-                            # Salva no banco
-                            match_id = await db.save_match(match)
-                            
-                            # Salva todas as odds
-                            for line_str, ah_line in match.ah_lines.items():
-                                for bk_name, bk_odds in ah_line.bookmaker_odds.items():
-                                    await db.save_odds(
-                                        match_id=match_id,
-                                        ah_line=line_str,
-                                        bookmaker=bk_name,
-                                        home_odds=bk_odds.home_odds,
-                                        away_odds=bk_odds.away_odds,
-                                    )
-                                    
-                                # Detecta oportunidades (para registro)
-                                if ah_line.num_bookmakers >= 3:
-                                    best_bk, best_odds = ah_line.best_home_odds
-                                    
-                                    await db.save_opportunity(
-                                        match_id=match_id,
-                                        ah_line=line_str,
-                                        side="home",
-                                        best_odds=best_odds,
-                                        best_bookmaker=best_bk,
-                                        num_bookmakers=ah_line.num_bookmakers,
-                                        dif_pct_best_second=ah_line.get_dif_best_second_home(),
-                                        dif_pct_best_median=ah_line.get_dif_best_median_home(),
-                                        minutes_to_kickoff=match.minutes_to_kickoff,
-                                    )
-                                    
-                        logger.info(f"[{league}] {len(matches)} partidas coletadas")
-                        
-                    except Exception as e:
-                        logger.error(f"Erro ao coletar {league}: {e}")
-                        
-                    # Delay entre ligas
-                    await asyncio.sleep(5)
+            cycle_count += 1
+            cycle_start = datetime.now(timezone.utc)
+            logger.info(f"=== CICLO {cycle_count} INICIADO ===")
+            
+            total_matches = 0
+            total_odds = 0
+            
+            for league in leagues:
+                try:
+                    matches = await scraper.scrape_league(league)
                     
-                # Delay entre ciclos completos
-                logger.info("Ciclo completo. Aguardando 60 segundos...")
-                await asyncio.sleep(60)
-                
-            except KeyboardInterrupt:
-                logger.info("Interrompido pelo usuário")
-                break
-            except Exception as e:
-                logger.error(f"Erro no ciclo de coleta: {e}")
-                await asyncio.sleep(30)
+                    league_odds = 0
+                    for match in matches:
+                        # Salva no banco
+                        match_id = await db.save_match(match)
+                        
+                        # Salva todas as odds
+                        for line_str, ah_line in match.ah_lines.items():
+                            for bk_name, bk_odds in ah_line.bookmaker_odds.items():
+                                await db.save_odds(
+                                    match_id=match_id,
+                                    ah_line=line_str,
+                                    bookmaker=bk_name,
+                                    home_odds=bk_odds.home_odds,
+                                    away_odds=bk_odds.away_odds,
+                                )
+                                league_odds += 1
+                    
+                    total_matches += len(matches)
+                    total_odds += league_odds
+                    
+                    if matches:
+                        logger.info(f"[{league}] {len(matches)} jogos, {league_odds} odds")
+                    
+                except Exception as e:
+                    logger.error(f"Erro em {league}: {e}")
+                    
+                # Delay entre ligas
+                await asyncio.sleep(LEAGUE_INTERVAL)
+            
+            # Resumo do ciclo
+            cycle_duration = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            logger.info(f"=== CICLO {cycle_count} COMPLETO ===")
+            logger.info(f"Duração: {cycle_duration:.0f}s | Jogos: {total_matches} | Odds: {total_odds}")
+            logger.info(f"Próximo ciclo em {CYCLE_INTERVAL}s...")
+            
+            # Aguarda próximo ciclo
+            await asyncio.sleep(CYCLE_INTERVAL)
+            
+    except KeyboardInterrupt:
+        logger.info("Interrompido pelo usuário (Ctrl+C)")
+    except Exception as e:
+        logger.exception(f"Erro fatal no modo coleta: {e}")
+    finally:
+        if scraper:
+            await scraper.close()
 
 
 async def run_production_mode(db: Database, cache: OddsCache):
