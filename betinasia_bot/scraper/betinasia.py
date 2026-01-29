@@ -310,6 +310,41 @@ class BetinAsiaScraper:
             logger.error(f"Erro ao navegar para futebol: {e}")
             return False
             
+    async def _expand_game_list(self):
+        """
+        Expande a lista de jogos clicando em 'Mostrar mais' e fazendo scroll.
+        """
+        try:
+            # Tenta clicar em "Mostrar mais" várias vezes
+            for _ in range(5):
+                try:
+                    # Procura botões de "Mostrar mais"
+                    show_more = await self._page.query_selector(
+                        "text=Mostrar mais, text=Show more, text=Mostrar Mais, "
+                        "button:has-text('mais'), button:has-text('more')"
+                    )
+                    
+                    if show_more:
+                        await show_more.click()
+                        await self._page.wait_for_timeout(1500)
+                        logger.debug("Clicou em 'Mostrar mais'")
+                    else:
+                        break
+                except:
+                    break
+                    
+            # Faz scroll para baixo para carregar mais jogos
+            for _ in range(3):
+                await self._page.evaluate("window.scrollBy(0, 1000)")
+                await self._page.wait_for_timeout(800)
+                
+            # Volta ao topo
+            await self._page.evaluate("window.scrollTo(0, 0)")
+            await self._page.wait_for_timeout(500)
+            
+        except Exception as e:
+            logger.debug(f"Erro ao expandir lista: {e}")
+            
     async def scrape_league(self, league_name: str) -> List[MatchData]:
         """
         Faz scrape de todas as partidas de uma liga.
@@ -341,7 +376,10 @@ class BetinAsiaScraper:
             league_url = f"{self.FOOTBALL_URL}/{league_code}"
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(3000)  # Aguarda página carregar completamente
+            await self._page.wait_for_timeout(2000)
+            
+            # Tenta expandir a lista clicando em "Mostrar mais" / "Show more"
+            await self._expand_game_list()
             
             # Encontra os jogos na página
             matches = await self._parse_league_page(league_name)
