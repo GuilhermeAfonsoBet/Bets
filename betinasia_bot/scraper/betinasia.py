@@ -307,9 +307,20 @@ class BetinAsiaScraper:
             
             # Clica em TODOS os botões "Show all lines" até não haver mais
             for attempt in range(5):
-                expand_buttons = await self._page.query_selector_all(
-                    "text=Show all lines, text=Mostrar todas as linhas"
-                )
+                # Tenta diferentes seletores
+                expand_buttons = []
+                
+                # Seletor por texto exato
+                btns1 = await self._page.query_selector_all("text='Show all lines'")
+                btns2 = await self._page.query_selector_all("text='Mostrar todas as linhas'")
+                btns3 = await self._page.query_selector_all("text='Show all'")
+                
+                # Seletor por texto parcial (mais flexível)
+                btns4 = await self._page.query_selector_all("button:has-text('Show all')")
+                btns5 = await self._page.query_selector_all("button:has-text('Mostrar')")
+                btns6 = await self._page.query_selector_all("[role='button']:has-text('Show all')")
+                
+                expand_buttons = btns1 + btns2 + btns3 + btns4 + btns5 + btns6
                 
                 visible_buttons = []
                 for button in expand_buttons:
@@ -319,17 +330,34 @@ class BetinAsiaScraper:
                     except:
                         continue
                 
-                if not visible_buttons:
+                # Remove duplicatas
+                unique_buttons = []
+                seen = set()
+                for btn in visible_buttons:
+                    try:
+                        box = await btn.bounding_box()
+                        if box:
+                            key = (int(box['x']), int(box['y']))
+                            if key not in seen:
+                                seen.add(key)
+                                unique_buttons.append(btn)
+                    except:
+                        pass
+                
+                if not unique_buttons:
                     logger.debug(f"Expansão completa após {attempt} tentativas")
                     break
                 
-                for button in visible_buttons:
+                logger.debug(f"Tentativa {attempt+1}: {len(unique_buttons)} botões 'Show all' encontrados")
+                
+                for button in unique_buttons:
                     try:
                         await button.scroll_into_view_if_needed()
                         await button.click()
                         await self._page.wait_for_timeout(1500)
                         logger.debug("Clicou em 'Show all lines'")
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Erro ao clicar: {e}")
                         continue
                             
         except Exception as e:
@@ -536,28 +564,28 @@ class BetinAsiaScraper:
             home_team = "Unknown Home"
             away_team = "Unknown Away"
             
-            # Padrão mais específico para evitar capturar menu
-            # Procura: "Nome do Time Vs. Nome do Time" (com letra maiúscula)
-            teams_pattern = r'([A-Z][A-Za-z0-9\s&\.\-\']+?)\s+Vs\.\s+([A-Z][A-Za-z0-9\s&\.\-\']+?)(?:\n|$)'
-            teams_match = re.search(teams_pattern, page_text)
-            
-            if teams_match:
-                home_team = teams_match.group(1).strip()
-                away_team = teams_match.group(2).strip()
-            else:
-                # Fallback: procura em linhas individuais
-                lines = page_text.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if ' Vs. ' in line and len(line) < 150:
-                        parts = line.split(' Vs. ')
-                        if len(parts) == 2:
-                            home_team = parts[0].strip()
-                            away_team = parts[1].strip()
-                            # Valida se parecem nomes de times (não menu)
-                            if len(home_team) > 2 and len(away_team) > 2:
-                                if not any(x in home_team.lower() for x in ['football', 'tennis', 'live', 'top']):
-                                    break
+            # Procura em linhas individuais - é mais confiável
+            lines = page_text.split('\n')
+            for line in lines:
+                line = line.strip()
+                # Linha deve conter " Vs. " e ter tamanho razoável
+                if ' Vs. ' in line and 10 < len(line) < 120:
+                    parts = line.split(' Vs. ')
+                    if len(parts) == 2:
+                        potential_home = parts[0].strip()
+                        potential_away = parts[1].strip()
+                        
+                        # Valida se parecem nomes de times (não itens de menu)
+                        menu_words = ['football', 'tennis', 'live', 'top', 'basketball', 
+                                     'baseball', 'hockey', 'cricket', 'rugby', 'boxing',
+                                     'handball', 'volleyball', 'golf', 'snooker', 'darts']
+                        
+                        is_menu = any(w in potential_home.lower() for w in menu_words)
+                        
+                        if not is_menu and len(potential_home) > 3 and len(potential_away) > 3:
+                            home_team = potential_home
+                            away_team = potential_away
+                            break
             
             # Extrai horário se disponível
             time_pattern = r'(\d{2}:\d{2})\s*\n\s*(\d{2}/\d{2}/\d{4})'
