@@ -675,6 +675,15 @@ class BetinAsiaScraper:
             # Divide o texto em linhas para processar
             lines = ah_section_text.split('\n')
             
+            # Handicaps válidos são múltiplos de 0.25 entre -10 e +10
+            def is_valid_handicap(value: float) -> bool:
+                """Verifica se é um handicap válido (múltiplo de 0.25)."""
+                if value < -10 or value > 10:
+                    return False
+                # Verifica se é múltiplo de 0.25
+                remainder = abs(value) % 0.25
+                return remainder < 0.001 or remainder > 0.249
+            
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
@@ -686,16 +695,34 @@ class BetinAsiaScraper:
                 if handicap_match:
                     handicap_str = handicap_match.group(1).replace(",", ".")
                     
+                    try:
+                        handicap_value = float(handicap_str)
+                    except:
+                        i += 1
+                        continue
+                    
+                    # IMPORTANTE: Valida se é um handicap válido
+                    if not is_valid_handicap(handicap_value):
+                        i += 1
+                        continue
+                    
                     # Procura "Home" e odds nas próximas linhas
                     home_odds = None
                     away_odds = None
+                    found_home = False
                     
-                    for j in range(i + 1, min(i + 6, len(lines))):
+                    for j in range(i + 1, min(i + 8, len(lines))):
                         next_line = lines[j].strip()
+                        
+                        if next_line == "Home":
+                            found_home = True
+                            continue
+                        elif next_line == "Away":
+                            continue
                         
                         # Procura por valor de odds (número decimal)
                         odds_match = re.match(r'^(\d+[,.]\d+)$', next_line)
-                        if odds_match:
+                        if odds_match and found_home:
                             odds_value = float(odds_match.group(1).replace(",", "."))
                             if home_odds is None:
                                 home_odds = odds_value
@@ -705,13 +732,12 @@ class BetinAsiaScraper:
                     
                     # Se encontrou ambas as odds
                     if home_odds and away_odds:
-                        # Valida range de odds
-                        if 1.01 <= home_odds <= 100 and 1.01 <= away_odds <= 100:
+                        # Valida range de odds (odds típicas entre 1.01 e 50)
+                        if 1.01 <= home_odds <= 50 and 1.01 <= away_odds <= 50:
                             # Formata linha com sinal
-                            line_float = float(handicap_str)
-                            if line_float > 0:
+                            if handicap_value > 0:
                                 handicap_str = f"+{handicap_str}"
-                            elif line_float == 0:
+                            elif handicap_value == 0:
                                 handicap_str = "0"
                             
                             ah_line = AHLine(line=handicap_str)
