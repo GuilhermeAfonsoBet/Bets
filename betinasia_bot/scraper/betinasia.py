@@ -108,19 +108,14 @@ class BetinAsiaScraper:
         )
         
         # Verifica se existe sessão salva
+        # Não expiramos por tempo - apenas verificamos se ainda é válida ao usar
         storage_state = None
         if os.path.exists(self.session_file):
             try:
-                # Verifica se a sessão não é muito antiga (24 horas)
-                file_age = datetime.now().timestamp() - os.path.getmtime(self.session_file)
-                if file_age < 86400:  # 24 horas em segundos
-                    storage_state = self.session_file
-                    logger.info("Carregando sessão salva...")
-                else:
-                    logger.info("Sessão expirada (>24h), será feito novo login")
-                    os.remove(self.session_file)
+                storage_state = self.session_file
+                logger.info("Carregando sessão salva...")
             except Exception as e:
-                logger.warning(f"Erro ao verificar sessão: {e}")
+                logger.warning(f"Erro ao carregar sessão: {e}")
         
         # Contexto com configurações de browser real
         context_options = {
@@ -447,63 +442,64 @@ class BetinAsiaScraper:
             # Navega para a página do jogo
             await self._page.goto(match_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(1500)
+            await self._page.wait_for_timeout(2000)
             
             # Extrai informações da página
             page_text = await self._page.inner_text("body")
             
-            # Tenta extrair times do título/header
-            # O formato típico é "Time1 vs Time2" ou "Time1 - Time2"
+            # Extrai ID da partida e data da URL
+            # URL: /sportsbook/football/XE/1/2026-01-31,22,94
+            url_match = re.search(r'/(\d{4}-\d{2}-\d{2}),(\d+),(\d+)', match_url)
             
-            # Procura por elementos que contenham os nomes dos times
+            if url_match:
+                date_str = url_match.group(1)
+                match_id = f"match_{url_match.group(2)}_{url_match.group(3)}"
+                kickoff_time = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            else:
+                match_id = f"match_{hash(match_url)}"
+                kickoff_time = datetime.now(timezone.utc) + timedelta(hours=2)
+            
+            # Extrai nomes dos times
+            # Formato: "Brighton & Hove Albion FC Vs. Everton" ou similar
             home_team = "Unknown Home"
             away_team = "Unknown Away"
             
-            # Tenta encontrar pelo padrão de URL
-            # URL: /sportsbook/football/XE/1/2026-01-31,22,94
-            match = re.search(r'/(\d{4}-\d{2}-\d{2}),(\d+),(\d+)', match_url)
-            match_id = f"match_{match.group(2)}_{match.group(3)}" if match else f"match_{hash(match_url)}"
+            # Procura padrão "Time1 Vs. Time2" ou "Time1 vs Time2"
+            vs_pattern = r'([A-Za-z][A-Za-z0-9\s&\.\-\']+?)\s+(?:Vs\.?|vs\.?|VS\.?)\s+([A-Za-z][A-Za-z0-9\s&\.\-\']+?)(?:\n|$)'
+            vs_match = re.search(vs_pattern, page_text)
             
-            # Tenta extrair data do URL
-            if match:
-                date_str = match.group(1)
-                kickoff_time = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if vs_match:
+                home_team = vs_match.group(1).strip()
+                away_team = vs_match.group(2).strip()
+                # Limpa possíveis lixos
+                home_team = re.sub(r'\s+', ' ', home_team)
+                away_team = re.sub(r'\s+', ' ', away_team)
             else:
-                kickoff_time = datetime.now(timezone.utc) + timedelta(hours=2)
-                
-            # Tenta encontrar nomes dos times na página
-            # Procura por elementos grandes/destacados com nomes
-            team_elements = await self._page.query_selector_all(
-                "[class*='team'], [class*='Team'], h1, h2, h3"
-            )
+                # Fallback: tenta encontrar por outros padrões
+                lines = page_text.split('\n')
+                for i, line in enumerate(lines):
+                    if 'Premier League' in line or 'La Liga' in line or 'Serie A' in line:
+                        # Próximas linhas podem ter os times
+                        if i + 2 < len(lines):
+                            candidate_home = lines[i + 1].strip()
+                            candidate_away = lines[i + 2].strip()
+                            if len(candidate_home) > 3 and len(candidate_away) > 3:
+                                if not any(x in candidate_home.lower() for x in ['home', 'away', 'draw', 'over', 'under']):
+                                    home_team = candidate_home
+                                    away_team = candidate_away
+                                    break
             
-            team_names = []
-            for el in team_elements:
-                text = await el.inner_text()
-                text = text.strip()
-                if text and len(text) > 2 and len(text) < 50:
-                    if not any(x in text.lower() for x in ['handicap', 'total', 'gol', 'over', 'under', 'odds']):
-                        team_names.append(text)
-                        
-            # Remove duplicatas mantendo ordem
-            seen = set()
-            unique_teams = []
-            for t in team_names:
-                if t not in seen:
-                    seen.add(t)
-                    unique_teams.append(t)
-                    
-            if len(unique_teams) >= 2:
-                home_team = unique_teams[0]
-                away_team = unique_teams[1]
-            elif len(unique_teams) == 1:
-                # Tenta separar por "vs" ou "-"
-                if " vs " in unique_teams[0]:
-                    parts = unique_teams[0].split(" vs ")
-                    home_team, away_team = parts[0].strip(), parts[1].strip()
-                elif " - " in unique_teams[0]:
-                    parts = unique_teams[0].split(" - ")
-                    home_team, away_team = parts[0].strip(), parts[1].strip()
+            # Extrai horário se disponível
+            # Formato: "12:00" seguido de data
+            time_pattern = r'(\d{2}:\d{2})\s*\n\s*(\d{2}/\d{2}/\d{4})'
+            time_match = re.search(time_pattern, page_text)
+            if time_match and url_match:
+                try:
+                    time_str = time_match.group(1)
+                    hour, minute = map(int, time_str.split(':'))
+                    kickoff_time = kickoff_time.replace(hour=hour, minute=minute)
+                except:
+                    pass
                     
             # Cria objeto da partida
             match_data = MatchData(
@@ -517,6 +513,9 @@ class BetinAsiaScraper:
             # Extrai odds de Asian Handicap
             match_data.ah_lines = await self._extract_ah_odds()
             
+            if match_data.ah_lines:
+                logger.debug(f"Jogo: {home_team} vs {away_team} - {len(match_data.ah_lines)} linhas AH")
+            
             return match_data
             
         except Exception as e:
@@ -527,70 +526,64 @@ class BetinAsiaScraper:
         """
         Extrai odds de Asian Handicap da página do jogo.
         
-        A página mostra uma tabela com:
-        - Linhas de handicap (-1.25, -1, -0.75, etc.)
-        - Para cada linha: odds Home e Away
-        - Tabela de comparação entre bookmakers
+        Formato do BetinAsia BLACK:
+        - Seção "Handicap Asiático" com linhas como:
+          -0,75 Home 2.205 Away 1.775
+          -0,5  Home 1.923 Away 2.029
         """
         ah_lines = {}
         
         try:
-            # Primeiro, tenta encontrar a seção de Handicap Asiático
-            # Procura por texto "Handicap Asiático" ou similar
-            
-            ah_section = await self._page.query_selector(
-                "text=Handicap Asiático, text=Asian Handicap, "
-                "[class*='handicap'], [class*='Handicap']"
-            )
-            
-            if not ah_section:
-                logger.debug("Seção de Handicap Asiático não encontrada")
-                return ah_lines
-                
-            # Procura por linhas de handicap
-            # Formato típico: linha (-1.25), Home (odds), Away (odds)
-            
-            # Tenta extrair pelo padrão de texto na página
             page_text = await self._page.inner_text("body")
             
-            # Regex para encontrar linhas de handicap
-            # Padrão: número com sinal (ex: -1.25, +0.5, -0.75)
-            # Seguido de "Home" e valor, "Away" e valor
+            # Procura pela seção de Handicap Asiático
+            if "Handicap Asiático" not in page_text and "Asian Handicap" not in page_text:
+                logger.debug("Seção de Handicap Asiático não encontrada")
+                return ah_lines
             
-            handicap_pattern = r'([+-]?\d+(?:[.,]\d+)?)\s*Home\s*(\d+[.,]\d+)\s*Away\s*(\d+[.,]\d+)'
-            matches = re.findall(handicap_pattern, page_text, re.IGNORECASE)
+            # Padrão para extrair linhas de AH
+            # Formato: -0,75 Home 2.205 Away 1.775
+            # ou: -0.75 Home 2.205 Away 1.775
+            ah_pattern = r'(-?\d+[,.]?\d*)\s*\n?\s*Home\s*\n?\s*(\d+[,.]\d+)\s*\n?\s*Away\s*\n?\s*(\d+[,.]\d+)'
+            
+            matches = re.findall(ah_pattern, page_text, re.IGNORECASE)
             
             for match in matches:
-                line_str = match[0].replace(",", ".")
-                home_odds = float(match[1].replace(",", "."))
-                away_odds = float(match[2].replace(",", "."))
-                
-                # Normaliza o formato da linha
-                if not line_str.startswith(("+", "-")):
-                    line_str = f"+{line_str}" if float(line_str) >= 0 else line_str
+                try:
+                    # Normaliza a linha (vírgula para ponto)
+                    line_str = match[0].replace(",", ".").strip()
+                    home_odds = float(match[1].replace(",", "."))
+                    away_odds = float(match[2].replace(",", "."))
                     
-                ah_line = AHLine(line=line_str)
-                
-                # Por enquanto, não temos bookmaker específico
-                # Usamos "best" como placeholder
-                ah_line.bookmaker_odds["best"] = BookmakerOdds(
-                    bookmaker="best",
-                    home_odds=home_odds,
-                    away_odds=away_odds,
-                )
-                
-                ah_lines[line_str] = ah_line
-                
-            # Tenta também extrair da tabela de bookmakers
-            # A tabela mostra cada bookmaker com suas odds
-            bookmaker_odds = await self._extract_bookmaker_table()
+                    # Ignora valores que não parecem odds válidas
+                    if home_odds < 1.01 or home_odds > 50:
+                        continue
+                    if away_odds < 1.01 or away_odds > 50:
+                        continue
+                    
+                    # Formata a linha com sinal
+                    line_float = float(line_str)
+                    if line_float > 0:
+                        line_str = f"+{line_str}"
+                    elif line_float == 0:
+                        line_str = "0"
+                        
+                    ah_line = AHLine(line=line_str)
+                    
+                    # Salva como "best" (melhor odd agregada)
+                    ah_line.bookmaker_odds["best"] = BookmakerOdds(
+                        bookmaker="best",
+                        home_odds=home_odds,
+                        away_odds=away_odds,
+                    )
+                    
+                    ah_lines[line_str] = ah_line
+                    logger.debug(f"AH encontrado: {line_str} H:{home_odds} A:{away_odds}")
+                    
+                except (ValueError, IndexError) as e:
+                    continue
             
-            # Mescla com as linhas encontradas
-            for bk_name, bk_data in bookmaker_odds.items():
-                for line_str, odds in bk_data.items():
-                    if line_str not in ah_lines:
-                        ah_lines[line_str] = AHLine(line=line_str)
-                    ah_lines[line_str].bookmaker_odds[bk_name] = odds
+            logger.info(f"Extraídas {len(ah_lines)} linhas de AH")
                     
         except Exception as e:
             logger.warning(f"Erro ao extrair odds AH: {e}")
