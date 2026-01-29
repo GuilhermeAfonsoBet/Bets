@@ -619,137 +619,74 @@ class BetinAsiaScraper:
     async def _extract_ah_odds(self) -> Dict[str, AHLine]:
         """
         Extrai odds de Asian Handicap da página do jogo.
-        
-        Formato do BetinAsia BLACK:
-        - Seção "Handicap Asiático" com linhas como:
-          -0,75 Home 2.205 Away 1.775
-          -0,5  Home 1.923 Away 2.029
+        Usa abordagem baseada em padrão de texto estruturado.
         """
         ah_lines = {}
         
         try:
-            # Primeiro, expande a seção de Handicap Asiático clicando em "Mostrar todas as linhas"
+            # Primeiro, expande a seção de Handicap Asiático
             await self._expand_ah_section()
-            await self._page.wait_for_timeout(500)
+            await self._page.wait_for_timeout(1000)
             
             # Extrai o texto da página
             page_text = await self._page.inner_text("body")
             
-            # Procura pela seção de Handicap Asiático
-            if "Handicap Asiático" not in page_text and "Asian Handicap" not in page_text:
-                logger.debug("Seção de Handicap Asiático não encontrada")
-                return ah_lines
-            
-            # IMPORTANTE: Isola apenas a seção de Handicap Asiático
-            # Procura entre "Handicap Asiático" e a próxima seção
-            ah_section_text = ""
-            
-            # Encontra posição de "Handicap Asiático"
-            ah_start = page_text.find("Handicap Asiático")
-            if ah_start == -1:
-                ah_start = page_text.find("Asian Handicap")
-            
-            if ah_start == -1:
+            # Verifica se a seção existe
+            if "Handicap Asiático" not in page_text:
                 logger.debug("Seção Handicap Asiático não encontrada")
                 return ah_lines
             
-            # Texto a partir de "Handicap Asiático"
-            text_from_ah = page_text[ah_start:]
-            
-            # Encontra onde termina a seção (próxima seção)
-            end_markers = ["Total De Gols", "Resultado Exato", "Escanteios", "1 X 2 E", "Chance Dupla", "Ambas Equipes"]
-            ah_end = len(text_from_ah)
-            
-            for marker in end_markers:
-                pos = text_from_ah.find(marker)
-                if pos > 50 and pos < ah_end:  # Deve estar após algum conteúdo
-                    ah_end = pos
-            
-            ah_section_text = text_from_ah[:ah_end]
-            
-            if len(ah_section_text) < 50:
-                logger.debug("Seção de Handicap Asiático muito curta")
-                return ah_lines
-            
-            # Agora extrai as linhas de AH apenas desta seção
-            # Divide o texto em linhas para processar
-            lines = ah_section_text.split('\n')
-            
             # Handicaps válidos são múltiplos de 0.25 entre -10 e +10
-            def is_valid_handicap(value: float) -> bool:
-                """Verifica se é um handicap válido (múltiplo de 0.25)."""
-                if value < -10 or value > 10:
-                    return False
-                # Verifica se é múltiplo de 0.25
-                remainder = abs(value) % 0.25
-                return remainder < 0.001 or remainder > 0.249
+            valid_handicaps = set()
+            for i in range(-40, 41):  # -10 a +10 em incrementos de 0.25
+                valid_handicaps.add(i * 0.25)
             
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
-                # Procura por linha de handicap (número com possível sinal e vírgula)
-                # Formato: -0,75 ou +1,25 ou 0
-                handicap_match = re.match(r'^([+-]?\d+[,.]?\d*)$', line)
-                
-                if handicap_match:
-                    handicap_str = handicap_match.group(1).replace(",", ".")
+            # Usa regex para encontrar padrão: HANDICAP Home ODDS Away ODDS
+            # Padrão mais flexível que captura a estrutura do site
+            # Formato no texto: "-0,75\nHome\n2.205\nAway\n1.775"
+            
+            # Primeiro, encontra todas as ocorrências de handicaps válidos seguidos de Home/Away
+            pattern = r'([+-]?\d+[,.]?\d*)\s*\n\s*Home\s*\n\s*(\d+[,.]\d+)\s*\n\s*Away\s*\n\s*(\d+[,.]\d+)'
+            
+            matches = re.findall(pattern, page_text)
+            
+            for match in matches:
+                try:
+                    handicap_str = match[0].replace(",", ".")
+                    handicap_value = float(handicap_str)
                     
-                    try:
-                        handicap_value = float(handicap_str)
-                    except:
-                        i += 1
+                    # Verifica se é um handicap válido
+                    if handicap_value not in valid_handicaps:
                         continue
                     
-                    # IMPORTANTE: Valida se é um handicap válido
-                    if not is_valid_handicap(handicap_value):
-                        i += 1
+                    home_odds = float(match[1].replace(",", "."))
+                    away_odds = float(match[2].replace(",", "."))
+                    
+                    # Valida odds
+                    if not (1.01 <= home_odds <= 50 and 1.01 <= away_odds <= 50):
                         continue
                     
-                    # Procura "Home" e odds nas próximas linhas
-                    home_odds = None
-                    away_odds = None
-                    found_home = False
+                    # Formata linha
+                    if handicap_value > 0:
+                        formatted_line = f"+{handicap_value:.2f}".rstrip('0').rstrip('.')
+                    elif handicap_value == 0:
+                        formatted_line = "0"
+                    else:
+                        formatted_line = f"{handicap_value:.2f}".rstrip('0').rstrip('.')
                     
-                    for j in range(i + 1, min(i + 8, len(lines))):
-                        next_line = lines[j].strip()
+                    # Evita duplicatas (pode ter o mesmo handicap em seções diferentes)
+                    if formatted_line not in ah_lines:
+                        ah_line = AHLine(line=formatted_line)
+                        ah_line.bookmaker_odds["best"] = BookmakerOdds(
+                            bookmaker="best",
+                            home_odds=home_odds,
+                            away_odds=away_odds,
+                        )
+                        ah_lines[formatted_line] = ah_line
+                        logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f}")
                         
-                        if next_line == "Home":
-                            found_home = True
-                            continue
-                        elif next_line == "Away":
-                            continue
-                        
-                        # Procura por valor de odds (número decimal)
-                        odds_match = re.match(r'^(\d+[,.]\d+)$', next_line)
-                        if odds_match and found_home:
-                            odds_value = float(odds_match.group(1).replace(",", "."))
-                            if home_odds is None:
-                                home_odds = odds_value
-                            elif away_odds is None:
-                                away_odds = odds_value
-                                break
-                    
-                    # Se encontrou ambas as odds
-                    if home_odds and away_odds:
-                        # Valida range de odds (odds típicas entre 1.01 e 50)
-                        if 1.01 <= home_odds <= 50 and 1.01 <= away_odds <= 50:
-                            # Formata linha com sinal
-                            if handicap_value > 0:
-                                handicap_str = f"+{handicap_str}"
-                            elif handicap_value == 0:
-                                handicap_str = "0"
-                            
-                            ah_line = AHLine(line=handicap_str)
-                            ah_line.bookmaker_odds["best"] = BookmakerOdds(
-                                bookmaker="best",
-                                home_odds=home_odds,
-                                away_odds=away_odds,
-                            )
-                            ah_lines[handicap_str] = ah_line
-                            logger.debug(f"AH: {handicap_str} H:{home_odds:.3f} A:{away_odds:.3f}")
-                
-                i += 1
+                except (ValueError, IndexError):
+                    continue
             
             logger.info(f"Extraídas {len(ah_lines)} linhas de AH")
                     
