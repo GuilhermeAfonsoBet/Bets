@@ -464,30 +464,42 @@ class BetinAsiaScraper:
             home_team = "Unknown Home"
             away_team = "Unknown Away"
             
-            # Procura padrão "Time1 Vs. Time2" ou "Time1 vs Time2"
-            vs_pattern = r'([A-Za-z][A-Za-z0-9\s&\.\-\']+?)\s+(?:Vs\.?|vs\.?|VS\.?)\s+([A-Za-z][A-Za-z0-9\s&\.\-\']+?)(?:\n|$)'
-            vs_match = re.search(vs_pattern, page_text)
+            # Divide o texto em linhas para análise
+            lines = page_text.split('\n')
             
-            if vs_match:
-                home_team = vs_match.group(1).strip()
-                away_team = vs_match.group(2).strip()
-                # Limpa possíveis lixos
-                home_team = re.sub(r'\s+', ' ', home_team)
-                away_team = re.sub(r'\s+', ' ', away_team)
-            else:
-                # Fallback: tenta encontrar por outros padrões
-                lines = page_text.split('\n')
-                for i, line in enumerate(lines):
-                    if 'Premier League' in line or 'La Liga' in line or 'Serie A' in line:
-                        # Próximas linhas podem ter os times
-                        if i + 2 < len(lines):
-                            candidate_home = lines[i + 1].strip()
-                            candidate_away = lines[i + 2].strip()
-                            if len(candidate_home) > 3 and len(candidate_away) > 3:
-                                if not any(x in candidate_home.lower() for x in ['home', 'away', 'draw', 'over', 'under']):
-                                    home_team = candidate_home
-                                    away_team = candidate_away
-                                    break
+            # Procura pela linha que contém "Vs." ou "vs"
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if ' Vs. ' in line or ' vs ' in line or ' VS ' in line:
+                    # Separa os times
+                    if ' Vs. ' in line:
+                        parts = line.split(' Vs. ')
+                    elif ' vs ' in line:
+                        parts = line.split(' vs ')
+                    else:
+                        parts = line.split(' VS ')
+                    
+                    if len(parts) == 2:
+                        home_team = parts[0].strip()
+                        away_team = parts[1].strip()
+                        
+                        # Limita tamanho e limpa
+                        home_team = home_team[-100:] if len(home_team) > 100 else home_team
+                        away_team = away_team[:100] if len(away_team) > 100 else away_team
+                        
+                        # Valida se parecem nomes de times
+                        if len(home_team) > 2 and len(away_team) > 2:
+                            if len(home_team) < 80 and len(away_team) < 80:
+                                break
+            
+            # Se ainda não encontrou, tenta pelo título da página
+            if home_team == "Unknown Home":
+                # Procura padrão no título: "Time1 Vs. Time2"
+                title_pattern = r'([A-Z][A-Za-z\s&\.\-\']{2,40})\s+Vs\.\s+([A-Z][A-Za-z\s&\.\-\']{2,40})'
+                title_match = re.search(title_pattern, page_text[:2000])
+                if title_match:
+                    home_team = title_match.group(1).strip()
+                    away_team = title_match.group(2).strip()
             
             # Extrai horário se disponível
             # Formato: "12:00" seguido de data
@@ -501,6 +513,10 @@ class BetinAsiaScraper:
                 except:
                     pass
                     
+            # Limita tamanho dos nomes (campo VARCHAR(200) no banco)
+            home_team = home_team[:150] if home_team else "Unknown Home"
+            away_team = away_team[:150] if away_team else "Unknown Away"
+            
             # Cria objeto da partida
             match_data = MatchData(
                 match_id=match_id,
