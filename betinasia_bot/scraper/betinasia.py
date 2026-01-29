@@ -346,7 +346,7 @@ class BetinAsiaScraper:
             league_url = f"{self.FOOTBALL_URL}/{league_code}"
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(2000)
+            await self._page.wait_for_timeout(3000)  # Aguarda página carregar completamente
             
             # Encontra os jogos na página
             matches = await self._parse_league_page(league_name)
