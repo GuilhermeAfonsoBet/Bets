@@ -775,14 +775,20 @@ class BetinAsiaScraper:
         
         try:
             # Encontra e clica na odds
-            elements = await self._page.query_selector_all(f"text=/{odds_str}/")
+            # Usa texto exato para evitar matches parciais
+            elements = await self._page.query_selector_all(f"text='{odds_str}'")
             
             clicked = False
             for el in elements:
                 try:
                     if await el.is_visible():
                         box = await el.bounding_box()
-                        if box and box['width'] > 20:
+                        # Verifica se o elemento está na área visível (y > 0)
+                        # e tem tamanho mínimo
+                        if box and box['width'] > 20 and box['height'] > 10 and box['y'] > 0:
+                            # Scroll para garantir que está visível
+                            await el.scroll_into_view_if_needed()
+                            await self._page.wait_for_timeout(300)
                             await el.click()
                             await self._page.wait_for_timeout(1500)
                             clicked = True
@@ -791,6 +797,7 @@ class BetinAsiaScraper:
                     continue
             
             if not clicked:
+                logger.debug(f"Não conseguiu clicar em odds {odds_str} ({side})")
                 return bookmakers
             
             # Extrai bookmakers do texto
