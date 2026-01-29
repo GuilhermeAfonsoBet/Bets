@@ -778,8 +778,10 @@ class BetinAsiaScraper:
             # Usa texto exato para evitar matches parciais
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
             
+            logger.debug(f"Buscando odds '{odds_str}' ({side}): {len(elements)} elementos encontrados")
+            
             clicked = False
-            for el in elements:
+            for i, el in enumerate(elements):
                 try:
                     if await el.is_visible():
                         # Primeiro faz scroll para o elemento
@@ -789,11 +791,15 @@ class BetinAsiaScraper:
                         # Depois verifica o bounding box
                         box = await el.bounding_box()
                         if box and box['width'] > 20 and box['height'] > 10:
+                            logger.debug(f"  Elemento [{i}]: clicando (y={box['y']:.0f})")
                             await el.click()
                             await self._page.wait_for_timeout(1500)
                             clicked = True
                             break
-                except:
+                        else:
+                            logger.debug(f"  Elemento [{i}]: box inválido {box}")
+                except Exception as e:
+                    logger.debug(f"  Elemento [{i}]: erro {e}")
                     continue
             
             if not clicked:
@@ -803,6 +809,8 @@ class BetinAsiaScraper:
             # Extrai bookmakers do texto
             panel_text = await self._page.inner_text("body")
             bookmakers = self._extract_bookmakers_from_text(panel_text)
+            
+            logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
             
             # Fecha o painel
             await self._page.keyboard.press("Escape")
