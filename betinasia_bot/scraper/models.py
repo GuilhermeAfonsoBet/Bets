@@ -80,6 +80,13 @@ class AHLine:
             return 0.0
         return (odds[0] - odds[1]) / odds[1] * 100
     
+    def get_dif_best_second_away(self) -> float:
+        """Diferença percentual entre melhor e segunda melhor odd (away)."""
+        odds = sorted(self.away_odds_list, reverse=True)
+        if len(odds) < 2:
+            return 0.0
+        return (odds[0] - odds[1]) / odds[1] * 100
+    
     def get_dif_best_median_home(self) -> float:
         """Diferença percentual entre melhor odd e mediana (home)."""
         best = self.best_home_odds[1]
@@ -88,12 +95,77 @@ class AHLine:
             return 0.0
         return (best - median) / median * 100
     
+    def get_dif_best_median_away(self) -> float:
+        """Diferença percentual entre melhor odd e mediana (away)."""
+        best = self.best_away_odds[1]
+        median = self.away_odds_median
+        if median == 0:
+            return 0.0
+        return (best - median) / median * 100
+    
+    @property
+    def second_best_home_odds(self) -> tuple[str, float]:
+        """Retorna (bookmaker, odds) com segunda melhor odd para home."""
+        if len(self.bookmaker_odds) < 2:
+            return ("", 0.0)
+        sorted_bks = sorted(
+            self.bookmaker_odds.items(), 
+            key=lambda x: x[1].home_odds, 
+            reverse=True
+        )
+        return sorted_bks[1][0], sorted_bks[1][1].home_odds
+    
+    @property
+    def second_best_away_odds(self) -> tuple[str, float]:
+        """Retorna (bookmaker, odds) com segunda melhor odd para away."""
+        if len(self.bookmaker_odds) < 2:
+            return ("", 0.0)
+        sorted_bks = sorted(
+            self.bookmaker_odds.items(), 
+            key=lambda x: x[1].away_odds, 
+            reverse=True
+        )
+        return sorted_bks[1][0], sorted_bks[1][1].away_odds
+    
     def get_pinnacle_odds(self, side: str = "home") -> Optional[float]:
         """Retorna odds da Pinnacle (pin88) se disponível."""
-        pin = self.bookmaker_odds.get("pin88") or self.bookmaker_odds.get("pinnacle")
+        pin = self.bookmaker_odds.get("pin88") or self.bookmaker_odds.get("pinnacle") or self.bookmaker_odds.get("pin")
         if pin:
             return pin.home_odds if side == "home" else pin.away_odds
         return None
+    
+    def get_metrics_summary(self, side: str = "home") -> dict:
+        """
+        Retorna resumo de métricas para análise.
+        
+        Métricas:
+        1. Maior odd
+        2. Segunda maior odd
+        3. Odd mediana
+        4. Número de casas
+        5. Casa com maior odd
+        6. Casa com segunda maior odd
+        """
+        if side == "home":
+            best_bk, best_odds = self.best_home_odds
+            second_bk, second_odds = self.second_best_home_odds
+            median = self.home_odds_median
+        else:
+            best_bk, best_odds = self.best_away_odds
+            second_bk, second_odds = self.second_best_away_odds
+            median = self.away_odds_median
+        
+        return {
+            "maior_odd": best_odds,
+            "segunda_maior_odd": second_odds,
+            "odd_mediana": median,
+            "num_casas": self.num_bookmakers,
+            "casa_maior_odd": best_bk,
+            "casa_segunda_maior": second_bk,
+            "dif_pct_best_second": self.get_dif_best_second_home() if side == "home" else self.get_dif_best_second_away(),
+            "dif_pct_best_median": self.get_dif_best_median_home() if side == "home" else self.get_dif_best_median_away(),
+            "pinnacle_odds": self.get_pinnacle_odds(side),
+        }
     
     def __str__(self):
         best_bk, best_odds = self.best_home_odds
