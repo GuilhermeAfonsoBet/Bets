@@ -772,7 +772,8 @@ class BetinAsiaScraper:
         Clica em uma odds específica e extrai os bookmakers do painel.
         
         IMPORTANTE: O clique deve ser no elemento PAI (DIV), não no SPAN de texto.
-        O SPAN contém o texto da odds, mas o DIV pai é o elemento clicável.
+        Quando há múltiplos elementos com a mesma odds (ex: mesma odds em AH e 1X2),
+        tenta todos até encontrar um que abra o painel de bookmakers.
         """
         bookmakers = {}
         
@@ -782,7 +783,7 @@ class BetinAsiaScraper:
             
             logger.debug(f"Buscando odds '{odds_str}' ({side}): {len(elements)} elementos encontrados")
             
-            clicked = False
+            # Tenta cada elemento até encontrar um que abra o painel com bookmakers
             for i, el in enumerate(elements):
                 try:
                     if await el.is_visible():
@@ -795,31 +796,33 @@ class BetinAsiaScraper:
                         if box and box['width'] > 20 and box['height'] > 10:
                             logger.debug(f"  Elemento [{i}]: clicando no PARENT (y={box['y']:.0f})")
                             
-                            # IMPORTANTE: Clica no elemento PAI (DIV), não no SPAN
+                            # Clica no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
                             await self._page.wait_for_timeout(1500)
-                            clicked = True
-                            break
+                            
+                            # Extrai bookmakers do texto
+                            panel_text = await self._page.inner_text("body")
+                            bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
+                            
+                            # Fecha o painel
+                            await self._page.keyboard.press("Escape")
+                            await self._page.wait_for_timeout(500)
+                            
+                            # Se encontrou bookmakers, sucesso!
+                            if len(bookmakers) > 0:
+                                return bookmakers
+                            else:
+                                logger.debug(f"  Elemento [{i}]: painel não abriu, tentando próximo...")
                         else:
                             logger.debug(f"  Elemento [{i}]: box inválido {box}")
                 except Exception as e:
                     logger.debug(f"  Elemento [{i}]: erro {e}")
                     continue
             
-            if not clicked:
-                logger.debug(f"Não conseguiu clicar em odds {odds_str} ({side})")
-                return bookmakers
-            
-            # Extrai bookmakers do texto
-            panel_text = await self._page.inner_text("body")
-            bookmakers = self._extract_bookmakers_from_text(panel_text)
-            
-            logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
-            
-            # Fecha o painel
-            await self._page.keyboard.press("Escape")
-            await self._page.wait_for_timeout(500)
+            logger.debug(f"Nenhum elemento abriu painel de bookmakers para odds {odds_str} ({side})")
             
         except Exception as e:
             logger.debug(f"Erro ao clicar em odds {side}: {e}")
