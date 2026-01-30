@@ -91,17 +91,20 @@ async def extract_bookmakers(page: Page, handicap: str, target_odds: float) -> l
     try:
         # Procura elementos de odds
         odds_str = f"{target_odds:.2f}"
+        odds_prefix = odds_str[:4]  # Ex: "1.92"
         
         # Usa JavaScript para encontrar e clicar
         clicked = await page.evaluate(f"""
-            (targetOdds, handicap) => {{
+            () => {{
+                const targetOdds = "{odds_prefix}";
+                const handicap = "{handicap}";
                 const spans = document.querySelectorAll('span');
                 for (const span of spans) {{
                     const text = span.innerText.trim();
                     if (text.length > 7) continue;
                     
                     // Verifica se é a odd que procuramos
-                    if (text.includes(targetOdds.substring(0, 4))) {{
+                    if (text.includes(targetOdds)) {{
                         // Verifica contexto
                         const parent = span.closest('div');
                         if (parent && parent.innerText.includes(handicap)) {{
@@ -114,7 +117,7 @@ async def extract_bookmakers(page: Page, handicap: str, target_odds: float) -> l
                 }}
                 return false;
             }}
-        """, odds_str, handicap)
+        """)
         
         if not clicked:
             return []
