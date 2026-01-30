@@ -526,9 +526,21 @@ class BetinAsiaScraper:
                 
             # Navega para a página da liga
             league_url = f"{self.FOOTBALL_URL}/{league_code}"
+            logger.debug(f"Navegando para: {league_url}")
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(3000)  # Espera mais para carregar jogos
+            await self._page.wait_for_timeout(4000)  # Espera mais para carregar jogos
+            
+            # Verifica se a URL está correta
+            current_url = self._page.url
+            logger.debug(f"URL atual: {current_url}")
+            
+            # Se a URL não contém o código da liga, tenta novamente
+            if league_code not in current_url:
+                logger.warning(f"URL incorreta! Esperado {league_code}, atual: {current_url}")
+                await self._page.goto(league_url)
+                await self._page.wait_for_load_state("networkidle")
+                await self._page.wait_for_timeout(4000)
             
             # Tenta expandir a lista clicando em "Mostrar mais" / "Show more"
             await self._expand_game_list()
