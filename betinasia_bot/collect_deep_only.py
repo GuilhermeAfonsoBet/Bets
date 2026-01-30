@@ -89,35 +89,51 @@ async def extract_bookmakers(page: Page, handicap: str, target_odds: float) -> l
     bookmakers = []
     
     try:
-        # Procura elementos de odds
-        odds_str = f"{target_odds:.2f}"
-        odds_prefix = odds_str[:4]  # Ex: "1.92"
+        # Procura elementos de odds usando seletores Playwright
+        odds_str = f"{target_odds:.3f}"[:5]  # Ex: "1.923" -> "1.92"
         
-        # Usa JavaScript para encontrar e clicar
-        clicked = await page.evaluate(f"""
-            () => {{
-                const targetOdds = "{odds_prefix}";
-                const handicap = "{handicap}";
-                const spans = document.querySelectorAll('span');
-                for (const span of spans) {{
-                    const text = span.innerText.trim();
-                    if (text.length > 7) continue;
-                    
-                    // Verifica se é a odd que procuramos
-                    if (text.includes(targetOdds)) {{
-                        // Verifica contexto
-                        const parent = span.closest('div');
-                        if (parent && parent.innerText.includes(handicap)) {{
-                            // Clica no elemento pai
-                            const clickTarget = span.parentElement || span;
-                            clickTarget.click();
-                            return true;
-                        }}
-                    }}
-                }}
-                return false;
-            }}
-        """)
+        # Tenta encontrar e clicar usando Playwright
+        clicked = False
+        
+        # Busca todos os spans com texto parecido com odds
+        spans = await page.query_selector_all("span")
+        
+        for span in spans:
+            try:
+                text = await span.inner_text()
+                text = text.strip()
+                
+                # Verifica se parece com uma odd
+                if len(text) > 7 or len(text) < 3:
+                    continue
+                
+                # Verifica se contém o valor da odd
+                if odds_str[:4] not in text.replace(",", "."):
+                    continue
+                
+                # Verifica contexto - o handicap deve estar próximo
+                parent = await span.evaluate_handle("el => el.closest('div')")
+                parent_text = await parent.evaluate("el => el.innerText || ''")
+                
+                # Normaliza handicap para comparação
+                hcp_check = handicap.replace("+", "").replace(",", ".")
+                if hcp_check not in parent_text.replace(",", "."):
+                    continue
+                
+                # Encontrou! Faz scroll e clique
+                await span.scroll_into_view_if_needed()
+                await page.wait_for_timeout(200)
+                
+                # Clica no elemento pai (div que contém a odd)
+                parent_elem = await span.evaluate_handle("el => el.parentElement")
+                await parent_elem.click()
+                await page.wait_for_timeout(2000)
+                
+                clicked = True
+                break
+                
+            except Exception:
+                continue
         
         if not clicked:
             return []
