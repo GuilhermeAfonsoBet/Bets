@@ -99,6 +99,9 @@ class BetinAsiaScraper:
         "sbo", "sharp", "sing"
     ]
     
+    # Filtro de stake mínimo: ignora linhas AH onde o max stake da best odd é <= este valor
+    MIN_STAKE_FILTER = 20.0
+    
     def __init__(
         self,
         headless: bool = None,
@@ -825,14 +828,16 @@ class BetinAsiaScraper:
                         away_odds=away_odds,
                     )
                     
-                    # Se solicitado, captura odds de cada bookmaker
+                    # Se solicitado, captura odds de cada bookmaker (COM FILTRO DE STAKE POR COMBINAÇÃO)
                     if capture_bookmakers:
                         bookmaker_odds = await self._capture_bookmaker_odds(
                             home_odds_str=match[1],
                             away_odds_str=match[2],
                             handicap=formatted_line
                         )
-                        ah_line.bookmaker_odds.update(bookmaker_odds)
+                        # Adiciona bookmakers que passaram no filtro de stake
+                        if bookmaker_odds:
+                            ah_line.bookmaker_odds.update(bookmaker_odds)
                     
                     ah_lines[formatted_line] = ah_line
                     logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f} ({len(ah_line.bookmaker_odds)} bks)")
@@ -859,22 +864,50 @@ class BetinAsiaScraper:
         Clica na odds de Home e Away para abrir o painel com todos os bookmakers.
         O parâmetro handicap ajuda a identificar o elemento correto quando há
         múltiplos elementos com a mesma odds (ex: mesma odds em AH e 1X2).
+        
+        FILTRO DE STAKE: Aplicado POR COMBINAÇÃO (home/away separadamente).
+        Se o stake máximo de uma combinação for <= MIN_STAKE_FILTER, 
+        ignora apenas essa combinação, não a linha inteira.
         """
         bookmaker_odds = {}
+        home_bks_filtered = {}
+        away_bks_filtered = {}
         
         try:
             # Captura odds de HOME
             home_bks = await self._click_and_extract_bookmakers(home_odds_str, "home", handicap)
             
+            # FILTRO DE STAKE para HOME
+            if home_bks:
+                stakes = [bk.get("limit", 0) for bk in home_bks.values()]
+                max_stake = max(stakes) if stakes else 0
+                
+                if max_stake > 0 and max_stake <= self.MIN_STAKE_FILTER:
+                    logger.debug(f"AH {handicap} HOME: Stake máx ${max_stake:.0f} <= ${self.MIN_STAKE_FILTER:.0f}, ignorando combinação")
+                    # Não usa os dados de HOME, mas continua para AWAY
+                else:
+                    home_bks_filtered = home_bks
+            
             # Captura odds de AWAY
             away_bks = await self._click_and_extract_bookmakers(away_odds_str, "away", handicap)
             
-            # Combina os resultados
-            all_bookmakers = set(home_bks.keys()) | set(away_bks.keys())
+            # FILTRO DE STAKE para AWAY
+            if away_bks:
+                stakes = [bk.get("limit", 0) for bk in away_bks.values()]
+                max_stake = max(stakes) if stakes else 0
+                
+                if max_stake > 0 and max_stake <= self.MIN_STAKE_FILTER:
+                    logger.debug(f"AH {handicap} AWAY: Stake máx ${max_stake:.0f} <= ${self.MIN_STAKE_FILTER:.0f}, ignorando combinação")
+                    # Não usa os dados de AWAY
+                else:
+                    away_bks_filtered = away_bks
+            
+            # Combina os resultados (apenas combinações que passaram no filtro)
+            all_bookmakers = set(home_bks_filtered.keys()) | set(away_bks_filtered.keys())
             
             for bk_name in all_bookmakers:
-                home_data = home_bks.get(bk_name, {})
-                away_data = away_bks.get(bk_name, {})
+                home_data = home_bks_filtered.get(bk_name, {})
+                away_data = away_bks_filtered.get(bk_name, {})
                 
                 bookmaker_odds[bk_name] = BookmakerOdds(
                     bookmaker=bk_name,
