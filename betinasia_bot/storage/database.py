@@ -133,18 +133,47 @@ class Database:
         self,
         match_id: int,
         ah_line: str,
-        bookmaker: str,
-        home_odds: float,
-        away_odds: float,
+        side: str,
+        best_odds: float,
+        best_bookmaker: str,
+        second_best_odds: float = None,
+        second_best_bookmaker: str = None,
+        median_odds: float = None,
+        num_bookmakers: int = None,
+        # Campos legados para compatibilidade
+        bookmaker: str = None,
+        home_odds: float = None,
+        away_odds: float = None,
     ):
-        """Salva registro de odds no histórico."""
+        """
+        Salva registro de odds no histórico.
+        
+        Args:
+            match_id: ID da partida
+            ah_line: Linha de AH (ex: "-0.5", "+1")
+            side: "home" ou "away"
+            best_odds: Melhor odd
+            best_bookmaker: Casa com melhor odd
+            second_best_odds: Segunda melhor odd
+            second_best_bookmaker: Casa com segunda melhor odd
+            median_odds: Mediana das odds
+            num_bookmakers: Número de casas com odds
+        """
         async with self.async_session() as session:
             odds = OddsHistory(
                 match_id=match_id,
                 ah_line=ah_line,
-                bookmaker=bookmaker,
-                home_odds=home_odds,
-                away_odds=away_odds,
+                side=side,
+                best_odds=best_odds,
+                best_bookmaker=best_bookmaker,
+                second_best_odds=second_best_odds,
+                second_best_bookmaker=second_best_bookmaker,
+                median_odds=median_odds,
+                num_bookmakers=num_bookmakers,
+                # Campos legados
+                bookmaker=bookmaker or best_bookmaker,
+                home_odds=home_odds if home_odds else (best_odds if side == "home" else None),
+                away_odds=away_odds if away_odds else (best_odds if side == "away" else None),
             )
             session.add(odds)
             await session.commit()

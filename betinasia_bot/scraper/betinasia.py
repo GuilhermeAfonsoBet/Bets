@@ -622,7 +622,12 @@ class BetinAsiaScraper:
             max_games = 20
             for i, game_url in enumerate(game_urls[:max_games]):
                 try:
-                    match_data = await self._scrape_single_match(game_url, league_name)
+                    # capture_bookmakers=True para obter odds de cada casa
+                    match_data = await self._scrape_single_match(
+                        game_url, 
+                        league_name, 
+                        capture_bookmakers=True
+                    )
                     if match_data:
                         matches.append(match_data)
                         logger.debug(f"  [{i+1}/{min(len(game_urls), max_games)}] {match_data}")

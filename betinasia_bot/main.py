@@ -175,17 +175,37 @@ async def run_collection_mode(db: Database, cache: OddsCache):
                         # Salva no banco
                         match_id = await db.save_match(match)
                         
-                        # Salva todas as odds
+                        # Salva métricas consolidadas por linha de AH (home e away)
                         for line_str, ah_line in match.ah_lines.items():
-                            for bk_name, bk_odds in ah_line.bookmaker_odds.items():
-                                await db.save_odds(
-                                    match_id=match_id,
-                                    ah_line=line_str,
-                                    bookmaker=bk_name,
-                                    home_odds=bk_odds.home_odds,
-                                    away_odds=bk_odds.away_odds,
-                                )
-                                league_odds += 1
+                            # Métricas HOME
+                            home_metrics = ah_line.get_metrics_summary("home")
+                            await db.save_odds(
+                                match_id=match_id,
+                                ah_line=line_str,
+                                side="home",
+                                best_odds=home_metrics["maior_odd"],
+                                best_bookmaker=home_metrics["casa_maior_odd"],
+                                second_best_odds=home_metrics["segunda_maior_odd"],
+                                second_best_bookmaker=home_metrics["casa_segunda_maior"],
+                                median_odds=home_metrics["odd_mediana"],
+                                num_bookmakers=home_metrics["num_casas"],
+                            )
+                            league_odds += 1
+                            
+                            # Métricas AWAY
+                            away_metrics = ah_line.get_metrics_summary("away")
+                            await db.save_odds(
+                                match_id=match_id,
+                                ah_line=line_str,
+                                side="away",
+                                best_odds=away_metrics["maior_odd"],
+                                best_bookmaker=away_metrics["casa_maior_odd"],
+                                second_best_odds=away_metrics["segunda_maior_odd"],
+                                second_best_bookmaker=away_metrics["casa_segunda_maior"],
+                                median_odds=away_metrics["odd_mediana"],
+                                num_bookmakers=away_metrics["num_casas"],
+                            )
+                            league_odds += 1
                     
                     total_matches += len(matches)
                     total_odds += league_odds

@@ -48,16 +48,28 @@ class Match(Base):
 
 
 class OddsHistory(Base):
-    """Tabela de histórico de odds."""
+    """Tabela de histórico de odds - métricas consolidadas por linha de AH."""
     
     __tablename__ = "odds_history"
     
     id = Column(Integer, primary_key=True)
     match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
     ah_line = Column(String(20), nullable=False)
-    bookmaker = Column(String(50), nullable=False)
-    home_odds = Column(Float, nullable=False)
-    away_odds = Column(Float, nullable=False)
+    side = Column(String(10), nullable=False)  # "home" ou "away"
+    
+    # Métricas principais
+    best_odds = Column(Float, nullable=False)
+    best_bookmaker = Column(String(50), nullable=False)
+    second_best_odds = Column(Float)
+    second_best_bookmaker = Column(String(50))
+    median_odds = Column(Float)
+    num_bookmakers = Column(Integer)
+    
+    # Campos legados (mantidos para compatibilidade)
+    bookmaker = Column(String(50))  # Deprecated - usar best_bookmaker
+    home_odds = Column(Float)  # Deprecated - usar best_odds com side="home"
+    away_odds = Column(Float)  # Deprecated - usar best_odds com side="away"
+    
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relacionamento
@@ -66,6 +78,7 @@ class OddsHistory(Base):
     __table_args__ = (
         Index("idx_odds_match_line", "match_id", "ah_line"),
         Index("idx_odds_scraped", "scraped_at"),
+        Index("idx_odds_side", "side"),
     )
 
 
