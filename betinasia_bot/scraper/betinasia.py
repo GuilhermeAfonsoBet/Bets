@@ -397,35 +397,14 @@ class BetinAsiaScraper:
     
     async def _expand_game_list(self):
         """
-        Expande a lista de jogos clicando em 'Mostrar mais' e fazendo scroll.
-        Também tenta expandir filtros de tempo para mostrar mais jogos.
+        Expande a lista de jogos fazendo scroll para carregar lazy content.
+        NÃO clica em filtros "All/Todos" pois isso expande para TODAS as ligas!
         """
         try:
-            # 1. Primeiro, tenta expandir filtros de tempo/data
-            # O site usa português: "Todos", "Hoje", "Cedo", etc.
-            time_filter_selectors = [
-                "text='Todos'", "text='All'",  # Português e inglês
-                "text='All matches'", "text='Upcoming'",
-                "text='All upcoming'", "text='View all'", "text='Next 7 days'",
-                "text='This week'", "text='Full schedule'",
-                "button:has-text('Todos')", "a:has-text('Todos')",
-                "button:has-text('All')", "a:has-text('All')",
-                "[class*='filter']:has-text('Todos')",
-                "[class*='filter']:has-text('All')"
-            ]
+            # REMOVIDO: Não clicar em filtros "All/Todos" - isso expande para todas as ligas!
+            # Os jogos da liga específica já são carregados quando navegamos para a página da liga.
             
-            for selector in time_filter_selectors:
-                try:
-                    filter_btn = await self._page.query_selector(selector)
-                    if filter_btn and await filter_btn.is_visible():
-                        await filter_btn.click()
-                        await self._page.wait_for_timeout(2000)
-                        logger.debug(f"Clicou em filtro de tempo: {selector}")
-                        break
-                except:
-                    continue
-            
-            # 2. Expande grupos de data (ex: "January 30", "January 31", etc.)
+            # 1. Expande grupos de data (ex: "January 30", "January 31", etc.)
             # Alguns sites agrupam jogos por data e precisam ser expandidos
             date_group_selectors = [
                 "[class*='date-group'] [class*='expand']",
@@ -447,7 +426,7 @@ class BetinAsiaScraper:
                 except:
                     continue
             
-            # 3. Tenta clicar em todos os botões "Show more" visíveis
+            # 2. Tenta clicar em todos os botões "Show more" visíveis
             for attempt in range(10):
                 try:
                     # Procura botões de "Mostrar mais" / "Show more"
@@ -476,17 +455,17 @@ class BetinAsiaScraper:
                     logger.debug(f"Erro ao expandir lista: {e}")
                     break
                     
-            # 4. Faz scroll extensivo para carregar jogos via lazy loading
+            # 3. Faz scroll extensivo para carregar jogos via lazy loading
             # Mais agressivo para garantir que todos os jogos carreguem
             for i in range(12):
                 await self._page.evaluate("window.scrollBy(0, 800)")
                 await self._page.wait_for_timeout(800)
                 
-            # 5. Volta ao topo e aguarda
+            # 4. Volta ao topo e aguarda
             await self._page.evaluate("window.scrollTo(0, 0)")
             await self._page.wait_for_timeout(1500)
             
-            # 6. Segundo round de scroll (às vezes mais jogos carregam depois)
+            # 5. Segundo round de scroll (às vezes mais jogos carregam depois)
             for i in range(5):
                 await self._page.evaluate("window.scrollBy(0, 1000)")
                 await self._page.wait_for_timeout(600)
