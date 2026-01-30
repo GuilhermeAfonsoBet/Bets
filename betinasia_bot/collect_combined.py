@@ -476,20 +476,33 @@ async def verify_session(page: Page) -> bool:
     try:
         await page.goto("https://black.betinasia.com/sportsbook")
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
         
-        # Verifica se está logado (procura nome de usuário ou botão de login)
-        content = await page.content()
-        if "Log In" in content and "JomanaSilva" not in content:
+        # Verifica URL - se redirecionou para login, sessão expirou
+        current_url = page.url
+        if "/login" in current_url:
+            logger.warning("Redirecionado para login - sessão expirada")
             return False
         
-        # Verifica se tem conteúdo de odds
+        # Verifica se tem elementos de odds na página
+        odds_elements = await page.query_selector_all("span")
         page_text = await page.inner_text("body")
-        if "Home" in page_text and "Away" in page_text:
+        
+        # Se tem "Football" e números que parecem odds, está OK
+        has_football = "Football" in page_text or "football" in page_text
+        has_odds_pattern = bool(re.search(r'\d\.\d{2,3}', page_text))
+        
+        if has_football and has_odds_pattern:
             return True
+        
+        # Verifica se tem botão de login visível
+        login_btn = await page.query_selector("text='Log In'")
+        if login_btn and await login_btn.is_visible():
+            return False
             
-        return False
-    except:
+        return True
+    except Exception as e:
+        logger.error(f"Erro verificando sessão: {e}")
         return False
 
 
