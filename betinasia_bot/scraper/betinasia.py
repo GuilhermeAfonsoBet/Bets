@@ -826,17 +826,13 @@ class BetinAsiaScraper:
                     )
                     
                     # Se solicitado, captura odds de cada bookmaker
-                    # OTIMIZAÇÃO: Captura bookmakers apenas para linhas próximas de 0
-                    # (as mais relevantes para apostas)
                     if capture_bookmakers:
-                        # Só captura bookmakers para linhas entre -2 e +2
-                        if abs(handicap_value) <= 2.0:
-                            bookmaker_odds = await self._capture_bookmaker_odds(
-                                home_odds_str=match[1],
-                                away_odds_str=match[2],
-                                handicap=formatted_line
-                            )
-                            ah_line.bookmaker_odds.update(bookmaker_odds)
+                        bookmaker_odds = await self._capture_bookmaker_odds(
+                            home_odds_str=match[1],
+                            away_odds_str=match[2],
+                            handicap=formatted_line
+                        )
+                        ah_line.bookmaker_odds.update(bookmaker_odds)
                     
                     ah_lines[formatted_line] = ah_line
                     logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f} ({len(ah_line.bookmaker_odds)} bks)")
