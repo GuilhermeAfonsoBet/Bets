@@ -366,7 +366,14 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
             # Navega
             await page.goto(game_url)
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(3000)
+            
+            # Verifica se carregou conteúdo
+            page_text = await page.inner_text("body")
+            if len(page_text) < 500:
+                logger.warning(f"[DEEP-{worker_id}] Página não carregou corretamente")
+                job_queue.task_done()
+                continue
             
             # Expande AH
             for attempt in range(3):
@@ -375,12 +382,17 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
                     try:
                         if await btn.is_visible():
                             await btn.click()
-                            await page.wait_for_timeout(600)
+                            await page.wait_for_timeout(800)
                     except:
                         pass
+                await page.wait_for_timeout(500)
             
             # Extrai nomes dos times
             home_team, away_team = await extract_team_names(page)
+            
+            # Log de debug
+            if home_team == "Home" and away_team == "Away":
+                logger.debug(f"[DEEP-{worker_id}] Não encontrou times. URL: {game_url[:60]}...")
             
             # Extrai ID da URL
             url_match = re.search(r'/(\d{4}-\d{2}-\d{2}),(\d+),(\d+)', game_url)
@@ -403,6 +415,14 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
             
             # Extrai AH do DOM
             ah_lines = await extract_best_odds_from_dom(page)
+            
+            if not ah_lines:
+                logger.warning(f"[DEEP-{worker_id}] Nenhuma linha AH encontrada em {game_url[:50]}...")
+                # Tenta screenshot para debug
+                try:
+                    await page.screenshot(path=f"debug_deep_{worker_id}.png")
+                except:
+                    pass
             
             # Captura bookmakers para cada linha (limitado às principais)
             odds_saved = 0
@@ -451,6 +471,28 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
     logger.info(f"[DEEP-{worker_id}] Worker encerrado - {processed} jogos")
 
 
+async def verify_session(page: Page) -> bool:
+    """Verifica se a sessão está válida."""
+    try:
+        await page.goto("https://black.betinasia.com/sportsbook")
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(2000)
+        
+        # Verifica se está logado (procura nome de usuário ou botão de login)
+        content = await page.content()
+        if "Log In" in content and "JomanaSilva" not in content:
+            return False
+        
+        # Verifica se tem conteúdo de odds
+        page_text = await page.inner_text("body")
+        if "Home" in page_text and "Away" in page_text:
+            return True
+            
+        return False
+    except:
+        return False
+
+
 async def main():
     """
     Executa coleta combinada.
@@ -475,6 +517,19 @@ async def main():
         viewport={"width": 1920, "height": 1080},
     )
     logger.info("Browser iniciado")
+    
+    # Verifica sessão
+    test_page = await context.new_page()
+    session_valid = await verify_session(test_page)
+    await test_page.close()
+    
+    if not session_valid:
+        logger.error("❌ Sessão expirada! Execute: python -c \"from scraper.betinasia import BetinAsiaScraper; import asyncio; s=BetinAsiaScraper(); asyncio.run(s.start()); asyncio.run(s.login())\"")
+        await browser.close()
+        await p.stop()
+        return
+    
+    logger.info("✓ Sessão válida")
     
     stats = {}
     stop_event = asyncio.Event()
