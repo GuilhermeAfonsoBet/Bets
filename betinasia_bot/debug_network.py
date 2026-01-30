@@ -89,10 +89,24 @@ async def debug_network():
     # 3. Clica em uma odds para abrir o painel de bookmakers
     print("\n[3] Clicando em uma odds para ver bookmakers...")
     
-    # Encontra um elemento de odds
-    odds_element = await page.query_selector("text='1.9'")
-    if not odds_element:
-        odds_element = await page.query_selector("text='2.0'")
+    # Encontra um elemento de odds (busca por padrões comuns de odds)
+    odds_patterns = ["1.9", "2.0", "1.8", "2.1", "1.7", "2.2", "1.95", "2.05"]
+    odds_element = None
+    
+    for pattern in odds_patterns:
+        elements = await page.query_selector_all(f"text='{pattern}'")
+        for el in elements:
+            try:
+                if await el.is_visible():
+                    box = await el.bounding_box()
+                    if box and box['width'] > 20:
+                        odds_element = el
+                        print(f"    Encontrou odds: {pattern}")
+                        break
+            except:
+                continue
+        if odds_element:
+            break
     
     if odds_element:
         parent = await odds_element.evaluate_handle("el => el.parentElement")
