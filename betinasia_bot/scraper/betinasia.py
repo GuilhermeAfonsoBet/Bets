@@ -37,27 +37,58 @@ class BetinAsiaScraper:
     FOOTBALL_URL = f"{BASE_URL}/sportsbook/football"
     
     # Mapeamento de ligas para códigos de URL
-    # Formato: /sportsbook/football/XE/{codigo}
+    # Formato: /sportsbook/football/{codigo_pagina}
+    # O código de página pode ser diferente do código nos links dos jogos
     LEAGUE_CODES = {
+        # Inglaterra
         "England Premier League": "XE/1",
         "England Championship": "XE/2",
         "England FA Cup": "XE/132",
-        "Germany Bundesliga": "XE/9",
-        "Germany 2. Bundesliga": "XE/10",
-        "Spain La Liga": "XE/11",
-        "Spain Segunda": "XE/12",
-        "Italy Serie A": "XE/13",
-        "Italy Serie B": "XE/14",
-        "France Ligue 1": "XE/15",
-        "France Ligue 2": "XE/16",
-        "Netherlands Eredivisie": "XE/17",
-        "Portugal Primeira Liga": "XE/19",
-        "Belgium Pro League": "XE/21",
-        "Turkey Super Lig": "XE/26",
-        "Brazil Serie A": "XE/31",
-        "Argentina Primera Division": "XE/32",
+        # Alemanha - código da página é XB, jogos aparecem como DE/12
+        "Germany Bundesliga": "XB",
+        "Germany 2. Bundesliga": "XB/2",
+        # Espanha
+        "Spain La Liga": "XL",
+        "Spain Segunda": "XL/2",
+        # Itália
+        "Italy Serie A": "XI",
+        "Italy Serie B": "XI/2",
+        # França
+        "France Ligue 1": "XF",
+        "France Ligue 2": "XF/2",
+        # Outros
+        "Netherlands Eredivisie": "XN",
+        "Portugal Primeira Liga": "XP",
+        "Belgium Pro League": "XBE",
+        "Turkey Super Lig": "TR/160",
+        "Brazil Serie A": "BR/1",
+        "Argentina Primera Division": "AR/1",
+        # Competições europeias
         "UEFA Champions League": "XE/5",
         "UEFA Europa League": "XE/6",
+    }
+    
+    # Mapeamento de código de liga para códigos de URL de jogos
+    # Usado para filtrar apenas jogos da liga correta
+    LEAGUE_URL_PATTERNS = {
+        "England Premier League": ["XE/1"],
+        "England Championship": ["XE/2"],
+        "Germany Bundesliga": ["DE/12", "XB"],
+        "Germany 2. Bundesliga": ["DE/13", "XB/2"],
+        "Spain La Liga": ["ES/16", "XL"],
+        "Spain Segunda": ["ES/17", "XL/2"],
+        "Italy Serie A": ["IT/19", "XI"],
+        "Italy Serie B": ["IT/20", "XI/2"],
+        "France Ligue 1": ["FR/38", "XF"],
+        "France Ligue 2": ["FR/39", "XF/2"],
+        "Netherlands Eredivisie": ["NL/", "XN"],
+        "Portugal Primeira Liga": ["PT/", "XP"],
+        "Belgium Pro League": ["BE/", "XBE"],
+        "Turkey Super Lig": ["TR/160"],
+        "Brazil Serie A": ["BR/"],
+        "Argentina Primera Division": ["AR/"],
+        "UEFA Champions League": ["XE/5"],
+        "UEFA Europa League": ["XE/6"],
     }
     
     # Bookmakers conhecidos (nomes podem ter 'e' no final: 3ete, pin88e)
@@ -368,32 +399,42 @@ class BetinAsiaScraper:
         Expande a lista de jogos clicando em 'Mostrar mais' e fazendo scroll.
         """
         try:
-            # Tenta clicar em "Mostrar mais" várias vezes
-            for _ in range(5):
+            # Tenta clicar em todos os botões "Show more" visíveis
+            for attempt in range(10):
                 try:
-                    # Procura botões de "Mostrar mais"
-                    show_more = await self._page.query_selector(
-                        "text=Mostrar mais, text=Show more, text=Mostrar Mais, "
-                        "button:has-text('mais'), button:has-text('more')"
+                    # Procura botões de "Mostrar mais" / "Show more"
+                    show_more_buttons = await self._page.query_selector_all(
+                        "text='Show more', text='Mostrar mais', text='Load more', "
+                        "button:has-text('more'), button:has-text('mais')"
                     )
                     
-                    if show_more:
-                        await show_more.click()
-                        await self._page.wait_for_timeout(1500)
-                        logger.debug("Clicou em 'Mostrar mais'")
-                    else:
+                    clicked = False
+                    for btn in show_more_buttons:
+                        try:
+                            if await btn.is_visible():
+                                await btn.scroll_into_view_if_needed()
+                                await btn.click()
+                                await self._page.wait_for_timeout(1500)
+                                logger.debug(f"Clicou em 'Show more' (tentativa {attempt+1})")
+                                clicked = True
+                        except:
+                            continue
+                    
+                    if not clicked:
                         break
-                except:
+                        
+                except Exception as e:
+                    logger.debug(f"Erro ao expandir lista: {e}")
                     break
                     
-            # Faz scroll para baixo para carregar mais jogos
-            for _ in range(3):
-                await self._page.evaluate("window.scrollBy(0, 1000)")
-                await self._page.wait_for_timeout(800)
+            # Faz scroll extensivo para carregar jogos via lazy loading
+            for i in range(8):
+                await self._page.evaluate("window.scrollBy(0, 800)")
+                await self._page.wait_for_timeout(1000)
                 
             # Volta ao topo
             await self._page.evaluate("window.scrollTo(0, 0)")
-            await self._page.wait_for_timeout(500)
+            await self._page.wait_for_timeout(1000)
             
         except Exception as e:
             logger.debug(f"Erro ao expandir lista: {e}")
@@ -429,7 +470,7 @@ class BetinAsiaScraper:
             league_url = f"{self.FOOTBALL_URL}/{league_code}"
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(2000)
+            await self._page.wait_for_timeout(3000)  # Espera mais para carregar jogos
             
             # Tenta expandir a lista clicando em "Mostrar mais" / "Show more"
             await self._expand_game_list()
@@ -478,8 +519,8 @@ class BetinAsiaScraper:
             # O site mostra jogos em linhas/cards
             # Cada jogo tem: data/hora, times, odds
             
-            # Tenta encontrar elementos de jogo por diferentes seletores
-            # Os jogos aparecem como linhas clicáveis
+            # Obtém padrões de URL para filtrar apenas jogos desta liga
+            url_patterns = self.LEAGUE_URL_PATTERNS.get(league_name, [])
             
             # Procura por links que levam a jogos individuais
             # Padrão de URL: /sportsbook/football/XE/1/2026-01-31,22,94?origin=sportsbook
@@ -491,6 +532,8 @@ class BetinAsiaScraper:
             # E depois navega para a página do jogo para pegar odds detalhadas
             
             game_urls = []
+            game_urls_all = []  # Para debug
+            
             for link in game_links:
                 href = await link.get_attribute("href")
                 # URLs de jogos têm vírgula e são de futebol
@@ -498,10 +541,20 @@ class BetinAsiaScraper:
                     # Remove query string para comparação
                     base_url = href.split("?")[0]
                     full_url = f"{self.BASE_URL}{base_url}" if base_url.startswith("/") else base_url
+                    
+                    if full_url not in game_urls_all:
+                        game_urls_all.append(full_url)
+                    
+                    # Filtra apenas jogos da liga correta
+                    if url_patterns:
+                        is_correct_league = any(pattern in href for pattern in url_patterns)
+                        if not is_correct_league:
+                            continue
+                    
                     if full_url not in game_urls:
                         game_urls.append(full_url)
-                        
-            logger.info(f"URLs únicas de jogos: {len(game_urls)}")
+            
+            logger.info(f"URLs únicas de jogos: {len(game_urls)} (de {len(game_urls_all)} totais na página)")
             
             # Limita para não sobrecarregar (ajuste conforme necessário)
             max_games = 20
