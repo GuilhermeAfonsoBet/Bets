@@ -22,7 +22,7 @@ async def check_database():
         # 1. Conta total de partidas
         from sqlalchemy import text
         
-        async with db._session() as session:
+        async with db.async_session() as session:
             # Total de partidas
             result = await session.execute(text("SELECT COUNT(*) FROM matches"))
             total_matches = result.scalar()
