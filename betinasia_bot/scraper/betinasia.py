@@ -617,9 +617,15 @@ class BetinAsiaScraper:
             
             logger.info(f"URLs únicas de jogos: {len(game_urls)} (de {len(game_urls_all)} totais, {len(game_urls_rejected)} rejeitadas)")
             
-            # Debug: mostra quais padrões estão sendo usados
+            # Debug: mostra quais padrões estão sendo usados e URLs rejeitadas
             if url_patterns:
                 logger.debug(f"Padrões de filtro para {league_name}: {url_patterns}")
+                
+                # Mostra algumas URLs rejeitadas para debug
+                if game_urls_rejected:
+                    logger.debug(f"Primeiras 5 URLs rejeitadas:")
+                    for url in game_urls_rejected[:5]:
+                        logger.debug(f"  - {url}")
             
             # Limita para não sobrecarregar (ajuste conforme necessário)
             max_games = 20
