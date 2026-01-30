@@ -19,9 +19,9 @@ async def debug_bundesliga():
     )
     page = await context.new_page()
     
-    # 1. Acessa a página da Bundesliga
-    print("\n[1] Acessando Germany Bundesliga (XB)...")
-    await page.goto("https://black.betinasia.com/sportsbook/football/XB")
+    # 1. Acessa a página da Bundesliga (URL correta: DE/12)
+    print("\n[1] Acessando Germany Bundesliga (DE/12)...")
+    await page.goto("https://black.betinasia.com/sportsbook/football/DE/12")
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(3000)
     
