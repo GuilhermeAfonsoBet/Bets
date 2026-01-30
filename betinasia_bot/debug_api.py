@@ -19,11 +19,27 @@ async def debug_api():
     )
     page = await context.new_page()
     
+    # Captura headers de requisições autenticadas
+    auth_headers = {}
+    
+    def capture_request(request):
+        url = request.url
+        if "black.betinasia.com" in url and "/web/" in url or "/v1/" in url:
+            headers = dict(request.headers)
+            if 'authorization' in headers or 'cookie' in headers:
+                auth_headers['url'] = url
+                auth_headers['headers'] = headers
+                print(f"    [CAPTURED] Auth headers from: {url[:60]}")
+    
+    page.on("request", capture_request)
+    
     # Primeiro, acessa o site para ter os cookies/sessão
     print("\n[1] Inicializando sessão...")
     await page.goto("https://black.betinasia.com/sportsbook")
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(2000)
+    
+    print(f"    Captured auth headers: {bool(auth_headers)}")
     
     # Endpoints para testar
     event_id = "2026-01-31,13,33"  # Brighton vs Everton
@@ -35,7 +51,21 @@ async def debug_api():
         "/api/version",
     ]
     
-    print("\n[2] Testando endpoints...")
+    # Navega para uma página que faz requisições autenticadas
+    print("\n[2] Navegando para capturar headers de autenticação...")
+    await page.goto("https://black.betinasia.com/sportsbook/football/XE/1/2026-01-31,13,33")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(3000)
+    
+    # Mostra headers capturados
+    if auth_headers:
+        print(f"\n    Headers capturados de: {auth_headers.get('url', 'N/A')[:60]}")
+        captured_h = auth_headers.get('headers', {})
+        for k, v in captured_h.items():
+            if k.lower() in ['authorization', 'cookie', 'x-csrf-token', 'x-auth-token']:
+                print(f"    {k}: {v[:50]}...")
+    
+    print("\n[3] Testando endpoints com headers capturados...")
     
     results = {}
     
@@ -44,35 +74,24 @@ async def debug_api():
         print(f"\n    Testing: {endpoint[:60]}...")
         
         try:
-            # Faz a requisição via JavaScript para manter cookies
-            response = await page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const response = await fetch("{url}", {{
-                            credentials: 'include',
-                            headers: {{
-                                'Accept': 'application/json',
-                            }}
-                        }});
-                        const text = await response.text();
-                        return {{
-                            status: response.status,
-                            contentType: response.headers.get('content-type'),
-                            body: text.substring(0, 5000),
-                            ok: response.ok
-                        }};
-                    }} catch (e) {{
-                        return {{ error: e.message }};
-                    }}
-                }}
-            """)
+            # Usa request do Playwright que mantém contexto/cookies
+            response = await context.request.get(url, headers={
+                'Accept': 'application/json',
+            })
             
-            results[endpoint] = response
+            status = response.status
+            body = await response.text()
+            content_type = response.headers.get('content-type', '')
             
-            print(f"    Status: {response.get('status', 'N/A')}")
-            print(f"    Content-Type: {response.get('contentType', 'N/A')}")
+            results[endpoint] = {
+                'status': status,
+                'content_type': content_type,
+                'body': body[:5000]
+            }
             
-            body = response.get('body', '')
+            print(f"    Status: {status}")
+            print(f"    Content-Type: {content_type}")
+            
             if body:
                 # Tenta parsear como JSON
                 try:
@@ -107,10 +126,12 @@ async def debug_api():
     
     # Análise específica do endpoint de eventos
     events_endpoint = f"/web/events/external/?event_id={event_id}&base_sport=fb"
-    if events_endpoint in results and results[events_endpoint].get('ok'):
+    if events_endpoint in results and results[events_endpoint].get('status') == 200:
         print("\n🎯 ENDPOINT DE EVENTOS FUNCIONA!")
         print("   Este endpoint pode conter os dados de odds/bookmakers!")
         print("   Verifique o arquivo: api_response__web_events_external_.json")
+    else:
+        print(f"\n⚠️ Endpoint de eventos retornou status: {results.get(events_endpoint, {}).get('status', 'N/A')}")
     
     await browser.close()
     await p.stop()
