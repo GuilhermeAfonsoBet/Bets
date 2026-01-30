@@ -20,43 +20,35 @@ async def debug_network():
     page = await context.new_page()
     
     # Lista para armazenar requisições capturadas
-    captured_requests = []
-    captured_responses = []
+    all_requests = []
+    all_responses = []
     
     # Intercepta todas as requisições
-    async def handle_request(request):
+    def handle_request(request):
         url = request.url
         # Filtra apenas requisições interessantes (não imagens, css, etc)
-        if any(x in url for x in ['.png', '.jpg', '.css', '.woff', '.svg', 'google', 'facebook']):
+        if any(x in url for x in ['.png', '.jpg', '.css', '.woff', '.svg', '.ico', 'google', 'facebook', 'analytics']):
             return
         
-        captured_requests.append({
+        all_requests.append({
             "url": url,
             "method": request.method,
-            "headers": dict(request.headers),
             "post_data": request.post_data,
         })
     
-    async def handle_response(response):
+    def handle_response(response):
         url = response.url
         # Filtra apenas requisições interessantes
-        if any(x in url for x in ['.png', '.jpg', '.css', '.woff', '.svg', 'google', 'facebook']):
+        if any(x in url for x in ['.png', '.jpg', '.css', '.woff', '.svg', '.ico', 'google', 'facebook', 'analytics']):
             return
         
         content_type = response.headers.get("content-type", "")
         
-        # Captura apenas JSON
-        if "json" in content_type or "api" in url.lower() or "odds" in url.lower():
-            try:
-                body = await response.text()
-                captured_responses.append({
-                    "url": url,
-                    "status": response.status,
-                    "content_type": content_type,
-                    "body_preview": body[:500] if body else "",
-                })
-            except:
-                pass
+        all_responses.append({
+            "url": url,
+            "status": response.status,
+            "content_type": content_type,
+        })
     
     page.on("request", handle_request)
     page.on("response", handle_response)
@@ -67,7 +59,7 @@ async def debug_network():
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(3000)
     
-    print(f"    Requisições capturadas até agora: {len(captured_requests)}")
+    print(f"    Requisições capturadas até agora: {len(all_requests)}")
     
     # 2. Expande as linhas de AH
     print("\n[2] Expandindo linhas de AH...")
@@ -82,9 +74,15 @@ async def debug_network():
     
     await page.wait_for_timeout(2000)
     
-    # Limpa as requisições anteriores para focar nas novas
-    captured_requests.clear()
-    captured_responses.clear()
+    # Salva requisições do carregamento inicial
+    initial_requests = list(all_requests)
+    initial_responses = list(all_responses)
+    
+    print(f"    Requisições após expansão: {len(all_requests)}")
+    
+    # Limpa para focar nas novas
+    all_requests.clear()
+    all_responses.clear()
     
     # 3. Clica em uma odds para abrir o painel de bookmakers
     print("\n[3] Clicando em uma odds para ver bookmakers...")
@@ -114,23 +112,25 @@ async def debug_network():
         await page.wait_for_timeout(3000)
         
         print(f"\n[4] Requisições capturadas após clicar na odds:")
-        print(f"    Total: {len(captured_requests)} requisições")
+        print(f"    Total: {len(all_requests)} requisições")
         
         # Mostra requisições capturadas
-        for i, req in enumerate(captured_requests[:20]):
+        for i, req in enumerate(all_requests[:20]):
             print(f"\n    [{i+1}] {req['method']} {req['url'][:100]}")
-            if req['post_data']:
-                print(f"        POST data: {req['post_data'][:200]}")
+            if req.get('post_data'):
+                print(f"        POST data: {str(req['post_data'])[:200]}")
         
-        print(f"\n[5] Respostas JSON capturadas:")
-        print(f"    Total: {len(captured_responses)} respostas")
+        print(f"\n[5] Respostas capturadas:")
+        print(f"    Total: {len(all_responses)} respostas")
         
-        for i, resp in enumerate(captured_responses[:10]):
+        for i, resp in enumerate(all_responses[:10]):
             print(f"\n    [{i+1}] {resp['url'][:80]}")
-            print(f"        Status: {resp['status']}, Type: {resp['content_type']}")
-            print(f"        Body: {resp['body_preview'][:300]}...")
+            print(f"        Status: {resp['status']}, Type: {resp.get('content_type', 'N/A')}")
     else:
         print("    Não encontrou elemento de odds para clicar")
+        print("    Tentando pegar screenshot para debug...")
+        await page.screenshot(path="debug_network_page.png")
+        print("    Screenshot salvo: debug_network_page.png")
     
     # 4. Verifica se há WebSocket
     print("\n[6] Verificando WebSockets...")
@@ -182,14 +182,28 @@ async def debug_network():
     # 6. Salva todas as requisições para análise
     print("\n[8] Salvando requisições para análise...")
     
-    with open("debug_network_requests.json", "w") as f:
-        json.dump(captured_requests, f, indent=2)
+    # Combina requisições iniciais + após clique
+    all_data = {
+        "initial_requests": initial_requests,
+        "initial_responses": initial_responses,
+        "after_click_requests": list(all_requests),
+        "after_click_responses": list(all_responses),
+    }
     
-    with open("debug_network_responses.json", "w") as f:
-        json.dump(captured_responses, f, indent=2)
+    with open("debug_network_all.json", "w") as f:
+        json.dump(all_data, f, indent=2)
     
-    print("    Salvo: debug_network_requests.json")
-    print("    Salvo: debug_network_responses.json")
+    print(f"    Total requisições iniciais: {len(initial_requests)}")
+    print(f"    Total respostas iniciais: {len(initial_responses)}")
+    print("    Salvo: debug_network_all.json")
+    
+    # Mostra URLs interessantes
+    print("\n[9] URLs potencialmente interessantes:")
+    interesting_keywords = ['api', 'odds', 'book', 'price', 'market', 'event', 'match', 'data']
+    for req in initial_requests + list(all_requests):
+        url_lower = req['url'].lower()
+        if any(kw in url_lower for kw in interesting_keywords):
+            print(f"    - {req['method']} {req['url'][:100]}")
     
     await browser.close()
     await p.stop()
@@ -198,11 +212,12 @@ async def debug_network():
     print("ANÁLISE:")
     print("="*70)
     
-    if captured_responses:
-        print("\n✓ Encontramos respostas JSON - pode haver uma API!")
-        print("  Analise os arquivos salvos para encontrar endpoints úteis.")
+    total_reqs = len(initial_requests) + len(all_requests)
+    if total_reqs > 0:
+        print(f"\n✓ Capturamos {total_reqs} requisições para análise.")
+        print("  Verifique o arquivo debug_network_all.json")
     else:
-        print("\n✗ Não encontramos respostas JSON óbvias.")
+        print("\n✗ Não capturamos requisições.")
         print("  Os dados podem estar renderizados no HTML ou via WebSocket.")
     
     print("\n" + "="*70)
