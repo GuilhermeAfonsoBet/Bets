@@ -220,6 +220,130 @@ async def fast_worker(page: Page, db: Database, stop_event: asyncio.Event, stats
     logger.info("[FAST] Worker encerrado")
 
 
+async def extract_team_names(page: Page) -> tuple:
+    """Extrai nomes dos times da página."""
+    try:
+        # Tenta extrair do header da página
+        header = await page.query_selector("h1, [class*='match-header'], [class*='event-header']")
+        if header:
+            text = await header.inner_text()
+            if " vs " in text or " v " in text:
+                sep = " vs " if " vs " in text else " v "
+                parts = text.split(sep)
+                return parts[0].strip(), parts[1].strip().split("\n")[0]
+        
+        # Fallback: procura no texto da página
+        page_text = await page.evaluate("() => document.body.innerText")
+        lines = page_text.split("\n")
+        for line in lines[:30]:
+            if " vs " in line and len(line) < 100:
+                parts = line.split(" vs ")
+                return parts[0].strip(), parts[1].strip()
+    except:
+        pass
+    return "Home", "Away"
+
+
+async def click_and_extract_bookmakers(page: Page, handicap: str, home_odds: float) -> list:
+    """Clica na odd e extrai bookmakers do painel."""
+    bookmakers = []
+    
+    try:
+        # Encontra todos os spans com odds
+        odds_str = f"{home_odds:.3f}"[:5]  # Ex: "1.923" -> "1.92"
+        
+        elements = await page.query_selector_all("span")
+        target_elem = None
+        
+        for elem in elements:
+            try:
+                text = await elem.inner_text()
+                if not text or len(text) > 10:
+                    continue
+                    
+                # Verifica se é a odd que procuramos
+                if odds_str[:4] in text.replace(",", "."):
+                    # Verifica contexto (deve ter o handicap)
+                    parent = await elem.evaluate_handle("el => el.closest('div')")
+                    ctx = await parent.evaluate("el => el.innerText")
+                    
+                    hcp_normalized = handicap.replace(",", ".").replace("+", "")
+                    if hcp_normalized in ctx.replace(",", "."):
+                        target_elem = elem
+                        break
+            except:
+                continue
+        
+        if not target_elem:
+            return []
+        
+        # Scroll e clique
+        await target_elem.scroll_into_view_if_needed()
+        await page.wait_for_timeout(300)
+        
+        # Clica no elemento pai (div)
+        await page.evaluate("""(elem) => {
+            const parent = elem.parentElement;
+            if (parent) parent.click();
+        }""", target_elem)
+        
+        await page.wait_for_timeout(2000)
+        
+        # Extrai texto do painel de bookmakers
+        panel_text = await page.evaluate("""
+            () => {
+                // Procura pelo painel lateral que aparece
+                const rightPanels = document.querySelectorAll('[class*="right"], [class*="sidebar"], [class*="panel"], [class*="drawer"]');
+                for (const panel of rightPanels) {
+                    const text = panel.innerText;
+                    if (text.includes('$') && text.length > 50) {
+                        // Verifica se tem nomes de bookmakers
+                        if (/sbo|pin|3et|bf|bdaq|mbook|4cast|sharp/i.test(text)) {
+                            return text;
+                        }
+                    }
+                }
+                // Fallback: todo o texto da página
+                return document.body.innerText;
+            }
+        """)
+        
+        # Parse dos bookmakers
+        # Padrões: "3et 1.854 $2,615" ou "pin88 1.862 $8,700"
+        patterns = [
+            r'(3et|3ete?)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(4casters?)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(bdaq)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(bf)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(pin88e?)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(mbook)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(sbo)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(sharp)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+            r'(sing)\s+(\d+[.,]\d+)\s+\$?([\d,]+)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, panel_text, re.IGNORECASE)
+            for m in matches:
+                bk_name = m[0].lower()
+                bk_odds = float(m[1].replace(",", "."))
+                bk_limit = m[2].replace(",", "")
+                bookmakers.append({
+                    'name': bk_name,
+                    'odds': bk_odds,
+                    'limit': int(bk_limit) if bk_limit.isdigit() else 0
+                })
+        
+        # Fecha painel
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+        
+    except Exception as e:
+        logger.debug(f"Erro extraindo bookmakers: {e}")
+    
+    return bookmakers
+
+
 async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: Database, stats: dict):
     """
     Worker de coleta profunda - captura bookmakers.
@@ -231,7 +355,6 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
         try:
             game = await asyncio.wait_for(job_queue.get(), timeout=10.0)
         except asyncio.TimeoutError:
-            # Verifica se ainda há jobs
             if job_queue.empty():
                 break
             continue
@@ -243,29 +366,23 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
             # Navega
             await page.goto(game_url)
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2500)
             
             # Expande AH
-            for _ in range(3):
+            for attempt in range(3):
                 btns = await page.query_selector_all("text='Show all lines'")
                 for btn in btns:
                     try:
                         if await btn.is_visible():
                             await btn.click()
-                            await page.wait_for_timeout(500)
+                            await page.wait_for_timeout(600)
                     except:
                         pass
             
-            # Extrai info
-            title = await page.title()
-            if " vs " in title:
-                parts = title.split(" - ")[0].split(" vs ")
-                home_team = parts[0].strip()
-                away_team = parts[1].strip() if len(parts) > 1 else "TBD"
-            else:
-                home_team = "TBD"
-                away_team = "TBD"
+            # Extrai nomes dos times
+            home_team, away_team = await extract_team_names(page)
             
+            # Extrai ID da URL
             url_match = re.search(r'/(\d{4}-\d{2}-\d{2}),(\d+),(\d+)', game_url)
             if url_match:
                 external_id = f"{url_match.group(1)}_{url_match.group(2)}_{url_match.group(3)}"
@@ -287,81 +404,43 @@ async def deep_worker(worker_id: int, page: Page, job_queue: asyncio.Queue, db: 
             # Extrai AH do DOM
             ah_lines = await extract_best_odds_from_dom(page)
             
-            # Captura bookmakers para cada linha
+            # Captura bookmakers para cada linha (limitado às principais)
             odds_saved = 0
-            for line in ah_lines:
+            lines_to_process = ah_lines[:15]  # Processa até 15 linhas
+            
+            for line in lines_to_process:
                 handicap = line['ah_line']
-                home_odds_val = str(line['home_odds'])
+                home_odds = line['home_odds']
                 
-                try:
-                    # Encontra elemento de odds
-                    elements = await page.query_selector_all(f"span:has-text('{home_odds_val}')")
-                    
-                    clicked = False
-                    for elem in elements:
-                        try:
-                            parent = await elem.evaluate_handle("el => el.closest('div')")
-                            parent_text = await parent.evaluate("el => el.innerText")
-                            
-                            if handicap.replace(',', '.') in parent_text.replace(',', '.'):
-                                await elem.scroll_into_view_if_needed()
-                                await page.wait_for_timeout(200)
-                                
-                                parent_div = await elem.evaluate_handle("el => el.parentElement")
-                                await parent_div.click()
-                                await page.wait_for_timeout(1500)
-                                
-                                clicked = True
-                                break
-                        except:
-                            continue
-                    
-                    if clicked:
-                        # Extrai bookmakers
-                        panel_text = await page.evaluate("""
-                            () => {
-                                const panels = document.querySelectorAll('[class*="panel"], [class*="sidebar"], [class*="drawer"]');
-                                for (const panel of panels) {
-                                    if (panel.innerText.includes('$') && 
-                                        (panel.innerText.includes('sbo') || panel.innerText.includes('pin') || 
-                                         panel.innerText.includes('bf') || panel.innerText.includes('3et'))) {
-                                        return panel.innerText;
-                                    }
-                                }
-                                return document.body.innerText;
-                            }
-                        """)
-                        
-                        # Parse
-                        bk_pattern = r'(3et|4casters|bdaq|bf|pin88|mbook|sbo|sharp|sing)\s+(\d+[.,]\d+)\s+\$?([\d,]+)'
-                        bk_matches = re.findall(bk_pattern, panel_text, re.IGNORECASE)
-                        
-                        if bk_matches:
-                            odds_list = sorted([float(m[1].replace(',', '.')) for m in bk_matches], reverse=True)
-                            
-                            await db.save_odds(
-                                match_id=match_id,
-                                ah_line=handicap,
-                                side="home",
-                                best_odds=odds_list[0] if odds_list else 0,
-                                best_bookmaker=bk_matches[0][0],
-                                second_best_odds=odds_list[1] if len(odds_list) > 1 else 0,
-                                second_best_bookmaker=bk_matches[1][0] if len(bk_matches) > 1 else "",
-                                median_odds=odds_list[len(odds_list)//2] if odds_list else 0,
-                                num_bookmakers=len(bk_matches),
-                            )
-                            odds_saved += 1
-                        
-                        await page.keyboard.press("Escape")
-                        await page.wait_for_timeout(300)
+                # Extrai bookmakers
+                bookmakers = await click_and_extract_bookmakers(page, handicap, home_odds)
                 
-                except Exception as e:
-                    logger.debug(f"[DEEP-{worker_id}] Erro em linha {handicap}: {e}")
+                if bookmakers:
+                    # Ordena por odds
+                    bookmakers.sort(key=lambda x: x['odds'], reverse=True)
+                    
+                    best = bookmakers[0]
+                    second = bookmakers[1] if len(bookmakers) > 1 else {'name': '', 'odds': 0}
+                    odds_list = [b['odds'] for b in bookmakers]
+                    median = odds_list[len(odds_list)//2] if odds_list else 0
+                    
+                    await db.save_odds(
+                        match_id=match_id,
+                        ah_line=handicap,
+                        side="home",
+                        best_odds=best['odds'],
+                        best_bookmaker=best['name'],
+                        second_best_odds=second['odds'],
+                        second_best_bookmaker=second['name'],
+                        median_odds=median,
+                        num_bookmakers=len(bookmakers),
+                    )
+                    odds_saved += 1
             
             processed += 1
             stats[f'deep_{worker_id}'] = processed
             
-            logger.info(f"[DEEP-{worker_id}] ✓ {home_team} vs {away_team}: {odds_saved} bookmaker lines")
+            logger.info(f"[DEEP-{worker_id}] ✓ {home_team} vs {away_team}: {odds_saved}/{len(lines_to_process)} bk lines")
             
             job_queue.task_done()
             
