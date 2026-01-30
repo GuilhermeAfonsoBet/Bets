@@ -397,15 +397,60 @@ class BetinAsiaScraper:
     async def _expand_game_list(self):
         """
         Expande a lista de jogos clicando em 'Mostrar mais' e fazendo scroll.
+        Também tenta expandir filtros de tempo para mostrar mais jogos.
         """
         try:
-            # Tenta clicar em todos os botões "Show more" visíveis
+            # 1. Primeiro, tenta expandir filtros de tempo/data
+            # O site pode ter filtros que limitam os jogos visíveis
+            time_filter_selectors = [
+                "text='All'", "text='All matches'", "text='Upcoming'",
+                "text='All upcoming'", "text='View all'", "text='Next 7 days'",
+                "text='This week'", "text='Full schedule'",
+                "button:has-text('All')", "a:has-text('All')",
+                "[class*='filter']:has-text('All')"
+            ]
+            
+            for selector in time_filter_selectors:
+                try:
+                    filter_btn = await self._page.query_selector(selector)
+                    if filter_btn and await filter_btn.is_visible():
+                        await filter_btn.click()
+                        await self._page.wait_for_timeout(2000)
+                        logger.debug(f"Clicou em filtro de tempo: {selector}")
+                        break
+                except:
+                    continue
+            
+            # 2. Expande grupos de data (ex: "January 30", "January 31", etc.)
+            # Alguns sites agrupam jogos por data e precisam ser expandidos
+            date_group_selectors = [
+                "[class*='date-group'] [class*='expand']",
+                "[class*='date-header']",
+                "[class*='match-day']",
+                "[class*='game-day']",
+            ]
+            
+            for selector in date_group_selectors:
+                try:
+                    date_groups = await self._page.query_selector_all(selector)
+                    for group in date_groups:
+                        try:
+                            if await group.is_visible():
+                                await group.click()
+                                await self._page.wait_for_timeout(500)
+                        except:
+                            continue
+                except:
+                    continue
+            
+            # 3. Tenta clicar em todos os botões "Show more" visíveis
             for attempt in range(10):
                 try:
                     # Procura botões de "Mostrar mais" / "Show more"
                     show_more_buttons = await self._page.query_selector_all(
                         "text='Show more', text='Mostrar mais', text='Load more', "
-                        "button:has-text('more'), button:has-text('mais')"
+                        "button:has-text('more'), button:has-text('mais'), "
+                        "text='Show all', text='Ver todos'"
                     )
                     
                     clicked = False
@@ -427,12 +472,21 @@ class BetinAsiaScraper:
                     logger.debug(f"Erro ao expandir lista: {e}")
                     break
                     
-            # Faz scroll extensivo para carregar jogos via lazy loading
-            for i in range(8):
+            # 4. Faz scroll extensivo para carregar jogos via lazy loading
+            # Mais agressivo para garantir que todos os jogos carreguem
+            for i in range(12):
                 await self._page.evaluate("window.scrollBy(0, 800)")
-                await self._page.wait_for_timeout(1000)
+                await self._page.wait_for_timeout(800)
                 
-            # Volta ao topo
+            # 5. Volta ao topo e aguarda
+            await self._page.evaluate("window.scrollTo(0, 0)")
+            await self._page.wait_for_timeout(1500)
+            
+            # 6. Segundo round de scroll (às vezes mais jogos carregam depois)
+            for i in range(5):
+                await self._page.evaluate("window.scrollBy(0, 1000)")
+                await self._page.wait_for_timeout(600)
+                
             await self._page.evaluate("window.scrollTo(0, 0)")
             await self._page.wait_for_timeout(1000)
             
@@ -533,6 +587,7 @@ class BetinAsiaScraper:
             
             game_urls = []
             game_urls_all = []  # Para debug
+            game_urls_rejected = []  # URLs rejeitadas (para debug)
             
             for link in game_links:
                 href = await link.get_attribute("href")
@@ -549,12 +604,18 @@ class BetinAsiaScraper:
                     if url_patterns:
                         is_correct_league = any(pattern in href for pattern in url_patterns)
                         if not is_correct_league:
+                            if full_url not in game_urls_rejected:
+                                game_urls_rejected.append(full_url)
                             continue
                     
                     if full_url not in game_urls:
                         game_urls.append(full_url)
             
-            logger.info(f"URLs únicas de jogos: {len(game_urls)} (de {len(game_urls_all)} totais na página)")
+            logger.info(f"URLs únicas de jogos: {len(game_urls)} (de {len(game_urls_all)} totais, {len(game_urls_rejected)} rejeitadas)")
+            
+            # Debug: mostra quais padrões estão sendo usados
+            if url_patterns:
+                logger.debug(f"Padrões de filtro para {league_name}: {url_patterns}")
             
             # Limita para não sobrecarregar (ajuste conforme necessário)
             max_games = 20
