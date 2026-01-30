@@ -526,14 +526,14 @@ class BetinAsiaScraper:
                 
             # Navega para a página da liga
             league_url = f"{self.FOOTBALL_URL}/{league_code}"
-            logger.debug(f"Navegando para: {league_url}")
+            logger.info(f"Navegando para: {league_url}")
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
             await self._page.wait_for_timeout(4000)  # Espera mais para carregar jogos
             
             # Verifica se a URL está correta
             current_url = self._page.url
-            logger.debug(f"URL atual: {current_url}")
+            logger.info(f"URL atual após navegação: {current_url}")
             
             # Se a URL não contém o código da liga, tenta novamente
             if league_code not in current_url:
