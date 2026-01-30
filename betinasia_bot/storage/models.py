@@ -47,6 +47,30 @@ class Match(Base):
     )
 
 
+class BestOddsHistory(Base):
+    """Tabela de histórico de best odds - coleta rápida sem cliques."""
+    
+    __tablename__ = "best_odds_history"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    ah_line = Column(String(20), nullable=False)
+    
+    # Best odds extraídas do DOM (sem clique)
+    best_home_odds = Column(Float, nullable=False)
+    best_away_odds = Column(Float, nullable=False)
+    
+    scraped_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="best_odds_history")
+    
+    __table_args__ = (
+        Index("idx_best_odds_match_line", "match_id", "ah_line"),
+        Index("idx_best_odds_scraped", "scraped_at"),
+    )
+
+
 class OddsHistory(Base):
     """Tabela de histórico de odds - métricas consolidadas por linha de AH."""
     

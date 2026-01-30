@@ -11,7 +11,7 @@ from typing import Optional, List
 from loguru import logger
 
 from config import settings
-from .models import Base, Match, OddsHistory, Opportunity, Bet, LeagueConfig
+from .models import Base, Match, OddsHistory, BestOddsHistory, Opportunity, Bet, LeagueConfig
 
 
 class Database:
@@ -176,6 +176,32 @@ class Database:
                 away_odds=away_odds if away_odds else (best_odds if side == "away" else None),
             )
             session.add(odds)
+            await session.commit()
+    
+    async def save_best_odds(
+        self,
+        match_id: int,
+        ah_line: str,
+        best_home_odds: float,
+        best_away_odds: float,
+    ):
+        """
+        Salva registro de best odds (coleta rápida sem cliques).
+        
+        Args:
+            match_id: ID da partida
+            ah_line: Linha de AH (ex: "-0.5", "+1")
+            best_home_odds: Melhor odd para home
+            best_away_odds: Melhor odd para away
+        """
+        async with self.async_session() as session:
+            best_odds = BestOddsHistory(
+                match_id=match_id,
+                ah_line=ah_line,
+                best_home_odds=best_home_odds,
+                best_away_odds=best_away_odds,
+            )
+            session.add(best_odds)
             await session.commit()
             
     # ==========================================
