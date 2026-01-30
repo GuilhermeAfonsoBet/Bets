@@ -38,28 +38,28 @@ class BetinAsiaScraper:
     
     # Mapeamento de ligas para códigos de URL
     # Formato: /sportsbook/football/{codigo_pagina}
-    # O código de página pode ser diferente do código nos links dos jogos
+    # IMPORTANTE: Usar os códigos que aparecem na URL quando você acessa a liga no site
     LEAGUE_CODES = {
         # Inglaterra
         "England Premier League": "XE/1",
         "England Championship": "XE/2",
         "England FA Cup": "XE/132",
-        # Alemanha - código da página é XB, jogos aparecem como DE/12
-        "Germany Bundesliga": "XB",
-        "Germany 2. Bundesliga": "XB/2",
-        # Espanha
-        "Spain La Liga": "XL",
-        "Spain Segunda": "XL/2",
-        # Itália
-        "Italy Serie A": "XI",
-        "Italy Serie B": "XI/2",
-        # França
-        "France Ligue 1": "XF",
-        "France Ligue 2": "XF/2",
+        # Alemanha - URL correta é DE/12 (não XB!)
+        "Germany Bundesliga": "DE/12",
+        "Germany 2. Bundesliga": "DE/13",
+        # Espanha - URL correta é ES/16
+        "Spain La Liga": "ES/16",
+        "Spain Segunda": "ES/17",
+        # Itália - URL correta é IT/19
+        "Italy Serie A": "IT/19",
+        "Italy Serie B": "IT/20",
+        # França - URL correta é FR/38
+        "France Ligue 1": "FR/38",
+        "France Ligue 2": "FR/39",
         # Outros
-        "Netherlands Eredivisie": "XN",
-        "Portugal Primeira Liga": "XP",
-        "Belgium Pro League": "XBE",
+        "Netherlands Eredivisie": "NL/1",
+        "Portugal Primeira Liga": "PT/1",
+        "Belgium Pro League": "BE/1",
         "Turkey Super Lig": "TR/160",
         "Brazil Serie A": "BR/1",
         "Argentina Primera Division": "AR/1",
@@ -70,20 +70,21 @@ class BetinAsiaScraper:
     
     # Mapeamento de código de liga para códigos de URL de jogos
     # Usado para filtrar apenas jogos da liga correta
+    # Baseado nos prints do site real
     LEAGUE_URL_PATTERNS = {
         "England Premier League": ["XE/1"],
         "England Championship": ["XE/2"],
-        "Germany Bundesliga": ["DE/12", "XB"],
-        "Germany 2. Bundesliga": ["DE/13", "XB/2"],
-        "Spain La Liga": ["ES/16", "XL"],
-        "Spain Segunda": ["ES/17", "XL/2"],
-        "Italy Serie A": ["IT/19", "XI"],
-        "Italy Serie B": ["IT/20", "XI/2"],
-        "France Ligue 1": ["FR/38", "XF"],
-        "France Ligue 2": ["FR/39", "XF/2"],
-        "Netherlands Eredivisie": ["NL/", "XN"],
-        "Portugal Primeira Liga": ["PT/", "XP"],
-        "Belgium Pro League": ["BE/", "XBE"],
+        "Germany Bundesliga": ["DE/12"],
+        "Germany 2. Bundesliga": ["DE/13"],
+        "Spain La Liga": ["ES/16"],
+        "Spain Segunda": ["ES/17"],
+        "Italy Serie A": ["IT/19"],
+        "Italy Serie B": ["IT/20"],
+        "France Ligue 1": ["FR/38"],
+        "France Ligue 2": ["FR/39"],
+        "Netherlands Eredivisie": ["NL/"],
+        "Portugal Primeira Liga": ["PT/"],
+        "Belgium Pro League": ["BE/"],
         "Turkey Super Lig": ["TR/160"],
         "Brazil Serie A": ["BR/"],
         "Argentina Primera Division": ["AR/"],
@@ -401,12 +402,15 @@ class BetinAsiaScraper:
         """
         try:
             # 1. Primeiro, tenta expandir filtros de tempo/data
-            # O site pode ter filtros que limitam os jogos visíveis
+            # O site usa português: "Todos", "Hoje", "Cedo", etc.
             time_filter_selectors = [
-                "text='All'", "text='All matches'", "text='Upcoming'",
+                "text='Todos'", "text='All'",  # Português e inglês
+                "text='All matches'", "text='Upcoming'",
                 "text='All upcoming'", "text='View all'", "text='Next 7 days'",
                 "text='This week'", "text='Full schedule'",
+                "button:has-text('Todos')", "a:has-text('Todos')",
                 "button:has-text('All')", "a:has-text('All')",
+                "[class*='filter']:has-text('Todos')",
                 "[class*='filter']:has-text('All')"
             ]
             
