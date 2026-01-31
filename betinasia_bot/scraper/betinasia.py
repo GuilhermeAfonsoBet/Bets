@@ -511,7 +511,7 @@ class BetinAsiaScraper:
             logger.info(f"Navegando para: {league_url}")
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(4000)  # Espera mais para carregar jogos
+            await self._page.wait_for_timeout(2000)  # Reduzido para acelerar
             
             # Verifica se a URL está correta
             current_url = self._page.url
@@ -522,7 +522,7 @@ class BetinAsiaScraper:
                 logger.warning(f"URL incorreta! Esperado {league_code}, atual: {current_url}")
                 await self._page.goto(league_url)
                 await self._page.wait_for_load_state("networkidle")
-                await self._page.wait_for_timeout(4000)
+                await self._page.wait_for_timeout(2000)
             
             # Tenta expandir a lista clicando em "Mostrar mais" / "Show more"
             await self._expand_game_list()
@@ -635,8 +635,8 @@ class BetinAsiaScraper:
                         matches.append(match_data)
                         logger.debug(f"  [{i+1}/{min(len(game_urls), max_games)}] {match_data}")
                         
-                    # Delay entre jogos para não sobrecarregar
-                    await self._page.wait_for_timeout(1000)
+                    # Delay mínimo entre jogos
+                    await self._page.wait_for_timeout(300)
                     
                 except Exception as e:
                     logger.warning(f"Erro ao processar jogo {game_url}: {e}")
@@ -666,7 +666,7 @@ class BetinAsiaScraper:
             # Navega para a página do jogo
             await self._page.goto(match_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(3000)  # Aumentado para garantir carregamento
+            await self._page.wait_for_timeout(1500)  # Reduzido para acelerar
             
             # Extrai informações da página
             page_text = await self._page.inner_text("body")
@@ -828,16 +828,11 @@ class BetinAsiaScraper:
                         away_odds=away_odds,
                     )
                     
-                    # Se solicitado, captura odds de cada bookmaker (COM FILTRO DE STAKE POR COMBINAÇÃO)
-                    if capture_bookmakers:
-                        bookmaker_odds = await self._capture_bookmaker_odds(
-                            home_odds_str=match[1],
-                            away_odds_str=match[2],
-                            handicap=formatted_line
-                        )
-                        # Adiciona bookmakers que passaram no filtro de stake
-                        if bookmaker_odds:
-                            ah_line.bookmaker_odds.update(bookmaker_odds)
+                    # Guarda os dados para captura posterior (limitada)
+                    ah_line._pending_capture = {
+                        "home_odds_str": match[1],
+                        "away_odds_str": match[2],
+                    }
                     
                     ah_lines[formatted_line] = ah_line
                     logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f} ({len(ah_line.bookmaker_odds)} bks)")
@@ -846,6 +841,40 @@ class BetinAsiaScraper:
                     continue
             
             logger.info(f"Extraídas {len(ah_lines)} linhas de AH")
+            
+            # Se solicitado, captura bookmakers apenas para linhas selecionadas
+            # Limita para evitar lentidão (só 5 linhas mais próximas de 0)
+            if capture_bookmakers and ah_lines:
+                # Ordena linhas por proximidade de 0
+                sorted_lines = sorted(
+                    ah_lines.keys(),
+                    key=lambda x: abs(float(x.replace("+", "")))
+                )
+                
+                # Captura apenas as 5 linhas mais próximas de 0
+                lines_to_capture = sorted_lines[:5]
+                logger.info(f"Capturando bookmakers para {len(lines_to_capture)} linhas: {lines_to_capture}")
+                
+                for line_key in lines_to_capture:
+                    ah_line = ah_lines[line_key]
+                    pending = getattr(ah_line, '_pending_capture', None)
+                    
+                    if pending:
+                        bookmaker_odds = await self._capture_bookmaker_odds(
+                            home_odds_str=pending["home_odds_str"],
+                            away_odds_str=pending["away_odds_str"],
+                            handicap=line_key
+                        )
+                        if bookmaker_odds:
+                            ah_line.bookmaker_odds.update(bookmaker_odds)
+                        
+                        # Remove atributo temporário
+                        delattr(ah_line, '_pending_capture')
+                
+                # Remove _pending_capture das linhas não processadas
+                for ah_line in ah_lines.values():
+                    if hasattr(ah_line, '_pending_capture'):
+                        delattr(ah_line, '_pending_capture')
                     
         except Exception as e:
             logger.warning(f"Erro ao extrair odds AH: {e}")
@@ -1000,13 +1029,9 @@ class BetinAsiaScraper:
             for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
-                        # Scroll agressivo: primeiro scroll normal, depois via JavaScript
-                        await el.scroll_into_view_if_needed()
-                        await self._page.wait_for_timeout(200)
-                        
-                        # Scroll adicional via JavaScript para garantir visibilidade
+                        # Scroll rápido via JavaScript
                         await el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
-                        await self._page.wait_for_timeout(300)
+                        await self._page.wait_for_timeout(100)
                         
                         # Verifica o bounding box
                         box = await el.bounding_box()
@@ -1016,31 +1041,18 @@ class BetinAsiaScraper:
                             is_correct = handicap_matches_context(handicap, context)
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            # Determina tempo de espera baseado no contexto
-                            # Elementos da seção AH (match=True) precisam de mais tempo
-                            wait_time = 1500 if is_correct else 1000
-                            
-                            # Tenta clicar no elemento PAI (DIV)
+                            # Clique rápido no elemento PAI
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
-                            await self._page.wait_for_timeout(wait_time)
+                            await self._page.wait_for_timeout(500)  # Reduzido de 1500ms
                             
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
-                            # Se não encontrou e é o elemento correto, espera mais tempo
-                            if len(bookmakers) == 0 and is_correct:
-                                logger.debug(f"  Elemento [{i}]: esperando mais tempo (2s)...")
-                                await self._page.wait_for_timeout(2000)
-                                panel_text = await self._page.inner_text("body")
-                                bookmakers = self._extract_bookmakers_from_text(panel_text)
-                            
-                            # Se ainda não encontrou, tenta clique via JavaScript
+                            # Se não encontrou, uma tentativa extra rápida
                             if len(bookmakers) == 0:
-                                logger.debug(f"  Elemento [{i}]: tentando clique via JavaScript...")
-                                await el.evaluate("el => el.parentElement.click()")
-                                await self._page.wait_for_timeout(1500)
+                                await self._page.wait_for_timeout(500)
                                 panel_text = await self._page.inner_text("body")
                                 bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
@@ -1048,7 +1060,7 @@ class BetinAsiaScraper:
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(300)
+                            await self._page.wait_for_timeout(150)
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
