@@ -1000,9 +1000,9 @@ class BetinAsiaScraper:
             for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
-                        # Scroll rápido via JavaScript
+                        # Scroll via JavaScript
                         await el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
-                        await self._page.wait_for_timeout(100)
+                        await self._page.wait_for_timeout(200)
                         
                         # Verifica o bounding box
                         box = await el.bounding_box()
@@ -1012,18 +1012,18 @@ class BetinAsiaScraper:
                             is_correct = handicap_matches_context(handicap, context)
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            # Clique rápido no elemento PAI (DIV)
+                            # Clique no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
-                            await self._page.wait_for_timeout(600)
+                            await self._page.wait_for_timeout(1000)
                             
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
-                            # Se não encontrou, tenta mais uma vez com espera curta
+                            # Se não encontrou, tenta mais uma vez com espera adicional
                             if len(bookmakers) == 0:
-                                await self._page.wait_for_timeout(400)
+                                await self._page.wait_for_timeout(800)
                                 panel_text = await self._page.inner_text("body")
                                 bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
@@ -1031,7 +1031,7 @@ class BetinAsiaScraper:
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(100)
+                            await self._page.wait_for_timeout(200)
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
