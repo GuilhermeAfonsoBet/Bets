@@ -996,13 +996,19 @@ class BetinAsiaScraper:
                 elements_with_context.sort(key=context_priority)
                 logger.debug(f"  Elementos reordenados por contexto (handicap={handicap})")
             
+            # Seletores que indicam que o painel de bookmakers abriu
+            # Procura por nomes de bookmakers conhecidos no painel
+            bookmaker_panel_selectors = [
+                "text=pin88", "text=sbo", "text=bf", "text=bdaq", 
+                "text=3et", "text=mbook", "text=sharp", "text=isn"
+            ]
+            
             # Tenta cada elemento até encontrar um que abra o painel com bookmakers
             for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
                         # Scroll via JavaScript
                         await el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
-                        await self._page.wait_for_timeout(200)
                         
                         # Verifica o bounding box
                         box = await el.bounding_box()
@@ -1015,23 +1021,34 @@ class BetinAsiaScraper:
                             # Clique no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
-                            await self._page.wait_for_timeout(1000)
+                            
+                            # Espera inteligente: aguarda painel de bookmakers aparecer (max 2s)
+                            panel_opened = False
+                            try:
+                                # Tenta esperar por qualquer bookmaker conhecido aparecer
+                                for selector in bookmaker_panel_selectors:
+                                    try:
+                                        await self._page.wait_for_selector(selector, timeout=500)
+                                        panel_opened = True
+                                        break
+                                    except:
+                                        continue
+                                
+                                # Se nenhum seletor específico funcionou, espera curto
+                                if not panel_opened:
+                                    await self._page.wait_for_timeout(300)
+                            except:
+                                await self._page.wait_for_timeout(300)
                             
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
-                            # Se não encontrou, tenta mais uma vez com espera adicional
-                            if len(bookmakers) == 0:
-                                await self._page.wait_for_timeout(800)
-                                panel_text = await self._page.inner_text("body")
-                                bookmakers = self._extract_bookmakers_from_text(panel_text)
-                            
                             logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(200)
+                            await self._page.wait_for_timeout(100)
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
