@@ -635,8 +635,8 @@ class BetinAsiaScraper:
                         matches.append(match_data)
                         logger.debug(f"  [{i+1}/{min(len(game_urls), max_games)}] {match_data}")
                         
-                    # Delay mínimo entre jogos
-                    await self._page.wait_for_timeout(300)
+                    # Delay entre jogos para evitar rate limit
+                    await self._page.wait_for_timeout(1000)
                     
                 except Exception as e:
                     logger.warning(f"Erro ao processar jogo {game_url}: {e}")
@@ -855,7 +855,7 @@ class BetinAsiaScraper:
                 lines_to_capture = sorted_lines[:5]
                 logger.info(f"Capturando bookmakers para {len(lines_to_capture)} linhas: {lines_to_capture}")
                 
-                for line_key in lines_to_capture:
+                for idx, line_key in enumerate(lines_to_capture):
                     ah_line = ah_lines[line_key]
                     pending = getattr(ah_line, '_pending_capture', None)
                     
@@ -870,6 +870,10 @@ class BetinAsiaScraper:
                         
                         # Remove atributo temporário
                         delattr(ah_line, '_pending_capture')
+                        
+                        # Delay entre linhas para evitar rate limit (exceto na última)
+                        if idx < len(lines_to_capture) - 1:
+                            await self._page.wait_for_timeout(1000)
                 
                 # Remove _pending_capture das linhas não processadas
                 for ah_line in ah_lines.values():
@@ -1083,7 +1087,7 @@ class BetinAsiaScraper:
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(300)
+                            await self._page.wait_for_timeout(500)  # Delay maior para evitar rate limit
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
