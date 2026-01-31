@@ -992,8 +992,15 @@ class BetinAsiaScraper:
             return False
         
         try:
-            # Encontra elementos com a odds
+            # Encontra elementos com a odds (tenta com ponto e vírgula)
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
+            
+            # Se não encontrou, tenta com vírgula
+            if len(elements) == 0:
+                odds_str_comma = odds_str.replace(".", ",")
+                elements = await self._page.query_selector_all(f"text='{odds_str_comma}'")
+                if elements:
+                    logger.debug(f"  Encontrado com vírgula: '{odds_str_comma}'")
             
             logger.debug(f"Buscando odds '{odds_str}' ({side}, AH {handicap}): {len(elements)} elementos encontrados")
             
@@ -1064,6 +1071,12 @@ class BetinAsiaScraper:
                                 found_any = [bk for bk in self.KNOWN_BOOKMAKERS if bk in text_lower]
                                 if found_any:
                                     logger.debug(f"  Bookmakers NO TEXTO mas não extraídos: {found_any}")
+                                    # Mostra contexto ao redor do primeiro bookmaker encontrado
+                                    bk = found_any[0]
+                                    idx = text_lower.find(bk)
+                                    if idx >= 0:
+                                        context = panel_text[max(0, idx-20):idx+100].replace('\n', '|')
+                                        logger.debug(f"  Contexto de '{bk}': '{context}'")
                                 else:
                                     # Mostra um trecho do texto para debug
                                     sample = panel_text[500:800].replace('\n', ' ')[:150]
