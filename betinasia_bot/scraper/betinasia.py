@@ -1041,27 +1041,18 @@ class BetinAsiaScraper:
                             is_correct = handicap_matches_context(handicap, context)
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            # Estratégia 1: Clique direto no elemento
-                            await el.click()
+                            # Usa clique via JavaScript (ignora overlays/interceptações)
+                            await el.evaluate("el => el.click()")
                             await self._page.wait_for_timeout(800)
                             
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
-                            # Estratégia 2: Se não encontrou, tenta clique no parent
+                            # Se não encontrou, tenta clique no parent via JS
                             if len(bookmakers) == 0:
-                                logger.debug(f"  Tentando clique no parent...")
-                                parent = await el.evaluate_handle("el => el.parentElement")
-                                await parent.click()
-                                await self._page.wait_for_timeout(800)
-                                panel_text = await self._page.inner_text("body")
-                                bookmakers = self._extract_bookmakers_from_text(panel_text)
-                            
-                            # Estratégia 3: Se ainda não encontrou, tenta double-click
-                            if len(bookmakers) == 0:
-                                logger.debug(f"  Tentando double-click...")
-                                await el.dblclick()
+                                logger.debug(f"  Tentando clique JS no parent...")
+                                await el.evaluate("el => el.parentElement.click()")
                                 await self._page.wait_for_timeout(800)
                                 panel_text = await self._page.inner_text("body")
                                 bookmakers = self._extract_bookmakers_from_text(panel_text)
