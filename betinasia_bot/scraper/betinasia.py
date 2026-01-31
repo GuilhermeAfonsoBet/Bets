@@ -1041,20 +1041,42 @@ class BetinAsiaScraper:
                             is_correct = handicap_matches_context(handicap, context)
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            # Clique rápido no elemento PAI
-                            parent = await el.evaluate_handle("el => el.parentElement")
-                            await parent.click()
-                            await self._page.wait_for_timeout(500)  # Reduzido de 1500ms
+                            # Estratégia 1: Clique direto no elemento
+                            await el.click()
+                            await self._page.wait_for_timeout(800)
                             
                             # Extrai bookmakers do texto
                             panel_text = await self._page.inner_text("body")
                             bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
-                            # Se não encontrou, uma tentativa extra rápida
+                            # Estratégia 2: Se não encontrou, tenta clique no parent
                             if len(bookmakers) == 0:
-                                await self._page.wait_for_timeout(500)
+                                logger.debug(f"  Tentando clique no parent...")
+                                parent = await el.evaluate_handle("el => el.parentElement")
+                                await parent.click()
+                                await self._page.wait_for_timeout(800)
                                 panel_text = await self._page.inner_text("body")
                                 bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            # Estratégia 3: Se ainda não encontrou, tenta double-click
+                            if len(bookmakers) == 0:
+                                logger.debug(f"  Tentando double-click...")
+                                await el.dblclick()
+                                await self._page.wait_for_timeout(800)
+                                panel_text = await self._page.inner_text("body")
+                                bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            # Debug: mostra parte do texto se não encontrou bookmakers
+                            if len(bookmakers) == 0:
+                                # Procura por nomes de bookmakers no texto para debug
+                                text_lower = panel_text.lower()
+                                found_any = [bk for bk in self.KNOWN_BOOKMAKERS if bk in text_lower]
+                                if found_any:
+                                    logger.debug(f"  Bookmakers NO TEXTO mas não extraídos: {found_any}")
+                                else:
+                                    # Mostra um trecho do texto para debug
+                                    sample = panel_text[500:800].replace('\n', ' ')[:150]
+                                    logger.debug(f"  Texto sample: '{sample}...'")
                             
                             logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
                             
