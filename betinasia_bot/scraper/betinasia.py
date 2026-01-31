@@ -511,7 +511,7 @@ class BetinAsiaScraper:
             logger.info(f"Navegando para: {league_url}")
             await self._page.goto(league_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(2000)  # Reduzido para acelerar
+            await self._page.wait_for_timeout(4000)  # Espera mais para carregar jogos
             
             # Verifica se a URL está correta
             current_url = self._page.url
@@ -522,7 +522,7 @@ class BetinAsiaScraper:
                 logger.warning(f"URL incorreta! Esperado {league_code}, atual: {current_url}")
                 await self._page.goto(league_url)
                 await self._page.wait_for_load_state("networkidle")
-                await self._page.wait_for_timeout(2000)
+                await self._page.wait_for_timeout(4000)
             
             # Tenta expandir a lista clicando em "Mostrar mais" / "Show more"
             await self._expand_game_list()
@@ -635,7 +635,7 @@ class BetinAsiaScraper:
                         matches.append(match_data)
                         logger.debug(f"  [{i+1}/{min(len(game_urls), max_games)}] {match_data}")
                         
-                    # Delay entre jogos para evitar rate limit
+                    # Delay entre jogos para não sobrecarregar
                     await self._page.wait_for_timeout(1000)
                     
                 except Exception as e:
@@ -666,7 +666,7 @@ class BetinAsiaScraper:
             # Navega para a página do jogo
             await self._page.goto(match_url)
             await self._page.wait_for_load_state("networkidle")
-            await self._page.wait_for_timeout(1500)  # Reduzido para acelerar
+            await self._page.wait_for_timeout(3000)  # Aumentado para garantir carregamento
             
             # Extrai informações da página
             page_text = await self._page.inner_text("body")
@@ -828,11 +828,16 @@ class BetinAsiaScraper:
                         away_odds=away_odds,
                     )
                     
-                    # Guarda os dados para captura posterior (limitada)
-                    ah_line._pending_capture = {
-                        "home_odds_str": match[1],
-                        "away_odds_str": match[2],
-                    }
+                    # Se solicitado, captura odds de cada bookmaker (COM FILTRO DE STAKE POR COMBINAÇÃO)
+                    if capture_bookmakers:
+                        bookmaker_odds = await self._capture_bookmaker_odds(
+                            home_odds_str=match[1],
+                            away_odds_str=match[2],
+                            handicap=formatted_line
+                        )
+                        # Adiciona bookmakers que passaram no filtro de stake
+                        if bookmaker_odds:
+                            ah_line.bookmaker_odds.update(bookmaker_odds)
                     
                     ah_lines[formatted_line] = ah_line
                     logger.debug(f"AH: {formatted_line} H:{home_odds:.3f} A:{away_odds:.3f} ({len(ah_line.bookmaker_odds)} bks)")
@@ -841,44 +846,6 @@ class BetinAsiaScraper:
                     continue
             
             logger.info(f"Extraídas {len(ah_lines)} linhas de AH")
-            
-            # Se solicitado, captura bookmakers apenas para linhas selecionadas
-            # Limita para evitar lentidão (só 5 linhas mais próximas de 0)
-            if capture_bookmakers and ah_lines:
-                # Ordena linhas por proximidade de 0
-                sorted_lines = sorted(
-                    ah_lines.keys(),
-                    key=lambda x: abs(float(x.replace("+", "")))
-                )
-                
-                # Captura apenas as 5 linhas mais próximas de 0
-                lines_to_capture = sorted_lines[:5]
-                logger.info(f"Capturando bookmakers para {len(lines_to_capture)} linhas: {lines_to_capture}")
-                
-                for idx, line_key in enumerate(lines_to_capture):
-                    ah_line = ah_lines[line_key]
-                    pending = getattr(ah_line, '_pending_capture', None)
-                    
-                    if pending:
-                        bookmaker_odds = await self._capture_bookmaker_odds(
-                            home_odds_str=pending["home_odds_str"],
-                            away_odds_str=pending["away_odds_str"],
-                            handicap=line_key
-                        )
-                        if bookmaker_odds:
-                            ah_line.bookmaker_odds.update(bookmaker_odds)
-                        
-                        # Remove atributo temporário
-                        delattr(ah_line, '_pending_capture')
-                        
-                        # Delay entre linhas para evitar rate limit (exceto na última)
-                        if idx < len(lines_to_capture) - 1:
-                            await self._page.wait_for_timeout(1000)
-                
-                # Remove _pending_capture das linhas não processadas
-                for ah_line in ah_lines.values():
-                    if hasattr(ah_line, '_pending_capture'):
-                        delattr(ah_line, '_pending_capture')
                     
         except Exception as e:
             logger.warning(f"Erro ao extrair odds AH: {e}")
@@ -996,15 +963,8 @@ class BetinAsiaScraper:
             return False
         
         try:
-            # Encontra elementos com a odds (tenta com ponto e vírgula)
+            # Encontra elementos com a odds
             elements = await self._page.query_selector_all(f"text='{odds_str}'")
-            
-            # Se não encontrou, tenta com vírgula
-            if len(elements) == 0:
-                odds_str_comma = odds_str.replace(".", ",")
-                elements = await self._page.query_selector_all(f"text='{odds_str_comma}'")
-                if elements:
-                    logger.debug(f"  Encontrado com vírgula: '{odds_str_comma}'")
             
             logger.debug(f"Buscando odds '{odds_str}' ({side}, AH {handicap}): {len(elements)} elementos encontrados")
             
@@ -1057,9 +1017,10 @@ class BetinAsiaScraper:
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
                             # Determina tempo de espera baseado no contexto
+                            # Elementos da seção AH (match=True) precisam de mais tempo
                             wait_time = 1500 if is_correct else 1000
                             
-                            # Clica no elemento PAI (DIV) - método que funcionava
+                            # Tenta clicar no elemento PAI (DIV)
                             parent = await el.evaluate_handle("el => el.parentElement")
                             await parent.click()
                             await self._page.wait_for_timeout(wait_time)
@@ -1087,7 +1048,7 @@ class BetinAsiaScraper:
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(500)  # Delay maior para evitar rate limit
+                            await self._page.wait_for_timeout(300)
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
