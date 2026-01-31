@@ -996,33 +996,17 @@ class BetinAsiaScraper:
                 elements_with_context.sort(key=context_priority)
                 logger.debug(f"  Elementos reordenados por contexto (handicap={handicap})")
             
-            # Seletores que indicam que o painel de bookmakers abriu
-            bookmaker_panel_selectors = [
-                "text=pin88", "text=sbo", "text=bf", "text=bdaq", 
-                "text=3et", "text=mbook", "text=sharp", "text=isn"
-            ]
-            
-            async def wait_for_panel(timeout_ms: int = 800) -> bool:
-                """Espera inteligente pelo painel de bookmakers."""
-                for selector in bookmaker_panel_selectors:
-                    try:
-                        await self._page.wait_for_selector(selector, timeout=timeout_ms)
-                        return True
-                    except:
-                        continue
-                return False
-            
-            async def try_extract_bookmakers() -> dict:
-                """Tenta extrair bookmakers do texto da página."""
-                panel_text = await self._page.inner_text("body")
-                return self._extract_bookmakers_from_text(panel_text)
-            
             # Tenta cada elemento até encontrar um que abra o painel com bookmakers
             for i, (el, context) in enumerate(elements_with_context):
                 try:
                     if await el.is_visible():
-                        # Scroll via JavaScript
+                        # Scroll agressivo: primeiro scroll normal, depois via JavaScript
+                        await el.scroll_into_view_if_needed()
+                        await self._page.wait_for_timeout(200)
+                        
+                        # Scroll adicional via JavaScript para garantir visibilidade
                         await el.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
+                        await self._page.wait_for_timeout(300)
                         
                         # Verifica o bounding box
                         box = await el.bounding_box()
@@ -1032,56 +1016,39 @@ class BetinAsiaScraper:
                             is_correct = handicap_matches_context(handicap, context)
                             logger.debug(f"  Elemento [{i}]: y={box['y']:.0f}, match={is_correct}, ctx='{context_short}...'")
                             
-                            bookmakers = {}
+                            # Determina tempo de espera baseado no contexto
+                            # Elementos da seção AH (match=True) precisam de mais tempo
+                            wait_time = 1500 if is_correct else 1000
                             
-                            # === PLANO A: Clique normal no elemento PAI ===
-                            try:
-                                parent = await el.evaluate_handle("el => el.parentElement")
-                                await parent.click()
-                                
-                                # Espera inteligente pelo painel
-                                if await wait_for_panel(800):
-                                    bookmakers = await try_extract_bookmakers()
-                                else:
-                                    # Painel não apareceu, tenta extrair mesmo assim
-                                    await self._page.wait_for_timeout(200)
-                                    bookmakers = await try_extract_bookmakers()
-                            except Exception as e:
-                                logger.debug(f"  Elemento [{i}]: Plano A falhou: {e}")
+                            # Tenta clicar no elemento PAI (DIV)
+                            parent = await el.evaluate_handle("el => el.parentElement")
+                            await parent.click()
+                            await self._page.wait_for_timeout(wait_time)
                             
-                            # === PLANO B: Se não funcionou, tenta clique via JavaScript ===
+                            # Extrai bookmakers do texto
+                            panel_text = await self._page.inner_text("body")
+                            bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            # Se não encontrou e é o elemento correto, espera mais tempo
+                            if len(bookmakers) == 0 and is_correct:
+                                logger.debug(f"  Elemento [{i}]: esperando mais tempo (2s)...")
+                                await self._page.wait_for_timeout(2000)
+                                panel_text = await self._page.inner_text("body")
+                                bookmakers = self._extract_bookmakers_from_text(panel_text)
+                            
+                            # Se ainda não encontrou, tenta clique via JavaScript
                             if len(bookmakers) == 0:
-                                try:
-                                    logger.debug(f"  Elemento [{i}]: tentando Plano B (JS click)...")
-                                    await el.evaluate("el => el.parentElement.click()")
-                                    
-                                    if await wait_for_panel(800):
-                                        bookmakers = await try_extract_bookmakers()
-                                    else:
-                                        await self._page.wait_for_timeout(200)
-                                        bookmakers = await try_extract_bookmakers()
-                                except Exception as e:
-                                    logger.debug(f"  Elemento [{i}]: Plano B falhou: {e}")
-                            
-                            # === PLANO C: Clique direto no elemento (não no pai) ===
-                            if len(bookmakers) == 0:
-                                try:
-                                    logger.debug(f"  Elemento [{i}]: tentando Plano C (clique direto)...")
-                                    await el.click()
-                                    
-                                    if await wait_for_panel(800):
-                                        bookmakers = await try_extract_bookmakers()
-                                    else:
-                                        await self._page.wait_for_timeout(200)
-                                        bookmakers = await try_extract_bookmakers()
-                                except Exception as e:
-                                    logger.debug(f"  Elemento [{i}]: Plano C falhou: {e}")
+                                logger.debug(f"  Elemento [{i}]: tentando clique via JavaScript...")
+                                await el.evaluate("el => el.parentElement.click()")
+                                await self._page.wait_for_timeout(1500)
+                                panel_text = await self._page.inner_text("body")
+                                bookmakers = self._extract_bookmakers_from_text(panel_text)
                             
                             logger.debug(f"  Bookmakers extraídos: {len(bookmakers)} - {list(bookmakers.keys())}")
                             
                             # Fecha o painel
                             await self._page.keyboard.press("Escape")
-                            await self._page.wait_for_timeout(100)
+                            await self._page.wait_for_timeout(300)
                             
                             # Se encontrou bookmakers, sucesso!
                             if len(bookmakers) > 0:
