@@ -173,10 +173,6 @@ class WebSocketCollector:
         
         # Parseia mensagens WebSocket
         match_odds = self._parse_ws_messages(event_id)
-        
-        # Extrai informações do jogo da página
-        if match_odds:
-            await self._extract_match_info(match_odds)
             
         return match_odds
         
@@ -193,14 +189,23 @@ class WebSocketCollector:
                     
                 # Processa cada item da mensagem
                 for item in data:
-                    if not isinstance(item, list) or len(item) < 3:
+                    if not isinstance(item, list) or len(item) < 2:
                         continue
                         
                     msg_type = item[0]
                     msg_meta = item[1] if len(item) > 1 else []
                     msg_data = item[2] if len(item) > 2 else {}
                     
-                    # Verifica se é do evento correto
+                    # Extrai informações do evento (times, liga, horário)
+                    if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
+                        sport_type = msg_meta[0]  # "fb", "fb_ht", etc.
+                        msg_event_id = msg_meta[1]
+                        
+                        # Verifica se é o evento correto (futebol principal)
+                        if msg_event_id == event_id and sport_type == "fb":
+                            self._parse_event_info(msg_data, match_odds)
+                    
+                    # Verifica se é do evento correto para offers
                     if isinstance(msg_meta, list) and len(msg_meta) >= 3:
                         msg_event_id = msg_meta[2]
                         if msg_event_id != event_id:
@@ -214,6 +219,32 @@ class WebSocketCollector:
                 continue
                 
         return match_odds if match_odds.ah_lines else None
+    
+    def _parse_event_info(self, data: dict, match_odds: MatchOdds):
+        """Extrai informações do evento (times, liga, horário)."""
+        try:
+            # Nome dos times
+            if 'home' in data:
+                match_odds.home_team = data['home']
+            if 'away' in data:
+                match_odds.away_team = data['away']
+                
+            # Liga
+            if 'competition_name' in data:
+                match_odds.league = data['competition_name']
+                
+            # Horário de início
+            if 'start_ts' in data:
+                try:
+                    # Formato: "2026-02-01T20:00:00Z"
+                    match_odds.kickoff_time = datetime.fromisoformat(
+                        data['start_ts'].replace('Z', '+00:00')
+                    )
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.debug(f"Erro ao extrair info do evento: {e}")
         
     def _parse_offers(self, data: dict, match_odds: MatchOdds):
         """Parseia dados de offers e adiciona ao MatchOdds."""
@@ -303,21 +334,6 @@ class WebSocketCollector:
                 "over": over_odds,
                 "under": under_odds
             }
-            
-    async def _extract_match_info(self, match_odds: MatchOdds):
-        """Extrai informações do jogo da página."""
-        try:
-            page_text = await self.scraper._page.inner_text("body")
-            
-            # Tenta extrair times do texto
-            # O formato geralmente é "Team A vs Team B" ou "Team A vs. Team B"
-            vs_match = re.search(r'([A-Za-z\s\.\-]+)\s+vs\.?\s+([A-Za-z\s\.\-]+)', page_text)
-            if vs_match:
-                match_odds.home_team = vs_match.group(1).strip()[:50]
-                match_odds.away_team = vs_match.group(2).strip()[:50]
-                
-        except Exception as e:
-            logger.debug(f"Erro ao extrair info do jogo: {e}")
 
 
 async def test_collector():
@@ -336,6 +352,8 @@ async def test_collector():
         
         if match:
             print(f"\nJogo: {match.home_team} vs {match.away_team}")
+            print(f"Liga: {match.league}")
+            print(f"Horário: {match.kickoff_time}")
             print(f"Event ID: {match.event_id}")
             print(f"\nAsian Handicap ({len(match.ah_lines)} linhas):")
             for line, odds in sorted(match.ah_lines.items()):
@@ -346,7 +364,7 @@ async def test_collector():
                 
             if match.over_under:
                 print(f"\nOver/Under ({len(match.over_under)} linhas):")
-                for line, odds in sorted(match.over_under.items()):
+                for line, odds in sorted(match.over_under.items())[:10]:  # Limita a 10
                     print(f"  {line}: O={odds['over']:.3f} U={odds['under']:.3f}")
         else:
             print("Nenhuma odds coletada")
