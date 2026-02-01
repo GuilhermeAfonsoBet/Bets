@@ -1,0 +1,30 @@
+[Unit]
+Description=BetinAsia Collector - Coleta Continua de Odds
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+Environment="PATH=/home/betbot/Bets/venv/bin"
+Environment="DISPLAY=:99"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStart=/home/betbot/Bets/venv/bin/python -m collector.continuous_collector
+Restart=always
+RestartSec=60
+
+# Logs
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/collector.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/collector_error.log
+
+# Limites
+TimeoutStopSec=60
+KillMode=mixed
+
+# Recursos
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
