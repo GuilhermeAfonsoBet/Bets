@@ -81,7 +81,9 @@ class WebSocketCollector:
         
     async def collect_league(self, league_name: str) -> List[MatchOdds]:
         """
-        Coleta odds de todos os jogos de uma liga.
+        Coleta odds de todos os jogos de uma liga em UMA ÚNICA navegação.
+        
+        O WebSocket já envia todas as odds da liga automaticamente!
         
         Args:
             league_name: Nome da liga (ex: "England Premier League")
@@ -96,35 +98,72 @@ class WebSocketCollector:
         if not league_code:
             logger.warning(f"Liga não mapeada: {league_name}")
             return []
+        
+        # Limpa mensagens anteriores
+        self._ws_messages.clear()
             
-        # Navega para a página da liga
+        # Navega para a página da liga (UMA ÚNICA VEZ)
         league_url = f"{self.scraper.FOOTBALL_URL}/{league_code}"
         await self.scraper._page.goto(league_url)
         await self.scraper._page.wait_for_load_state("networkidle")
-        await self.scraper._page.wait_for_timeout(3000)
+        await self.scraper._page.wait_for_timeout(4000)  # Aguarda WebSocket enviar dados
         
-        # Encontra URLs dos jogos
-        game_urls = await self._find_game_urls(league_name)
-        logger.info(f"Encontrados {len(game_urls)} jogos")
+        # Parseia TODAS as mensagens de uma vez
+        results = self._parse_all_ws_messages()
         
-        # Coleta cada jogo
-        results = []
-        for i, (event_id, url) in enumerate(game_urls[:20]):  # Limita a 20 jogos
-            try:
-                match_odds = await self.collect_match(event_id, url)
-                if match_odds and match_odds.ah_lines:
-                    results.append(match_odds)
-                    logger.debug(f"[{i+1}/{len(game_urls)}] {event_id}: {len(match_odds.ah_lines)} linhas AH")
-                    
-                # Pequeno delay entre jogos
-                await self.scraper._page.wait_for_timeout(500)
-                
-            except Exception as e:
-                logger.warning(f"Erro ao coletar {event_id}: {e}")
-                continue
-                
-        logger.info(f"Coletados {len(results)} jogos com odds")
+        logger.info(f"Coletados {len(results)} jogos com odds em UMA navegação")
         return results
+    
+    def _parse_all_ws_messages(self) -> List[MatchOdds]:
+        """
+        Parseia todas as mensagens WebSocket e extrai odds de múltiplos jogos.
+        """
+        # Dicionário para acumular dados por event_id
+        matches: Dict[str, MatchOdds] = {}
+        
+        for msg in self._ws_messages:
+            try:
+                data = json.loads(msg)
+                
+                if not isinstance(data, list) or len(data) == 0:
+                    continue
+                    
+                for item in data:
+                    if not isinstance(item, list) or len(item) < 2:
+                        continue
+                        
+                    msg_type = item[0]
+                    msg_meta = item[1]
+                    msg_data = item[2] if len(item) > 2 else {}
+                    
+                    # Processa eventos (info dos times)
+                    if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
+                        sport_type = msg_meta[0]
+                        event_id = msg_meta[1]
+                        
+                        # Apenas futebol principal
+                        if sport_type == 'fb' and 'home' in msg_data:
+                            if event_id not in matches:
+                                matches[event_id] = MatchOdds(event_id=event_id, sport="fb")
+                            self._parse_event_info(msg_data, matches[event_id])
+                    
+                    # Processa offers (odds)
+                    if msg_type in ['offers_hcap', 'offers_event']:
+                        if isinstance(msg_meta, list) and len(msg_meta) >= 3:
+                            sport_type = msg_meta[1]
+                            event_id = msg_meta[2]
+                            
+                            # Apenas futebol principal
+                            if sport_type == 'fb':
+                                if event_id not in matches:
+                                    matches[event_id] = MatchOdds(event_id=event_id, sport="fb")
+                                self._parse_offers(msg_data, matches[event_id])
+                            
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                continue
+        
+        # Retorna apenas jogos com odds
+        return [m for m in matches.values() if m.ah_lines]
         
     async def _find_game_urls(self, league_name: str) -> List[tuple]:
         """Encontra URLs de jogos na página da liga."""
