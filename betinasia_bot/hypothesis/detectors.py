@@ -195,6 +195,11 @@ class H3LineMonotonicityDetector:
         # Armazena odds por (match_id, side)
         # Valor: {line: odd}
         self.lines_by_match: Dict[Tuple[int, str], Dict[str, float]] = defaultdict(dict)
+        
+        # Inversões ativas - para não registrar a mesma inversão múltiplas vezes
+        # Key: (match_id, line_a, line_b, side)
+        # Value: True se inversão está ativa
+        self.active_inversions: Dict[Tuple[int, str, str, str], bool] = {}
     
     def update_line(
         self, 
@@ -239,45 +244,40 @@ class H3LineMonotonicityDetector:
             line_a, odd_a = sorted_lines[i]
             line_b, odd_b = sorted_lines[i + 1]
             
+            # Chave para rastrear inversão
+            inversion_key = (match_id, str(line_a), str(line_b), side)
+            
             # Para home: linha mais negativa deve ter odd MENOR
             # Para away: linha mais negativa deve ter odd MAIOR
+            is_inverted = False
+            
             if side == "home":
                 # line_a < line_b (ex: -0.75 < -0.5)
                 # odd_a deveria ser < odd_b
                 expected = "a < b"
                 if odd_a >= odd_b:
+                    is_inverted = True
                     actual = "a >= b"
                     magnitude = odd_a - odd_b
-                    
-                    # Linha A está com odd alta demais - apostar nela
                     recommended_line = str(line_a)
                     recommended_odd = odd_a
-                    
-                    events.append(H3LineMonotonicityEvent(
-                        match_id=match_id,
-                        line_a=str(line_a),
-                        line_b=str(line_b),
-                        side=side,
-                        odd_line_a=odd_a,
-                        odd_line_b=odd_b,
-                        expected_relation=expected,
-                        actual_relation=actual,
-                        magnitude=magnitude,
-                        magnitude_pct=(magnitude / odd_b * 100) if odd_b > 0 else 0,
-                        # Dados para análise de valor
-                        recommended_line=recommended_line,
-                        recommended_odd=recommended_odd,
-                    ))
+                    magnitude_pct = (magnitude / odd_b * 100) if odd_b > 0 else 0
             else:  # away
                 # Para away: linha mais negativa = mais difícil ganhar = odd MAIOR
                 expected = "a > b"
                 if odd_a <= odd_b:
+                    is_inverted = True
                     actual = "a <= b"
                     magnitude = odd_b - odd_a
-                    
-                    # Linha B está com odd alta demais - apostar nela
                     recommended_line = str(line_b)
                     recommended_odd = odd_b
+                    magnitude_pct = (magnitude / odd_a * 100) if odd_a > 0 else 0
+            
+            if is_inverted:
+                # Só registra se é uma NOVA inversão (não estava ativa antes)
+                if not self.active_inversions.get(inversion_key, False):
+                    self.active_inversions[inversion_key] = True
+                    logger.debug(f"H3: Nova inversão detectada - {inversion_key}")
                     
                     events.append(H3LineMonotonicityEvent(
                         match_id=match_id,
@@ -289,11 +289,15 @@ class H3LineMonotonicityDetector:
                         expected_relation=expected,
                         actual_relation=actual,
                         magnitude=magnitude,
-                        magnitude_pct=(magnitude / odd_a * 100) if odd_a > 0 else 0,
-                        # Dados para análise de valor
+                        magnitude_pct=magnitude_pct,
                         recommended_line=recommended_line,
                         recommended_odd=recommended_odd,
                     ))
+            else:
+                # Inversão corrigida - remove do tracking
+                if self.active_inversions.get(inversion_key, False):
+                    self.active_inversions[inversion_key] = False
+                    logger.debug(f"H3: Inversão corrigida - {inversion_key}")
         
         return events
 
