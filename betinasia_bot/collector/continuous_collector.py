@@ -22,6 +22,11 @@ from loguru import logger
 from scraper.fast_collector import FastCollector, CollectionResult
 from storage.database import Database
 from storage.models import Match, BestOddsHistory
+from storage.models_hypothesis import (
+    H1PricingEvent, H3LineMonotonicityEvent,
+    H3bTemporalReversalEvent, H6CorrelationLagEvent
+)
+from hypothesis.detectors import HypothesisDetector, save_hypothesis_events
 from sqlalchemy import select, text
 from config import settings
 
@@ -50,6 +55,10 @@ class ContinuousCollector:
         self.start_time: Optional[datetime] = None
         self.last_collection_time: Optional[datetime] = None
         self._last_browser_start: Optional[datetime] = None
+        
+        # Detector de hipóteses
+        self.hypothesis_detector = HypothesisDetector()
+        self.total_hypothesis_events = 0
         
     async def start(self):
         """Inicia o coletor."""
@@ -116,6 +125,15 @@ class ContinuousCollector:
             if self.total_collections > 0:
                 avg = self.total_matches_collected / self.total_collections
                 logger.info(f"Media de jogos/coleta: {avg:.1f}")
+            
+            # Estatísticas de hipóteses
+            logger.info("--- Eventos de Hipóteses ---")
+            logger.info(f"Total de eventos detectados: {self.total_hypothesis_events}")
+            stats = self.hypothesis_detector.get_stats()
+            logger.info(f"  H1 (Precificação): {stats['h1']}")
+            logger.info(f"  H3 (Linhas adjacentes): {stats['h3']}")
+            logger.info(f"  H3b (Reversões temporais): {stats['h3b']}")
+            logger.info(f"  H6 (Correlação/Lag): {stats['h6']}")
                 
         logger.info("Coletor parado")
         
@@ -198,8 +216,10 @@ class ContinuousCollector:
         Estrategia:
         - Tabela matches: UPSERT (atualiza se existir)
         - Tabela best_odds_history: INSERT (historico)
+        - Detectores de hipóteses: analisa e salva eventos
         """
         saved_count = 0
+        hypothesis_events_count = 0
         
         async with self.db.async_session() as session:
             for match_odds in result.matches:
@@ -229,7 +249,7 @@ class ContinuousCollector:
                         session.add(match)
                         await session.flush()  # Para obter o ID
                     
-                    # 2. Salva odds no historico
+                    # 2. Salva odds no historico + detecta hipóteses
                     for line, odds in match_odds.ah_lines.items():
                         best_odds = BestOddsHistory(
                             match_id=match.id,
@@ -238,8 +258,19 @@ class ContinuousCollector:
                             best_away_odds=odds.away_odds,
                         )
                         session.add(best_odds)
+                        
+                        # === DETECÇÃO DE HIPÓTESES (AH) ===
+                        if odds.home_odds and odds.away_odds:
+                            events = self.hypothesis_detector.process_market_update(
+                                match_id=match.id,
+                                market_type="AH",
+                                line=str(line),
+                                home_odd=odds.home_odds,
+                                away_odd=odds.away_odds,
+                            )
+                            hypothesis_events_count += await save_hypothesis_events(session, events)
                     
-                    # 3. Salva Over/Under (se existir)
+                    # 3. Salva Over/Under (se existir) + detecta hipóteses
                     for line, odds in match_odds.over_under.items():
                         # Usa ah_line com prefixo "OU_" para diferenciar
                         best_odds = BestOddsHistory(
@@ -249,16 +280,41 @@ class ContinuousCollector:
                             best_away_odds=odds.under_odds,  # under no campo away
                         )
                         session.add(best_odds)
+                        
+                        # === DETECÇÃO DE HIPÓTESES (OU) ===
+                        if odds.over_odds and odds.under_odds:
+                            events = self.hypothesis_detector.process_market_update(
+                                match_id=match.id,
+                                market_type="OU",
+                                line=str(line),
+                                home_odd=odds.over_odds,
+                                away_odd=odds.under_odds,
+                            )
+                            hypothesis_events_count += await save_hypothesis_events(session, events)
                     
-                    # 4. Salva 1X2 (se existir)
+                    # 4. Salva 1X2 (se existir) + detecta hipóteses
                     if match_odds.match_odds:
+                        home_odd = match_odds.match_odds.get('h', 0)
+                        away_odd = match_odds.match_odds.get('a', 0)
+                        
                         best_odds = BestOddsHistory(
                             match_id=match.id,
                             ah_line="1X2",
-                            best_home_odds=match_odds.match_odds.get('h', 0),
-                            best_away_odds=match_odds.match_odds.get('a', 0),
+                            best_home_odds=home_odd,
+                            best_away_odds=away_odd,
                         )
                         session.add(best_odds)
+                        
+                        # === DETECÇÃO DE HIPÓTESES (1X2) ===
+                        if home_odd and away_odd:
+                            events = self.hypothesis_detector.process_market_update(
+                                match_id=match.id,
+                                market_type="1X2",
+                                line="1X2",
+                                home_odd=home_odd,
+                                away_odd=away_odd,
+                            )
+                            hypothesis_events_count += await save_hypothesis_events(session, events)
                         
                         # Draw separado
                         if 'd' in match_odds.match_odds:
@@ -278,6 +334,11 @@ class ContinuousCollector:
                     
             # Commit de tudo
             await session.commit()
+        
+        # Atualiza contador de eventos de hipóteses
+        self.total_hypothesis_events += hypothesis_events_count
+        if hypothesis_events_count > 0:
+            logger.info(f"  → {hypothesis_events_count} eventos de hipóteses detectados")
             
         return saved_count
 

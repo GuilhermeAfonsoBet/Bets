@@ -1,0 +1,235 @@
+# -*- coding: utf-8 -*-
+"""
+Modelos SQLAlchemy para eventos de hipóteses.
+
+Armazena eventos detectados pelos monitores de hipóteses:
+- H1: Precificação incorreta
+- H3: Quebra de monotonicidade entre linhas adjacentes
+- H3b: Reversões temporais de odds
+- H6: Atrasos em odds correlacionadas
+"""
+
+from sqlalchemy import (
+    Column, Integer, String, Float, Boolean, DateTime, 
+    ForeignKey, Text, Index, JSON
+)
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+from .models import Base
+
+
+class H1PricingEvent(Base):
+    """
+    Eventos de precificação incorreta (H1).
+    
+    Detecta quando o overround de um mercado está anômalo
+    (arbitragem ou mispricing significativo).
+    """
+    
+    __tablename__ = "h1_pricing_events"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    
+    # Mercado
+    market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
+    ah_line = Column(String(20), nullable=False)
+    
+    # Odds observadas
+    odd_side_a = Column(Float, nullable=False)  # home/over
+    odd_side_b = Column(Float, nullable=False)  # away/under
+    
+    # Cálculos de precificação
+    implied_prob_total = Column(Float, nullable=False)  # soma das probs implícitas
+    overround = Column(Float, nullable=False)  # margem (>1 normal, <1 arb)
+    fair_odd_a = Column(Float)  # odd justa calculada
+    fair_odd_b = Column(Float)
+    deviation_a = Column(Float)  # desvio da odd real vs justa
+    deviation_b = Column(Float)
+    
+    # Classificação
+    is_arb = Column(Boolean, default=False)  # se há arbitragem
+    mispriced_side = Column(String(10))  # qual lado está mal precificado
+    edge_estimate = Column(Float)  # estimativa de edge
+    
+    # Timestamp
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="h1_pricing_events")
+    
+    __table_args__ = (
+        Index("idx_h1_match", "match_id"),
+        Index("idx_h1_detected", "detected_at"),
+        Index("idx_h1_is_arb", "is_arb"),
+    )
+
+
+class H3LineMonotonicityEvent(Base):
+    """
+    Eventos de quebra de monotonicidade entre linhas adjacentes (H3).
+    
+    Detecta quando a relação de preços entre linhas de AH está invertida.
+    Ex: AH -0.75 pagando mais que AH -0.5 (deveria pagar menos).
+    """
+    
+    __tablename__ = "h3_line_monotonicity_events"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    
+    # Linhas envolvidas
+    line_a = Column(String(20), nullable=False)  # linha menor (ex: -0.75)
+    line_b = Column(String(20), nullable=False)  # linha maior (ex: -0.5)
+    side = Column(String(10), nullable=False)  # home ou away
+    
+    # Odds das linhas
+    odd_line_a = Column(Float, nullable=False)
+    odd_line_b = Column(Float, nullable=False)
+    
+    # Métricas da anomalia
+    expected_relation = Column(String(20), nullable=False)  # "a < b" ou "a > b"
+    actual_relation = Column(String(20), nullable=False)
+    magnitude = Column(Float, nullable=False)  # diferença absoluta
+    magnitude_pct = Column(Float)  # diferença percentual
+    
+    # Timestamp
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="h3_line_events")
+    
+    __table_args__ = (
+        Index("idx_h3_match", "match_id"),
+        Index("idx_h3_detected", "detected_at"),
+    )
+
+
+class H3bTemporalReversalEvent(Base):
+    """
+    Eventos de reversão temporal de odds (H3b).
+    
+    Detecta quando uma odd reverte direção ao longo do tempo
+    (estava subindo e começou a descer, ou vice-versa).
+    """
+    
+    __tablename__ = "h3b_temporal_reversal_events"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    
+    # Mercado
+    market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
+    ah_line = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)  # home, away, over, under
+    
+    # Direções
+    direction_before = Column(String(10), nullable=False)  # up ou down
+    direction_after = Column(String(10), nullable=False)  # up ou down
+    
+    # Métricas
+    reversal_magnitude = Column(Float, nullable=False)  # tamanho da reversão
+    streak_before = Column(Integer)  # movimentos consecutivos antes
+    odd_at_reversal = Column(Float, nullable=False)  # odd no momento da reversão
+    odd_before = Column(Float)  # odd antes do último movimento
+    
+    # Contexto
+    num_reversals_1h = Column(Integer)  # reversões na última hora
+    oscillation_index = Column(Float)  # índice de oscilação
+    
+    # Timestamp
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="h3b_reversal_events")
+    
+    __table_args__ = (
+        Index("idx_h3b_match", "match_id"),
+        Index("idx_h3b_detected", "detected_at"),
+        Index("idx_h3b_market", "market_type", "ah_line"),
+    )
+
+
+class H6CorrelationLagEvent(Base):
+    """
+    Eventos de atraso em odds correlacionadas (H6).
+    
+    Detecta quando um mercado move mas mercados correlacionados
+    não acompanham (lag).
+    """
+    
+    __tablename__ = "h6_correlation_lag_events"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    
+    # Mercado líder (que moveu primeiro)
+    leader_market_type = Column(String(20), nullable=False)
+    leader_line = Column(String(20), nullable=False)
+    leader_side = Column(String(10), nullable=False)
+    leader_move_direction = Column(String(10), nullable=False)  # up ou down
+    leader_move_magnitude = Column(Float, nullable=False)
+    leader_odd_before = Column(Float)
+    leader_odd_after = Column(Float, nullable=False)
+    
+    # Mercado atrasado
+    lagged_market_type = Column(String(20), nullable=False)
+    lagged_line = Column(String(20), nullable=False)
+    lagged_side = Column(String(10), nullable=False)
+    lagged_current_odd = Column(Float, nullable=False)
+    
+    # Métricas de atraso
+    lag_seconds = Column(Float, nullable=False)  # tempo de atraso
+    expected_direction = Column(String(10))  # direção esperada do lag
+    expected_move = Column(Float)  # movimento esperado
+    correlation_coefficient = Column(Float)  # correlação esperada
+    
+    # Timestamp
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="h6_lag_events")
+    
+    __table_args__ = (
+        Index("idx_h6_match", "match_id"),
+        Index("idx_h6_detected", "detected_at"),
+        Index("idx_h6_lag", "lag_seconds"),
+    )
+
+
+class OddsMovementHistory(Base):
+    """
+    Histórico de movimentos de odds para análise temporal.
+    
+    Usado pelos detectores H3b e H6 para rastrear mudanças.
+    Mais leve que BestOddsHistory, focado em detectar mudanças.
+    """
+    
+    __tablename__ = "odds_movement_history"
+    
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    
+    # Identificação do mercado
+    market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
+    ah_line = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    
+    # Movimento
+    odd_before = Column(Float)
+    odd_after = Column(Float, nullable=False)
+    direction = Column(String(10))  # up, down, ou null se primeiro registro
+    magnitude = Column(Float)  # diferença absoluta
+    magnitude_pct = Column(Float)  # diferença percentual
+    
+    # Timestamp
+    recorded_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relacionamento
+    match = relationship("Match", backref="odds_movements")
+    
+    __table_args__ = (
+        Index("idx_movement_match_market", "match_id", "market_type", "ah_line", "side"),
+        Index("idx_movement_recorded", "recorded_at"),
+    )

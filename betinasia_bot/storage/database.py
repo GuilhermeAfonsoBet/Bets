@@ -12,6 +12,10 @@ from loguru import logger
 
 from config import settings
 from .models import Base, Match, OddsHistory, BestOddsHistory, Opportunity, Bet, LeagueConfig
+from .models_hypothesis import (
+    H1PricingEvent, H3LineMonotonicityEvent,
+    H3bTemporalReversalEvent, H6CorrelationLagEvent, OddsMovementHistory
+)
 
 
 class Database:
