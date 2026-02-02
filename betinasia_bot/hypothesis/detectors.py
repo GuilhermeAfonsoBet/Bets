@@ -88,6 +88,11 @@ class H1PricingDetector:
     
     def __init__(self):
         self.current_markets: Dict[Tuple[int, str, str], MarketSnapshot] = {}
+        
+        # Cache de situações já reportadas - evita duplicar eventos
+        # Key: (match_id, market_type, line)
+        # Value: (is_arb, mispriced_side, odds_hash) - última situação reportada
+        self.reported_situations: Dict[Tuple[int, str, str], Tuple[bool, str, str]] = {}
     
     def update_market(self, snapshot: MarketSnapshot) -> Optional[H1PricingEvent]:
         """
@@ -144,17 +149,32 @@ class H1PricingDetector:
             mispriced_side = "away"
             edge_estimate = deviation_away
         
-        # Se há anomalia, cria evento
+        # Se há anomalia, verifica se já foi reportada
         if is_arb or mispriced_side:
             # Determina lado recomendado para apostar
-            # Se side_a está com odd acima da justa (deviation > 0), apostar em side_a
-            # Se side_b está com odd acima da justa (deviation > 0), apostar em side_b
             if deviation_home > deviation_away:
                 recommended_side = "side_a"
                 recommended_odd = snapshot.home_odd
             else:
                 recommended_side = "side_b"
                 recommended_odd = snapshot.away_odd
+            
+            # Cria hash das odds para detectar mudanças
+            odds_hash = f"{snapshot.home_odd:.2f}-{snapshot.away_odd:.2f}"
+            
+            # Verifica se já reportou esta situação
+            key = (snapshot.match_id, snapshot.market_type, snapshot.line)
+            current_situation = (is_arb, mispriced_side, odds_hash)
+            
+            if key in self.reported_situations:
+                last_situation = self.reported_situations[key]
+                if last_situation == current_situation:
+                    # Mesma situação já reportada - não duplicar
+                    return None
+            
+            # Nova situação ou situação mudou - registrar
+            self.reported_situations[key] = current_situation
+            logger.debug(f"H1: Nova anomalia detectada - {key} - arb={is_arb}, side={mispriced_side}")
             
             return H1PricingEvent(
                 match_id=snapshot.match_id,
@@ -171,10 +191,15 @@ class H1PricingDetector:
                 is_arb=is_arb,
                 mispriced_side=mispriced_side,
                 edge_estimate=edge_estimate,
-                # Dados para análise de valor
                 recommended_side=recommended_side,
                 recommended_odd=recommended_odd,
             )
+        else:
+            # Mercado voltou ao normal - limpar do cache se existia
+            key = (snapshot.match_id, snapshot.market_type, snapshot.line)
+            if key in self.reported_situations:
+                del self.reported_situations[key]
+                logger.debug(f"H1: Anomalia corrigida - {key}")
         
         return None
 
