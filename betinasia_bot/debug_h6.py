@@ -43,13 +43,14 @@ async def analyze_h6_conditions():
                         LAG(scraped_at) OVER (PARTITION BY match_id, ah_line ORDER BY scraped_at) as prev_time
                     FROM best_odds_history
                     WHERE scraped_at >= NOW() - INTERVAL '1 hour'
+                      AND best_home_odds > 0 AND best_away_odds > 0
                 )
                 SELECT 
                     COUNT(*) as total_records,
                     COUNT(CASE WHEN prev_home IS NOT NULL AND best_home_odds != prev_home THEN 1 END) as home_changes,
                     COUNT(CASE WHEN prev_away IS NOT NULL AND best_away_odds != prev_away THEN 1 END) as away_changes,
-                    COUNT(CASE WHEN prev_home IS NOT NULL AND ABS(best_home_odds - prev_home) / prev_home >= 0.005 THEN 1 END) as significant_home_changes,
-                    COUNT(CASE WHEN prev_away IS NOT NULL AND ABS(best_away_odds - prev_away) / prev_away >= 0.005 THEN 1 END) as significant_away_changes
+                    COUNT(CASE WHEN prev_home IS NOT NULL AND prev_home > 0 AND ABS(best_home_odds - prev_home) / prev_home >= 0.005 THEN 1 END) as significant_home_changes,
+                    COUNT(CASE WHEN prev_away IS NOT NULL AND prev_away > 0 AND ABS(best_away_odds - prev_away) / prev_away >= 0.005 THEN 1 END) as significant_away_changes
                 FROM consecutive_odds
             """))
             row = result.fetchone()
