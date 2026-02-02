@@ -720,7 +720,8 @@ def main() -> int:
     story.append(
         Paragraph(
             "Importante: o Bayes Global é uma <b>política dinâmica</b> (as regras mudam ao longo do tempo). "
-            "Abaixo estão as regras da semana mais recente disponível no dataset (portfólio 'atual' segundo o walk-forward).",
+            "Abaixo estão as regras da <b>última semana completa</b> disponível no dataset (OOS no walk-forward). "
+            "Isso evita que uma <b>semana corrente parcial</b> apareça como se já fosse uma semana OOS concluída.",
             styles["BodyText"],
         )
     )
@@ -733,11 +734,32 @@ def main() -> int:
     except Exception:
         data_min = data_max = pd.NaT
 
-    # Regras da semana mais recente (garantidamente consistentes com o Anexo A):
-    # sempre derivadas de WF_RULES (e não de um CSV separado).
+    # Regras da semana OOS mais recente COMPLETA:
+    # - Se o dataset contém apenas o início da semana corrente (semana parcial), não queremos tratar essa semana como "OOS concluída".
     wf_rules["active"] = (wf_rules["status"] == "ok") & (wf_rules["stake_frac"] > 0)
-    last_week = str(wf_rules["test_week"].iloc[-1])
-    cur = wf_rules[(wf_rules["test_week"] == last_week) & (wf_rules["active"])].copy()
+
+    def _parse_week(week_str: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+        a, b = str(week_str).split("/", 1)
+        return pd.to_datetime(a, errors="coerce"), pd.to_datetime(b, errors="coerce")
+
+    last_week = str(wf_rules["test_week"].iloc[-1])  # fallback
+    try:
+        if (not wf_week.empty) and ("week" in wf_week.columns) and pd.notna(data_max):
+            dm = pd.to_datetime(data_max, errors="coerce")
+            dm_d = dm.date() if pd.notna(dm) else None
+            if dm_d is not None:
+                candidates = []
+                for wstr in wf_week["week"].astype(str).unique().tolist():
+                    ws, we = _parse_week(wstr)
+                    if pd.notna(we) and (we.date() <= dm_d):
+                        candidates.append((we, str(wstr)))
+                if candidates:
+                    # maior week_end <= data_max.date()
+                    last_week = max(candidates, key=lambda t: t[0])[1]
+    except Exception:
+        pass
+
+    cur = wf_rules[(wf_rules["test_week"].astype(str) == last_week) & (wf_rules["active"])].copy()
     # persistir também como artefato auxiliar (para uso externo)
     cur_csv_path = OUT_DIR / "global_bayes_current_week_rules.csv"
     cur.to_csv(cur_csv_path, index=False)
@@ -949,13 +971,18 @@ def main() -> int:
     # - Caso contrário, alvo = próxima semana após a última semana completa do dataset.
     next_week = "—"
     target_week = "—"
-    train_cutoff_dt = data_max  # default: usa tudo que existe até data_max
+    # default: treinar apenas em semanas completas (até o fim da última semana OOS completa)
+    train_cutoff_dt = pd.NaT
     train_note = ""
     try:
         next_start = (last_end_dt + pd.Timedelta(days=1)) if pd.notna(last_end_dt) else pd.NaT
         next_end = (next_start + pd.Timedelta(days=6)) if pd.notna(next_start) else pd.NaT
         next_week = f"{next_start.date().isoformat()}/{next_end.date().isoformat()}" if pd.notna(next_start) and pd.notna(next_end) else "—"
         target_week = next_week
+        if pd.notna(last_end_dt):
+            # inclui toda a última semana completa (end-of-week), exclui qualquer início da semana corrente
+            train_cutoff_dt = pd.to_datetime(last_end_dt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+            train_note = " (treino usa apenas semanas completas)"
 
         # Se data_max cai dentro da semana last_week (e antes do fim), tratamos last_week como "semana operacional a iniciar".
         if pd.notna(data_max) and pd.notna(last_start_dt) and pd.notna(last_end_dt):
