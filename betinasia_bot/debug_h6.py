@@ -116,7 +116,7 @@ async def analyze_h6_conditions():
                     ah_line, 
                     prev_odd, 
                     current_odd,
-                    ROUND(ABS(current_odd - prev_odd) / prev_odd * 100, 3) as pct_change,
+                    ROUND((ABS(current_odd - prev_odd) / prev_odd * 100)::numeric, 3) as pct_change,
                     scraped_at,
                     scraped_at - prev_time as time_diff
                 FROM movements
