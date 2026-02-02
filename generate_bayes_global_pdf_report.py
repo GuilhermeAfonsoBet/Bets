@@ -943,18 +943,33 @@ def main() -> int:
             styles["BodyText"],
         )
     )
-    # próxima semana após a semana corrente (W-SUN)
+    # Semana alvo (operacional):
+    # - Se o dataset já contém apenas o começo da semana "corrente" (W-SUN), a semana operacional a iniciar é a própria
+    #   semana corrente (ex.: data_max=2026-02-02 => alvo=2026-02-02/2026-02-08) e o treino deve excluir a semana parcial.
+    # - Caso contrário, alvo = próxima semana após a última semana completa do dataset.
+    next_week = "—"
+    target_week = "—"
+    train_cutoff_dt = data_max  # default: usa tudo que existe até data_max
+    train_note = ""
     try:
         next_start = (last_end_dt + pd.Timedelta(days=1)) if pd.notna(last_end_dt) else pd.NaT
         next_end = (next_start + pd.Timedelta(days=6)) if pd.notna(next_start) else pd.NaT
         next_week = f"{next_start.date().isoformat()}/{next_end.date().isoformat()}" if pd.notna(next_start) and pd.notna(next_end) else "—"
+        target_week = next_week
+
+        # Se data_max cai dentro da semana last_week (e antes do fim), tratamos last_week como "semana operacional a iniciar".
+        if pd.notna(data_max) and pd.notna(last_start_dt) and pd.notna(last_end_dt):
+            if (pd.to_datetime(data_max) >= pd.to_datetime(last_start_dt)) and (pd.to_datetime(data_max) < pd.to_datetime(last_end_dt) + pd.Timedelta(days=1)):
+                target_week = last_week
+                train_cutoff_dt = pd.to_datetime(last_start_dt) - pd.Timedelta(microseconds=1)
+                train_note = " (treino exclui semana corrente parcial)"
     except Exception:
-        next_week = "—"
+        target_week = "—"
 
     story.append(
         Paragraph(
-            f"- Semana alvo (próxima): <b>{next_week}</b><br/>"
-            f"- Treino: dados até <b>{(data_max.date().isoformat() if pd.notna(data_max) else '—')}</b> (pode incluir semana parcial).",
+            f"- Semana alvo (operacional): <b>{target_week}</b><br/>"
+            f"- Treino: dados até <b>{(train_cutoff_dt.date().isoformat() if pd.notna(train_cutoff_dt) else '—')}</b>{train_note}.",
             styles["BodyText"],
         )
     )
@@ -990,9 +1005,9 @@ def main() -> int:
             p_raw = pd.to_numeric(df_fwd["proba_raw_sexdom"], errors="coerce").to_numpy(dtype=float)
             df_fwd["proba_cal_sexdom"] = _apply_isotonic_safe(p_raw, CALIB_SEXDOM, floor=CALIB_FLOOR_SEXDOM)
 
-        # treino até data_max
-        if pd.notna(data_max):
-            df_fwd = df_fwd[pd.to_datetime(df_fwd["BIA_ApostaUTC"]) <= pd.to_datetime(data_max)].copy()
+        # treino até o cutoff definido (evita incluir semana parcial quando a semana operacional é a semana corrente)
+        if pd.notna(train_cutoff_dt):
+            df_fwd = df_fwd[pd.to_datetime(df_fwd["BIA_ApostaUTC"]) <= pd.to_datetime(train_cutoff_dt)].copy()
 
         # map score_col por dia (alinhado ao operacional)
         def score_col_for_dow(dow: str) -> str:
@@ -1058,7 +1073,7 @@ def main() -> int:
             for k, rule in rules_fwd.items():
                 out_rows.append(
                     {
-                        "test_week": next_week,
+                        "test_week": target_week,
                         "bet_type": rule.bet_type,
                         "dow_pt": rule.dow,
                         "score_col": rule.score_col,
