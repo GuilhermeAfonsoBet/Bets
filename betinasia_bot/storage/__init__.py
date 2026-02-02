@@ -3,5 +3,6 @@
 
 from .database import Database
 from .models import Base
+from .models_summary import OddsSummary
 
-__all__ = ["Database", "Base"]
+__all__ = ["Database", "Base", "OddsSummary"]

@@ -284,18 +284,35 @@ async def calculate_closing_lines():
         await db.close()
 
 
+async def update_and_compact(date: str = None, dry_run: bool = False):
+    """
+    Atualiza resultados E compacta odds em uma unica execucao.
+    """
+    # 1. Atualiza resultados
+    await update_results(date=date, dry_run=dry_run)
+    
+    # 2. Compacta odds dos jogos finalizados
+    if not dry_run:
+        print()
+        from .compact_odds import compact_odds
+        await compact_odds(dry_run=dry_run)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Atualiza resultados dos jogos")
     parser.add_argument("--date", type=str, help="Data especifica (YYYY-MM-DD)")
     parser.add_argument("--dry-run", action="store_true", help="Apenas mostra o que seria atualizado")
     parser.add_argument("--closing-lines", action="store_true", help="Calcula closing lines")
+    parser.add_argument("--no-compact", action="store_true", help="Nao compacta odds apos atualizar")
     
     args = parser.parse_args()
     
     if args.closing_lines:
         asyncio.run(calculate_closing_lines())
-    else:
+    elif args.no_compact:
         asyncio.run(update_results(date=args.date, dry_run=args.dry_run))
+    else:
+        asyncio.run(update_and_compact(date=args.date, dry_run=args.dry_run))
 
 
 if __name__ == "__main__":
