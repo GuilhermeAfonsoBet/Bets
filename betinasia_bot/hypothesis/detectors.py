@@ -475,6 +475,12 @@ class H6CorrelationLagDetector:
             
             # Só considera movimentos significativos
             if magnitude_pct >= H6_MOVEMENT_THRESHOLD:
+                # Log do movimento significativo
+                logger.debug(
+                    f"H6: Movimento {snapshot.market_type} {snapshot.line} {snapshot.side}: "
+                    f"{old_snap.odd:.2f} -> {snapshot.odd:.2f} ({magnitude_pct*100:.2f}%)"
+                )
+                
                 # Registra movimento
                 self.last_moves[key] = (now, old_snap.odd, snapshot.odd, direction)
                 
@@ -488,6 +494,9 @@ class H6CorrelationLagDetector:
                     magnitude,
                     now
                 )
+                
+                if events:
+                    logger.info(f"H6: Detectados {len(events)} eventos de lag para match {snapshot.match_id}")
         
         # Atualiza odd atual
         self.current_odds[key] = snapshot
@@ -510,12 +519,16 @@ class H6CorrelationLagDetector:
         # Obtém linhas adjacentes para verificar
         adjacent_lines = self._get_adjacent_lines(line)
         
+        logger.debug(f"H6: Verificando linhas adjacentes a {line}: {adjacent_lines[:6]}...")
+        
         for adj_line in adjacent_lines:
             corr_key = (match_id, market_type, adj_line, side)
             
             # Verifica se o mercado correlacionado existe
             if corr_key not in self.current_odds:
                 continue
+            
+            logger.debug(f"H6: Linha adjacente {adj_line} encontrada")
             
             # Verifica se moveu recentemente
             if corr_key in self.last_moves:
@@ -524,7 +537,12 @@ class H6CorrelationLagDetector:
                 
                 if move_age < H6_LAG_THRESHOLD_SECONDS:
                     # Mercado correlacionado moveu recentemente, OK
+                    logger.debug(f"H6: {adj_line} moveu há {move_age:.1f}s - OK")
                     continue
+                else:
+                    logger.debug(f"H6: {adj_line} último movimento há {move_age:.1f}s - LAG!")
+            else:
+                logger.debug(f"H6: {adj_line} nunca moveu - potencial LAG")
             
             # Mercado correlacionado NÃO moveu ou está atrasado
             corr_snap = self.current_odds[corr_key]
@@ -572,18 +590,22 @@ class H6CorrelationLagDetector:
         except ValueError:
             return []
         
-        # Linhas adjacentes com delta de 0.25 e 0.5
-        deltas = [-0.5, -0.25, 0.25, 0.5]
+        # Linhas adjacentes - inclui deltas de 0.25, 0.5 e 1.0 
+        # para cobrir tanto linhas fracionárias quanto inteiras
+        deltas = [-1.0, -0.5, -0.25, 0.25, 0.5, 1.0]
         adjacent = []
         
         for delta in deltas:
             adj_val = line_val + delta
-            # Formata de volta para string
+            # Formata de volta para string - tenta vários formatos
+            # pois o banco pode ter "1" ou "1.0"
             if adj_val == int(adj_val):
-                adj_str = str(int(adj_val))
+                # Adiciona ambos formatos para garantir match
+                adjacent.append(str(int(adj_val)))
+                adjacent.append(f"{adj_val:.1f}")
             else:
                 adj_str = str(adj_val)
-            adjacent.append(adj_str)
+                adjacent.append(adj_str)
         
         return adjacent
 
