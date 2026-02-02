@@ -68,42 +68,108 @@ deviation = (best_odd - fair_odd) / fair_odd
 
 ---
 
-## H3 - Hipótese de Quebras de Monotonicidade
+## H3 - Quebra de Monotonicidade entre Linhas Adjacentes
 
-**Objetivo:** Detectar quando as best odds revertem direção (quebra de monotonicidade).
+**Objetivo:** Detectar quando a relação de preços entre linhas adjacentes de AH está invertida.
+
+**Conceito:**
+- Se AH **-0.5** home paga **1.90**
+- Então AH **-0.75** home deveria pagar **MENOS** (ex: 1.70) — mais fácil ganhar
+- E AH **-0.25** home deveria pagar **MAIS** (ex: 2.10) — mais difícil ganhar
+- **ANOMALIA** = essa relação está invertida
 
 **Abordagem com Best Odds:**
-- Monitorar continuamente a série temporal de cada best odd
-- Detectar mudança de direção (subindo→descendo ou descendo→subindo)
+- A cada snapshot, verificar se odds entre linhas adjacentes seguem ordem esperada
+- Gravar evento quando inversão detectada
+
+### Variáveis a Gravar (por evento detectado):
+
+| Nome da Variável | Tipo | Descrição |
+|------------------|------|-----------|
+| `h3_anomaly_count` | int | Quantas anomalias de linha detectadas |
+| `h3_last_anomaly_time` | datetime | Quando foi detectada última anomalia |
+| `h3_anomaly_lines` | tuple | Par de linhas com inversão (ex: "-0.5, -0.75") |
+| `h3_anomaly_odds` | tuple | Odds das linhas (ex: "1.90, 1.95") |
+| `h3_anomaly_magnitude` | float | Tamanho da inversão (diferença de odds) |
+| `h3_anomaly_side` | categorical | "home" ou "away" |
+| `h3_time_since_anomaly` | float | Segundos entre anomalia e nossa aposta |
+| `h3_bet_on_anomaly_line` | bool | Se apostamos em uma das linhas anômalas |
+
+### Exemplo de Anomalia:
+```
+Linha    | Odd Home (esperado) | Odd Home (real) | Status
+---------|---------------------|-----------------|--------
+AH -0.25 | 2.10                | 2.10            | OK
+AH -0.5  | 1.90                | 1.90            | OK  
+AH -0.75 | 1.70                | 1.95            | ANOMALIA! Deveria ser < 1.90
+```
+
+### Lógica de Detecção:
+```python
+# Para cada par de linhas adjacentes
+for i in range(len(linhas) - 1):
+    linha_menor = linhas[i]      # ex: -0.5
+    linha_maior = linhas[i+1]    # ex: -0.25
+    
+    # Se linha menos negativa, odd home deve ser MAIOR
+    if odd_home[linha_maior] < odd_home[linha_menor]:
+        GRAVAR_EVENTO_ANOMALIA()
+```
+
+---
+
+## H3b - Reversões Temporais de Odds (Monotonicidade Temporal)
+
+**Objetivo:** Detectar quando uma odd reverte direção ao longo do tempo (estava subindo, começou a descer ou vice-versa).
+
+**Conceito:**
+- Movimento monotônico: odds só sobe OU só desce ao longo do tempo
+- **REVERSÃO** = mudança de direção (up → down ou down → up)
+- Pode indicar: correção de exagero, informação nova, incerteza do mercado
+
+**Abordagem com Best Odds:**
+- Monitorar série temporal de cada best odd
+- Detectar mudança de direção
 - Gravar evento quando reversão é detectada
 
 ### Variáveis a Gravar (por evento detectado):
 
 | Nome da Variável | Tipo | Descrição |
 |------------------|------|-----------|
-| `h3_total_reversals` | int | Total de reversões detectadas no evento |
-| `h3_reversals_1h_before_bet` | int | Reversões na última hora antes da aposta |
-| `h3_last_reversal_time` | datetime | Timestamp da última reversão |
-| `h3_time_since_reversal` | float | Segundos entre última reversão e nossa aposta |
-| `h3_is_post_reversal` | bool | Se apostamos logo após uma reversão (<5 min) |
-| `h3_reversal_magnitude` | float | Tamanho da última reversão (em odds) |
-| `h3_direction_before` | categorical | "up" ou "down" - direção antes da reversão |
-| `h3_direction_after` | categorical | "up" ou "down" - direção após a reversão |
-| `h3_streak_before_break` | int | Movimentos consecutivos na direção antes de quebrar |
-| `h3_oscillation_index` | float | `num_reversões / num_movimentos` (0-1) |
-| `h3_max_reversal_magnitude` | float | Maior reversão observada no evento |
+| `h3b_reversal_count` | int | Total de reversões detectadas no evento |
+| `h3b_reversals_1h` | int | Reversões na última hora |
+| `h3b_last_reversal_time` | datetime | Timestamp da última reversão |
+| `h3b_time_since_reversal` | float | Segundos desde última reversão |
+| `h3b_is_post_reversal` | bool | Se apostamos logo após reversão (<5 min) |
+| `h3b_reversal_magnitude` | float | Tamanho da reversão (diferença de odd) |
+| `h3b_direction_before` | categorical | "up" ou "down" antes da reversão |
+| `h3b_direction_after` | categorical | "up" ou "down" após reversão |
+| `h3b_streak_before_break` | int | Movimentos consecutivos antes de reverter |
+| `h3b_oscillation_index` | float | `num_reversões / num_movimentos` (0 = estável, 1 = muito instável) |
+
+### Exemplo de Reversão:
+```
+Tempo    | Odd    | Direção | Status
+---------|--------|---------|--------
+10:00    | 1.85   | -       | -
+10:05    | 1.87   | UP      | -
+10:10    | 1.90   | UP      | Streak = 2
+10:15    | 1.88   | DOWN    | REVERSÃO! (up → down)
+```
 
 ### Lógica de Detecção:
-```
+```python
 # Para cada atualização de best odd
 if odd_atual > odd_anterior:
-    direção_atual = "up"
+    direcao_atual = "up"
+elif odd_atual < odd_anterior:
+    direcao_atual = "down"
 else:
-    direção_atual = "down"
+    return  # Sem movimento
 
 # Reversão = mudança de direção
-if direção_atual != direção_anterior:
-    GRAVAR_EVENTO_REVERSÃO()
+if direcao_atual != direcao_anterior:
+    GRAVAR_EVENTO_REVERSAO()
 ```
 
 ---
@@ -203,10 +269,14 @@ for mercado_correlacionado in get_correlacionados(A):
 | H1 | `h1_had_arb` | bool | Se houve oportunidade de arb |
 | H1 | `h1_avg_edge` | float | Edge médio detectado |
 | H1 | `h1_time_since_mispricing` | float | Segundos desde último mispricing |
-| H3 | `h3_total_reversals` | int | Total de reversões |
-| H3 | `h3_is_post_reversal` | bool | Se apostamos após reversão |
-| H3 | `h3_oscillation_index` | float | Índice de oscilação (0-1) |
-| H3 | `h3_max_reversal_magnitude` | float | Maior reversão observada |
+| H3 | `h3_anomaly_count` | int | Anomalias de linha detectadas |
+| H3 | `h3_bet_on_anomaly_line` | bool | Se apostamos em linha anômala |
+| H3 | `h3_anomaly_magnitude` | float | Magnitude da inversão |
+| H3 | `h3_time_since_anomaly` | float | Segundos desde última anomalia |
+| H3b | `h3b_reversal_count` | int | Total de reversões temporais |
+| H3b | `h3b_is_post_reversal` | bool | Se apostamos após reversão |
+| H3b | `h3b_oscillation_index` | float | Índice de oscilação (0-1) |
+| H3b | `h3b_max_reversal_magnitude` | float | Maior reversão observada |
 | H6 | `h6_lag_events_count` | int | Eventos de lag detectados |
 | H6 | `h6_avg_lag_seconds` | float | Lag médio em segundos |
 | H6 | `h6_max_lag_seconds` | float | Maior lag observado |
@@ -214,31 +284,51 @@ for mercado_correlacionado in get_correlacionados(A):
 
 ---
 
-## Próximos Passos
+## STATUS DE IMPLEMENTAÇÃO
 
-1. **Integrar `monitoramento_hipoteses.py` ao sistema de coleta**
-   - Chamar `monitor.process_odd_update()` a cada atualização de best odd
-   - Configurar diretório de saída dos eventos
+**IMPORTANTE:** O monitoramento ainda **NÃO ESTÁ IMPLEMENTADO** na operação atual de coleta.
 
-2. **Criar script de merge**
-   - Ler eventos detectados dos arquivos JSONL
-   - Cruzar com tabela resumo de apostas por `event_id`
-   - Calcular variáveis agregadas
+O arquivo `monitoramento_hipoteses.py` na raiz do workspace é apenas uma **proposta de código** que precisa ser integrada ao sistema de coleta existente em `betinasia_bot/`.
 
-3. **Definir janela de coleta**
-   - Recomendação: mínimo 2 semanas de dados para análise inicial
-   - Idealmente 1 mês para variabilidade suficiente
+### O que existe hoje:
+- `betinasia_bot/collector/continuous_collector.py` - Coleta odds do site
+- `betinasia_bot/storage/database.py` - Armazena em banco de dados
+- `betinasia_bot/results/compact_odds.py` - Compacta dados
 
-4. **Validar detecções**
-   - Revisar manualmente alguns eventos detectados
-   - Ajustar thresholds se necessário
+### O que FALTA fazer:
+1. Integrar detectores de hipóteses no fluxo de coleta
+2. Criar tabelas para armazenar eventos detectados
+3. Implementar merge com tabela resumo
 
 ---
 
-## Arquivo de Implementação
+## Próximos Passos
 
-Ver: `monitoramento_hipoteses.py` para código completo com:
-- `PricingMonitor` - H1
-- `MonotonicityMonitor` - H3  
-- `CorrelationLagMonitor` - H6
-- `HypothesisMonitor` - Agregador
+1. **Revisar sistema de coleta atual**
+   - Entender estrutura do `continuous_collector.py`
+   - Identificar ponto de integração
+
+2. **Implementar detectores no coletor**
+   - H1: verificar pares de odds a cada snapshot
+   - H3: verificar monotonicidade entre linhas a cada snapshot
+   - H3b: verificar reversões temporais a cada atualização
+   - H6: verificar correlações entre mercados
+
+3. **Criar storage para eventos**
+   - Tabela `hypothesis_events` no banco
+   - Ou arquivos JSONL por dia
+
+4. **Criar script de merge**
+   - Cruzar eventos com tabela resumo de apostas
+   - Calcular variáveis agregadas
+
+---
+
+## Arquivos Relevantes
+
+| Arquivo | Descrição | Status |
+|---------|-----------|--------|
+| `monitoramento_hipoteses.py` (raiz) | Proposta de código para detectores | Proposta |
+| `variaveis_hipoteses.md` (raiz) | Este documento | Atualizado |
+| `betinasia_bot/docs/HIPOTESES_ESTRATEGIA.md` | Documento principal de hipóteses | Atualizado |
+| `betinasia_bot/collector/continuous_collector.py` | Coletor atual | Precisa integração |

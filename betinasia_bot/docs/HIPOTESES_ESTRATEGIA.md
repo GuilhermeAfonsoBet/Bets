@@ -35,17 +35,49 @@
 
 ---
 
-### H3: Quebra de Monotonicidade
+### H3: Quebra de Monotonicidade entre Linhas Adjacentes
 
 | Campo | Descricao |
 |-------|-----------|
-| **Nome** | Quebra de Monotonicidade |
-| **Descricao** | A progressao de odds entre linhas adjacentes de AH deve ser monotonica e suave. Desvios indicam possivel mispricing. |
-| **Forma de Medicao** | Para cada jogo, ordenar linhas AH. Calcular delta entre linhas adjacentes. Flag se delta tem sinal diferente do esperado ou magnitude muito diferente da media. |
-| **Variaveis** | odds_ah_all_lines (ordenadas), handicap_values |
+| **Nome** | Quebra de Monotonicidade entre Linhas Adjacentes |
+| **Descricao** | A progressao de odds entre linhas adjacentes de AH deve ser monotonica. Se AH -0.5 home paga 1.90, entao AH -0.75 home deveria pagar MENOS (mais facil ganhar) e AH -0.25 home deveria pagar MAIS (mais dificil). Inversoes indicam mispricing. |
+| **Forma de Medicao** | Para cada jogo, ordenar linhas AH. Calcular delta entre linhas adjacentes. Flag se delta tem sinal diferente do esperado ou magnitude anomala. |
+| **Variaveis** | odds_ah_all_lines (ordenadas), handicap_values, h3_anomaly_detected, h3_anomaly_lines, h3_anomaly_magnitude |
 | **Complexidade** | Baixa-Media |
 | **Estudos/Mercado** | Menos documentado formalmente, mas conceito usado por apostadores quantitativos. Relacionado a "arbitragem de linha" em mercados financeiros. |
 | **Comentarios** | Abordagem elegante e logicamente solida. Anomalias podem ser raras mas de alto valor. Implementacao relativamente simples. |
+
+**Exemplo de anomalia:**
+```
+Linha    | Odd Home (esperado) | Odd Home (real) | Status
+---------|---------------------|-----------------|--------
+AH -0.25 | 2.10                | 2.10            | OK
+AH -0.5  | 1.90                | 1.90            | OK  
+AH -0.75 | 1.70                | 1.95            | ANOMALIA! Deveria ser < 1.90
+```
+
+---
+
+### H3b: Reversoes Temporais de Odds (Monotonicidade Temporal)
+
+| Campo | Descricao |
+|-------|-----------|
+| **Nome** | Reversoes Temporais de Odds |
+| **Descricao** | Quando a odd de um mercado especifico reverte direcao ao longo do tempo (estava subindo e comeca a descer, ou vice-versa), pode indicar incerteza do mercado ou correcao de movimento exagerado. |
+| **Forma de Medicao** | Monitorar serie temporal de cada odd. Detectar mudanca de direcao (up->down ou down->up). Contar reversoes, medir magnitude e tempo entre reversoes. |
+| **Variaveis** | h3b_reversal_count, h3b_last_reversal_time, h3b_reversal_magnitude, h3b_direction_before, h3b_direction_after, h3b_oscillation_index |
+| **Complexidade** | Baixa |
+| **Estudos/Mercado** | Relacionado a conceitos de mean-reversion em mercados financeiros. Odds que oscilam muito podem indicar incerteza ou informacao conflitante. |
+| **Comentarios** | Hipotese: apostas feitas logo apos uma reversao podem ter valor diferente. Mercados "nervosos" podem ser mais ou menos lucrativos. |
+
+**Definicao de reversao:**
+- Movimento UP: odd_atual > odd_anterior
+- Movimento DOWN: odd_atual < odd_anterior
+- REVERSAO: direcao_atual != direcao_anterior
+
+**Metricas principais:**
+- `oscillation_index = num_reversoes / num_movimentos` (0 = totalmente monotonica, 1 = alternando sempre)
+- `streak_before_reversal` = quantos movimentos consecutivos na mesma direcao antes de reverter
 
 ---
 
@@ -148,31 +180,88 @@ Diferenca: 19% → ANOMALIA
 
 ---
 
-### H3: Quebra de Monotonicidade
+### H3: Quebra de Monotonicidade entre Linhas Adjacentes
+
+**Logica:**
+- Linhas de AH mais negativas (ex: -0.75 vs -0.5) sao mais faceis de ganhar para o home
+- Portanto, a odd do home deve ser MENOR em linhas mais negativas
+- Se essa relacao se inverte, ha anomalia
 
 **Implementacao:**
 ```python
-def check_monotonicity(ah_lines: dict) -> list:
+def check_line_monotonicity(ah_lines: dict) -> list:
+    """
+    Verifica se odds entre linhas adjacentes seguem ordem esperada.
+    ah_lines: {handicap: {'home': odd, 'away': odd}, ...}
+    """
     anomalies = []
-    sorted_lines = sorted(ah_lines.items())  # [(−2, odds), (−1.75, odds), ...]
+    sorted_lines = sorted(ah_lines.items())  # [(−0.75, odds), (−0.5, odds), (−0.25, odds), ...]
     
     for i in range(1, len(sorted_lines)):
         prev_hcap, prev = sorted_lines[i-1]
         curr_hcap, curr = sorted_lines[i]
         
-        # Se handicap fica mais negativo, home odds deve AUMENTAR
-        if curr_hcap < prev_hcap:  # mais negativo
-            if curr.home_odds < prev.home_odds:  # mas odds diminuiu
+        # Se handicap fica MENOS negativo (ex: -0.5 -> -0.25)
+        # Home odds deve AUMENTAR (mais dificil ganhar)
+        if curr_hcap > prev_hcap:
+            if curr['home'] < prev['home']:  # mas odds DIMINUIU
                 anomalies.append({
                     'tipo': 'home_nao_monotonica',
                     'linhas': (prev_hcap, curr_hcap),
-                    'odds': (prev.home_odds, curr.home_odds),
+                    'odds': (prev['home'], curr['home']),
                     'delta_esperado': 'positivo',
-                    'delta_real': curr.home_odds - prev.home_odds
+                    'delta_real': curr['home'] - prev['home']
                 })
     
     return anomalies
 ```
+
+**Quando gravar evento:**
+- A cada snapshot de odds, verificar monotonicidade entre todas as linhas disponíveis
+- Se anomalia detectada, gravar: linhas envolvidas, odds, magnitude da inversao, timestamp
+
+---
+
+### H3b: Reversoes Temporais de Odds
+
+**Logica:**
+- Uma odd movendo consistentemente em uma direcao sugere tendencia clara
+- Quando a direcao reverte, pode indicar: correcao de exagero, informacao nova, ou incerteza
+- Apostas apos reversoes podem ter caracteristicas diferentes
+
+**Implementacao:**
+```python
+def check_temporal_reversal(odd_history: list) -> dict:
+    """
+    Detecta reversao de direcao na serie temporal de uma odd.
+    odd_history: [(timestamp, odd), (timestamp, odd), ...]
+    """
+    if len(odd_history) < 3:
+        return None
+    
+    # Calcula direcoes dos ultimos movimentos
+    prev_move = odd_history[-2][1] - odd_history[-3][1]
+    curr_move = odd_history[-1][1] - odd_history[-2][1]
+    
+    prev_dir = 'up' if prev_move > 0 else 'down' if prev_move < 0 else 'flat'
+    curr_dir = 'up' if curr_move > 0 else 'down' if curr_move < 0 else 'flat'
+    
+    # Reversao = mudanca de direcao
+    if prev_dir != 'flat' and curr_dir != 'flat' and prev_dir != curr_dir:
+        return {
+            'reversal_detected': True,
+            'direction_before': prev_dir,
+            'direction_after': curr_dir,
+            'magnitude': abs(curr_move),
+            'timestamp': odd_history[-1][0]
+        }
+    
+    return None
+```
+
+**Quando gravar evento:**
+- A cada atualizacao de odd, verificar se houve reversao
+- Se sim, gravar: mercado, direcao anterior, direcao nova, magnitude, streak antes da reversao
 
 ---
 
