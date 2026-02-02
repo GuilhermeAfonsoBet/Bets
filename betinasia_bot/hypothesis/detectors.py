@@ -139,6 +139,16 @@ class H1PricingDetector:
         
         # Se há anomalia, cria evento
         if is_arb or mispriced_side:
+            # Determina lado recomendado para apostar
+            # Se side_a está com odd acima da justa (deviation > 0), apostar em side_a
+            # Se side_b está com odd acima da justa (deviation > 0), apostar em side_b
+            if deviation_home > deviation_away:
+                recommended_side = "side_a"
+                recommended_odd = snapshot.home_odd
+            else:
+                recommended_side = "side_b"
+                recommended_odd = snapshot.away_odd
+            
             return H1PricingEvent(
                 match_id=snapshot.match_id,
                 market_type=snapshot.market_type,
@@ -154,6 +164,9 @@ class H1PricingDetector:
                 is_arb=is_arb,
                 mispriced_side=mispriced_side,
                 edge_estimate=edge_estimate,
+                # Dados para análise de valor
+                recommended_side=recommended_side,
+                recommended_odd=recommended_odd,
             )
         
         return None
@@ -229,6 +242,10 @@ class H3LineMonotonicityDetector:
                     actual = "a >= b"
                     magnitude = odd_a - odd_b
                     
+                    # Linha A está com odd alta demais - apostar nela
+                    recommended_line = str(line_a)
+                    recommended_odd = odd_a
+                    
                     events.append(H3LineMonotonicityEvent(
                         match_id=match_id,
                         line_a=str(line_a),
@@ -240,6 +257,9 @@ class H3LineMonotonicityDetector:
                         actual_relation=actual,
                         magnitude=magnitude,
                         magnitude_pct=(magnitude / odd_b * 100) if odd_b > 0 else 0,
+                        # Dados para análise de valor
+                        recommended_line=recommended_line,
+                        recommended_odd=recommended_odd,
                     ))
             else:  # away
                 # Para away: linha mais negativa = mais difícil ganhar = odd MAIOR
@@ -247,6 +267,10 @@ class H3LineMonotonicityDetector:
                 if odd_a <= odd_b:
                     actual = "a <= b"
                     magnitude = odd_b - odd_a
+                    
+                    # Linha B está com odd alta demais - apostar nela
+                    recommended_line = str(line_b)
+                    recommended_odd = odd_b
                     
                     events.append(H3LineMonotonicityEvent(
                         match_id=match_id,
@@ -259,6 +283,9 @@ class H3LineMonotonicityDetector:
                         actual_relation=actual,
                         magnitude=magnitude,
                         magnitude_pct=(magnitude / odd_a * 100) if odd_a > 0 else 0,
+                        # Dados para análise de valor
+                        recommended_line=recommended_line,
+                        recommended_odd=recommended_odd,
                     ))
         
         return events
@@ -350,6 +377,9 @@ class H3bTemporalReversalDetector:
                     odd_before=last_odd,
                     num_reversals_1h=self.reversal_counts[key],
                     oscillation_index=oscillation_idx,
+                    # Dados para análise de valor
+                    bet_odd=snapshot.odd,
+                    bet_side=snapshot.side,
                 )
         
         # Atualiza direção
@@ -519,6 +549,11 @@ class H6CorrelationLagDetector:
                     expected_direction=expected_direction,
                     expected_move=magnitude * correlation_coef,
                     correlation_coefficient=correlation_coef,
+                    # Dados para análise de valor (apostar no mercado atrasado)
+                    bet_market_type=market_type,
+                    bet_line=adj_line,
+                    bet_side=side,
+                    bet_odd=corr_snap.odd,
                 ))
         
         return events

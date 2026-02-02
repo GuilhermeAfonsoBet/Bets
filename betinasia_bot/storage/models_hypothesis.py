@@ -36,7 +36,7 @@ class H1PricingEvent(Base):
     market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
     ah_line = Column(String(20), nullable=False)
     
-    # Odds observadas
+    # Odds observadas no momento do evento
     odd_side_a = Column(Float, nullable=False)  # home/over
     odd_side_b = Column(Float, nullable=False)  # away/under
     
@@ -50,8 +50,26 @@ class H1PricingEvent(Base):
     
     # Classificação
     is_arb = Column(Boolean, default=False)  # se há arbitragem
-    mispriced_side = Column(String(10))  # qual lado está mal precificado
+    mispriced_side = Column(String(10))  # qual lado está mal precificado (side_a ou side_b)
     edge_estimate = Column(Float)  # estimativa de edge
+    
+    # === DADOS PARA ANÁLISE DE VALOR ===
+    # Lado recomendado para apostar (baseado no mispricing)
+    recommended_side = Column(String(10))  # "side_a" ou "side_b"
+    recommended_odd = Column(Float)  # odd do lado recomendado
+    
+    # Closing line (preenchido após o jogo)
+    closing_odd_side_a = Column(Float)
+    closing_odd_side_b = Column(Float)
+    closing_odd_recommended = Column(Float)
+    
+    # CLV (preenchido após o jogo)
+    clv = Column(Float)  # recommended_odd - closing_odd_recommended
+    clv_pct = Column(Float)  # CLV percentual
+    
+    # Resultado (preenchido após o jogo)
+    bet_result = Column(String(20))  # win, loss, half_win, half_loss, push
+    profit_loss = Column(Float)  # P&L para stake=1
     
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -63,6 +81,8 @@ class H1PricingEvent(Base):
         Index("idx_h1_match", "match_id"),
         Index("idx_h1_detected", "detected_at"),
         Index("idx_h1_is_arb", "is_arb"),
+        Index("idx_h1_clv", "clv_pct"),
+        Index("idx_h1_result", "bet_result"),
     )
 
 
@@ -72,6 +92,8 @@ class H3LineMonotonicityEvent(Base):
     
     Detecta quando a relação de preços entre linhas de AH está invertida.
     Ex: AH -0.75 pagando mais que AH -0.5 (deveria pagar menos).
+    
+    Estratégia: apostar na linha que está "cara demais" esperando correção.
     """
     
     __tablename__ = "h3_line_monotonicity_events"
@@ -84,7 +106,7 @@ class H3LineMonotonicityEvent(Base):
     line_b = Column(String(20), nullable=False)  # linha maior (ex: -0.5)
     side = Column(String(10), nullable=False)  # home ou away
     
-    # Odds das linhas
+    # Odds das linhas no momento do evento
     odd_line_a = Column(Float, nullable=False)
     odd_line_b = Column(Float, nullable=False)
     
@@ -93,6 +115,24 @@ class H3LineMonotonicityEvent(Base):
     actual_relation = Column(String(20), nullable=False)
     magnitude = Column(Float, nullable=False)  # diferença absoluta
     magnitude_pct = Column(Float)  # diferença percentual
+    
+    # === DADOS PARA ANÁLISE DE VALOR ===
+    # Linha recomendada (a que está com odd "errada" - potencial valor)
+    recommended_line = Column(String(20))  # line_a ou line_b
+    recommended_odd = Column(Float)  # odd da linha recomendada
+    
+    # Closing line (preenchido após o jogo)
+    closing_odd_line_a = Column(Float)
+    closing_odd_line_b = Column(Float)
+    closing_odd_recommended = Column(Float)
+    
+    # CLV (preenchido após o jogo)
+    clv = Column(Float)  # recommended_odd - closing_odd_recommended
+    clv_pct = Column(Float)
+    
+    # Resultado (preenchido após o jogo)
+    bet_result = Column(String(20))  # win, loss, half_win, half_loss, push
+    profit_loss = Column(Float)  # P&L para stake=1
     
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -103,6 +143,8 @@ class H3LineMonotonicityEvent(Base):
     __table_args__ = (
         Index("idx_h3_match", "match_id"),
         Index("idx_h3_detected", "detected_at"),
+        Index("idx_h3_clv", "clv_pct"),
+        Index("idx_h3_result", "bet_result"),
     )
 
 
@@ -112,6 +154,8 @@ class H3bTemporalReversalEvent(Base):
     
     Detecta quando uma odd reverte direção ao longo do tempo
     (estava subindo e começou a descer, ou vice-versa).
+    
+    Estratégia possível: apostar na direção da reversão (ou contra).
     """
     
     __tablename__ = "h3b_temporal_reversal_events"
@@ -138,6 +182,22 @@ class H3bTemporalReversalEvent(Base):
     num_reversals_1h = Column(Integer)  # reversões na última hora
     oscillation_index = Column(Float)  # índice de oscilação
     
+    # === DADOS PARA ANÁLISE DE VALOR ===
+    # Odd e lado no momento do evento (para análise posterior)
+    bet_odd = Column(Float)  # = odd_at_reversal (duplicado para clareza)
+    bet_side = Column(String(10))  # = side (duplicado para clareza)
+    
+    # Closing line (preenchido após o jogo)
+    closing_odd = Column(Float)
+    
+    # CLV (preenchido após o jogo)
+    clv = Column(Float)  # bet_odd - closing_odd
+    clv_pct = Column(Float)
+    
+    # Resultado (preenchido após o jogo)
+    bet_result = Column(String(20))  # win, loss, half_win, half_loss, push
+    profit_loss = Column(Float)  # P&L para stake=1
+    
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     
@@ -148,6 +208,8 @@ class H3bTemporalReversalEvent(Base):
         Index("idx_h3b_match", "match_id"),
         Index("idx_h3b_detected", "detected_at"),
         Index("idx_h3b_market", "market_type", "ah_line"),
+        Index("idx_h3b_clv", "clv_pct"),
+        Index("idx_h3b_result", "bet_result"),
     )
 
 
@@ -157,6 +219,8 @@ class H6CorrelationLagEvent(Base):
     
     Detecta quando um mercado move mas mercados correlacionados
     não acompanham (lag).
+    
+    Estratégia: apostar no mercado atrasado na direção esperada do movimento.
     """
     
     __tablename__ = "h6_correlation_lag_events"
@@ -173,17 +237,35 @@ class H6CorrelationLagEvent(Base):
     leader_odd_before = Column(Float)
     leader_odd_after = Column(Float, nullable=False)
     
-    # Mercado atrasado
+    # Mercado atrasado (onde apostaríamos)
     lagged_market_type = Column(String(20), nullable=False)
     lagged_line = Column(String(20), nullable=False)
     lagged_side = Column(String(10), nullable=False)
-    lagged_current_odd = Column(Float, nullable=False)
+    lagged_current_odd = Column(Float, nullable=False)  # odd no momento do evento
     
     # Métricas de atraso
     lag_seconds = Column(Float, nullable=False)  # tempo de atraso
     expected_direction = Column(String(10))  # direção esperada do lag
     expected_move = Column(Float)  # movimento esperado
     correlation_coefficient = Column(Float)  # correlação esperada
+    
+    # === DADOS PARA ANÁLISE DE VALOR ===
+    # Aposta recomendada: mercado atrasado, esperando que mova na direção do líder
+    bet_market_type = Column(String(20))  # = lagged_market_type
+    bet_line = Column(String(20))  # = lagged_line
+    bet_side = Column(String(10))  # = lagged_side
+    bet_odd = Column(Float)  # = lagged_current_odd
+    
+    # Closing line (preenchido após o jogo)
+    closing_odd = Column(Float)
+    
+    # CLV (preenchido após o jogo)
+    clv = Column(Float)  # bet_odd - closing_odd
+    clv_pct = Column(Float)
+    
+    # Resultado (preenchido após o jogo)
+    bet_result = Column(String(20))  # win, loss, half_win, half_loss, push
+    profit_loss = Column(Float)  # P&L para stake=1
     
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -195,6 +277,8 @@ class H6CorrelationLagEvent(Base):
         Index("idx_h6_match", "match_id"),
         Index("idx_h6_detected", "detected_at"),
         Index("idx_h6_lag", "lag_seconds"),
+        Index("idx_h6_clv", "clv_pct"),
+        Index("idx_h6_result", "bet_result"),
     )
 
 
