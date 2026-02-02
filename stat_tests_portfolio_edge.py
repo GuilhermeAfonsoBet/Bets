@@ -94,10 +94,11 @@ def signflip_permutation_pvalue_mean(x: np.ndarray, n_perm: int = 50000, seed: i
 
 
 def spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
-    rx = pd.Series(x).rank(method="average").to_numpy(float)
-    ry = pd.Series(y).rank(method="average").to_numpy(float)
-    rx -= np.mean(rx)
-    ry -= np.mean(ry)
+    # pandas>=3 pode devolver arrays read-only; evitar operações in-place
+    rx = pd.Series(x).rank(method="average").to_numpy(dtype=float, copy=True)
+    ry = pd.Series(y).rank(method="average").to_numpy(dtype=float, copy=True)
+    rx = rx - float(np.mean(rx))
+    ry = ry - float(np.mean(ry))
     den = float(np.sqrt(np.sum(rx * rx) * np.sum(ry * ry)))
     return float(np.sum(rx * ry) / den) if den > 0 else float("nan")
 

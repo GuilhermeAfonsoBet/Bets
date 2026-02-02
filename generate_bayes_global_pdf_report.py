@@ -278,7 +278,17 @@ def main() -> int:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
     today = date.today().isoformat()
-    pdf_path = OUT_DIR / f"Relatorio_BayesGlobal_Mesa_Profissional_{today}.pdf"
+    # Preferir "as-of" pela data máxima do dataset (evita nomear por data de execução do script).
+    # Ex.: se o Excel vai até 2026-02-01, o relatório sai como ..._2026-02-01.pdf mesmo que rode no dia seguinte.
+    asof = today
+    try:
+        _dt = pd.read_csv(SCORED, usecols=["BIA_ApostaUTC"], parse_dates=["BIA_ApostaUTC"])
+        _mx = _dt["BIA_ApostaUTC"].max()
+        if pd.notna(_mx):
+            asof = _mx.date().isoformat()
+    except Exception:
+        asof = today
+    pdf_path = OUT_DIR / f"Relatorio_BayesGlobal_Mesa_Profissional_{asof}.pdf"
 
     # load artifacts
     wf_week = pd.read_csv(WF_WEEKLY)
