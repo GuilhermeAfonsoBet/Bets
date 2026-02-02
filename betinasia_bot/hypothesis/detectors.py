@@ -41,10 +41,10 @@ H3B_MIN_HISTORY = 3  # mínimo de pontos para detectar reversão
 H3B_WINDOW_SECONDS = 3600  # janela de 1 hora para contar reversões
 
 # H6 - Correlação/Lag
-# NOTA: Threshold deve ser > COLLECTION_INTERVAL (60s) para fazer sentido
-# Com coleta a cada 60s, só conseguimos detectar lags de ~2 ciclos ou mais
-H6_LAG_THRESHOLD_SECONDS = 120  # 2 minutos de atraso para considerar lag
-H6_MOVEMENT_THRESHOLD = 0.005  # 0.5% de movimento para considerar significativo
+# Com ciclo de 10s, conseguimos detectar lags menores
+# Threshold de ~30s = 3 ciclos sem movimento no mercado correlacionado
+H6_LAG_THRESHOLD_SECONDS = 30  # 30 segundos de atraso para considerar lag
+H6_MOVEMENT_THRESHOLD = 0.003  # 0.3% de movimento para considerar significativo
 
 
 # ============================================================================

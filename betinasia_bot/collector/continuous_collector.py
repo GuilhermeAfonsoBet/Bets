@@ -40,7 +40,7 @@ class ContinuousCollector:
     """
     
     # Configuracoes
-    COLLECTION_INTERVAL = 60  # segundos entre coletas
+    CYCLE_TIME = 10  # segundos entre INÍCIO de cada ciclo (não após)
     MAX_CONSECUTIVE_ERRORS = 5  # erros consecutivos antes de pausa longa
     ERROR_PAUSE_SECONDS = 300  # pausa apos muitos erros (5 min)
     SESSION_REFRESH_INTERVAL = 3600  # reconecta browser a cada 1 hora
@@ -82,7 +82,7 @@ class ContinuousCollector:
             signal.signal(sig, self._signal_handler)
             
         logger.info("Coletor continuo iniciado com sucesso")
-        logger.info(f"Intervalo entre coletas: {self.COLLECTION_INTERVAL}s")
+        logger.info(f"Ciclo de coleta: {self.CYCLE_TIME}s (tempo entre início de cada ciclo)")
         
     async def _start_browser(self):
         """Inicia ou reinicia o browser."""
@@ -143,6 +143,8 @@ class ContinuousCollector:
         
         while self.running:
             try:
+                cycle_start = datetime.now(timezone.utc)
+                
                 # Verifica se precisa reiniciar browser
                 if self._should_refresh_browser():
                     logger.info("Reiniciando browser (refresh periodico)...")
@@ -154,10 +156,16 @@ class ContinuousCollector:
                 # Reset contador de erros
                 self.consecutive_errors = 0
                 
+                # Calcula tempo restante até próximo ciclo
+                cycle_elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+                sleep_time = max(0, self.CYCLE_TIME - cycle_elapsed)
+                
                 # Aguarda proximo ciclo
-                if self.running:
-                    logger.debug(f"Aguardando {self.COLLECTION_INTERVAL}s para proxima coleta...")
-                    await asyncio.sleep(self.COLLECTION_INTERVAL)
+                if self.running and sleep_time > 0:
+                    logger.debug(f"Coleta levou {cycle_elapsed:.1f}s, aguardando {sleep_time:.1f}s...")
+                    await asyncio.sleep(sleep_time)
+                elif self.running:
+                    logger.debug(f"Coleta levou {cycle_elapsed:.1f}s (> {self.CYCLE_TIME}s), próximo ciclo imediato")
                     
             except Exception as e:
                 self.consecutive_errors += 1
