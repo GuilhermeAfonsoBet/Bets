@@ -105,6 +105,11 @@ class H1PricingDetector:
     def _check_pricing(self, snapshot: MarketSnapshot) -> Optional[H1PricingEvent]:
         """Verifica se há mispricing no mercado."""
         
+        # EXCLUI 1X2 - tem 3 outcomes (H/D/A), não 2
+        # Calcular overround com só H+A dá resultado errado (~75% em vez de ~107%)
+        if snapshot.market_type == "1X2":
+            return None
+        
         # Valida odds
         if snapshot.home_odd <= 1.0 or snapshot.away_odd <= 1.0:
             return None
