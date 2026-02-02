@@ -101,6 +101,40 @@ class OddsSummary(Base):
     clv_pct = Column(Float)  # CLV percentual
     
     # ==========================================
+    # H1 - PRECIFICAÇÃO
+    # ==========================================
+    
+    h1_pricing_events_count = Column(Integer, default=0)  # Mispricings detectados
+    h1_had_arb = Column(Integer, default=0)  # Teve oportunidade de arbitragem (0/1)
+    h1_avg_edge = Column(Float)  # Edge médio detectado
+    h1_max_edge = Column(Float)  # Maior edge detectado
+    
+    # ==========================================
+    # H3 - MONOTONICIDADE ENTRE LINHAS
+    # ==========================================
+    
+    h3_line_anomaly_count = Column(Integer, default=0)  # Anomalias de linha detectadas
+    h3_anomaly_magnitude_max = Column(Float)  # Maior magnitude de anomalia
+    h3_anomaly_magnitude_avg = Column(Float)  # Magnitude média
+    
+    # ==========================================
+    # H3b - REVERSÕES TEMPORAIS
+    # ==========================================
+    
+    h3b_reversal_count = Column(Integer, default=0)  # Reversões detectadas
+    h3b_oscillation_index = Column(Float)  # Índice de oscilação (0-1)
+    h3b_max_reversal_magnitude = Column(Float)  # Maior reversão
+    h3b_avg_reversal_magnitude = Column(Float)  # Reversão média
+    
+    # ==========================================
+    # H6 - CORRELAÇÃO / LAG
+    # ==========================================
+    
+    h6_lag_events_count = Column(Integer, default=0)  # Eventos de lag detectados
+    h6_avg_lag_seconds = Column(Float)  # Lag médio em segundos
+    h6_max_lag_seconds = Column(Float)  # Maior lag observado
+    
+    # ==========================================
     # METADADOS
     # ==========================================
     

@@ -21,6 +21,10 @@ from sqlalchemy import select, and_
 from storage.database import Database
 from storage.models import Match, BestOddsHistory
 from storage.models_summary import OddsSummary
+from storage.models_hypothesis import (
+    H1PricingEvent, H3LineMonotonicityEvent,
+    H3bTemporalReversalEvent, H6CorrelationLagEvent
+)
 
 
 def calculate_ah_result(
@@ -193,6 +197,155 @@ def calculate_steam_moves(odds_list: List[float], threshold: float = 3.0) -> Dic
     }
 
 
+async def get_hypothesis_metrics(
+    session,
+    match_id: int,
+    market_type: str,
+    line: Optional[float],
+    side: str
+) -> Dict:
+    """
+    Busca métricas de hipóteses para um mercado específico.
+    
+    Args:
+        session: Sessão do banco
+        match_id: ID do jogo
+        market_type: Tipo de mercado (AH, OU, 1X2)
+        line: Linha do mercado
+        side: Lado (home, away, over, under)
+    
+    Returns:
+        Dict com métricas de H1, H3, H3b, H6
+    """
+    metrics = {
+        # H1
+        "h1_pricing_events_count": 0,
+        "h1_had_arb": 0,
+        "h1_avg_edge": None,
+        "h1_max_edge": None,
+        # H3
+        "h3_line_anomaly_count": 0,
+        "h3_anomaly_magnitude_max": None,
+        "h3_anomaly_magnitude_avg": None,
+        # H3b
+        "h3b_reversal_count": 0,
+        "h3b_oscillation_index": None,
+        "h3b_max_reversal_magnitude": None,
+        "h3b_avg_reversal_magnitude": None,
+        # H6
+        "h6_lag_events_count": 0,
+        "h6_avg_lag_seconds": None,
+        "h6_max_lag_seconds": None,
+    }
+    
+    line_str = str(line) if line is not None else market_type
+    
+    # ===== H1 - Precificação =====
+    try:
+        result = await session.execute(
+            select(H1PricingEvent).where(
+                and_(
+                    H1PricingEvent.match_id == match_id,
+                    H1PricingEvent.market_type == market_type,
+                    H1PricingEvent.ah_line == line_str
+                )
+            )
+        )
+        h1_events = result.scalars().all()
+        
+        if h1_events:
+            metrics["h1_pricing_events_count"] = len(h1_events)
+            metrics["h1_had_arb"] = 1 if any(e.is_arb for e in h1_events) else 0
+            edges = [e.edge_estimate for e in h1_events if e.edge_estimate]
+            if edges:
+                metrics["h1_avg_edge"] = sum(edges) / len(edges)
+                metrics["h1_max_edge"] = max(edges)
+    except Exception as e:
+        logger.debug(f"Erro ao buscar H1: {e}")
+    
+    # ===== H3 - Monotonicidade entre linhas =====
+    try:
+        result = await session.execute(
+            select(H3LineMonotonicityEvent).where(
+                and_(
+                    H3LineMonotonicityEvent.match_id == match_id,
+                    H3LineMonotonicityEvent.side == side
+                )
+            )
+        )
+        h3_events = result.scalars().all()
+        
+        # Filtra eventos onde a linha atual está envolvida
+        relevant_h3 = [
+            e for e in h3_events 
+            if e.line_a == line_str or e.line_b == line_str
+        ]
+        
+        if relevant_h3:
+            metrics["h3_line_anomaly_count"] = len(relevant_h3)
+            magnitudes = [e.magnitude for e in relevant_h3 if e.magnitude]
+            if magnitudes:
+                metrics["h3_anomaly_magnitude_max"] = max(magnitudes)
+                metrics["h3_anomaly_magnitude_avg"] = sum(magnitudes) / len(magnitudes)
+    except Exception as e:
+        logger.debug(f"Erro ao buscar H3: {e}")
+    
+    # ===== H3b - Reversões temporais =====
+    try:
+        result = await session.execute(
+            select(H3bTemporalReversalEvent).where(
+                and_(
+                    H3bTemporalReversalEvent.match_id == match_id,
+                    H3bTemporalReversalEvent.market_type == market_type,
+                    H3bTemporalReversalEvent.ah_line == line_str,
+                    H3bTemporalReversalEvent.side == side
+                )
+            )
+        )
+        h3b_events = result.scalars().all()
+        
+        if h3b_events:
+            metrics["h3b_reversal_count"] = len(h3b_events)
+            
+            # Pega o último índice de oscilação (mais recente)
+            osc_indices = [e.oscillation_index for e in h3b_events if e.oscillation_index is not None]
+            if osc_indices:
+                metrics["h3b_oscillation_index"] = osc_indices[-1]
+            
+            magnitudes = [e.reversal_magnitude for e in h3b_events if e.reversal_magnitude]
+            if magnitudes:
+                metrics["h3b_max_reversal_magnitude"] = max(magnitudes)
+                metrics["h3b_avg_reversal_magnitude"] = sum(magnitudes) / len(magnitudes)
+    except Exception as e:
+        logger.debug(f"Erro ao buscar H3b: {e}")
+    
+    # ===== H6 - Correlação / Lag =====
+    try:
+        # Busca eventos onde este mercado foi o líder ou o atrasado
+        result = await session.execute(
+            select(H6CorrelationLagEvent).where(
+                and_(
+                    H6CorrelationLagEvent.match_id == match_id,
+                    # Mercado como líder ou atrasado
+                    ((H6CorrelationLagEvent.leader_line == line_str) | 
+                     (H6CorrelationLagEvent.lagged_line == line_str))
+                )
+            )
+        )
+        h6_events = result.scalars().all()
+        
+        if h6_events:
+            metrics["h6_lag_events_count"] = len(h6_events)
+            lags = [e.lag_seconds for e in h6_events if e.lag_seconds]
+            if lags:
+                metrics["h6_avg_lag_seconds"] = sum(lags) / len(lags)
+                metrics["h6_max_lag_seconds"] = max(lags)
+    except Exception as e:
+        logger.debug(f"Erro ao buscar H6: {e}")
+    
+    return metrics
+
+
 async def process_match(
     session,
     match: Match,
@@ -316,6 +469,11 @@ async def process_match(
             clv = opening_odds - closing_odds
             clv_pct = ((opening_odds - closing_odds) / closing_odds) * 100 if closing_odds > 0 else 0
             
+            # Busca métricas de hipóteses
+            hypothesis_metrics = await get_hypothesis_metrics(
+                session, match.id, market_type, line_value, side
+            )
+            
             # Cria resumo
             summary = OddsSummary(
                 match_id=match.id,
@@ -359,6 +517,25 @@ async def process_match(
                 
                 clv=clv,
                 clv_pct=clv_pct,
+                
+                # Métricas de Hipóteses
+                h1_pricing_events_count=hypothesis_metrics["h1_pricing_events_count"],
+                h1_had_arb=hypothesis_metrics["h1_had_arb"],
+                h1_avg_edge=hypothesis_metrics["h1_avg_edge"],
+                h1_max_edge=hypothesis_metrics["h1_max_edge"],
+                
+                h3_line_anomaly_count=hypothesis_metrics["h3_line_anomaly_count"],
+                h3_anomaly_magnitude_max=hypothesis_metrics["h3_anomaly_magnitude_max"],
+                h3_anomaly_magnitude_avg=hypothesis_metrics["h3_anomaly_magnitude_avg"],
+                
+                h3b_reversal_count=hypothesis_metrics["h3b_reversal_count"],
+                h3b_oscillation_index=hypothesis_metrics["h3b_oscillation_index"],
+                h3b_max_reversal_magnitude=hypothesis_metrics["h3b_max_reversal_magnitude"],
+                h3b_avg_reversal_magnitude=hypothesis_metrics["h3b_avg_reversal_magnitude"],
+                
+                h6_lag_events_count=hypothesis_metrics["h6_lag_events_count"],
+                h6_avg_lag_seconds=hypothesis_metrics["h6_avg_lag_seconds"],
+                h6_max_lag_seconds=hypothesis_metrics["h6_max_lag_seconds"],
             )
             
             if not dry_run:
