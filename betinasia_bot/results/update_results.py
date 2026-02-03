@@ -28,45 +28,380 @@ from storage.models import Match, BestOddsHistory
 API_KEY = "2707432f357b84409fd3212f9c1a84a5"
 
 
+import unicodedata
+import re
+from difflib import SequenceMatcher
+
+
+def remove_accents(text: str) -> str:
+    """Remove acentos de uma string."""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def normalize_team_name(name: str) -> str:
-    """Normaliza nome do time para comparacao."""
-    # Remove sufixos comuns
-    suffixes = [" FC", " CF", " SC", " AC", " BC", " United", " City"]
+    """
+    Normaliza nome do time para comparacao.
+    Muito mais agressivo para maximizar matches.
+    """
+    if not name:
+        return ""
+    
     result = name
-    for suffix in suffixes:
+    
+    # Remove acentos
+    result = remove_accents(result)
+    
+    # Lowercase
+    result = result.lower()
+    
+    # Remove sufixos comuns (ordem importa - do mais específico para o mais geral)
+    suffixes_to_remove = [
+        # Sufixos longos primeiro
+        " football club", " futebol clube", " fussball club",
+        " soccer club", " sport club", " sporting club",
+        " athletic club", " atletico clube",
+        " reserves", " reserve", " youth", " u23", " u21", " u19", " u18",
+        " women", " ladies", " feminino",
+        " amateure", " amateur", " amador",
+        # Sufixos médios
+        " united", " city", " town", " county", " rovers", " wanderers",
+        " albion", " athletic", " hotspur", " villa",
+        # Sufixos curtos
+        " fc", " cf", " sc", " ac", " bc", " rc", " cd", " ud", " sd",
+        " fk", " sk", " nk", " bk", " if", " ff",
+        " sv", " vfb", " vfl", " tsv", " tsg", " fsv", " bsc", " bsv",
+        " rcd", " rsd", " afc", " cfc", " sfc",
+        " (rj)", " (sp)", " (mg)", " (ba)", " (pr)", " (rs)",  # Brasil estados
+        " (ksa)", " (uae)", " (jor)", " (qat)",  # Países árabes
+    ]
+    
+    for suffix in suffixes_to_remove:
         result = result.replace(suffix, "")
     
-    # Lowercase e remove espacos extras
-    result = result.lower().strip()
+    # Remove prefixos comuns
+    prefixes_to_remove = [
+        "real ", "deportivo ", "club ", "sporting ", "athletic ",
+        "fc ", "cf ", "sc ", "ac ", "as ", "us ", "ss ",
+        "al ", "al-",  # Times árabes
+    ]
     
-    # Mapeamentos conhecidos
-    mappings = {
-        "man utd": "manchester united",
-        "man city": "manchester city",
-        "spurs": "tottenham",
-        "wolves": "wolverhampton",
-        "brighton": "brighton & hove albion",
-        "newcastle": "newcastle united",
-        "west ham": "west ham united",
-        "nottm forest": "nottingham forest",
-        "nott'm forest": "nottingham forest",
-        "atletico madrid": "atletico de madrid",
-        "atlético madrid": "atletico de madrid",
-        "athletic bilbao": "athletic club",
-        "real sociedad": "real sociedad san sebastian",
-        "bayern munich": "bayern münchen",
-        "bayern munchen": "bayern münchen",
-        "rb leipzig": "rasenballsport leipzig",
-        "psg": "paris saint germain",
-        "paris saint-germain": "paris saint germain",
-    }
+    for prefix in prefixes_to_remove:
+        if result.startswith(prefix):
+            result = result[len(prefix):]
     
-    for k, v in mappings.items():
-        if k in result:
-            result = v
-            break
-            
+    # Remove caracteres especiais, mantém apenas letras e espaços
+    result = re.sub(r'[^a-z\s]', ' ', result)
+    
+    # Remove espaços múltiplos
+    result = ' '.join(result.split())
+    
+    result = result.strip()
+    
     return result
+
+
+# Mapeamentos conhecidos (BetinAsia -> API-Football)
+TEAM_MAPPINGS = {
+    # Inglaterra
+    "man utd": "manchester united",
+    "man city": "manchester city", 
+    "manchester city": "manchester city",
+    "spurs": "tottenham",
+    "tottenham hotspur": "tottenham",
+    "wolves": "wolverhampton",
+    "wolverhampton wanderers": "wolverhampton",
+    "brighton": "brighton",
+    "brighton hove albion": "brighton",
+    "newcastle": "newcastle",
+    "newcastle utd": "newcastle",
+    "west ham": "west ham",
+    "west ham utd": "west ham",
+    "nottm forest": "nottingham forest",
+    "nottingham forest": "nottingham forest",
+    "nott'm forest": "nottingham forest",
+    "arsenal": "arsenal",
+    "chelsea": "chelsea",
+    "liverpool": "liverpool",
+    "everton": "everton",
+    "aston villa": "aston villa",
+    "leeds": "leeds",
+    "leeds utd": "leeds",
+    "bournemouth": "bournemouth",
+    "brentford": "brentford",
+    "fulham": "fulham",
+    "crystal palace": "crystal palace",
+    "leicester": "leicester",
+    "southampton": "southampton",
+    
+    # Espanha
+    "atletico madrid": "atletico madrid",
+    "atletico de madrid": "atletico madrid",
+    "atlético madrid": "atletico madrid",
+    "athletic bilbao": "athletic bilbao",
+    "athletic club": "athletic bilbao",
+    "real sociedad": "real sociedad",
+    "real betis": "real betis",
+    "real madrid": "real madrid",
+    "barcelona": "barcelona",
+    "sevilla": "sevilla",
+    "villarreal": "villarreal",
+    "valencia": "valencia",
+    "osasuna": "osasuna",
+    "celta vigo": "celta vigo",
+    "mallorca": "mallorca",
+    "getafe": "getafe",
+    "girona": "girona",
+    "alaves": "alaves",
+    "cadiz": "cadiz",
+    "almeria": "almeria",
+    "las palmas": "las palmas",
+    "rayo vallecano": "rayo vallecano",
+    "elche": "elche",
+    "levante": "levante",
+    "espanyol": "espanyol",
+    "malaga": "malaga",
+    "mirandes": "mirandes",
+    "oviedo": "oviedo",
+    "real oviedo": "oviedo",
+    
+    # Alemanha  
+    "bayern munich": "bayern munich",
+    "bayern munchen": "bayern munich",
+    "bayern münchen": "bayern munich",
+    "borussia dortmund": "borussia dortmund",
+    "dortmund": "borussia dortmund",
+    "rb leipzig": "rb leipzig",
+    "rasenballsport leipzig": "rb leipzig",
+    "bayer leverkusen": "bayer leverkusen",
+    "leverkusen": "bayer leverkusen",
+    "eintracht frankfurt": "eintracht frankfurt",
+    "frankfurt": "eintracht frankfurt",
+    "wolfsburg": "wolfsburg",
+    "monchengladbach": "monchengladbach",
+    "borussia monchengladbach": "monchengladbach",
+    "werder bremen": "werder bremen",
+    "bremen": "werder bremen",
+    "hoffenheim": "hoffenheim",
+    "tsg hoffenheim": "hoffenheim",
+    "freiburg": "freiburg",
+    "mainz": "mainz",
+    "mainz 05": "mainz",
+    "koln": "koln",
+    "cologne": "koln",
+    "augsburg": "augsburg",
+    "union berlin": "union berlin",
+    "hertha berlin": "hertha berlin",
+    "st pauli": "st pauli",
+    "fc st pauli": "st pauli",
+    "hamburger": "hamburger sv",
+    "hamburg": "hamburger sv",
+    "hsv": "hamburger sv",
+    
+    # Itália
+    "juventus": "juventus",
+    "inter": "inter",
+    "inter milan": "inter",
+    "internazionale": "inter",
+    "ac milan": "ac milan",
+    "milan": "ac milan",
+    "napoli": "napoli",
+    "roma": "roma",
+    "as roma": "roma",
+    "lazio": "lazio",
+    "atalanta": "atalanta",
+    "fiorentina": "fiorentina",
+    "torino": "torino",
+    "bologna": "bologna",
+    "udinese": "udinese",
+    "sassuolo": "sassuolo",
+    "verona": "verona",
+    "hellas verona": "verona",
+    "monza": "monza",
+    "lecce": "lecce",
+    "empoli": "empoli",
+    "cagliari": "cagliari",
+    "genoa": "genoa",
+    "salernitana": "salernitana",
+    "frosinone": "frosinone",
+    
+    # França
+    "psg": "paris saint germain",
+    "paris saint-germain": "paris saint germain",
+    "paris sg": "paris saint germain",
+    "marseille": "marseille",
+    "olympique marseille": "marseille",
+    "lyon": "lyon",
+    "olympique lyon": "lyon",
+    "monaco": "monaco",
+    "lille": "lille",
+    "lens": "lens",
+    "rennes": "rennes",
+    "nice": "nice",
+    "reims": "reims",
+    "montpellier": "montpellier",
+    "toulouse": "toulouse",
+    "strasbourg": "strasbourg",
+    "nantes": "nantes",
+    "brest": "brest",
+    "lorient": "lorient",
+    "clermont": "clermont",
+    "metz": "metz",
+    "le havre": "le havre",
+    
+    # Portugal
+    "benfica": "benfica",
+    "porto": "porto",
+    "fc porto": "porto",
+    "sporting": "sporting cp",
+    "sporting cp": "sporting cp",
+    "sporting lisbon": "sporting cp",
+    "braga": "braga",
+    "sc braga": "braga",
+    "guimaraes": "guimaraes",
+    "vitoria guimaraes": "guimaraes",
+    "casa pia": "casa pia",
+    "avs": "avs",
+    "avs sad": "avs",
+    
+    # Holanda
+    "ajax": "ajax",
+    "psv": "psv",
+    "psv eindhoven": "psv",
+    "feyenoord": "feyenoord",
+    "az alkmaar": "az alkmaar",
+    "az": "az alkmaar",
+    "twente": "twente",
+    "fc twente": "twente",
+    "utrecht": "utrecht",
+    
+    # Rússia
+    "zenit": "zenit",
+    "zenit st petersburg": "zenit",
+    "fk zenit st petersburg": "zenit",
+    "spartak moscow": "spartak moscow",
+    "spartak moskva": "spartak moscow",
+    "cska moscow": "cska moscow",
+    "cska moskva": "cska moscow",
+    "lokomotiv moscow": "lokomotiv moscow",
+    "lokomotiv moskva": "lokomotiv moscow",
+    "dinamo moscow": "dinamo moscow",
+    "dinamo moskva": "dinamo moscow",
+    "fk dinamo moskva": "dinamo moscow",
+    
+    # Turquia
+    "galatasaray": "galatasaray",
+    "fenerbahce": "fenerbahce",
+    "fenerbahçe": "fenerbahce",
+    "besiktas": "besiktas",
+    "trabzonspor": "trabzonspor",
+    "kocaelispor": "kocaelispor",
+    
+    # Áustria
+    "salzburg": "salzburg",
+    "red bull salzburg": "salzburg",
+    "rb salzburg": "salzburg",
+    "rapid wien": "rapid wien",
+    "rapid vienna": "rapid wien",
+    "austria wien": "austria wien",
+    "austria vienna": "austria wien",
+    "lask": "lask",
+    "lask linz": "lask",
+    "spg wels": "spg wels",
+    
+    # Outros
+    "celtic": "celtic",
+    "rangers": "rangers",
+    "anderlecht": "anderlecht",
+    "club brugge": "club brugge",
+    "brugge": "club brugge",
+}
+
+
+def get_mapped_name(name: str) -> str:
+    """Busca nome no mapeamento."""
+    normalized = normalize_team_name(name)
+    
+    # Busca exata no mapeamento
+    if normalized in TEAM_MAPPINGS:
+        return TEAM_MAPPINGS[normalized]
+    
+    # Busca parcial (se o nome normalizado contém uma chave)
+    for key, value in TEAM_MAPPINGS.items():
+        if key in normalized or normalized in key:
+            return value
+    
+    return normalized
+
+
+def similarity_ratio(s1: str, s2: str) -> float:
+    """Calcula similaridade entre duas strings (0-1)."""
+    return SequenceMatcher(None, s1, s2).ratio()
+
+
+def word_overlap_score(s1: str, s2: str) -> float:
+    """Calcula score baseado em palavras em comum."""
+    words1 = set(s1.split())
+    words2 = set(s2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    # Palavras em comum
+    common = words1 & words2
+    
+    # Ignora palavras muito curtas
+    common = {w for w in common if len(w) > 2}
+    
+    if not common:
+        return 0.0
+    
+    # Score = proporção de palavras em comum
+    return len(common) / min(len(words1), len(words2))
+
+
+def match_single_team(name1: str, name2: str, threshold: float = 0.6) -> bool:
+    """
+    Verifica se dois nomes de time correspondem.
+    Usa múltiplas estratégias de matching.
+    """
+    # Normaliza
+    n1 = normalize_team_name(name1)
+    n2 = normalize_team_name(name2)
+    
+    # 1. Match exato após normalização
+    if n1 == n2:
+        return True
+    
+    # 2. Busca no mapeamento
+    m1 = get_mapped_name(name1)
+    m2 = get_mapped_name(name2)
+    if m1 == m2:
+        return True
+    
+    # 3. Um contém o outro
+    if n1 in n2 or n2 in n1:
+        return True
+    if m1 in m2 or m2 in m1:
+        return True
+    
+    # 4. Similaridade de string (fuzzy matching)
+    if similarity_ratio(n1, n2) >= threshold:
+        return True
+    if similarity_ratio(m1, m2) >= threshold:
+        return True
+    
+    # 5. Overlap de palavras significativas
+    if word_overlap_score(n1, n2) >= 0.5:
+        return True
+    
+    # 6. Primeira palavra igual (geralmente o nome principal)
+    words1 = n1.split()
+    words2 = n2.split()
+    if words1 and words2 and len(words1[0]) > 3 and words1[0] == words2[0]:
+        return True
+    
+    return False
 
 
 def match_teams(
@@ -75,23 +410,24 @@ def match_teams(
     api_home: str,
     api_away: str
 ) -> bool:
-    """Verifica se os times correspondem."""
-    b_home = normalize_team_name(betinasia_home)
-    b_away = normalize_team_name(betinasia_away)
-    a_home = normalize_team_name(api_home)
-    a_away = normalize_team_name(api_away)
+    """
+    Verifica se os times correspondem.
+    Usa matching robusto com múltiplas estratégias.
+    """
+    # Match normal
+    home_match = match_single_team(betinasia_home, api_home)
+    away_match = match_single_team(betinasia_away, api_away)
     
-    # Match exato
-    if b_home == a_home and b_away == a_away:
+    if home_match and away_match:
         return True
-        
-    # Match parcial (um nome contem o outro)
-    home_match = (b_home in a_home or a_home in b_home or 
-                  any(w in a_home for w in b_home.split() if len(w) > 3))
-    away_match = (b_away in a_away or a_away in b_away or
-                  any(w in a_away for w in b_away.split() if len(w) > 3))
     
-    return home_match and away_match
+    # Tenta match invertido (caso raro de ordem trocada)
+    # home_inv = match_single_team(betinasia_home, api_away)
+    # away_inv = match_single_team(betinasia_away, api_home)
+    # if home_inv and away_inv:
+    #     return True
+    
+    return False
 
 
 async def update_results(date: str = None, dry_run: bool = False):
