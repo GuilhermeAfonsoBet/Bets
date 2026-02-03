@@ -111,16 +111,16 @@ async def verify_system():
                 else:
                     print(f"\n   ✅ Resultados sendo coletados")
             else:
-                # Verifica na tabela matches
+                # Verifica na tabela matches (campos: home_score, away_score, status)
                 result = await session.execute(text("""
                     SELECT 
                         COUNT(*) as total,
-                        COUNT(CASE WHEN ft_home IS NOT NULL OR status = 'Ended' THEN 1 END) as with_result
+                        COUNT(CASE WHEN home_score IS NOT NULL OR status = 'finished' THEN 1 END) as with_result
                     FROM matches
                 """))
                 row = result.fetchone()
                 print(f"\n   Total de jogos (tabela matches): {row[0]:,}")
-                print(f"   Com resultado (ft_home != NULL ou Ended): {row[1]:,}")
+                print(f"   Com resultado (home_score != NULL ou finished): {row[1]:,}")
                 
                 if row[1] == 0:
                     issues.append("⚠️ Nenhum resultado de jogo encontrado")
@@ -156,11 +156,11 @@ async def verify_system():
                     m.id,
                     m.home_team,
                     m.away_team,
-                    m.ft_home,
-                    m.ft_away,
+                    m.home_score,
+                    m.away_score,
                     (SELECT MAX(scraped_at) FROM best_odds_history WHERE match_id = m.id) as last_odd_time
                 FROM matches m
-                WHERE m.ft_home IS NOT NULL OR m.status = 'Ended'
+                WHERE m.home_score IS NOT NULL OR m.status = 'finished'
                 ORDER BY m.id DESC
                 LIMIT 5
             """))
@@ -247,9 +247,9 @@ async def verify_system():
             
             # Busca um jogo finalizado com dados completos
             result = await session.execute(text("""
-                SELECT m.id, m.home_team, m.away_team, m.ft_home, m.ft_away, m.status
+                SELECT m.id, m.home_team, m.away_team, m.home_score, m.away_score, m.status
                 FROM matches m
-                WHERE m.ft_home IS NOT NULL
+                WHERE m.home_score IS NOT NULL
                 ORDER BY m.id DESC
                 LIMIT 1
             """))
