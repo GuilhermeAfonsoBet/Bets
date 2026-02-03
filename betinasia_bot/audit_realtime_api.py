@@ -68,15 +68,23 @@ class RealtimeAPIAuditor:
         cookies = await self.scraper._context.cookies()
         self.cookies = {c['name']: c['value'] for c in cookies}
         
+        print(f"\nCookies extraídos: {len(self.cookies)}")
+        for name in list(self.cookies.keys())[:10]:
+            print(f"  - {name}: {self.cookies[name][:20]}...")
+        
         # Configura cliente HTTP para API
+        # Usa os mesmos headers que o browser
         self.http_client = httpx.AsyncClient(
             base_url="https://black.betinasia.com",
             cookies=self.cookies,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
                 "Content-Type": "application/json",
                 "Origin": "https://black.betinasia.com",
+                "Referer": "https://black.betinasia.com/sportsbook/football",
+                "X-Requested-With": "XMLHttpRequest",
             },
             timeout=30.0
         )
@@ -101,6 +109,9 @@ class RealtimeAPIAuditor:
         """
         Chama a API de betslip para obter odds reais.
         
+        Usa o próprio browser (Playwright) para fazer a requisição,
+        garantindo que a sessão autenticada seja usada.
+        
         Args:
             event_id: ID do evento (ex: "2026-02-01,22,94")
             bet_type: Tipo de aposta
@@ -111,26 +122,55 @@ class RealtimeAPIAuditor:
         try:
             await asyncio.sleep(self.API_DELAY)  # Rate limit
             
-            response = await self.http_client.post(
-                "/v1/betslips/",
-                json={
-                    "sport": "fb",
-                    "event_id": event_id,
-                    "bet_type": bet_type,
-                    "betslip_type": "normal",
-                    "equivalent_bets": True
+            # Usa o browser para fazer a requisição via JavaScript
+            # Isso garante que todos os cookies e headers da sessão sejam usados
+            result = await self.scraper._page.evaluate("""
+                async (params) => {
+                    try {
+                        const response = await fetch('/v1/betslips/', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                sport: params.sport,
+                                event_id: params.event_id,
+                                bet_type: params.bet_type,
+                                betslip_type: 'normal',
+                                equivalent_bets: true
+                            })
+                        });
+                        
+                        const data = await response.json();
+                        return {
+                            status: response.status,
+                            data: data
+                        };
+                    } catch (e) {
+                        return {
+                            status: 0,
+                            error: e.toString()
+                        };
+                    }
                 }
-            )
+            """, {"sport": "fb", "event_id": event_id, "bet_type": bet_type})
             
-            if response.status_code == 429:
+            if result.get("error"):
+                logger.warning(f"Erro no fetch: {result['error']}")
+                return None
+                
+            status = result.get("status", 0)
+            
+            if status == 429:
                 logger.warning("Rate limited pela API!")
                 return None
                 
-            if response.status_code != 200:
-                logger.warning(f"Erro na API: {response.status_code}")
+            if status != 200:
+                logger.warning(f"Erro na API: {status}")
                 return None
                 
-            return response.json()
+            return result.get("data")
             
         except Exception as e:
             logger.error(f"Erro ao chamar API: {e}")
