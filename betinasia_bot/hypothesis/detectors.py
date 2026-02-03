@@ -602,14 +602,8 @@ class H6CorrelationLagDetector:
                 lag_seconds = (now - self.last_moves[corr_key][0]).total_seconds()
             
             if lag_seconds >= H6_LAG_THRESHOLD_SECONDS:
-                # CORREÇÃO: Só gerar evento quando líder move DOWN
-                # Quando líder DESCE: atrasada ainda está com odd MAIOR
-                # Apostar agora = pegar odd maior antes de descer = CLV positivo
-                # Quando líder SOBE: atrasada ainda está com odd MENOR
-                # Apostar agora = pegar odd menor antes de subir = CLV negativo
-                if direction != "down":
-                    logger.debug(f"H6: Ignorando lag - líder moveu UP (só apostamos quando líder move DOWN)")
-                    continue
+                # NOTA: Análise estatística mostrou que AMBAS as direções (UP e DOWN)
+                # geram CLV positivo significativo. Capturamos eventos em ambas direções.
                 
                 # Determina correlação esperada
                 expected_direction = direction  # mesma direção para mesmo lado
@@ -633,7 +627,6 @@ class H6CorrelationLagDetector:
                     expected_move=magnitude * correlation_coef,
                     correlation_coefficient=correlation_coef,
                     # Dados para análise de valor (apostar no mercado atrasado)
-                    # Apostamos no mesmo lado - a odd vai DESCER, pegamos ela MAIOR agora
                     bet_market_type=market_type,
                     bet_line=adj_line,
                     bet_side=side,
