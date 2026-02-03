@@ -1,7 +1,7 @@
 # Hipóteses de Estratégia - BetinAsia Bot
 
 **Data:** Fevereiro 2026  
-**Versão:** 2.0  
+**Versão:** 3.0  
 **Status:** Em validação
 
 ---
@@ -27,34 +27,120 @@ Para cada hipótese, coletamos eventos (momentos onde a condição da hipótese 
 
 ---
 
-## H1: Precificação Incorreta (Overround Anômalo)
+## H1: Precificação Incorreta
 
 ### O que é?
 
-Detecta quando o overround (margem total do mercado) está anormalmente baixo ou quando há arbitragem.
+Detecta inconsistências na precificação de mercados, incluindo:
+- **Arbitragem:** Overround < 100% (lucro garantido)
+- **Mispricing simples:** Odd de um lado significativamente acima da odd justa
+- **Mispricing cruzado:** Inconsistências entre diferentes tipos de mercado (1X2, AH, OU)
 
-### Por que pode haver valor?
+### Cálculo do Overround
 
-- **Arbitragem (overround < 100%):** Lucro garantido apostando em ambos os lados
-- **Mispricing:** Quando um lado está com odd acima da "odd justa"
+**Para mercados de 2 outcomes (AH, OU):**
+```
+Overround = (1/odd_home) + (1/odd_away)
 
-### Exemplo Prático
+Exemplo AH -0.5:
+- Home: 2.10 → 1/2.10 = 0.476
+- Away: 1.85 → 1/1.85 = 0.541
+- Overround = 0.476 + 0.541 = 1.017 (101.7%)
+```
+
+**Para mercado 1X2 (3 outcomes):**
+```
+Overround = (1/odd_home) + (1/odd_draw) + (1/odd_away)
+
+Exemplo:
+- Home: 2.50 → 1/2.50 = 0.400
+- Draw: 3.20 → 1/3.20 = 0.313
+- Away: 2.90 → 1/2.90 = 0.345
+- Overround = 0.400 + 0.313 + 0.345 = 1.058 (105.8%)
+```
+
+**NOTA:** Nossa implementação atual EXCLUI o mercado 1X2 da detecção H1 porque não coletamos a odd de empate no mesmo registro que Home/Away. Isso será corrigido em versão futura.
+
+### Tipos de Mispricing
+
+#### 1. Arbitragem (Implementado)
+Overround < 100% significa lucro garantido apostando em ambos os lados.
 
 ```
-Mercado AH -0.5:
-- Home: 2.10  → Prob implícita: 47.6%
-- Away: 1.85  → Prob implícita: 54.1%
-- TOTAL: 101.7% (overround normal)
+Exemplo de arbitragem:
+- Home: 2.20 → 45.5%
+- Away: 1.90 → 52.6%
+- TOTAL: 98.1% → ARBITRAGEM!
 
-Mercado com anomalia:
-- Home: 2.20  → Prob implícita: 45.5%
-- Away: 1.90  → Prob implícita: 52.6%
-- TOTAL: 98.1% (ARBITRAGEM!)
+Aposta proporcional:
+- R$100 em Home a 2.20 → retorno R$220
+- R$115 em Away a 1.90 → retorno R$218.50
+- Investimento: R$215 | Retorno garantido: ~R$219
+```
 
-Odds justas (removendo margem):
-- Home justa: 2.10 / 0.981 = 2.14
-- Home real: 2.20
-- Desvio: +2.8% → APOSTAR EM HOME
+#### 2. Mispricing Simples (Implementado)
+Um lado tem odd significativamente acima da odd justa calculada.
+
+```
+Odds justas (sem margem):
+- Fair_home = odd_home * (1/overround)
+- Desvio = (odd_real - odd_justa) / odd_justa
+
+Se desvio > 2%, consideramos mispricing.
+```
+
+#### 3. Mispricing Cruzado entre Mercados (Proposta Futura)
+
+Detectar inconsistências comparando diferentes tipos de mercado que deveriam ter probabilidades relacionadas.
+
+##### 3.1 Comparação 1X2 vs Asian Handicap
+
+A probabilidade de Home ganhar no 1X2 deve ser consistente com o AH 0.0:
+
+```
+1X2:
+- P(Home vencer) = 1/odd_home_1x2
+
+AH 0.0 (Draw No Bet):
+- P(Home vencer ou empatar) = 1/odd_home_ah0
+
+Se P(Home) do 1X2 > P(Home ou empate) do AH 0.0:
+→ INCONSISTÊNCIA! Home no 1X2 está subprecificado
+```
+
+##### 3.2 Comparação 1X2 vs Asian Handicap -0.5
+
+AH -0.5 Home = Home vencer (sem empate):
+
+```
+Deveria ser aproximadamente igual:
+P(Home vencer) ≈ 1/odd_home_1x2 × [1 - P(empate)]
+
+Onde P(empate) pode ser estimada da odd de empate no 1X2.
+```
+
+##### 3.3 Comparação OU vs AH do Favorito
+
+Jogos com expectativa de mais gols geralmente favorecem o time mais forte:
+
+```
+Over 2.5 odds baixas → Expectativa de jogo com gols
+→ Favorito deveria ter odds menores (mais provável vencer)
+
+Se Over 2.5 = 1.70 (muitos gols esperados)
+Mas Favorito AH -0.5 = 2.20 (odds altas para favorito)
+→ Possível inconsistência
+```
+
+##### 3.4 Triangulação 1X2 completa
+
+Com as três odds do 1X2, podemos validar se são consistentes:
+
+```
+P(Home) + P(Draw) + P(Away) = Overround (~105-108%)
+
+Se muito diferente:
+→ Alguma odd está incorreta
 ```
 
 ### Métricas Coletadas
@@ -67,17 +153,16 @@ Odds justas (removendo margem):
 | `recommended_side` | Lado com maior desvio positivo |
 | `recommended_odd` | Odd no momento da detecção |
 
-### Como Validar
+### Status Atual
 
-- Calcular CLV médio dos eventos detectados
-- Comparar ROI de apostar no `recommended_side`
-- Verificar se detecções de arbitragem são reais (confirmar odds no site)
+[OK] **Implementado e coletando dados**
+- Detecta arbitragem e mispricing simples para AH e OU
+- Mercado 1X2 excluído temporariamente (precisa coletar odd de empate junto)
 
-### Status
-
-✅ **Implementado e coletando dados**
-- 43k+ eventos detectados
-- Próximo passo: análise de CLV
+**Próximos passos:**
+1. Incluir odd de empate na coleta para calcular overround de 1X2 corretamente
+2. Implementar detecção de mispricing cruzado entre mercados
+3. Análise de CLV dos eventos detectados
 
 ---
 
@@ -136,8 +221,9 @@ A linha -0.75 está pagando MAIS que -0.5, mas deveria pagar MENOS.
 
 ### Status
 
-✅ **Implementado e coletando dados**
-- 585 eventos detectados
+[OK] **Implementado e coletando dados**
+- Detecta inversões entre linhas adjacentes
+- Registra apenas primeira detecção (evita duplicatas)
 - Próximo passo: análise de CLV
 
 ---
@@ -162,7 +248,7 @@ Tempo  | Odd Home | Direção | Status
 10:00  | 1.85     | -       | -
 10:30  | 1.88     | UP      | Tendência de alta
 11:00  | 1.92     | UP      | Streak = 2
-11:30  | 1.90     | DOWN    | REVERSÃO!
+11:30  | 1.90     | DOWN    | REVERSAO!
 
 A odd estava subindo (mercado duvidando do home) e reverteu.
 Possível interpretação: correção de movimento exagerado.
@@ -187,73 +273,68 @@ Possível interpretação: correção de movimento exagerado.
 
 ### Status
 
-✅ **Implementado e coletando dados**
-- 570 eventos detectados
+[OK] **Implementado e coletando dados**
 - Próximo passo: análise de CLV por direção
 
 ---
 
-## H6: Correlação Incompleta entre Mercados (Lag)
+## H6: Inconsistência de Movimento entre Linhas Correlacionadas
 
 ### O que é?
 
-Detecta quando um mercado move mas mercados correlacionados NÃO movem junto (ficam "atrasados").
+Detecta quando uma linha de mercado move significativamente mas linhas correlacionadas (adjacentes) NÃO moveram junto no mesmo período.
 
-### Por que mercados devem ser correlacionados?
+### Conceito
 
-```
-Over 2.5 e AH do favorito são correlacionados:
-
-Se Over 2.5 CAI (mercado espera mais gols):
-→ Provavelmente o favorito vai ganhar por mais
-→ AH -0.5 do favorito deveria CAIR também
-
-Se AH -0.5 do favorito ainda não moveu:
-→ Está "atrasado" (lag)
-→ Oportunidade de apostar antes que corrija
-```
+Entre dois ciclos de coleta, esperamos que linhas correlacionadas movam de forma semelhante. Se uma linha move 5% e a adjacente não move, pode indicar:
+- Ineficiência temporária
+- Oportunidade de apostar na linha "atrasada"
 
 ### Exemplo Prático
 
 ```
-Momento T0:
-- Over 2.5:      1.90
-- AH -0.5 Home:  1.95
+Ciclo N:
+- AH -1.0 Home: 1.90
+- AH -2.0 Home: 1.85
 
-Momento T1 (informação entra no mercado):
-- Over 2.5:      1.80  ⬇️ Moveu -5.3%
-- AH -0.5 Home:  1.95  ⚠️ Ainda não moveu!
+Ciclo N+1:
+- AH -1.0 Home: 2.00 (+5.3%)
+- AH -2.0 Home: 1.86 (+0.5%)
 
-OPORTUNIDADE: Apostar em AH -0.5 Home a 1.95
-(esperando que corrija para ~1.85)
-
-Momento T2 (correção):
-- Over 2.5:      1.80
-- AH -0.5 Home:  1.86  ⬇️ Corrigiu
+A linha -1.0 moveu 5.3%, mas a -2.0 moveu apenas 0.5%.
+Esperaríamos movimento similar nas duas linhas.
+→ Oportunidade: apostar em AH -2.0 Home (ainda não corrigiu)
 ```
 
-### Correlações Monitoradas
+### Implementação Atual
 
-| Mercado Líder | Mercado Correlacionado | Correlação Esperada |
-|---------------|------------------------|---------------------|
-| AH -0.5 Home | AH -0.75 Home | Mesma direção (+0.90) |
-| AH -0.5 Home | AH -0.25 Home | Mesma direção (+0.90) |
-| AH -0.5 Home | AH +0.5 Away | Direção oposta (-0.95) |
-| OU 2.5 Over | OU 2.0 Over | Mesma direção (+0.85) |
+Comparamos **linhas adjacentes do mesmo tipo de mercado:**
 
-### Limitação Atual ⚠️
+| Mercado Líder | Linhas Adjacentes Verificadas |
+|---------------|-------------------------------|
+| AH -1.0 | AH -2.0, AH 0.0, AH -1.5, AH -0.5 |
+| OU 2.5 | OU 3.5, OU 1.5, OU 3.0, OU 2.0 |
 
-**Problema:** Com coleta batch (todos os mercados ao mesmo tempo), não conseguimos detectar o "momento" de lag.
+**Parâmetros:**
+- Movimento mínimo para considerar: 0.3%
+- Tempo de lag para considerar "atrasado": 30 segundos
 
-```
-Coleta a cada 60s:
-- Ciclo 1: Over=1.90, AH=1.95
-- Ciclo 2: Over=1.80, AH=1.86 (ambos já moveram)
+### Proposta Futura: Correlações Entre Tipos de Mercado
 
-Nunca capturamos o momento T1 onde Over moveu mas AH ainda não.
-```
+Atualmente só comparamos linhas do mesmo tipo (AH com AH, OU com OU). 
 
-**Solução necessária:** Coleta em tempo real (streaming) ou intervalo muito menor.
+Uma extensão seria comparar **tipos diferentes** de mercado que são correlacionados:
+
+| Mercado Líder | Mercado Correlacionado | Correlação |
+|---------------|------------------------|------------|
+| OU 2.5 Over | AH -0.5 Favorito | Positiva |
+| OU 2.5 Under | AH +0.5 Underdog | Positiva |
+| 1X2 Home | AH 0.0 Home | Positiva |
+
+**Implementação necessária:**
+1. Identificar qual time é favorito (menor odd no AH)
+2. Mapear correlações entre tipos de mercado
+3. Detectar quando um tipo move e o correlacionado não
 
 ### Métricas Coletadas
 
@@ -261,15 +342,16 @@ Nunca capturamos o momento T1 onde Over moveu mas AH ainda não.
 |-------|-----------|
 | `leader_market/line` | Mercado que moveu primeiro |
 | `lagged_market/line` | Mercado atrasado |
-| `lag_seconds` | Tempo de atraso |
+| `lag_seconds` | Tempo desde último movimento do lagged |
 | `expected_direction` | Direção esperada do movimento |
 | `bet_odd` | Odd do mercado atrasado |
 
 ### Status
 
-⚠️ **Implementado mas com limitações**
-- 0 eventos detectados (devido a coleta batch)
-- Precisa: streaming ou intervalo < 30s
+[OK] **Implementado e coletando dados**
+- Detecta inconsistências entre linhas adjacentes do mesmo tipo
+- Próximo passo: análise de CLV
+- Futuro: adicionar correlações entre tipos de mercado (OU vs AH)
 
 ---
 
@@ -299,7 +381,7 @@ Steam Move = Variação > 5% em < 30 minutos
 
 ### Status
 
-⏳ **Não implementado ainda**
+[PENDENTE] **Não implementado ainda**
 - Precisa: tracking de variação entre coletas consecutivas
 
 ---
@@ -322,7 +404,7 @@ Ligas menores/menos populares são menos eficientes e podem ter mais oportunidad
 |------|----------|---------------------|
 | 1 | Premier League, La Liga, Serie A | Muito eficiente |
 | 2 | Championship, Eredivisie | Eficiente |
-| 3 | League One, 2ª divisão europeia | Menos eficiente |
+| 3 | League One, 2a divisão europeia | Menos eficiente |
 | 4 | National League, ligas menores | Potencialmente ineficiente |
 
 ### Métricas a Analisar
@@ -333,7 +415,7 @@ Ligas menores/menos populares são menos eficientes e podem ter mais oportunidad
 
 ### Status
 
-⏳ **Não implementado ainda**
+[PENDENTE] **Não implementado ainda**
 - Precisa: classificação de ligas por tier
 
 ---
@@ -357,40 +439,49 @@ Não temos dado explícito de "abertura" no site BetinAsia.
 
 ### Status
 
-⏳ **Não implementado ainda**
+[PENDENTE] **Não implementado ainda**
 - Precisa: tracking de "primeira coleta" por jogo
 
 ---
 
 ## Resumo de Status
 
-| Hipótese | Implementado | Coletando | Eventos | Próximo Passo |
-|----------|--------------|-----------|---------|---------------|
-| H1 | ✅ | ✅ | 43k+ | Análise CLV |
-| H3 | ✅ | ✅ | 585 | Análise CLV |
-| H3b | ✅ | ✅ | 570 | Análise CLV |
-| H4 | ❌ | - | - | Implementar |
-| H5 | ❌ | - | - | Classificar ligas |
-| H6 | ⚠️ | ❌ | 0 | Precisa streaming |
-| H7 | ❌ | - | - | Implementar |
+| Hipótese | Implementado | Coletando | Próximo Passo |
+|----------|--------------|-----------|---------------|
+| H1 | [OK] | [OK] | Análise CLV, incluir 1X2 |
+| H3 | [OK] | [OK] | Análise CLV |
+| H3b | [OK] | [OK] | Análise CLV |
+| H4 | [X] | - | Implementar |
+| H5 | [X] | - | Classificar ligas |
+| H6 | [OK] | [OK] | Análise CLV, correlações entre tipos |
+| H7 | [X] | - | Implementar |
 
 ---
 
 ## Próximos Passos
 
-1. **Análise de CLV** para H1, H3, H3b
-   - Rodar `update_hypothesis_results.py` após jogos terminarem
+1. **Análise de CLV** para H1, H3, H3b, H6
+   - Rodar `python -m results.update_hypothesis_results` após jogos terminarem
    - Analisar distribuição de CLV
    - Calcular ROI simulado
 
-2. **Implementar H4 (Steam Moves)**
+2. **Incluir 1X2 corretamente no H1**
+   - Coletar odd de empate no mesmo registro
+   - Implementar cálculo de overround para 3 outcomes
+
+3. **Implementar mispricing cruzado (H1 avançado)**
+   - Comparar 1X2 vs AH 0.0
+   - Comparar OU vs AH do favorito
+
+4. **Implementar correlações entre tipos para H6**
+   - OU vs AH correlacionados
+   - 1X2 vs AH correlacionados
+
+5. **Implementar H4 (Steam Moves)**
    - Tracker de variação entre coletas
 
-3. **Classificar ligas para H5**
+6. **Classificar ligas para H5**
    - Criar tabela de tiers
-
-4. **Avaliar necessidade de streaming para H6**
-   - Alternativa: reduzir intervalo de coleta
 
 ---
 
