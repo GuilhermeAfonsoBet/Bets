@@ -400,6 +400,26 @@ class H3bTemporalReversalDetector:
                 total_moves = len(history) - 1
                 oscillation_idx = self.reversal_counts[key] / total_moves if total_moves > 0 else 0
                 
+                # LÓGICA CORRIGIDA PARA ESCOLHA DO LADO:
+                # - Reversão UP (odd subiu): odd MELHOROU → apostar NESSE lado
+                # - Reversão DOWN (odd desceu): odd PIOROU → apostar no lado OPOSTO
+                if current_direction == "up":
+                    # Odd subiu = melhorou = apostar nesse lado
+                    bet_side = snapshot.side
+                    bet_odd = snapshot.odd
+                else:
+                    # Odd desceu = piorou = apostar no lado OPOSTO
+                    opposite_sides = {
+                        "home": "away",
+                        "away": "home",
+                        "over": "under",
+                        "under": "over",
+                    }
+                    bet_side = opposite_sides.get(snapshot.side, snapshot.side)
+                    # Não temos a odd do lado oposto aqui, então usamos None
+                    # O script de análise vai precisar buscar
+                    bet_odd = None
+                
                 event = H3bTemporalReversalEvent(
                     match_id=snapshot.match_id,
                     market_type=snapshot.market_type,
@@ -414,8 +434,8 @@ class H3bTemporalReversalDetector:
                     num_reversals_1h=self.reversal_counts[key],
                     oscillation_index=oscillation_idx,
                     # Dados para análise de valor
-                    bet_odd=snapshot.odd,
-                    bet_side=snapshot.side,
+                    bet_odd=bet_odd,
+                    bet_side=bet_side,
                 )
         
         # Atualiza direção
@@ -582,6 +602,15 @@ class H6CorrelationLagDetector:
                 lag_seconds = (now - self.last_moves[corr_key][0]).total_seconds()
             
             if lag_seconds >= H6_LAG_THRESHOLD_SECONDS:
+                # CORREÇÃO: Só gerar evento quando líder move DOWN
+                # Quando líder DESCE: atrasada ainda está com odd MAIOR
+                # Apostar agora = pegar odd maior antes de descer = CLV positivo
+                # Quando líder SOBE: atrasada ainda está com odd MENOR
+                # Apostar agora = pegar odd menor antes de subir = CLV negativo
+                if direction != "down":
+                    logger.debug(f"H6: Ignorando lag - líder moveu UP (só apostamos quando líder move DOWN)")
+                    continue
+                
                 # Determina correlação esperada
                 expected_direction = direction  # mesma direção para mesmo lado
                 correlation_coef = 0.90  # default para linhas adjacentes
@@ -604,6 +633,7 @@ class H6CorrelationLagDetector:
                     expected_move=magnitude * correlation_coef,
                     correlation_coefficient=correlation_coef,
                     # Dados para análise de valor (apostar no mercado atrasado)
+                    # Apostamos no mesmo lado - a odd vai DESCER, pegamos ela MAIOR agora
                     bet_market_type=market_type,
                     bet_line=adj_line,
                     bet_side=side,
