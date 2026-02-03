@@ -222,15 +222,22 @@ class ContinuousCollector:
         Salva resultado da coleta no banco de dados.
         
         Estrategia:
+        - APENAS jogos pré-match (kickoff no futuro)
         - Tabela matches: UPSERT (atualiza se existir)
         - Tabela best_odds_history: INSERT (historico)
         - Detectores de hipóteses: analisa e salva eventos
         """
         saved_count = 0
+        skipped_live = 0
         hypothesis_events_count = 0
+        now = datetime.now(timezone.utc)
         
         async with self.db.async_session() as session:
             for match_odds in result.matches:
+                # FILTRO: Apenas jogos pré-match (kickoff no futuro)
+                if match_odds.kickoff_time and match_odds.kickoff_time <= now:
+                    skipped_live += 1
+                    continue  # Pula jogos ao vivo ou já finalizados
                 try:
                     # 1. Salva/atualiza match
                     existing = await session.execute(
@@ -347,6 +354,10 @@ class ContinuousCollector:
         self.total_hypothesis_events += hypothesis_events_count
         if hypothesis_events_count > 0:
             logger.info(f"  → {hypothesis_events_count} eventos de hipóteses detectados")
+        
+        # Log de jogos pulados (ao vivo)
+        if skipped_live > 0:
+            logger.debug(f"  → {skipped_live} jogos ao vivo/finalizados ignorados (apenas pré-match)")
             
         return saved_count
 
