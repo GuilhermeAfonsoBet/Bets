@@ -98,6 +98,7 @@ async def get_closing_odd(
 ) -> Optional[float]:
     """
     Busca a closing line (última odd antes do kickoff).
+    Se não houver odds pré-jogo, usa a última odd disponível como fallback.
     """
     # Determina o campo de odd baseado no lado
     if side in ("home", "over", "side_a"):
@@ -106,14 +107,18 @@ async def get_closing_odd(
         odd_field = BestOddsHistory.best_away_odds
     
     # Constrói a linha para busca
+    # Para OU, a linha pode vir como "15.0" ou "OU_15.0"
     if market_type == "OU":
-        ah_line_search = f"OU_{line}"
+        if not line.startswith("OU_"):
+            ah_line_search = f"OU_{line}"
+        else:
+            ah_line_search = line
     elif market_type == "1X2":
         ah_line_search = "1X2"
     else:
         ah_line_search = line
     
-    # Busca última odd antes do kickoff
+    # Primeiro tenta buscar última odd ANTES do kickoff (closing line real)
     result = await session.execute(
         select(BestOddsHistory)
         .where(
@@ -128,6 +133,22 @@ async def get_closing_odd(
     )
     
     closing = result.scalar_one_or_none()
+    
+    # Fallback: se não há odds pré-jogo, usa a ÚLTIMA odd disponível
+    if not closing:
+        result = await session.execute(
+            select(BestOddsHistory)
+            .where(
+                and_(
+                    BestOddsHistory.match_id == match.id,
+                    BestOddsHistory.ah_line == ah_line_search
+                )
+            )
+            .order_by(BestOddsHistory.scraped_at.desc())
+            .limit(1)
+        )
+        closing = result.scalar_one_or_none()
+    
     if closing:
         if side in ("home", "over", "side_a"):
             return closing.best_home_odds
