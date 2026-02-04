@@ -346,6 +346,8 @@ Vou auditar {self.num_audits} eventos.
         """
         page = self.scraper._page
         
+        total_clicked = 0
+        
         try:
             # Tenta clicar em todos os botões "Show all lines" várias vezes
             for attempt in range(3):
@@ -371,16 +373,21 @@ Vou auditar {self.num_audits} eventos.
                                     await btn.click()
                                     await page.wait_for_timeout(800)
                                     buttons_clicked += 1
+                                    total_clicked += 1
                             except:
                                 continue
                     except:
                         continue
                 
                 if buttons_clicked > 0:
-                    print(f"    Expandiu {buttons_clicked} seções")
                     await page.wait_for_timeout(500)
                 else:
                     break  # Não encontrou mais botões
+            
+            if total_clicked > 0:
+                print(f"    Expandiu {total_clicked} seções")
+            else:
+                print(f"    Nenhum botão 'Show all' encontrado (pode já estar expandido)")
                     
         except Exception as e:
             logger.debug(f"Erro ao expandir linhas: {e}")
@@ -452,11 +459,38 @@ Vou auditar {self.num_audits} eventos.
             
             if not target_odd:
                 print(f"    Não encontrou odd alvo no texto da página")
-                # Debug: mostra linhas que contêm as variantes
+                
+                # Debug avançado: mostra o que tem na página
+                print(f"    === DEBUG ===")
+                
+                # Verifica se tem Asian Handicap
+                if "Asian Handicap" in body_text:
+                    print(f"    Seção 'Asian Handicap' encontrada")
+                    # Extrai seção AH
+                    ah_start = body_text.find("Asian Handicap")
+                    ah_section = body_text[ah_start:ah_start+2000]
+                    print(f"    Primeiras linhas AH:")
+                    for i, l in enumerate(ah_section.split('\n')[:15]):
+                        if l.strip():
+                            print(f"      {i}: {l.strip()[:60]}")
+                else:
+                    print(f"    AVISO: Seção 'Asian Handicap' NÃO encontrada!")
+                
+                # Mostra linhas que parecem ser handicaps (números negativos)
+                print(f"\n    Linhas com handicaps negativos:")
+                for l in body_text.split('\n'):
+                    l_stripped = l.strip()
+                    if re.match(r'^-\d', l_stripped) and len(l_stripped) < 100:
+                        print(f"      {l_stripped[:70]}")
+                
+                # Mostra linhas que contêm as variantes
+                print(f"\n    Linhas contendo variantes buscadas:")
                 for variant in line_variants:
-                    matches = [l for l in body_text.split('\n') if variant in l][:3]
+                    matches = [l.strip() for l in body_text.split('\n') if variant in l][:2]
                     for m in matches:
-                        print(f"      Linha com {variant}: {m[:80]}...")
+                        print(f"      [{variant}]: {m[:70]}...")
+                
+                print(f"    === FIM DEBUG ===")
                 return False
             
             # === ESTRATÉGIA 1: Query selector direto + clique no pai (como no scraper) ===
