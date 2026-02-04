@@ -282,34 +282,47 @@ Vou auditar {self.num_audits} eventos.
             # Formata a linha para o padrão do site (usa vírgula)
             line_display = line.replace(".", ",")
             
-            # Tenta clicar com retry (atualizações podem causar falhas)
+            # Tenta clicar com retry robusto (refresh + re-expand entre tentativas)
             click_result = None
-            for attempt in range(3):
+            max_attempts = 5  # Mais tentativas para dar tempo da linha aparecer
+            
+            for attempt in range(max_attempts):
                 click_result = await self._click_specific_odd(line_display, side)
-                
-                # Se a linha não existe mais, não adianta tentar de novo
-                if click_result == "LINE_NOT_AVAILABLE":
-                    return AuditResult(
-                        timestamp=datetime.now(timezone.utc),
-                        match_info=match_info,
-                        event_id=event_id,
-                        line=line,
-                        side=side,
-                        websocket_odd=ws_odd,
-                        betslip_best_odd=None,
-                        betslip_limit=None,
-                        difference_pct=None,
-                        status="LINE_NOT_AVAILABLE"
-                    )
                 
                 if click_result == True:
                     break
+                
+                # Se não encontrou, pode ser delay da plataforma
+                remaining = max_attempts - attempt - 1
+                if remaining > 0:
+                    print(f"    Tentativa {attempt + 1}/{max_attempts} falhou, aguardando e recarregando...")
                     
-                print(f"    Tentativa {attempt + 1} falhou, aguardando...")
-                await page.wait_for_timeout(1000)
+                    # Aguarda um pouco (pode ser delay da plataforma)
+                    await page.wait_for_timeout(2000)
+                    
+                    # A cada 2 tentativas, faz refresh da página
+                    if attempt > 0 and attempt % 2 == 0:
+                        print(f"    Recarregando página...")
+                        await page.reload()
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(2000)
+                        
+                        # Re-encontra o jogo
+                        game_found = await self._find_and_click_game(home_team, away_team)
+                        if not game_found:
+                            print(f"    Jogo não encontrado após reload")
+                            continue
+                        
+                        await page.wait_for_timeout(1500)
+                    
+                    # Re-expande as linhas
+                    print(f"    Re-expandindo linhas...")
+                    await self._expand_all_lines()
+                    await page.wait_for_timeout(1000)
             
             if click_result != True:
-                print(f"    ERRO: Não conseguiu clicar na odd")
+                # Após todas as tentativas, confirma que a linha não existe
+                print(f"    LINHA CONFIRMADA COMO NÃO DISPONÍVEL após {max_attempts} tentativas")
                 return AuditResult(
                     timestamp=datetime.now(timezone.utc),
                     match_info=match_info,
@@ -320,7 +333,7 @@ Vou auditar {self.num_audits} eventos.
                     betslip_best_odd=None,
                     betslip_limit=None,
                     difference_pct=None,
-                    status="CLICK_FAILED"
+                    status="LINE_NOT_AVAILABLE"
                 )
             
             await self.scraper._page.wait_for_timeout(2000)
@@ -606,12 +619,12 @@ Vou auditar {self.num_audits} eventos.
                         if l_stripped not in available_lines:
                             available_lines.append(l_stripped)
                 
-                print(f"    LINHA NÃO DISPONÍVEL!")
+                print(f"    Linha não encontrada nesta tentativa")
                 print(f"    Buscando: {line_variants}")
-                print(f"    Linhas AH disponíveis: {available_lines[:20]}")
+                print(f"    Linhas AH disponíveis: {available_lines[:15]}")
                 
-                # Retorna indicador especial para linha não disponível
-                return "LINE_NOT_AVAILABLE"
+                # Retorna False para tentar novamente (não LINE_NOT_AVAILABLE ainda)
+                return False
             
             # === ESTRATÉGIA 1: Query selector direto + clique no pai (como no scraper) ===
             print(f"    Estratégia 1: buscando span com texto '{target_odd}'")
