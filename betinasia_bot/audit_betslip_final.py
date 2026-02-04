@@ -334,7 +334,7 @@ Vou auditar {self.num_audits} eventos.
         Estrutura do BetinAsia (dos prints):
         | -0,5  | Home | 2.394 | Away | 1.700 |
         
-        As odds são elementos clicáveis (spans com cor azul/laranja).
+        Usa múltiplas estratégias de clique para robustez.
         """
         page = self.scraper._page
         
@@ -345,110 +345,205 @@ Vou auditar {self.num_audits} eventos.
             # Possíveis formatos da linha no site
             line_variants = []
             if line_float == int(line_float):
-                # Inteiro: pode aparecer como "0", "+0", "-10", etc
-                line_variants.append(str(int(line_float)))
-                if line_float >= 0:
-                    line_variants.append(f"+{int(line_float)}")
-                line_variants.append(f"{int(line_float)},0")
-                line_variants.append(f"{int(line_float)}.0")
+                int_val = int(line_float)
+                # Formatos com sinal
+                if int_val > 0:
+                    line_variants.extend([f"+{int_val}", f"+{int_val},0", f"+{int_val}.0"])
+                elif int_val < 0:
+                    line_variants.extend([str(int_val), f"{int_val},0", f"{int_val}.0"])
+                else:
+                    line_variants.extend(["0", "+0", "0,0", "0.0", "+0.0", "+0,0"])
             else:
-                # Decimal: "-0.5" pode aparecer como "-0,5"
+                # Decimal
                 line_variants.append(line.replace(".", ","))
                 line_variants.append(line)
+                # Com sinal explícito se positivo
+                if line_float > 0 and not line.startswith("+"):
+                    line_variants.append("+" + line.replace(".", ","))
+                    line_variants.append("+" + line)
             
             print(f"    Procurando linha: {line_variants}")
             
-            # JavaScript para encontrar a linha e clicar na odd
+            # === ESTRATÉGIA 1: Locator do Playwright ===
+            for variant in line_variants:
+                try:
+                    # Procura span/div que contenha a linha
+                    line_locator = page.locator(f"span:has-text('{variant}'), div:has-text('{variant}')").first
+                    
+                    if await line_locator.count() > 0:
+                        # Encontrou a linha - agora encontra o container com Home/Away
+                        parent = line_locator.locator("xpath=ancestor::div[contains(., 'Home') and contains(., 'Away')]").first
+                        
+                        if await parent.count() > 0:
+                            # Encontra todos os elementos com números decimais (odds)
+                            odd_elements = await parent.locator("span").all()
+                            
+                            for i, el in enumerate(odd_elements):
+                                text = (await el.inner_text()).strip()
+                                
+                                # Verifica se é uma odd (formato X.XX ou X,XX)
+                                if re.match(r'^\d+[.,]\d{2,3}$', text):
+                                    # Determina posição relativa (home = esquerda, away = direita)
+                                    box = await el.bounding_box()
+                                    parent_box = await parent.bounding_box()
+                                    
+                                    if box and parent_box:
+                                        is_left = box['x'] < (parent_box['x'] + parent_box['width'] / 2)
+                                        el_side = 'home' if is_left else 'away'
+                                        
+                                        if el_side == side:
+                                            print(f"    Encontrou odd {text} para {side} (Estratégia 1)")
+                                            await el.scroll_into_view_if_needed()
+                                            await page.wait_for_timeout(200)
+                                            
+                                            # Tenta clicar
+                                            try:
+                                                await el.click()
+                                                await page.wait_for_timeout(1000)
+                                                return True
+                                            except:
+                                                # Tenta clicar no pai
+                                                try:
+                                                    parent_el = el.locator("xpath=..")
+                                                    await parent_el.click()
+                                                    await page.wait_for_timeout(1000)
+                                                    return True
+                                                except:
+                                                    pass
+                except Exception as e:
+                    logger.debug(f"Estratégia 1 falhou para {variant}: {e}")
+                    continue
+            
+            # === ESTRATÉGIA 2: JavaScript mais simples ===
+            print(f"    Tentando Estratégia 2 (JavaScript)")
+            
             clicked = await page.evaluate("""
                 (params) => {
                     const lineVariants = params.lineVariants;
-                    const targetSide = params.side;
+                    const side = params.side;
                     
-                    console.log('Procurando linha:', lineVariants, 'lado:', targetSide);
+                    // Pega todo o texto da página
+                    const bodyText = document.body.innerText;
+                    const lines = bodyText.split('\\n');
                     
-                    // Encontra todas as linhas da tabela de Asian Handicap
-                    const rows = document.querySelectorAll('div, tr');
-                    
-                    for (const row of rows) {
-                        const rowText = row.innerText || '';
+                    // Procura linha que contém a variante + Home + odd + Away + odd
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i].trim();
                         
-                        // Verifica se esta linha contém o handicap que queremos
-                        let foundLine = false;
-                        for (const variant of lineVariants) {
-                            // Procura a linha no início ou após quebra de linha
-                            const lineRegex = new RegExp('(^|\\n)\\s*' + variant.replace(/[+\-.,]/g, '\\$&') + '\\s*(\\n|$|\\s+Home)', 'i');
-                            if (lineRegex.test(rowText) || rowText.trim().startsWith(variant)) {
-                                foundLine = true;
+                        // Verifica se é uma linha de handicap
+                        let hasVariant = false;
+                        for (const v of lineVariants) {
+                            if (line.startsWith(v) || line.includes('\\t' + v) || line.includes(' ' + v)) {
+                                hasVariant = true;
                                 break;
                             }
                         }
                         
-                        if (!foundLine) continue;
+                        if (!hasVariant) continue;
+                        if (!line.includes('Home') || !line.includes('Away')) continue;
                         
-                        // Verifica se tem Home e Away (é uma linha de AH)
-                        if (!rowText.includes('Home') || !rowText.includes('Away')) continue;
+                        // Extrai odds: procura por padrão numérico
+                        const numbers = line.match(/\\d+[.,]\\d{2,3}/g);
+                        if (!numbers || numbers.length < 2) continue;
                         
-                        console.log('Linha encontrada:', rowText.substring(0, 100));
+                        // Em geral: primeiro número após Home é odd home, primeiro após Away é odd away
+                        const homeIdx = line.indexOf('Home');
+                        const awayIdx = line.indexOf('Away');
                         
-                        // Encontra as odds dentro desta linha
-                        // Padrão: Home ODD Away ODD
-                        const oddsMatch = rowText.match(/Home\s*\n?\s*(\d+[.,]\d+)\s*\n?\s*Away\s*\n?\s*(\d+[.,]\d+)/i);
+                        let homeOdd = null, awayOdd = null;
                         
-                        if (!oddsMatch) {
-                            console.log('Não encontrou odds no padrão esperado');
-                            continue;
-                        }
-                        
-                        const homeOdd = oddsMatch[1];
-                        const awayOdd = oddsMatch[2];
-                        const targetOdd = targetSide === 'home' ? homeOdd : awayOdd;
-                        
-                        console.log('Odds encontradas: Home=' + homeOdd + ', Away=' + awayOdd);
-                        console.log('Odd alvo:', targetOdd);
-                        
-                        // Encontra o elemento com essa odd e clica
-                        const elements = row.querySelectorAll('span, button, div, a');
-                        
-                        for (const el of elements) {
-                            const text = (el.innerText || el.textContent || '').trim();
-                            
-                            if (text === targetOdd) {
-                                console.log('Encontrou elemento com odd:', text);
-                                
-                                // Tenta clicar
-                                try {
-                                    el.click();
-                                    console.log('Clicou no elemento');
-                                    return true;
-                                } catch (e) {
-                                    console.log('Erro ao clicar, tentando pai');
-                                    try {
-                                        el.parentElement.click();
-                                        return true;
-                                    } catch (e2) {
-                                        console.log('Erro ao clicar no pai também');
-                                    }
-                                }
+                        for (const num of numbers) {
+                            const numIdx = line.indexOf(num);
+                            if (numIdx > homeIdx && numIdx < awayIdx && !homeOdd) {
+                                homeOdd = num;
+                            } else if (numIdx > awayIdx && !awayOdd) {
+                                awayOdd = num;
                             }
                         }
                         
-                        // Fallback: procura no documento inteiro pelo valor da odd
-                        const allElements = document.querySelectorAll('span, button');
-                        for (const el of allElements) {
-                            const text = (el.innerText || '').trim();
-                            if (text === targetOdd) {
-                                el.click();
-                                return true;
+                        const targetOdd = side === 'home' ? homeOdd : awayOdd;
+                        if (!targetOdd) continue;
+                        
+                        console.log('Encontrou odd alvo:', targetOdd);
+                        
+                        // Encontra e clica no elemento
+                        const allSpans = document.querySelectorAll('span, div, button');
+                        for (const el of allSpans) {
+                            const elText = (el.innerText || '').trim();
+                            if (elText === targetOdd) {
+                                try {
+                                    el.scrollIntoView({block: 'center'});
+                                    el.click();
+                                    return true;
+                                } catch (e) {
+                                    try {
+                                        el.parentElement.click();
+                                        return true;
+                                    } catch (e2) {}
+                                }
                             }
                         }
                     }
                     
-                    console.log('Não conseguiu encontrar/clicar na odd');
                     return false;
                 }
             """, {"lineVariants": line_variants, "side": side})
             
-            return clicked
+            if clicked:
+                await page.wait_for_timeout(1000)
+                return True
+            
+            # === ESTRATÉGIA 3: Query selector direto por texto de odds ===
+            print(f"    Tentando Estratégia 3 (query selector)")
+            
+            # Pega todo texto da página para encontrar odds
+            body_text = await page.inner_text("body")
+            
+            for variant in line_variants:
+                # Procura a linha no texto
+                for line_text in body_text.split('\n'):
+                    if variant in line_text and 'Home' in line_text and 'Away' in line_text:
+                        # Extrai odds
+                        odds = re.findall(r'\d+[.,]\d{2,3}', line_text)
+                        if len(odds) >= 2:
+                            # Determina qual odd é qual
+                            home_idx = line_text.find('Home')
+                            away_idx = line_text.find('Away')
+                            
+                            home_odd = None
+                            away_odd = None
+                            
+                            for odd in odds:
+                                odd_idx = line_text.find(odd)
+                                if odd_idx > home_idx and odd_idx < away_idx:
+                                    home_odd = odd
+                                elif odd_idx > away_idx:
+                                    away_odd = odd
+                            
+                            target_odd = home_odd if side == 'home' else away_odd
+                            
+                            if target_odd:
+                                print(f"    Odd alvo: {target_odd}")
+                                
+                                # Encontra elemento com esse texto
+                                elements = await page.query_selector_all('span, div.odds, button')
+                                
+                                for el in elements:
+                                    try:
+                                        el_text = await el.inner_text()
+                                        if el_text.strip() == target_odd:
+                                            await el.scroll_into_view_if_needed()
+                                            await page.wait_for_timeout(200)
+                                            
+                                            # Clica no pai (mais confiável)
+                                            await el.evaluate("el => el.parentElement.click()")
+                                            await page.wait_for_timeout(1000)
+                                            return True
+                                    except:
+                                        continue
+            
+            print(f"    Nenhuma estratégia funcionou")
+            return False
             
         except Exception as e:
             logger.error(f"Erro ao clicar: {e}")
