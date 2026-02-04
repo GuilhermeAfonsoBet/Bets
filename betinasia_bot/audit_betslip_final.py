@@ -115,12 +115,15 @@ Vou auditar {self.num_audits} eventos.
                 
                 h6_events = await self._find_h6_events(audited)
                 
+                if h6_events:
+                    print(f"\n    → {len(h6_events)} H6 novos para auditar neste ciclo")
+                
                 for h6 in h6_events:
                     if len(self.audit_results) >= self.num_audits:
                         break
                     result = await self._audit_event(h6)
                     self.audit_results.append(result)
-                    audited.add(h6['event_id'])
+                    audited.add(h6['audit_key'])  # Chave única: event_id + linha + lado
                 
                 print(f"\rProcessados: {self.events_processed} | "
                       f"H6: {self.h6_events_detected} | "
@@ -138,6 +141,7 @@ Vou auditar {self.num_audits} eventos.
         """Encontra eventos H6 nas mensagens WebSocket."""
         events = {}
         h6_list = []
+        skipped_already_audited = 0
         
         for msg in self._ws_messages:
             try:
@@ -202,17 +206,26 @@ Vou auditar {self.num_audits} eventos.
                                         
                                         for h6 in det.get("h6_events", []):
                                             self.h6_events_detected += 1
-                                            if event_id not in already_audited:
+                                            # Chave única: event_id + linha + lado
+                                            audit_key = f"{event_id}|{h6.lagged_line}|{h6.lagged_side}"
+                                            if audit_key not in already_audited:
                                                 info = events.get(event_id, {})
                                                 h6_list.append({
                                                     'event_id': event_id,
+                                                    'audit_key': audit_key,
                                                     'match_info': f"{info.get('home', '?')} vs {info.get('away', '?')}",
                                                     'line': str(h6.lagged_line),
                                                     'side': h6.lagged_side,
                                                     'websocket_odd': h6.lagged_current_odd,
                                                 })
+                                            else:
+                                                skipped_already_audited += 1
             except:
                 continue
+        
+        # Debug: mostra estatísticas
+        if skipped_already_audited > 0:
+            print(f"\n    (Pulou {skipped_already_audited} H6 de jogos já auditados)")
                 
         return h6_list
     
