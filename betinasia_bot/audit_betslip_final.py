@@ -105,8 +105,8 @@ Vou auditar {self.num_audits} eventos.
                 self._ws_messages.clear()
                 
                 await self.scraper._page.goto(self.FOOTBALL_URL)
-                await self.scraper._page.wait_for_load_state("networkidle")
-                await self.scraper._page.wait_for_timeout(6000)
+                await self.scraper._page.wait_for_load_state("domcontentloaded")
+                await self.scraper._page.wait_for_timeout(8000)  # Espera WebSocket carregar
                 
                 h6_events = await self._find_h6_events(audited)
                 
@@ -228,8 +228,8 @@ Vou auditar {self.num_audits} eventos.
             # Navega para página do jogo
             game_url = f"https://black.betinasia.com/sportsbook/football/{event_id}"
             await self.scraper._page.goto(game_url)
-            await self.scraper._page.wait_for_load_state("networkidle")
-            await self.scraper._page.wait_for_timeout(2000)
+            await self.scraper._page.wait_for_load_state("domcontentloaded")
+            await self.scraper._page.wait_for_timeout(3000)  # Espera conteúdo carregar
             
             # Clica na odd para abrir betslip
             print(f"    Clicando na odd {line} {side}...")
