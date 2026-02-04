@@ -283,15 +283,32 @@ Vou auditar {self.num_audits} eventos.
             line_display = line.replace(".", ",")
             
             # Tenta clicar com retry (atualizações podem causar falhas)
-            clicked = False
+            click_result = None
             for attempt in range(3):
-                clicked = await self._click_specific_odd(line_display, side)
-                if clicked:
+                click_result = await self._click_specific_odd(line_display, side)
+                
+                # Se a linha não existe mais, não adianta tentar de novo
+                if click_result == "LINE_NOT_AVAILABLE":
+                    return AuditResult(
+                        timestamp=datetime.now(timezone.utc),
+                        match_info=match_info,
+                        event_id=event_id,
+                        line=line,
+                        side=side,
+                        websocket_odd=ws_odd,
+                        betslip_best_odd=None,
+                        betslip_limit=None,
+                        difference_pct=None,
+                        status="LINE_NOT_AVAILABLE"
+                    )
+                
+                if click_result == True:
                     break
+                    
                 print(f"    Tentativa {attempt + 1} falhou, aguardando...")
                 await page.wait_for_timeout(1000)
             
-            if not clicked:
+            if click_result != True:
                 print(f"    ERRO: Não conseguiu clicar na odd")
                 return AuditResult(
                     timestamp=datetime.now(timezone.utc),
@@ -580,40 +597,21 @@ Vou auditar {self.num_audits} eventos.
                     break
             
             if not target_odd:
-                print(f"    Não encontrou odd alvo no texto da página")
-                
-                # Debug avançado: mostra o que tem na página
-                print(f"    === DEBUG ===")
-                
-                # Verifica se tem Asian Handicap
-                if "Asian Handicap" in body_text:
-                    print(f"    Seção 'Asian Handicap' encontrada")
-                    # Extrai seção AH
-                    ah_start = body_text.find("Asian Handicap")
-                    ah_section = body_text[ah_start:ah_start+2000]
-                    print(f"    Primeiras linhas AH:")
-                    for i, l in enumerate(ah_section.split('\n')[:15]):
-                        if l.strip():
-                            print(f"      {i}: {l.strip()[:60]}")
-                else:
-                    print(f"    AVISO: Seção 'Asian Handicap' NÃO encontrada!")
-                
-                # Mostra linhas que parecem ser handicaps (números negativos)
-                print(f"\n    Linhas com handicaps negativos:")
+                # Extrai todas as linhas AH disponíveis
+                available_lines = []
                 for l in body_text.split('\n'):
                     l_stripped = l.strip()
-                    if re.match(r'^-\d', l_stripped) and len(l_stripped) < 100:
-                        print(f"      {l_stripped[:70]}")
+                    # Linhas AH: começam com +/- e número
+                    if re.match(r'^[+-]?\d+([.,]\d+)?$', l_stripped) and len(l_stripped) < 10:
+                        if l_stripped not in available_lines:
+                            available_lines.append(l_stripped)
                 
-                # Mostra linhas que contêm as variantes
-                print(f"\n    Linhas contendo variantes buscadas:")
-                for variant in line_variants:
-                    matches = [l.strip() for l in body_text.split('\n') if variant in l][:2]
-                    for m in matches:
-                        print(f"      [{variant}]: {m[:70]}...")
+                print(f"    LINHA NÃO DISPONÍVEL!")
+                print(f"    Buscando: {line_variants}")
+                print(f"    Linhas AH disponíveis: {available_lines[:20]}")
                 
-                print(f"    === FIM DEBUG ===")
-                return False
+                # Retorna indicador especial para linha não disponível
+                return "LINE_NOT_AVAILABLE"
             
             # === ESTRATÉGIA 1: Query selector direto + clique no pai (como no scraper) ===
             print(f"    Estratégia 1: buscando span com texto '{target_odd}'")
@@ -767,7 +765,7 @@ Vou auditar {self.num_audits} eventos.
         print("RESULTADOS DA AUDITORIA")
         print("=" * 70)
         
-        counts = {"IDENTICAL": 0, "OK": 0, "MINOR_DIFF": 0, "MAJOR_DIFF": 0}
+        counts = {"IDENTICAL": 0, "OK": 0, "MINOR_DIFF": 0, "MAJOR_DIFF": 0, "LINE_NOT_AVAILABLE": 0}
         diffs = []
         errors = 0
         
@@ -784,7 +782,8 @@ Vou auditar {self.num_audits} eventos.
                 
             emoji = {
                 "IDENTICAL": "✅", "OK": "✅", 
-                "MINOR_DIFF": "⚠️", "MAJOR_DIFF": "❌"
+                "MINOR_DIFF": "⚠️", "MAJOR_DIFF": "❌",
+                "LINE_NOT_AVAILABLE": "📉"
             }.get(r.status, "❓")
             print(f"  Status:        {emoji} {r.status}")
             
@@ -800,7 +799,8 @@ Vou auditar {self.num_audits} eventos.
         print(f"  ✅ Idênticas/OK (diff < 0.5%): {counts['IDENTICAL'] + counts['OK']}/{total}")
         print(f"  ⚠️ Diff pequena (0.5-2%):      {counts['MINOR_DIFF']}/{total}")
         print(f"  ❌ Diff grande (>2%):          {counts['MAJOR_DIFF']}/{total}")
-        print(f"  ❓ Erros:                      {errors}/{total}")
+        print(f"  📉 Linha indisponível:         {counts['LINE_NOT_AVAILABLE']}/{total}")
+        print(f"  ❓ Outros erros:               {errors}/{total}")
         
         if diffs:
             print(f"\n  Diferença média: {sum(diffs)/len(diffs):.3f}%")
