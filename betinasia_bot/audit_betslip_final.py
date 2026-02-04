@@ -331,70 +331,122 @@ Vou auditar {self.num_audits} eventos.
         """
         Clica numa odd específica para abrir o betslip.
         
-        A estrutura do BetinAsia é:
-        [LINHA] | Home | [ODD_HOME] | Away | [ODD_AWAY]
+        Estrutura do BetinAsia (dos prints):
+        | -0,5  | Home | 2.394 | Away | 1.700 |
+        
+        As odds são elementos clicáveis (spans com cor azul/laranja).
         """
         page = self.scraper._page
         
         try:
-            # Tenta encontrar a linha e clicar na odd correta
-            clicked = await page.evaluate(f"""
-                () => {{
-                    const targetLine = "{line}";
-                    const targetSide = "{side}";
+            # Formata a linha para diferentes possibilidades
+            line_float = float(line.replace(",", "."))
+            
+            # Possíveis formatos da linha no site
+            line_variants = []
+            if line_float == int(line_float):
+                # Inteiro: pode aparecer como "0", "+0", "-10", etc
+                line_variants.append(str(int(line_float)))
+                if line_float >= 0:
+                    line_variants.append(f"+{int(line_float)}")
+                line_variants.append(f"{int(line_float)},0")
+                line_variants.append(f"{int(line_float)}.0")
+            else:
+                # Decimal: "-0.5" pode aparecer como "-0,5"
+                line_variants.append(line.replace(".", ","))
+                line_variants.append(line)
+            
+            print(f"    Procurando linha: {line_variants}")
+            
+            # JavaScript para encontrar a linha e clicar na odd
+            clicked = await page.evaluate("""
+                (params) => {
+                    const lineVariants = params.lineVariants;
+                    const targetSide = params.side;
                     
-                    // Pega todo o texto da página
-                    const pageText = document.body.innerText;
+                    console.log('Procurando linha:', lineVariants, 'lado:', targetSide);
                     
-                    // Encontra todas as linhas de AH
-                    // Padrão: LINHA seguido de Home ODD Away ODD
-                    const linePattern = new RegExp(
-                        targetLine.replace(/[+-]/g, '\\\\$&') + 
-                        '\\\\s*\\\\n?\\\\s*Home\\\\s*\\\\n?\\\\s*(\\\\d+[,.]\\\\d+)\\\\s*\\\\n?\\\\s*Away\\\\s*\\\\n?\\\\s*(\\\\d+[,.]\\\\d+)',
-                        'i'
-                    );
+                    // Encontra todas as linhas da tabela de Asian Handicap
+                    const rows = document.querySelectorAll('div, tr');
                     
-                    const match = pageText.match(linePattern);
-                    if (!match) {{
-                        console.log('Linha não encontrada:', targetLine);
-                        return false;
-                    }}
-                    
-                    // Encontra o valor da odd que queremos clicar
-                    const targetOdd = targetSide === 'home' ? match[1] : match[2];
-                    console.log('Odd a clicar:', targetOdd);
-                    
-                    // Encontra e clica no elemento com essa odd
-                    const elements = document.querySelectorAll('span, button, div');
-                    for (const el of elements) {{
-                        const text = (el.innerText || '').trim();
-                        if (text === targetOdd) {{
-                            // Verifica se é clicável
-                            const style = window.getComputedStyle(el);
-                            if (style.cursor === 'pointer' || el.tagName === 'BUTTON') {{
+                    for (const row of rows) {
+                        const rowText = row.innerText || '';
+                        
+                        // Verifica se esta linha contém o handicap que queremos
+                        let foundLine = false;
+                        for (const variant of lineVariants) {
+                            // Procura a linha no início ou após quebra de linha
+                            const lineRegex = new RegExp('(^|\\n)\\s*' + variant.replace(/[+\-.,]/g, '\\$&') + '\\s*(\\n|$|\\s+Home)', 'i');
+                            if (lineRegex.test(rowText) || rowText.trim().startsWith(variant)) {
+                                foundLine = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!foundLine) continue;
+                        
+                        // Verifica se tem Home e Away (é uma linha de AH)
+                        if (!rowText.includes('Home') || !rowText.includes('Away')) continue;
+                        
+                        console.log('Linha encontrada:', rowText.substring(0, 100));
+                        
+                        // Encontra as odds dentro desta linha
+                        // Padrão: Home ODD Away ODD
+                        const oddsMatch = rowText.match(/Home\s*\n?\s*(\d+[.,]\d+)\s*\n?\s*Away\s*\n?\s*(\d+[.,]\d+)/i);
+                        
+                        if (!oddsMatch) {
+                            console.log('Não encontrou odds no padrão esperado');
+                            continue;
+                        }
+                        
+                        const homeOdd = oddsMatch[1];
+                        const awayOdd = oddsMatch[2];
+                        const targetOdd = targetSide === 'home' ? homeOdd : awayOdd;
+                        
+                        console.log('Odds encontradas: Home=' + homeOdd + ', Away=' + awayOdd);
+                        console.log('Odd alvo:', targetOdd);
+                        
+                        // Encontra o elemento com essa odd e clica
+                        const elements = row.querySelectorAll('span, button, div, a');
+                        
+                        for (const el of elements) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            
+                            if (text === targetOdd) {
+                                console.log('Encontrou elemento com odd:', text);
+                                
+                                // Tenta clicar
+                                try {
+                                    el.click();
+                                    console.log('Clicou no elemento');
+                                    return true;
+                                } catch (e) {
+                                    console.log('Erro ao clicar, tentando pai');
+                                    try {
+                                        el.parentElement.click();
+                                        return true;
+                                    } catch (e2) {
+                                        console.log('Erro ao clicar no pai também');
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Fallback: procura no documento inteiro pelo valor da odd
+                        const allElements = document.querySelectorAll('span, button');
+                        for (const el of allElements) {
+                            const text = (el.innerText || '').trim();
+                            if (text === targetOdd) {
                                 el.click();
                                 return true;
-                            }}
-                            // Tenta clicar no pai
-                            if (el.parentElement) {{
-                                el.parentElement.click();
-                                return true;
-                            }}
-                        }}
-                    }}
+                            }
+                        }
+                    }
                     
-                    // Fallback: clica em qualquer elemento com a odd
-                    for (const el of elements) {{
-                        const text = (el.innerText || '').trim();
-                        if (text === targetOdd) {{
-                            el.click();
-                            return true;
-                        }}
-                    }}
-                    
+                    console.log('Não conseguiu encontrar/clicar na odd');
                     return false;
-                }}
-            """)
+                }
+            """, {"lineVariants": line_variants, "side": side})
             
             return clicked
             
