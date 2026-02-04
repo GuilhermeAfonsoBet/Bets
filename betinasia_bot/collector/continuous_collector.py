@@ -222,22 +222,29 @@ class ContinuousCollector:
         Salva resultado da coleta no banco de dados.
         
         Estrategia:
-        - APENAS jogos pré-match (kickoff no futuro)
+        - Jogos pré-match E in-match (com flag is_live para distinção)
         - Tabela matches: UPSERT (atualiza se existir)
         - Tabela best_odds_history: INSERT (historico)
-        - Detectores de hipóteses: analisa e salva eventos
+        - Detectores de hipóteses: analisa e salva eventos com is_live flag
         """
         saved_count = 0
-        skipped_live = 0
+        live_count = 0
+        prematch_count = 0
         hypothesis_events_count = 0
         now = datetime.now(timezone.utc)
         
         async with self.db.async_session() as session:
             for match_odds in result.matches:
-                # FILTRO: Apenas jogos pré-match (kickoff no futuro)
-                if match_odds.kickoff_time and match_odds.kickoff_time <= now:
-                    skipped_live += 1
-                    continue  # Pula jogos ao vivo ou já finalizados
+                # Determina se o jogo está ao vivo (in-match) ou é pre-match
+                is_live = False
+                if match_odds.kickoff_time:
+                    is_live = match_odds.kickoff_time <= now
+                
+                if is_live:
+                    live_count += 1
+                else:
+                    prematch_count += 1
+                
                 try:
                     # 1. Salva/atualiza match
                     existing = await session.execute(
@@ -282,6 +289,7 @@ class ContinuousCollector:
                                 line=str(line),
                                 home_odd=odds.home_odds,
                                 away_odd=odds.away_odds,
+                                is_live=is_live,  # Flag para distinguir pre-match vs in-match
                             )
                             hypothesis_events_count += await save_hypothesis_events(session, events)
                     
@@ -304,6 +312,7 @@ class ContinuousCollector:
                                 line=str(line),
                                 home_odd=odds.over_odds,
                                 away_odd=odds.under_odds,
+                                is_live=is_live,  # Flag para distinguir pre-match vs in-match
                             )
                             hypothesis_events_count += await save_hypothesis_events(session, events)
                     
@@ -328,6 +337,7 @@ class ContinuousCollector:
                                 line="1X2",
                                 home_odd=home_odd,
                                 away_odd=away_odd,
+                                is_live=is_live,  # Flag para distinguir pre-match vs in-match
                             )
                             hypothesis_events_count += await save_hypothesis_events(session, events)
                         
@@ -355,9 +365,9 @@ class ContinuousCollector:
         if hypothesis_events_count > 0:
             logger.info(f"  → {hypothesis_events_count} eventos de hipóteses detectados")
         
-        # Log de jogos pulados (ao vivo)
-        if skipped_live > 0:
-            logger.debug(f"  → {skipped_live} jogos ao vivo/finalizados ignorados (apenas pré-match)")
+        # Log de distribuição pre-match vs in-match
+        if live_count > 0 or prematch_count > 0:
+            logger.debug(f"  → Jogos: {prematch_count} pré-match, {live_count} in-match")
             
         return saved_count
 

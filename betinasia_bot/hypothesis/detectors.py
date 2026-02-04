@@ -692,12 +692,22 @@ class HypothesisDetector:
         line: str,
         home_odd: float,
         away_odd: float,
-        timestamp: datetime = None
+        timestamp: datetime = None,
+        is_live: bool = False  # True = in-match, False = pre-match
     ) -> Dict[str, List]:
         """
         Processa atualização de um mercado completo (ambos os lados).
         
         Esta é a função principal para integração com o coletor.
+        
+        Args:
+            match_id: ID do jogo
+            market_type: Tipo de mercado (AH, OU, 1X2)
+            line: Linha do mercado
+            home_odd: Odd do lado home/over
+            away_odd: Odd do lado away/under
+            timestamp: Timestamp da atualização
+            is_live: Se o jogo está ao vivo (in-match) ou é pre-match
         
         Returns:
             Dict com listas de eventos detectados por hipótese.
@@ -711,6 +721,9 @@ class HypothesisDetector:
             "h3b_events": [],
             "h6_events": [],
         }
+        
+        # Guarda is_live para uso nos eventos
+        self._current_is_live = is_live
         
         # Cria snapshots
         market_snap = MarketSnapshot(
@@ -743,6 +756,7 @@ class HypothesisDetector:
         # H1 - Precificação
         h1_event = self.h1_detector.update_market(market_snap)
         if h1_event:
+            h1_event.is_live = is_live  # Adiciona flag is_live
             results["h1_events"].append(h1_event)
             self.event_counts["h1"] += 1
         
@@ -754,6 +768,9 @@ class HypothesisDetector:
             h3_events_away = self.h3_detector.update_line(
                 match_id, line, "away", away_odd
             )
+            # Adiciona flag is_live a todos os eventos H3
+            for event in h3_events_home + h3_events_away:
+                event.is_live = is_live
             results["h3_events"].extend(h3_events_home)
             results["h3_events"].extend(h3_events_away)
             self.event_counts["h3"] += len(h3_events_home) + len(h3_events_away)
@@ -762,15 +779,20 @@ class HypothesisDetector:
         h3b_event_home = self.h3b_detector.update_odd(home_snap)
         h3b_event_away = self.h3b_detector.update_odd(away_snap)
         if h3b_event_home:
+            h3b_event_home.is_live = is_live  # Adiciona flag is_live
             results["h3b_events"].append(h3b_event_home)
             self.event_counts["h3b"] += 1
         if h3b_event_away:
+            h3b_event_away.is_live = is_live  # Adiciona flag is_live
             results["h3b_events"].append(h3b_event_away)
             self.event_counts["h3b"] += 1
         
         # H6 - Correlação/Lag
         h6_events_home = self.h6_detector.update_odd(home_snap)
         h6_events_away = self.h6_detector.update_odd(away_snap)
+        # Adiciona flag is_live a todos os eventos H6
+        for event in h6_events_home + h6_events_away:
+            event.is_live = is_live
         results["h6_events"].extend(h6_events_home)
         results["h6_events"].extend(h6_events_away)
         self.event_counts["h6"] += len(h6_events_home) + len(h6_events_away)

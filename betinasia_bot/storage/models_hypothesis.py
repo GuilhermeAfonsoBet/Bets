@@ -74,6 +74,9 @@ class H1PricingEvent(Base):
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     
+    # Status do jogo no momento da detecção
+    is_live = Column(Boolean, default=False)  # True = in-match, False = pre-match
+    
     # Relacionamento
     match = relationship("Match", backref="h1_pricing_events")
     
@@ -83,6 +86,7 @@ class H1PricingEvent(Base):
         Index("idx_h1_is_arb", "is_arb"),
         Index("idx_h1_clv", "clv_pct"),
         Index("idx_h1_result", "bet_result"),
+        Index("idx_h1_is_live", "is_live"),
     )
 
 
@@ -137,6 +141,9 @@ class H3LineMonotonicityEvent(Base):
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     
+    # Status do jogo no momento da detecção
+    is_live = Column(Boolean, default=False)  # True = in-match, False = pre-match
+    
     # Relacionamento
     match = relationship("Match", backref="h3_line_events")
     
@@ -145,6 +152,7 @@ class H3LineMonotonicityEvent(Base):
         Index("idx_h3_detected", "detected_at"),
         Index("idx_h3_clv", "clv_pct"),
         Index("idx_h3_result", "bet_result"),
+        Index("idx_h3_is_live", "is_live"),
     )
 
 
@@ -201,6 +209,9 @@ class H3bTemporalReversalEvent(Base):
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     
+    # Status do jogo no momento da detecção
+    is_live = Column(Boolean, default=False)  # True = in-match, False = pre-match
+    
     # Relacionamento
     match = relationship("Match", backref="h3b_reversal_events")
     
@@ -210,6 +221,7 @@ class H3bTemporalReversalEvent(Base):
         Index("idx_h3b_market", "market_type", "ah_line"),
         Index("idx_h3b_clv", "clv_pct"),
         Index("idx_h3b_result", "bet_result"),
+        Index("idx_h3b_is_live", "is_live"),
     )
 
 
@@ -270,6 +282,9 @@ class H6CorrelationLagEvent(Base):
     # Timestamp
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     
+    # Status do jogo no momento da detecção
+    is_live = Column(Boolean, default=False)  # True = in-match, False = pre-match
+    
     # Relacionamento
     match = relationship("Match", backref="h6_lag_events")
     
@@ -279,6 +294,7 @@ class H6CorrelationLagEvent(Base):
         Index("idx_h6_lag", "lag_seconds"),
         Index("idx_h6_clv", "clv_pct"),
         Index("idx_h6_result", "bet_result"),
+        Index("idx_h6_is_live", "is_live"),
     )
 
 
