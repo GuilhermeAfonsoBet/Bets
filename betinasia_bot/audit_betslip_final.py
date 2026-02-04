@@ -861,7 +861,7 @@ async def main():
     logger.remove()
     logger.add(sys.stderr, level="WARNING")
     
-    auditor = BetslipAuditor(num_audits=5)
+    auditor = BetslipAuditor(num_audits=20)
     await auditor.run_audit()
 
 
