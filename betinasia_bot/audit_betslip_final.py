@@ -225,17 +225,56 @@ Vou auditar {self.num_audits} eventos.
         print(f"    Odd WebSocket: {ws_odd:.3f}")
         
         try:
-            # Navega para página do jogo
-            game_url = f"https://black.betinasia.com/sportsbook/football/{event_id}"
-            print(f"    Navegando para: {game_url}")
-            await self.scraper._page.goto(game_url)
-            await self.scraper._page.wait_for_load_state("domcontentloaded")
-            await self.scraper._page.wait_for_timeout(2000)
+            page = self.scraper._page
             
-            # IMPORTANTE: Expande "Show all lines" para mostrar todas as linhas AH
+            # Extrai nomes dos times
+            teams = match_info.split(' vs ')
+            home_team = teams[0].strip() if len(teams) > 0 else ""
+            away_team = teams[1].strip() if len(teams) > 1 else ""
+            
+            print(f"    Buscando jogo: '{home_team}' vs '{away_team}'")
+            
+            # NOVA ABORDAGEM: Não navega - busca o jogo na página atual
+            # O WebSocket já está enviando dados desta página
+            
+            # Primeiro, tenta encontrar e clicar no jogo específico
+            game_found = await self._find_and_click_game(home_team, away_team)
+            
+            if not game_found:
+                print(f"    Jogo não encontrado na página atual, tentando navegar...")
+                # Fallback: tenta navegar para página geral de futebol e procurar
+                await page.goto("https://black.betinasia.com/sportsbook/football")
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(3000)
+                
+                # Expande e procura novamente
+                await self._expand_all_lines()
+                await page.wait_for_timeout(1500)
+                
+                game_found = await self._find_and_click_game(home_team, away_team)
+            
+            if not game_found:
+                print(f"    ERRO: Jogo não encontrado")
+                return AuditResult(
+                    timestamp=datetime.now(timezone.utc),
+                    match_info=match_info,
+                    event_id=event_id,
+                    line=line,
+                    side=side,
+                    websocket_odd=ws_odd,
+                    betslip_best_odd=None,
+                    betslip_limit=None,
+                    difference_pct=None,
+                    status="GAME_NOT_FOUND"
+                )
+            
+            # Aguarda carregar os detalhes do jogo
+            await page.wait_for_timeout(2000)
+            
+            # Expande linhas do jogo
             print(f"    Expandindo linhas...")
             await self._expand_all_lines()
-            await self.scraper._page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1500)
             
             # Clica na odd para abrir betslip
             print(f"    Clicando na odd {line} {side}...")
@@ -250,7 +289,7 @@ Vou auditar {self.num_audits} eventos.
                 if clicked:
                     break
                 print(f"    Tentativa {attempt + 1} falhou, aguardando...")
-                await self.scraper._page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1000)
             
             if not clicked:
                 print(f"    ERRO: Não conseguiu clicar na odd")
@@ -338,6 +377,89 @@ Vou auditar {self.num_audits} eventos.
                 difference_pct=None,
                 status=f"ERROR: {str(e)[:30]}"
             )
+    
+    async def _find_and_click_game(self, home_team: str, away_team: str) -> bool:
+        """
+        Encontra e clica num jogo específico na página.
+        
+        Args:
+            home_team: Nome do time da casa
+            away_team: Nome do time visitante
+            
+        Returns:
+            True se encontrou e clicou no jogo
+        """
+        page = self.scraper._page
+        
+        try:
+            body_text = await page.inner_text("body")
+            
+            # Verifica se o jogo está na página
+            # Procura pelos nomes dos times (podem estar parciais)
+            home_words = home_team.split()[:2]  # Primeiras 2 palavras
+            away_words = away_team.split()[:2]
+            
+            home_found = any(word in body_text for word in home_words if len(word) > 3)
+            away_found = any(word in body_text for word in away_words if len(word) > 3)
+            
+            if not home_found and not away_found:
+                print(f"    Times não encontrados na página")
+                return False
+            
+            print(f"    Times encontrados: home={home_found}, away={away_found}")
+            
+            # Tenta encontrar um elemento com o nome do time e clicar
+            for team_name in [home_team, away_team]:
+                # Tenta com nome completo primeiro
+                for name_variant in [team_name, team_name.split()[0] if team_name else ""]:
+                    if not name_variant or len(name_variant) < 3:
+                        continue
+                    
+                    try:
+                        # Busca link ou div clicável com o nome do time
+                        selectors = [
+                            f"a:has-text('{name_variant}')",
+                            f"div:has-text('{name_variant}')",
+                            f"span:has-text('{name_variant}')",
+                        ]
+                        
+                        for selector in selectors:
+                            try:
+                                elements = await page.query_selector_all(selector)
+                                
+                                for el in elements[:5]:  # Tenta nos primeiros 5
+                                    try:
+                                        el_text = await el.inner_text()
+                                        
+                                        # Verifica se é o contexto certo (jogo, não menu)
+                                        if len(el_text) < 200:  # Não é um container grande
+                                            # Clica para abrir detalhes do jogo
+                                            await el.scroll_into_view_if_needed()
+                                            await el.click()
+                                            await page.wait_for_timeout(1500)
+                                            
+                                            # Verifica se abriu detalhes do jogo
+                                            new_text = await page.inner_text("body")
+                                            if "Asian Handicap" in new_text:
+                                                print(f"    Clicou no jogo '{name_variant}'")
+                                                return True
+                                    except:
+                                        continue
+                            except:
+                                continue
+                    except:
+                        continue
+            
+            # Se não precisou clicar mas o jogo está visível, retorna True
+            if "Asian Handicap" in body_text and home_found:
+                print(f"    Jogo já está visível na página")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Erro ao buscar jogo: {e}")
+            return False
     
     async def _expand_all_lines(self):
         """
