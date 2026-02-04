@@ -285,6 +285,14 @@ class H6CorrelationLagEvent(Base):
     # Status do jogo no momento da detecção
     is_live = Column(Boolean, default=False)  # True = in-match, False = pre-match
     
+    # === VERIFICAÇÃO / AUDITORIA ===
+    # Permite identificar falsos positivos (odds que não existem de fato)
+    verification_status = Column(String(30))  # NULL=não verificado, VERIFIED=existe, FALSE_POSITIVE=não existe
+    verification_reason = Column(String(50))  # Motivo se falso positivo: LINE_NOT_AVAILABLE, GAME_NOT_FOUND, etc.
+    verified_at = Column(DateTime(timezone=True))  # Quando foi verificado
+    verified_odd = Column(Float)  # Odd real encontrada no betslip (se verificado)
+    verified_diff_pct = Column(Float)  # Diferença % entre WebSocket e betslip
+    
     # Relacionamento
     match = relationship("Match", backref="h6_lag_events")
     
@@ -295,6 +303,7 @@ class H6CorrelationLagEvent(Base):
         Index("idx_h6_clv", "clv_pct"),
         Index("idx_h6_result", "bet_result"),
         Index("idx_h6_is_live", "is_live"),
+        Index("idx_h6_verification", "verification_status"),
     )
 
 

@@ -23,6 +23,10 @@ sys.path.insert(0, '.')
 from scraper.betinasia import BetinAsiaScraper
 from scraper.betslip_extractor import BetslipExtractor, BetslipData
 from hypothesis.detectors import HypothesisDetector
+from storage.database import Database
+from storage.models_hypothesis import H6CorrelationLagEvent
+from storage.models import Match
+from sqlalchemy import select, and_
 
 
 @dataclass
@@ -39,6 +43,7 @@ class AuditResult:
     difference_pct: Optional[float]
     status: str
     betslip_data: Optional[BetslipData] = None
+    db_match_id: Optional[int] = None  # ID no banco de dados para atualizar
 
 
 class BetslipAuditor:
@@ -839,12 +844,45 @@ Vou auditar {self.num_audits} eventos.
             print(f"  Diferença máxima: {max(diffs):.3f}%")
         
         print("\n" + "=" * 70)
+        print("TAXA DE OPORTUNIDADES REAIS")
+        print("=" * 70)
+        
+        # Oportunidades reais = odds que existem de fato (qualquer status exceto falso positivo)
+        real_opportunities = counts['IDENTICAL'] + counts['OK'] + counts['MINOR_DIFF'] + counts['MAJOR_DIFF']
+        false_positives = counts['LINE_NOT_AVAILABLE'] + errors
+        
+        if total > 0:
+            real_rate = real_opportunities / total * 100
+            false_rate = false_positives / total * 100
+            
+            print(f"\n  📊 TAXA DE SUCESSO: {real_rate:.1f}%")
+            print(f"     ({real_opportunities} de {total} eventos H6 têm odds reais)")
+            print(f"\n  📉 FALSOS POSITIVOS: {false_rate:.1f}%")
+            print(f"     ({false_positives} de {total} eventos não existem de fato)")
+            
+            print(f"\n  💡 PARA ESTIMAR OPORTUNIDADES REAIS:")
+            print(f"     Total H6 detectados × {real_rate:.1f}% = oportunidades apostáveis")
+            
+            if diffs:
+                print(f"\n  📈 QUALIDADE DAS ODDS (quando existem):")
+                print(f"     Diferença média WebSocket vs Betslip: {sum(diffs)/len(diffs):.3f}%")
+                
+                # Odds idênticas ou muito próximas
+                accurate = counts['IDENTICAL'] + counts['OK']
+                if real_opportunities > 0:
+                    accuracy_rate = accurate / real_opportunities * 100
+                    print(f"     Taxa de precisão (diff < 0.5%): {accuracy_rate:.1f}%")
+        
+        print("\n" + "=" * 70)
         print("CONCLUSÃO")
         print("=" * 70)
         
-        found = counts['IDENTICAL'] + counts['OK'] + counts['MINOR_DIFF'] + counts['MAJOR_DIFF']
-        if found == 0:
+        if real_opportunities == 0:
             print("❓ Nenhuma auditoria bem sucedida - verificar seletores")
+        elif false_positives > real_opportunities:
+            print(f"⚠️ MAIORIA SÃO FALSOS POSITIVOS ({false_rate:.0f}%)")
+            print("   A maioria das odds detectadas via WebSocket não existe no site.")
+            print("   Pode ser: linhas extremas, mercados removidos, ou delay de dados.")
         elif counts['MAJOR_DIFF'] == 0 and counts['MINOR_DIFF'] == 0:
             print("✅ ODDS DO WEBSOCKET = BEST ODDS DO BETSLIP!")
             print("   Os dados coletados são confiáveis para apostas.")
@@ -852,7 +890,7 @@ Vou auditar {self.num_audits} eventos.
             print("✅ Odds muito próximas (diferenças < 2%)")
             print("   Provavelmente variação normal de mercado.")
         else:
-            pct_major = counts['MAJOR_DIFF'] / found * 100
+            pct_major = counts['MAJOR_DIFF'] / real_opportunities * 100 if real_opportunities > 0 else 0
             print(f"⚠️ {pct_major:.0f}% com diferença > 2%")
             print("   Verificar se WebSocket captura best odds corretamente.")
 
@@ -861,7 +899,7 @@ async def main():
     logger.remove()
     logger.add(sys.stderr, level="WARNING")
     
-    auditor = BetslipAuditor(num_audits=20)
+    auditor = BetslipAuditor(num_audits=50)
     await auditor.run_audit()
 
 
