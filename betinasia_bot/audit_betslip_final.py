@@ -610,18 +610,37 @@ Vou auditar {self.num_audits} eventos.
                     break
             
             if not target_odd:
-                # Extrai todas as linhas AH disponíveis
-                available_lines = []
+                # Extrai todas as linhas AH disponíveis (formato: +X, -X, +X.X, -X,X, 0)
+                # NÃO incluir odds (formato X.XXX com 3 casas decimais)
+                available_lines = set()
                 for l in body_text.split('\n'):
                     l_stripped = l.strip()
-                    # Linhas AH: começam com +/- e número
-                    if re.match(r'^[+-]?\d+([.,]\d+)?$', l_stripped) and len(l_stripped) < 10:
-                        if l_stripped not in available_lines:
-                            available_lines.append(l_stripped)
+                    # Handicaps: +1,5 / -0,5 / +1.5 / -0.5 / 0 / +0 / -1 / +2,25 etc
+                    # NÃO odds: 1.850, 2.100, 6.700 (3 dígitos decimais ou valores > 1.5 sem sinal)
+                    if re.match(r'^[+-]\d+([.,]\d{1,2})?$', l_stripped):  # Com sinal: +1,5, -0,5
+                        available_lines.add(l_stripped)
+                    elif re.match(r'^0([.,]0+)?$', l_stripped):  # Zero: 0, 0.0, 0,0
+                        available_lines.add("0")
+                
+                # Ordena por valor numérico
+                def line_sort_key(x):
+                    try:
+                        return float(x.replace(',', '.').replace('+', ''))
+                    except:
+                        return 0
+                sorted_lines = sorted(available_lines, key=line_sort_key)
                 
                 print(f"    Linha não encontrada nesta tentativa")
                 print(f"    Buscando: {line_variants}")
-                print(f"    Linhas AH disponíveis: {available_lines[:15]}")
+                print(f"    Handicaps AH disponíveis: {sorted_lines}")
+                
+                # Aviso se a linha buscada é muito extrema
+                try:
+                    line_val = abs(float(line.replace(',', '.')))
+                    if line_val > 5:
+                        print(f"    AVISO: Linha {line} é muito extrema - pode não estar visível na interface")
+                except:
+                    pass
                 
                 # Retorna False para tentar novamente (não LINE_NOT_AVAILABLE ainda)
                 return False
