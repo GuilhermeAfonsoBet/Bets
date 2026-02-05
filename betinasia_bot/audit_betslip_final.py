@@ -521,14 +521,15 @@ Vou auditar {self.num_audits} eventos.
         try:
             # Tenta clicar em todos os botões "Show all lines" várias vezes
             for attempt in range(3):
-                # Diferentes seletores para o botão
+                # Seletores em inglês (principal) e português (fallback)
                 selectors = [
                     "text='Show all lines'",
-                    "text='Mostrar todas as linhas'",
                     "text='Show all'",
                     "button:has-text('Show all')",
+                    "button:has-text('Show')",
+                    "[role='button']:has-text('Show')",
+                    "text='Mostrar todas as linhas'",
                     "button:has-text('Mostrar')",
-                    "[role='button']:has-text('Show all')",
                 ]
                 
                 buttons_clicked = 0
