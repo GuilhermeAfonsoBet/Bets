@@ -727,13 +727,12 @@ Vou auditar {self.num_audits} eventos.
                     audit_total_duration_ms=audit_total
                 )
             
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(500)
             
             # === TIMING: Expandir linhas ===
             expand_start = time.time()
             print(f"    Expandindo linhas...")
             await self._expand_all_lines()
-            await page.wait_for_timeout(1500)
             lag_expand_lines = int((time.time() - expand_start) * 1000)
             print(f"    [LAG] Expandir linhas: {lag_expand_lines}ms")
             
@@ -1200,49 +1199,39 @@ Vou auditar {self.num_audits} eventos.
         return False
     
     async def _expand_all_lines(self):
-        """Expande todas as linhas clicando em 'Show all lines'."""
+        """Expande todas as linhas clicando em 'Show all lines' via JavaScript (rápido)."""
         page = self.scraper._page
         
-        total_clicked = 0
-        
         try:
-            for attempt in range(3):
-                # Seletores em inglês (principal) e português (fallback)
-                selectors = [
-                    "text='Show all lines'",
-                    "text='Show all'",
-                    "button:has-text('Show all')",
-                    "button:has-text('Show')",
-                    "[role='button']:has-text('Show')",
-                    "text='Mostrar todas as linhas'",
-                    "button:has-text('Mostrar')",
-                ]
-                
-                buttons_clicked = 0
-                
-                for selector in selectors:
-                    try:
-                        buttons = await page.query_selector_all(selector)
-                        for btn in buttons:
-                            try:
-                                if await btn.is_visible():
-                                    await btn.scroll_into_view_if_needed()
-                                    await btn.click()
-                                    await page.wait_for_timeout(800)
-                                    buttons_clicked += 1
-                                    total_clicked += 1
-                            except:
-                                continue
-                    except:
-                        continue
-                
-                if buttons_clicked > 0:
-                    await page.wait_for_timeout(500)
-                else:
-                    break
+            # Clica em TODOS os botões "Show all" de uma vez via JavaScript
+            result = await page.evaluate("""
+                () => {
+                    let clicked = 0;
+                    
+                    // Procura todos os elementos clicáveis com texto "Show all" / "Show all lines" / "Mostrar"
+                    const allElements = document.querySelectorAll('span, button, div, a, [role="button"]');
+                    
+                    for (const el of allElements) {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        
+                        if ((text === 'show all lines' || text === 'show all' || 
+                             text === 'mostrar todas as linhas' || text === 'mostrar') &&
+                            el.offsetParent !== null) {  // Visível
+                            try {
+                                el.click();
+                                clicked++;
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    return clicked;
+                }
+            """)
             
-            if total_clicked > 0:
-                print(f"    Expandiu {total_clicked} seções")
+            if result > 0:
+                # Espera única para todas as seções carregarem
+                await page.wait_for_timeout(1000)
+                print(f"    Expandiu {result} seções")
             else:
                 print(f"    Nenhum botão 'Show all' encontrado (pode já estar expandido)")
                     
