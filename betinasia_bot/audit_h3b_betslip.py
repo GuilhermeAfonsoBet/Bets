@@ -58,11 +58,23 @@ class AuditResult:
     status: str = ""
     reversal_direction: str = ""  # "up" ou "down"
     
-    # Timing/Lag (em milissegundos)
+    # Timing/Lag GRANULAR (em milissegundos)
     hypothesis_detected_at: Optional[datetime] = None
-    lag_detection_to_click_ms: Optional[int] = None
-    lag_click_to_betslip_ms: Optional[int] = None
-    audit_total_duration_ms: Optional[int] = None
+    
+    # Lag desde detecção até início da auditoria
+    lag_queue_wait_ms: Optional[int] = None  # Tempo esperando na fila (se houver outros eventos antes)
+    
+    # Lags dentro da auditoria
+    lag_find_game_ms: Optional[int] = None  # Tempo para encontrar o jogo na página
+    lag_expand_lines_ms: Optional[int] = None  # Tempo para expandir linhas
+    lag_click_odd_ms: Optional[int] = None  # Tempo para clicar na odd
+    lag_betslip_open_ms: Optional[int] = None  # Tempo para betslip abrir
+    lag_extract_data_ms: Optional[int] = None  # Tempo para extrair dados do betslip
+    
+    # Totais
+    lag_detection_to_click_ms: Optional[int] = None  # Total: detecção → clique
+    lag_click_to_betslip_ms: Optional[int] = None  # Total: clique → dados extraídos
+    audit_total_duration_ms: Optional[int] = None  # Total da auditoria
     
     # Debug
     betslip_data: Optional[BetslipData] = None
@@ -129,12 +141,10 @@ class H3BAuditor:
             return
         
         try:
-            # Determina se é uma oportunidade válida
-            # Regra: conseguiu extrair odd E diferença < 2%
-            is_valid = False
-            if result.betslip_best_odd is not None and result.difference_pct is not None:
-                if abs(result.difference_pct) < 2.0:
-                    is_valid = True
+            # Determina se é uma oportunidade válida (não é falso positivo)
+            # Regra: conseguiu extrair odd do betslip = oportunidade existe na prática
+            # Falso positivo = existe no WebSocket mas não existe no betslip real
+            is_valid = result.betslip_best_odd is not None
             
             # Extrai texto bruto do betslip para debug
             raw_text = None
@@ -231,19 +241,47 @@ Vou auditar {self.num_audits} eventos.
         
         audited = set()
         
+        # Métricas de timing
+        timing_stats = {
+            'page_load': [],
+            'websocket_wait': [],
+            'hypothesis_detection': [],
+            'total_cycle': [],
+        }
+        
         try:
             while len(self.audit_results) < self.num_audits:
+                cycle_start = time.time()
                 self._ws_messages.clear()
                 
+                # === ETAPA 1: Carrega página ===
+                load_start = time.time()
                 await self.scraper._page.goto(self.FOOTBALL_URL)
                 await self.scraper._page.wait_for_load_state("domcontentloaded")
-                await self.scraper._page.wait_for_timeout(8000)
+                load_time = int((time.time() - load_start) * 1000)
+                timing_stats['page_load'].append(load_time)
                 
+                # === ETAPA 2: Espera WebSocket coletar dados ===
+                # OTIMIZAÇÃO: Reduzido de 8s para 5s (mínimo para WebSocket popular)
+                ws_start = time.time()
+                await self.scraper._page.wait_for_timeout(5000)
+                ws_time = int((time.time() - ws_start) * 1000)
+                timing_stats['websocket_wait'].append(ws_time)
+                
+                # === ETAPA 3: Detecta hipóteses ===
+                detect_start = time.time()
                 h3b_events = await self._find_h3b_events(audited)
+                detect_time = int((time.time() - detect_start) * 1000)
+                timing_stats['hypothesis_detection'].append(detect_time)
+                
+                cycle_time = int((time.time() - cycle_start) * 1000)
+                timing_stats['total_cycle'].append(cycle_time)
                 
                 if h3b_events:
-                    print(f"\n    → {len(h3b_events)} H3B novos para auditar neste ciclo")
+                    print(f"\n    → {len(h3b_events)} H3B novos para auditar")
+                    print(f"    [TIMING] Ciclo: {cycle_time}ms (load:{load_time}ms + ws:{ws_time}ms + detect:{detect_time}ms)")
                 
+                # === ETAPA 4: Audita cada evento IMEDIATAMENTE ===
                 for h3b in h3b_events:
                     if len(self.audit_results) >= self.num_audits:
                         break
@@ -262,7 +300,8 @@ Vou auditar {self.num_audits} eventos.
                       f"Auditados: {len(self.audit_results)}/{self.num_audits}", 
                       end="", flush=True)
                 
-                await asyncio.sleep(3)
+                # Pequena pausa entre ciclos
+                await asyncio.sleep(2)
                 
         finally:
             await self.close()
@@ -438,15 +477,165 @@ Vou auditar {self.num_audits} eventos.
                                                 
                                                 if audit_key not in already_audited:
                                                     info = events.get(event_id, {})
+                                                    home_team = info.get('home', '?')
+                                                    away_team = info.get('away', '?')
                                                     h3b_list.append({
                                                         'event_id': event_id,
                                                         'audit_key': audit_key,
-                                                        'match_info': f"{info.get('home', '?')} vs {info.get('away', '?')}",
+                                                        'match_info': f"{home_team} vs {away_team}",
+                                                        'home_team': home_team,
+                                                        'away_team': away_team,
                                                         'market_type': 'OU',
+                                                        'market_period': 'full_time',
                                                         'line': str(h3b.ah_line),
                                                         'side': h3b.side,
                                                         'websocket_odd': h3b.odd_at_reversal,
                                                         'direction': direction,
+                                                        'detected_at': datetime.now(timezone.utc),
+                                                    })
+                                                else:
+                                                    skipped_already_audited += 1
+                                
+                                # Processa AH Half-Time
+                                if 'ah_ht' in msg_data:
+                                    ah_ht_data = msg_data['ah_ht']
+                                    lines = []
+                                    
+                                    if isinstance(ah_ht_data, list) and len(ah_ht_data) >= 2:
+                                        if isinstance(ah_ht_data[0], (int, float)):
+                                            lines = [ah_ht_data]
+                                        elif isinstance(ah_ht_data[0], list):
+                                            lines = ah_ht_data
+                                            
+                                    for line_data in lines:
+                                        if len(line_data) < 2:
+                                            continue
+                                            
+                                        line = line_data[0]
+                                        odds_list = line_data[1] if len(line_data) > 1 else []
+                                        
+                                        home_odds = 0
+                                        away_odds = 0
+                                        
+                                        if isinstance(odds_list, list):
+                                            for o in odds_list:
+                                                if isinstance(o, list) and len(o) >= 2:
+                                                    if o[0] == 'h':
+                                                        home_odds = float(o[1])
+                                                    elif o[0] == 'a':
+                                                        away_odds = float(o[1])
+                                        
+                                        if home_odds > 0 and away_odds > 0:
+                                            self.events_processed += 1
+                                            
+                                            det = self.hypothesis_detector.process_market_update(
+                                                match_id=hash(event_id) % 1000000,
+                                                market_type="AH_HT",
+                                                line=str(line),
+                                                home_odd=home_odds,
+                                                away_odd=away_odds,
+                                            )
+                                            
+                                            for h3b in det.get("h3b_events", []):
+                                                self.h3b_events_detected += 1
+                                                
+                                                direction = h3b.direction_after
+                                                if self.direction_filter != "all" and direction != self.direction_filter:
+                                                    skipped_wrong_direction += 1
+                                                    continue
+                                                
+                                                # Sem filtro de linha extrema para HT
+                                                
+                                                audit_key = f"{event_id}|AH_HT|{h3b.ah_line}|{h3b.side}"
+                                                
+                                                if audit_key not in already_audited:
+                                                    info = events.get(event_id, {})
+                                                    home_team = info.get('home', '?')
+                                                    away_team = info.get('away', '?')
+                                                    h3b_list.append({
+                                                        'event_id': event_id,
+                                                        'audit_key': audit_key,
+                                                        'match_info': f"{home_team} vs {away_team}",
+                                                        'home_team': home_team,
+                                                        'away_team': away_team,
+                                                        'market_type': 'AH',
+                                                        'market_period': 'half_time',
+                                                        'line': str(h3b.ah_line),
+                                                        'side': h3b.side,
+                                                        'websocket_odd': h3b.odd_at_reversal,
+                                                        'direction': direction,
+                                                        'detected_at': datetime.now(timezone.utc),
+                                                    })
+                                                else:
+                                                    skipped_already_audited += 1
+                                
+                                # Processa OU Half-Time
+                                if 'ou_ht' in msg_data:
+                                    ou_ht_data = msg_data['ou_ht']
+                                    lines = []
+                                    
+                                    if isinstance(ou_ht_data, list) and len(ou_ht_data) >= 2:
+                                        if isinstance(ou_ht_data[0], (int, float)):
+                                            lines = [ou_ht_data]
+                                        elif isinstance(ou_ht_data[0], list):
+                                            lines = ou_ht_data
+                                    
+                                    for line_data in lines:
+                                        if len(line_data) < 2:
+                                            continue
+                                        
+                                        line = line_data[0]
+                                        odds_list = line_data[1] if len(line_data) > 1 else []
+                                        
+                                        over_odds = 0
+                                        under_odds = 0
+                                        
+                                        if isinstance(odds_list, list):
+                                            for o in odds_list:
+                                                if isinstance(o, list) and len(o) >= 2:
+                                                    if o[0] == 'o':
+                                                        over_odds = float(o[1])
+                                                    elif o[0] == 'u':
+                                                        under_odds = float(o[1])
+                                        
+                                        if over_odds > 0 and under_odds > 0:
+                                            self.events_processed += 1
+                                            
+                                            det = self.hypothesis_detector.process_market_update(
+                                                match_id=hash(event_id) % 1000000,
+                                                market_type="OU_HT",
+                                                line=str(line),
+                                                home_odd=over_odds,
+                                                away_odd=under_odds,
+                                            )
+                                            
+                                            for h3b in det.get("h3b_events", []):
+                                                self.h3b_events_detected += 1
+                                                
+                                                direction = h3b.direction_after
+                                                if self.direction_filter != "all" and direction != self.direction_filter:
+                                                    skipped_wrong_direction += 1
+                                                    continue
+                                                
+                                                audit_key = f"{event_id}|OU_HT|{h3b.ah_line}|{h3b.side}"
+                                                
+                                                if audit_key not in already_audited:
+                                                    info = events.get(event_id, {})
+                                                    home_team = info.get('home', '?')
+                                                    away_team = info.get('away', '?')
+                                                    h3b_list.append({
+                                                        'event_id': event_id,
+                                                        'audit_key': audit_key,
+                                                        'match_info': f"{home_team} vs {away_team}",
+                                                        'home_team': home_team,
+                                                        'away_team': away_team,
+                                                        'market_type': 'OU',
+                                                        'market_period': 'half_time',
+                                                        'line': str(h3b.ah_line),
+                                                        'side': h3b.side,
+                                                        'websocket_odd': h3b.odd_at_reversal,
+                                                        'direction': direction,
+                                                        'detected_at': datetime.now(timezone.utc),
                                                     })
                                                 else:
                                                     skipped_already_audited += 1
@@ -461,7 +650,7 @@ Vou auditar {self.num_audits} eventos.
         return h3b_list
     
     async def _audit_event(self, h3b: dict) -> AuditResult:
-        """Audita um evento abrindo o betslip."""
+        """Audita um evento abrindo o betslip com medição granular de tempo."""
         # Extrai dados do evento
         event_id = h3b['event_id']
         match_info = h3b['match_info']
@@ -475,17 +664,24 @@ Vou auditar {self.num_audits} eventos.
         direction = h3b['direction']
         detected_at = h3b.get('detected_at', datetime.now(timezone.utc))
         
-        # Início do tracking de tempo
+        # === TIMING: Início da auditoria ===
         audit_start = time.time()
+        
+        # Lag desde detecção até início da auditoria (tempo na fila)
+        lag_queue_wait = int((datetime.now(timezone.utc) - detected_at).total_seconds() * 1000)
         
         print(f"\n\n>>> AUDITANDO H3B ({direction.upper()}): {match_info}")
         print(f"    Event ID: {event_id}")
         print(f"    Mercado: {market_type} {line} {side} ({market_period})")
         print(f"    Odd WebSocket: {ws_odd:.3f}")
+        print(f"    [LAG] Fila (detecção → início auditoria): {lag_queue_wait}ms")
         
-        # Calcula lag desde detecção
-        lag_since_detection = (datetime.now(timezone.utc) - detected_at).total_seconds() * 1000
-        print(f"    Lag desde detecção: {lag_since_detection:.0f}ms")
+        # Variáveis de timing granular
+        lag_find_game = 0
+        lag_expand_lines = 0
+        lag_click_odd = 0
+        lag_betslip_open = 0
+        lag_extract_data = 0
         
         try:
             page = self.scraper._page
@@ -498,6 +694,9 @@ Vou auditar {self.num_audits} eventos.
             
             print(f"    Buscando jogo: '{home_team}' vs '{away_team}'")
             
+            # === TIMING: Buscar jogo ===
+            find_game_start = time.time()
+            
             # Busca o jogo na página atual
             game_found = await self._find_and_click_game(home_team, away_team)
             
@@ -505,15 +704,21 @@ Vou auditar {self.num_audits} eventos.
                 print(f"    Jogo não encontrado na página atual, tentando navegar...")
                 await page.goto("https://black.betinasia.com/sportsbook/football")
                 await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(2000)  # Reduzido de 3000
                 
                 await self._expand_all_lines()
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1000)  # Reduzido de 1500
                 
                 game_found = await self._find_and_click_game(home_team, away_team)
             
+            lag_find_game = int((time.time() - find_game_start) * 1000)
+            
+            print(f"    [LAG] Buscar jogo: {lag_find_game}ms")
+            
             if not game_found:
                 print(f"    ERRO: Jogo não encontrado")
+                audit_total = int((time.time() - audit_start) * 1000)
+                print(f"    [LAG TOTAL] {audit_total}ms")
                 return AuditResult(
                     timestamp=datetime.now(timezone.utc),
                     match_info=match_info,
@@ -528,22 +733,30 @@ Vou auditar {self.num_audits} eventos.
                     status="GAME_NOT_FOUND",
                     reversal_direction=direction,
                     hypothesis_detected_at=detected_at,
-                    audit_total_duration_ms=int((time.time() - audit_start) * 1000)
+                    lag_queue_wait_ms=lag_queue_wait,
+                    lag_find_game_ms=lag_find_game,
+                    audit_total_duration_ms=audit_total
                 )
             
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1000)  # Reduzido de 2000
             
+            # === TIMING: Expandir linhas ===
+            expand_start = time.time()
             print(f"    Expandindo linhas...")
             await self._expand_all_lines()
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(500)  # Reduzido de 1500
+            lag_expand_lines = int((time.time() - expand_start) * 1000)
+            print(f"    [LAG] Expandir linhas: {lag_expand_lines}ms")
             
+            # === TIMING: Clicar na odd ===
+            click_start = time.time()
             print(f"    Clicando na odd {line} {side}...")
             
             line_display = line.replace(".", ",")
             
-            # Tenta clicar com retry
+            # Tenta clicar com retry (máximo 3 tentativas para ser mais rápido)
             click_result = None
-            max_attempts = 5
+            max_attempts = 3  # Reduzido de 5
             
             for attempt in range(max_attempts):
                 click_result = await self._click_specific_odd(line_display, side, market_type)
@@ -554,30 +767,32 @@ Vou auditar {self.num_audits} eventos.
                 remaining = max_attempts - attempt - 1
                 if remaining > 0:
                     print(f"    Tentativa {attempt + 1}/{max_attempts} falhou, aguardando...")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(1000)  # Reduzido de 2000
                     
-                    if attempt > 0 and attempt % 2 == 0:
+                    if attempt > 0:
                         print(f"    Recarregando página...")
                         await page.reload()
                         await page.wait_for_load_state("domcontentloaded")
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(1500)
                         
                         game_found = await self._find_and_click_game(home_team, away_team)
                         if not game_found:
                             continue
                         
-                        await page.wait_for_timeout(1500)
+                        await page.wait_for_timeout(500)
                     
                     print(f"    Re-expandindo linhas...")
                     await self._expand_all_lines()
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)
             
-            # Marca tempo do clique
-            click_time = time.time()
-            lag_detection_to_click = int((click_time - audit_start) * 1000)
+            lag_click_odd = int((time.time() - click_start) * 1000)
+            lag_detection_to_click = lag_queue_wait + lag_find_game + lag_expand_lines + lag_click_odd
+            print(f"    [LAG] Clicar odd: {lag_click_odd}ms")
             
             if click_result != True:
-                print(f"    LINHA CONFIRMADA COMO NÃO DISPONÍVEL após {max_attempts} tentativas")
+                audit_total = int((time.time() - audit_start) * 1000)
+                print(f"    LINHA NÃO DISPONÍVEL após {max_attempts} tentativas")
+                print(f"    [LAG TOTAL] {audit_total}ms")
                 return AuditResult(
                     timestamp=datetime.now(timezone.utc),
                     match_info=match_info,
@@ -592,23 +807,33 @@ Vou auditar {self.num_audits} eventos.
                     status="LINE_NOT_AVAILABLE",
                     reversal_direction=direction,
                     hypothesis_detected_at=detected_at,
+                    lag_queue_wait_ms=lag_queue_wait,
+                    lag_find_game_ms=lag_find_game,
+                    lag_expand_lines_ms=lag_expand_lines,
+                    lag_click_odd_ms=lag_click_odd,
                     lag_detection_to_click_ms=lag_detection_to_click,
-                    audit_total_duration_ms=int((time.time() - audit_start) * 1000)
+                    audit_total_duration_ms=audit_total
                 )
             
-            print(f"    Lag até clique: {lag_detection_to_click}ms")
+            print(f"    [LAG] Detecção → Clique: {lag_detection_to_click}ms")
             
-            await page.wait_for_timeout(2000)
+            # === TIMING: Espera betslip abrir ===
+            betslip_open_start = time.time()
+            await page.wait_for_timeout(1500)  # Reduzido de 2000
+            lag_betslip_open = int((time.time() - betslip_open_start) * 1000)
             
-            # Extrai dados do betslip
+            # === TIMING: Extrai dados do betslip ===
+            extract_start = time.time()
             betslip_data = await self.extractor.extract_best_odd()
+            lag_extract_data = int((time.time() - extract_start) * 1000)
             
-            # Marca tempo da extração
-            extract_time = time.time()
-            lag_click_to_betslip = int((extract_time - click_time) * 1000)
+            lag_click_to_betslip = lag_betslip_open + lag_extract_data
+            print(f"    [LAG] Betslip abrir: {lag_betslip_open}ms, Extrair: {lag_extract_data}ms")
             
             if not betslip_data:
+                audit_total = int((time.time() - audit_start) * 1000)
                 print(f"    ERRO: Não conseguiu extrair dados do betslip")
+                print(f"    [LAG TOTAL] {audit_total}ms")
                 return AuditResult(
                     timestamp=datetime.now(timezone.utc),
                     match_info=match_info,
@@ -623,9 +848,15 @@ Vou auditar {self.num_audits} eventos.
                     status="EXTRACT_FAILED",
                     reversal_direction=direction,
                     hypothesis_detected_at=detected_at,
+                    lag_queue_wait_ms=lag_queue_wait,
+                    lag_find_game_ms=lag_find_game,
+                    lag_expand_lines_ms=lag_expand_lines,
+                    lag_click_odd_ms=lag_click_odd,
+                    lag_betslip_open_ms=lag_betslip_open,
+                    lag_extract_data_ms=lag_extract_data,
                     lag_detection_to_click_ms=lag_detection_to_click,
                     lag_click_to_betslip_ms=lag_click_to_betslip,
-                    audit_total_duration_ms=int((time.time() - audit_start) * 1000)
+                    audit_total_duration_ms=audit_total
                 )
             
             best_odd = betslip_data.best_odd
@@ -635,7 +866,6 @@ Vou auditar {self.num_audits} eventos.
             diff_abs = best_odd - ws_odd
             
             # Classificação por magnitude da diferença
-            # Nota: diferenças grandes são reais (odds se ajustando rapidamente)
             if abs(diff_pct) < 0.1:
                 status = "IDENTICAL"
             elif abs(diff_pct) < 0.5:
@@ -647,11 +877,18 @@ Vou auditar {self.num_audits} eventos.
             
             audit_total = int((time.time() - audit_start) * 1000)
             
-            print(f"    Betslip Best Odd: {best_odd:.3f}")
-            print(f"    Betslip Limite: ${best_limit:,.0f}")
-            print(f"    Diferença: {diff_pct:+.2f}%")
-            print(f"    Status: {status}")
-            print(f"    Lag total: {audit_total}ms (clique: {lag_detection_to_click}ms, extração: {lag_click_to_betslip}ms)")
+            print(f"    ✅ Betslip Best Odd: {best_odd:.3f}")
+            print(f"    💰 Betslip Limite: ${best_limit:,.0f}")
+            print(f"    📊 Diferença: {diff_pct:+.2f}%")
+            print(f"    📋 Status: {status}")
+            print(f"    ⏱️  [LAG BREAKDOWN]")
+            print(f"       Fila: {lag_queue_wait}ms")
+            print(f"       Buscar jogo: {lag_find_game}ms")
+            print(f"       Expandir linhas: {lag_expand_lines}ms")
+            print(f"       Clicar odd: {lag_click_odd}ms")
+            print(f"       Betslip abrir: {lag_betslip_open}ms")
+            print(f"       Extrair dados: {lag_extract_data}ms")
+            print(f"       TOTAL: {audit_total}ms")
             
             # Fecha betslip
             await self.extractor.close_betslip()
@@ -674,6 +911,12 @@ Vou auditar {self.num_audits} eventos.
                 status=status,
                 reversal_direction=direction,
                 hypothesis_detected_at=detected_at,
+                lag_queue_wait_ms=lag_queue_wait,
+                lag_find_game_ms=lag_find_game,
+                lag_expand_lines_ms=lag_expand_lines,
+                lag_click_odd_ms=lag_click_odd,
+                lag_betslip_open_ms=lag_betslip_open,
+                lag_extract_data_ms=lag_extract_data,
                 lag_detection_to_click_ms=lag_detection_to_click,
                 lag_click_to_betslip_ms=lag_click_to_betslip,
                 audit_total_duration_ms=audit_total,
@@ -682,6 +925,7 @@ Vou auditar {self.num_audits} eventos.
             
         except Exception as e:
             logger.error(f"Erro: {e}")
+            audit_total = int((time.time() - audit_start) * 1000)
             return AuditResult(
                 timestamp=datetime.now(timezone.utc),
                 match_info=match_info,
@@ -696,7 +940,7 @@ Vou auditar {self.num_audits} eventos.
                 status=f"ERROR: {str(e)[:30]}",
                 reversal_direction=direction,
                 hypothesis_detected_at=detected_at,
-                audit_total_duration_ms=int((time.time() - audit_start) * 1000)
+                audit_total_duration_ms=audit_total
             )
     
     def _get_team_aliases(self, team_name: str) -> list:
