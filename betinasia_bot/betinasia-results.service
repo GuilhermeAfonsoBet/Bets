@@ -1,15 +1,20 @@
 [Unit]
 Description=BetinAsia Results Updater - Atualiza resultados dos jogos
-After=network.target postgresql.service
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=betbot
 Group=betbot
 WorkingDirectory=/home/betbot/Bets/betinasia_bot
-Environment="PATH=/home/betbot/Bets/betinasia_bot/venv/bin"
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PATH=/home/betbot/Bets/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
 ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
-ExecStart=/home/betbot/Bets/betinasia_bot/venv/bin/python -m results.auto_update_results
+ExecStart=/home/betbot/Bets/venv/bin/python -m results.auto_update_results
 Restart=always
 RestartSec=300
 
@@ -20,6 +25,10 @@ StandardError=append:/home/betbot/Bets/betinasia_bot/logs/results_updater_error.
 # Limites
 TimeoutStopSec=60
 KillMode=mixed
+KillSignal=SIGTERM
+
+# Recursos
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

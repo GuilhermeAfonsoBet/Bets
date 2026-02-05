@@ -37,6 +37,13 @@ class ContinuousCollector:
     
     Roda em loop infinito, coletando odds das principais ligas
     e salvando no banco de dados.
+    
+    Projetado para rodar por semanas sem intervenção:
+    - Auto-restart de browser periodicamente
+    - Reconexão automática em caso de falha
+    - Logging com rotação diária
+    - Métricas de uptime e saúde
+    - Limpeza periódica de memória
     """
     
     # Configuracoes
@@ -44,6 +51,8 @@ class ContinuousCollector:
     MAX_CONSECUTIVE_ERRORS = 5  # erros consecutivos antes de pausa longa
     ERROR_PAUSE_SECONDS = 300  # pausa apos muitos erros (5 min)
     SESSION_REFRESH_INTERVAL = 3600  # reconecta browser a cada 1 hora
+    STATS_LOG_INTERVAL = 100  # log de estatísticas a cada N ciclos
+    MEMORY_CLEANUP_INTERVAL = 500  # limpeza de memória a cada N ciclos
     
     def __init__(self):
         self.collector: Optional[FastCollector] = None
@@ -52,8 +61,10 @@ class ContinuousCollector:
         self.consecutive_errors = 0
         self.total_collections = 0
         self.total_matches_collected = 0
+        self.total_errors = 0
         self.start_time: Optional[datetime] = None
         self.last_collection_time: Optional[datetime] = None
+        self.last_successful_save: Optional[datetime] = None
         self._last_browser_start: Optional[datetime] = None
         
         # Detector de hipóteses
@@ -156,6 +167,14 @@ class ContinuousCollector:
                 # Reset contador de erros
                 self.consecutive_errors = 0
                 
+                # Log periódico de estatísticas
+                if self.total_collections % self.STATS_LOG_INTERVAL == 0:
+                    self._log_periodic_stats()
+                
+                # Limpeza periódica de memória
+                if self.total_collections % self.MEMORY_CLEANUP_INTERVAL == 0:
+                    self._cleanup_memory()
+                
                 # Calcula tempo restante até próximo ciclo
                 cycle_elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                 sleep_time = max(0, self.CYCLE_TIME - cycle_elapsed)
@@ -169,6 +188,7 @@ class ContinuousCollector:
                     
             except Exception as e:
                 self.consecutive_errors += 1
+                self.total_errors += 1
                 logger.error(f"Erro na coleta ({self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}): {e}")
                 
                 if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
@@ -185,6 +205,41 @@ class ContinuousCollector:
                     await asyncio.sleep(30)  # Pausa curta entre retries
                     
         await self.stop()
+    
+    def _log_periodic_stats(self):
+        """Loga estatísticas periódicas de uptime."""
+        if not self.start_time:
+            return
+            
+        uptime = datetime.now(timezone.utc) - self.start_time
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        
+        avg_matches = (self.total_matches_collected / self.total_collections 
+                      if self.total_collections > 0 else 0)
+        error_rate = (self.total_errors / self.total_collections * 100 
+                     if self.total_collections > 0 else 0)
+        
+        logger.info("=" * 50)
+        logger.info("ESTATÍSTICAS PERIÓDICAS")
+        logger.info(f"  Uptime: {days}d {hours}h {minutes}m")
+        logger.info(f"  Ciclos: {self.total_collections}")
+        logger.info(f"  Jogos coletados: {self.total_matches_collected}")
+        logger.info(f"  Média jogos/ciclo: {avg_matches:.1f}")
+        logger.info(f"  Erros totais: {self.total_errors} ({error_rate:.1f}%)")
+        logger.info(f"  Eventos hipóteses: {self.total_hypothesis_events}")
+        
+        if self.last_successful_save:
+            age = (datetime.now(timezone.utc) - self.last_successful_save).total_seconds()
+            logger.info(f"  Último save: {age:.0f}s atrás")
+        logger.info("=" * 50)
+    
+    def _cleanup_memory(self):
+        """Limpeza periódica de memória."""
+        import gc
+        gc.collect()
+        logger.debug("Limpeza de memória executada")
         
     def _should_refresh_browser(self) -> bool:
         """Verifica se deve reiniciar o browser."""
@@ -209,6 +264,8 @@ class ContinuousCollector:
         self.total_collections += 1
         self.total_matches_collected += saved_count
         self.last_collection_time = datetime.now(timezone.utc)
+        if saved_count > 0:
+            self.last_successful_save = datetime.now(timezone.utc)
         
         cycle_duration = (self.last_collection_time - cycle_start).total_seconds()
         

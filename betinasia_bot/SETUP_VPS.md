@@ -1,368 +1,267 @@
 # Guia de Setup da VPS - BetinAsia Bot
 
-Este guia mostra como configurar sua VPS DigitalOcean do zero.
+## Visão Geral
 
-## 1. Primeiro Acesso à VPS
+O sistema coleta odds de futebol do BetinAsia 24/7, rodando como serviço no Linux (systemd). Mesmo que você desconecte do SSH, o bot continua rodando.
 
-### 1.1 Conectando via SSH
+**Serviços:**
+- `betinasia-collector` — Coleta contínua de odds (a cada ~10 segundos)
+- `betinasia-results` — Atualiza resultados dos jogos (a cada 4 horas)
+- `betinasia-xvfb` — Display virtual para o Playwright
 
-Após criar o droplet, você receberá um email com o IP e senha.
+---
 
-**No Windows:**
-- Baixe e instale o [PuTTY](https://www.putty.org/) ou use o Windows Terminal
-- Ou use o PowerShell: `ssh root@SEU_IP_AQUI`
+## Setup Rápido (Recomendado)
 
-**No Mac/Linux:**
+### 1. Conectar na VPS
+
 ```bash
 ssh root@SEU_IP_AQUI
 ```
 
-Na primeira conexão, digite "yes" quando perguntar sobre fingerprint.
-
-### 1.2 Mudando a senha (primeira vez)
-
-O sistema vai pedir para mudar a senha no primeiro login.
-
----
-
-## 2. Configuração Inicial do Servidor
-
-### 2.1 Atualizar o sistema
+### 2. Clonar o repositório
 
 ```bash
-apt update && apt upgrade -y
-```
-
-### 2.2 Instalar dependências do sistema
-
-```bash
-# Ferramentas essenciais
-apt install -y git curl wget htop nano
-
-# Python 3.11+
-apt install -y python3 python3-pip python3-venv python3-dev
-
-# PostgreSQL
-apt install -y postgresql postgresql-contrib
-
-# Redis
-apt install -y redis-server
-
-# Dependências do Playwright (navegador)
-apt install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libasound2
-```
-
-### 2.3 Verificar instalações
-
-```bash
-python3 --version    # Deve ser 3.10+
-psql --version       # PostgreSQL
-redis-cli ping       # Deve responder PONG
-```
-
----
-
-## 3. Configurar PostgreSQL
-
-### 3.1 Criar usuário e banco de dados
-
-```bash
-# Acessar o PostgreSQL
-sudo -u postgres psql
-```
-
-Dentro do prompt do PostgreSQL:
-
-```sql
--- Criar usuário
-CREATE USER betbot WITH PASSWORD 'COLOQUE_UMA_SENHA_SEGURA_AQUI';
-
--- Criar banco de dados
-CREATE DATABASE betinasia_bot OWNER betbot;
-
--- Dar permissões
-GRANT ALL PRIVILEGES ON DATABASE betinasia_bot TO betbot;
-
--- Sair
-\q
-```
-
-### 3.2 Testar conexão
-
-```bash
-psql -U betbot -d betinasia_bot -h localhost
-# Digite a senha quando pedir
-# Se conectar, digite \q para sair
-```
-
----
-
-## 4. Configurar Redis
-
-O Redis já deve estar rodando após a instalação.
-
-```bash
-# Verificar status
-systemctl status redis
-
-# Se não estiver rodando:
-systemctl start redis
-systemctl enable redis  # Iniciar automaticamente no boot
-```
-
----
-
-## 5. Criar Usuário da Aplicação (Segurança)
-
-Não é boa prática rodar aplicações como root.
-
-```bash
-# Criar usuário
+# Criar usuário (se primeira vez)
 adduser betbot
-# Responda as perguntas (ou pressione Enter para pular)
-
-# Dar acesso sudo (opcional, para manutenção)
 usermod -aG sudo betbot
-
-# Mudar para o usuário
 su - betbot
-```
 
----
-
-## 6. Clonar e Configurar o Projeto
-
-### 6.1 Clonar do GitHub
-
-```bash
-# Como usuário betbot
+# Clonar
 cd ~
 git clone https://github.com/SEU_USUARIO/Bets.git
 cd Bets/betinasia_bot
+exit  # Volta para root
 ```
 
-### 6.2 Criar ambiente virtual Python
+### 3. Configurar credenciais
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+# Copiar e editar .env
+sudo -u betbot cp /home/betbot/Bets/betinasia_bot/.env.example /home/betbot/Bets/betinasia_bot/.env
+sudo -u betbot nano /home/betbot/Bets/betinasia_bot/.env
 ```
 
-### 6.3 Instalar dependências
+Preencha obrigatoriamente:
+- `BETINASIA_USERNAME` — Seu usuário do BetinAsia
+- `BETINASIA_PASSWORD` — Sua senha do BetinAsia
+- `DATABASE_URL` — `postgresql://betbot:betbot_secure_2026@localhost:5432/betinasia_bot`
+
+### 4. Executar deploy
 
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Instalar browsers do Playwright
-playwright install chromium
-playwright install-deps
+sudo bash /home/betbot/Bets/betinasia_bot/deploy.sh --full
 ```
 
-### 6.4 Configurar variáveis de ambiente
-
-```bash
-# Copiar arquivo de exemplo
-cp .env.example .env
-
-# Editar com suas configurações
-nano .env
-```
-
-Preencha:
-- `BETINASIA_USERNAME` e `BETINASIA_PASSWORD`
-- `DATABASE_URL` com a senha que criou
-- `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` (opcional)
-
-Salvar: `Ctrl+O`, Enter, `Ctrl+X`
+**Pronto!** O bot está rodando em background.
 
 ---
 
-## 7. Inicializar Banco de Dados
+## Comandos do Dia-a-Dia
 
+### Ver status de tudo
 ```bash
-# Ativar ambiente virtual (se não estiver)
-source venv/bin/activate
-
-# Rodar script de migração
-python -m storage.migrate
+sudo bash /home/betbot/Bets/betinasia_bot/status.sh
 ```
 
----
-
-## 8. Testar a Aplicação
-
-### 8.1 Teste rápido do scraper
-
+### Ver logs em tempo real
 ```bash
-python -m scraper.test_connection
+# Logs do coletor
+sudo journalctl -u betinasia-collector -f
+
+# Ou os arquivos de log
+tail -f /home/betbot/Bets/betinasia_bot/logs/collector.log
 ```
 
-### 8.2 Rodar em modo de desenvolvimento
-
-```bash
-python main.py --dry-run
-```
-
----
-
-## 9. Configurar para Rodar 24/7 (Systemd)
-
-### 9.1 Criar arquivo de serviço
-
-```bash
-sudo nano /etc/systemd/system/betinasia-bot.service
-```
-
-Conteúdo:
-
-```ini
-[Unit]
-Description=BetinAsia Bot
-After=network.target postgresql.service redis.service
-
-[Service]
-Type=simple
-User=betbot
-WorkingDirectory=/home/betbot/Bets/betinasia_bot
-Environment=PATH=/home/betbot/Bets/betinasia_bot/venv/bin
-ExecStart=/home/betbot/Bets/betinasia_bot/venv/bin/python main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 9.2 Ativar e iniciar serviço
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable betinasia-bot
-sudo systemctl start betinasia-bot
-```
-
-### 9.3 Verificar status
-
-```bash
-sudo systemctl status betinasia-bot
-```
-
-### 9.4 Ver logs em tempo real
-
-```bash
-sudo journalctl -u betinasia-bot -f
-```
-
----
-
-## 10. Comandos Úteis
-
-### Gerenciar o serviço
-
+### Controlar serviços
 ```bash
 # Parar
-sudo systemctl stop betinasia-bot
+sudo systemctl stop betinasia-collector
+
+# Iniciar
+sudo systemctl start betinasia-collector
 
 # Reiniciar
-sudo systemctl restart betinasia-bot
+sudo systemctl restart betinasia-collector
 
-# Ver logs
-sudo journalctl -u betinasia-bot -n 100
-
-# Ver logs em tempo real
-sudo journalctl -u betinasia-bot -f
+# Ver status detalhado
+sudo systemctl status betinasia-collector
 ```
 
-### Monitorar o servidor
-
+### Ver estatísticas do banco
 ```bash
-# Uso de CPU/RAM
-htop
-
-# Espaço em disco
-df -h
-
-# Processos Python
-ps aux | grep python
+cd /home/betbot/Bets/betinasia_bot
+source /home/betbot/Bets/venv/bin/activate
+python check_collector_status.py
 ```
 
-### Atualizar código
-
+### Atualizar código do GitHub
 ```bash
-cd ~/Bets
+cd /home/betbot/Bets
 git pull
-sudo systemctl restart betinasia-bot
+sudo bash betinasia_bot/deploy.sh --update
 ```
 
 ---
 
-## 11. Troubleshooting
+## Monitoramento Automático
 
-### Erro de conexão com PostgreSQL
+### Health Check a cada 5 minutos
 
 ```bash
-# Verificar se está rodando
+# Instalar cron de health check
+(sudo crontab -l 2>/dev/null; echo "*/5 * * * * /home/betbot/Bets/betinasia_bot/healthcheck.sh >> /home/betbot/Bets/betinasia_bot/logs/healthcheck.log 2>&1") | sudo crontab -
+```
+
+O health check:
+- Verifica se o serviço está rodando
+- Reinicia automaticamente se parou
+- Verifica se há dados recentes (alerta se > 15 min sem coleta)
+- Verifica espaço em disco
+
+---
+
+## Backup do Banco
+
+```bash
+# Backup manual
+sudo -u betbot pg_dump betinasia_bot > backup_$(date +%Y%m%d_%H%M).sql
+
+# Restaurar
+sudo -u betbot psql betinasia_bot < backup_XXXXXXXX_XXXX.sql
+```
+
+### Backup automático diário
+
+```bash
+# Cria script de backup
+cat > /home/betbot/backup_db.sh << 'EOF'
+#!/bin/bash
+BACKUP_DIR="/home/betbot/backups"
+mkdir -p $BACKUP_DIR
+pg_dump betinasia_bot | gzip > "$BACKUP_DIR/betinasia_$(date +%Y%m%d).sql.gz"
+# Remove backups com mais de 30 dias
+find $BACKUP_DIR -name "*.sql.gz" -mtime +30 -delete
+EOF
+chmod +x /home/betbot/backup_db.sh
+
+# Agenda no cron (diário às 3h)
+(sudo -u betbot crontab -l 2>/dev/null; echo "0 3 * * * /home/betbot/backup_db.sh") | sudo -u betbot crontab -
+```
+
+---
+
+## Troubleshooting
+
+### Bot parou de coletar
+
+```bash
+# 1. Ver status
+sudo systemctl status betinasia-collector
+
+# 2. Ver últimos logs de erro
+tail -50 /home/betbot/Bets/betinasia_bot/logs/collector_error.log
+
+# 3. Ver logs do journald
+sudo journalctl -u betinasia-collector -n 100 --no-pager
+
+# 4. Reiniciar
+sudo systemctl restart betinasia-collector
+```
+
+### Sessão expirou (login)
+
+O Playwright faz login automático. Se persistir:
+
+```bash
+# Para o serviço
+sudo systemctl stop betinasia-collector
+
+# Faz login manual para salvar sessão
+cd /home/betbot/Bets/betinasia_bot
+source /home/betbot/Bets/venv/bin/activate
+DISPLAY=:99 python -c "
+from scraper.betinasia import BetinAsiaScraper
+import asyncio
+async def login():
+    s = BetinAsiaScraper()
+    await s.start()
+    await s.login()
+    await s.close()
+asyncio.run(login())
+"
+
+# Reinicia
+sudo systemctl start betinasia-collector
+```
+
+### Memória alta
+
+```bash
+# Ver uso de memória
+htop
+
+# Reiniciar serviço (limpa memória)
+sudo systemctl restart betinasia-collector
+
+# Limpar dados antigos do banco (opcional)
+cd /home/betbot/Bets/betinasia_bot
+source /home/betbot/Bets/venv/bin/activate
+python cleanup_old_data.py
+```
+
+### PostgreSQL não conecta
+
+```bash
+# Verificar status
 sudo systemctl status postgresql
+
+# Reiniciar
+sudo systemctl restart postgresql
 
 # Ver logs
 sudo tail -f /var/log/postgresql/postgresql-*-main.log
 ```
 
-### Erro de conexão com Redis
+---
 
-```bash
-# Verificar se está rodando
-sudo systemctl status redis
+## Especificações Recomendadas da VPS
 
-# Testar conexão
-redis-cli ping
-```
+| Recurso | Mínimo | Recomendado |
+|---------|--------|-------------|
+| CPU     | 1 vCPU | 2 vCPUs     |
+| RAM     | 2 GB   | 4 GB        |
+| Disco   | 25 GB  | 50 GB       |
+| OS      | Ubuntu 22.04+ | Ubuntu 24.04 |
 
-### Playwright não funciona
-
-```bash
-# Reinstalar dependências
-playwright install-deps
-
-# Testar browser
-python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); print('OK'); b.close(); p.stop()"
-```
-
-### Ver uso de memória do bot
-
-```bash
-ps aux | grep python | grep main.py
-```
+**Estimativa de uso de disco por mês:**
+- Banco PostgreSQL: ~500 MB/mês (depende do volume de jogos)
+- Logs: ~200 MB/mês (com rotação configurada)
+- Total: ~700 MB/mês
 
 ---
 
-## 12. Backup
+## Arquitetura
 
-### Backup do banco de dados
-
-```bash
-# Criar backup
-pg_dump -U betbot betinasia_bot > backup_$(date +%Y%m%d).sql
-
-# Restaurar backup
-psql -U betbot betinasia_bot < backup_20260128.sql
 ```
-
-### Backup das configurações
-
-```bash
-# Copiar .env para lugar seguro
-cp .env ~/.env_backup
+VPS (Ubuntu)
+├── systemd
+│   ├── betinasia-xvfb.service      # Display virtual
+│   ├── betinasia-collector.service  # Coleta de odds (principal)
+│   └── betinasia-results.service    # Atualização de resultados
+├── logrotate
+│   └── /etc/logrotate.d/betinasia   # Rotação de logs diária
+├── cron
+│   ├── healthcheck (5 em 5 min)     # Monitoramento
+│   └── backup_db (diário 3h)        # Backup do banco
+└── /home/betbot/Bets/
+    ├── venv/                         # Ambiente virtual Python
+    └── betinasia_bot/
+        ├── .env                      # Credenciais (não commitado)
+        ├── logs/                     # Logs do sistema
+        ├── collector/                # Coletor contínuo
+        ├── scraper/                  # Scraper BetinAsia
+        ├── storage/                  # Banco de dados
+        ├── hypothesis/               # Detectores de hipóteses
+        └── results/                  # Atualização de resultados
 ```
-
----
-
-## Próximos Passos
-
-1. Testar conexão com BetinAsia
-2. Rodar coleta de dados por 2-4 semanas
-3. Treinar modelo com dados coletados
-4. Ativar execução de apostas (DRY_RUN=false)

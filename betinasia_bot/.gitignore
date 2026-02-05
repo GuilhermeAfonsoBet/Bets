@@ -45,3 +45,8 @@ htmlcov/
 # Backups
 *.bak
 *.backup
+*.sql
+*.sql.gz
+
+# Session files
+betinasia_session.json
