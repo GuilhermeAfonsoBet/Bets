@@ -10,7 +10,7 @@ Type=simple
 User=betbot
 Group=betbot
 WorkingDirectory=/home/betbot/Bets/betinasia_bot
-EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+# .env é lido pelo Python (pydantic) - não precisa de EnvironmentFile no systemd
 Environment="PATH=/home/betbot/Bets/betinasia_bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="DISPLAY=:99"
 Environment="PYTHONUNBUFFERED=1"
