@@ -267,9 +267,14 @@ class BetslipExtractor:
             odds_pattern = r'(\d+[.,]\d{2,3})'
             odds_matches = re.findall(odds_pattern, section)
             
-            # Extrai valores monetários (limites)
-            limit_pattern = r'\$\s*([\d,]+)'
+            # Extrai valores monetários (limites) - diferentes formatos possíveis
+            # Formato: $2,474 ou $600 ou $ 1,500
+            limit_pattern = r'\$\s*([\d,]+(?:\.\d+)?)'
             limit_matches = re.findall(limit_pattern, section)
+            
+            # Debug: mostra o que encontrou
+            if not limit_matches:
+                logger.debug(f"Limites não encontrados. Seção: {section[:200]}")
             
             if len(odds_matches) < 3:
                 logger.warning(f"Encontrou apenas {len(odds_matches)} odds, esperava 3+")

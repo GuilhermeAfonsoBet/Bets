@@ -342,3 +342,58 @@ class OddsMovementHistory(Base):
         Index("idx_movement_match_market", "match_id", "market_type", "ah_line", "side"),
         Index("idx_movement_recorded", "recorded_at"),
     )
+
+
+class BetslipAuditResult(Base):
+    """
+    Resultados de auditoria de betslip.
+    
+    Compara odds do WebSocket com odds reais do betslip para
+    validar a precisão dos dados coletados.
+    """
+    
+    __tablename__ = "betslip_audit_results"
+    
+    id = Column(Integer, primary_key=True)
+    
+    # Identificação do evento
+    hypothesis_type = Column(String(10), nullable=False)  # H1, H3, H3B, H6
+    hypothesis_event_id = Column(Integer)  # ID do evento na tabela correspondente
+    event_id = Column(String(100))  # ID do evento no WebSocket
+    match_info = Column(String(200))  # "Home vs Away"
+    
+    # Mercado
+    market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
+    line = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)  # home, away, over, under
+    
+    # Odds comparação
+    websocket_odd = Column(Float, nullable=False)
+    betslip_odd = Column(Float)  # Null se não conseguiu extrair
+    difference_pct = Column(Float)  # (betslip - websocket) / websocket * 100
+    
+    # Limites
+    betslip_limit = Column(Float)  # Limite de aposta
+    
+    # Status e classificação
+    status = Column(String(30), nullable=False)  # IDENTICAL, OK, MINOR_DIFF, MAJOR_DIFF, LINE_NOT_AVAILABLE, GAME_NOT_FOUND, ERROR
+    is_valid_opportunity = Column(Boolean, default=False)  # True se diff < 2%
+    
+    # Contexto do evento
+    reversal_direction = Column(String(10))  # Para H3B: up, down
+    lag_direction = Column(String(10))  # Para H6: up, down
+    
+    # Metadados
+    audited_at = Column(DateTime(timezone=True), server_default=func.now())
+    audit_duration_ms = Column(Integer)  # Tempo que levou para auditar
+    
+    # Dados brutos para debug
+    raw_betslip_text = Column(Text)  # Texto extraído do betslip
+    
+    __table_args__ = (
+        Index("idx_audit_hypothesis", "hypothesis_type"),
+        Index("idx_audit_status", "status"),
+        Index("idx_audit_valid", "is_valid_opportunity"),
+        Index("idx_audit_date", "audited_at"),
+        Index("idx_audit_diff", "difference_pct"),
+    )

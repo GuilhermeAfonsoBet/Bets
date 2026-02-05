@@ -12,6 +12,7 @@ import asyncio
 import json
 import sys
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ sys.path.insert(0, '.')
 from scraper.betinasia import BetinAsiaScraper
 from scraper.betslip_extractor import BetslipExtractor, BetslipData
 from hypothesis.detectors import HypothesisDetector
+from storage.database import Database
+from storage.models_hypothesis import BetslipAuditResult
 
 
 @dataclass
@@ -40,6 +43,7 @@ class AuditResult:
     status: str
     reversal_direction: str  # "up" ou "down"
     betslip_data: Optional[BetslipData] = None
+    audit_duration_ms: Optional[int] = None
 
 
 class H3BAuditor:
@@ -47,11 +51,15 @@ class H3BAuditor:
     
     FOOTBALL_URL = "https://black.betinasia.com/sportsbook/football"
     
-    def __init__(self, num_audits: int = 50, direction_filter: str = "up"):
+    # Filtro de linhas extremas (volatilidade alta)
+    MAX_AH_LINE = 5.0
+    
+    def __init__(self, num_audits: int = 50, direction_filter: str = "up", save_to_db: bool = True):
         """
         Args:
             num_audits: Número de auditorias a realizar
             direction_filter: "up" para reversão UP, "down" para DOWN, "all" para ambas
+            save_to_db: Se True, salva resultados no banco de dados
         """
         self.scraper: Optional[BetinAsiaScraper] = None
         self.extractor: Optional[BetslipExtractor] = None
@@ -59,9 +67,11 @@ class H3BAuditor:
         self.hypothesis_detector = HypothesisDetector()
         self.num_audits = num_audits
         self.direction_filter = direction_filter
+        self.save_to_db = save_to_db
         self.audit_results: List[AuditResult] = []
         self.events_processed = 0
         self.h3b_events_detected = 0
+        self.db: Optional[Database] = None
         
     async def start(self):
         """Inicia o auditor."""
@@ -72,16 +82,66 @@ class H3BAuditor:
         self.extractor = BetslipExtractor(self.scraper._page)
         self.scraper._page.on('websocket', self._on_websocket)
         
+        # Conecta ao banco se necessário
+        if self.save_to_db:
+            self.db = Database()
+            await self.db.connect()
+            print("Conectado ao banco de dados")
+        
         print("Auditor H3B iniciado e logado")
         
     async def close(self):
         """Fecha o auditor."""
         if self.scraper:
             await self.scraper.close()
+        if self.db:
+            await self.db.close()
             
     def _on_websocket(self, ws):
         """Callback quando WebSocket conecta."""
         ws.on('framereceived', lambda data: self._ws_messages.append(str(data)))
+    
+    async def _save_result_to_db(self, result: AuditResult, h3b: dict):
+        """Salva resultado da auditoria no banco de dados."""
+        if not self.db:
+            return
+        
+        try:
+            # Determina se é uma oportunidade válida (diff < 2%)
+            is_valid = False
+            if result.difference_pct is not None and abs(result.difference_pct) < 2.0:
+                is_valid = True
+            
+            # Extrai texto bruto do betslip para debug
+            raw_text = None
+            if result.betslip_data:
+                raw_text = result.betslip_data.raw_text
+            
+            audit_record = BetslipAuditResult(
+                hypothesis_type="H3B",
+                event_id=result.event_id,
+                match_info=result.match_info,
+                market_type=result.market_type,
+                line=result.line,
+                side=result.side,
+                websocket_odd=result.websocket_odd,
+                betslip_odd=result.betslip_best_odd,
+                difference_pct=result.difference_pct,
+                betslip_limit=result.betslip_limit,
+                status=result.status,
+                is_valid_opportunity=is_valid,
+                reversal_direction=result.reversal_direction,
+                audited_at=result.timestamp,
+                audit_duration_ms=result.audit_duration_ms,
+                raw_betslip_text=raw_text
+            )
+            
+            async with self.db.get_session() as session:
+                session.add(audit_record)
+                await session.commit()
+                
+        except Exception as e:
+            logger.debug(f"Erro ao salvar auditoria no banco: {e}")
 
     async def run_audit(self):
         """Executa ciclos de auditoria."""
@@ -131,9 +191,17 @@ Vou auditar {self.num_audits} eventos.
                 for h3b in h3b_events:
                     if len(self.audit_results) >= self.num_audits:
                         break
+                    
+                    audit_start = time.time()
                     result = await self._audit_event(h3b)
+                    result.audit_duration_ms = int((time.time() - audit_start) * 1000)
+                    
                     self.audit_results.append(result)
                     audited.add(h3b['audit_key'])
+                    
+                    # Salva no banco
+                    if self.save_to_db:
+                        await self._save_result_to_db(result, h3b)
                 
                 print(f"\rProcessados: {self.events_processed} | "
                       f"H3B: {self.h3b_events_detected} | "
@@ -230,6 +298,15 @@ Vou auditar {self.num_audits} eventos.
                                                 if self.direction_filter != "all" and direction != self.direction_filter:
                                                     skipped_wrong_direction += 1
                                                     continue
+                                                
+                                                # Filtro de linhas extremas (|AH| > 5)
+                                                try:
+                                                    line_val = abs(float(h3b.ah_line))
+                                                    if line_val > 5:
+                                                        # print(f"    Pulando linha extrema: AH {h3b.ah_line}")
+                                                        continue
+                                                except:
+                                                    pass
                                                 
                                                 # Chave única
                                                 audit_key = f"{event_id}|AH|{h3b.ah_line}|{h3b.side}"
@@ -464,7 +541,13 @@ Vou auditar {self.num_audits} eventos.
             
             diff_pct = ((best_odd - ws_odd) / ws_odd) * 100
             
-            if abs(diff_pct) < 0.1:
+            # Validação: se diff > 50%, provavelmente clicamos na linha errada
+            if abs(diff_pct) > 50:
+                print(f"    ⚠️ AVISO: Diferença muito grande ({diff_pct:+.1f}%)")
+                print(f"    ⚠️ Provavelmente clicou na linha ERRADA!")
+                print(f"    WebSocket odd: {ws_odd:.3f}, Betslip odd: {best_odd:.3f}")
+                status = "WRONG_LINE_CLICKED"
+            elif abs(diff_pct) < 0.1:
                 status = "IDENTICAL"
             elif abs(diff_pct) < 0.5:
                 status = "OK"
@@ -514,6 +597,53 @@ Vou auditar {self.num_audits} eventos.
                 reversal_direction=direction
             )
     
+    def _get_team_aliases(self, team_name: str) -> list:
+        """Retorna aliases conhecidos para um time."""
+        # Mapeamento de aliases comuns
+        aliases = {
+            # England
+            "Wolves": ["Wolverhampton", "Wolves", "Wolverhampton Wanderers"],
+            "Wolverhampton": ["Wolverhampton", "Wolves", "Wolverhampton Wanderers"],
+            "Man United": ["Manchester United", "Man United", "Man Utd"],
+            "Manchester United": ["Manchester United", "Man United", "Man Utd"],
+            "Man City": ["Manchester City", "Man City"],
+            "Manchester City": ["Manchester City", "Man City"],
+            "Spurs": ["Tottenham", "Spurs", "Tottenham Hotspur"],
+            "Tottenham": ["Tottenham", "Spurs", "Tottenham Hotspur"],
+            # Spain
+            "Athletic Bilbao": ["Athletic Bilbao", "Athletic Club", "Ath Bilbao", "Athletic"],
+            "Athletic Club": ["Athletic Bilbao", "Athletic Club", "Ath Bilbao", "Athletic"],
+            "Atletico Madrid": ["Atletico Madrid", "Atl Madrid", "Atlético Madrid"],
+            "Real Madrid": ["Real Madrid", "R Madrid"],
+            "Barcelona": ["Barcelona", "FC Barcelona", "Barça"],
+            # France
+            "PSG": ["PSG", "Paris Saint-Germain", "Paris SG", "Paris Saint Germain"],
+            "Paris Saint-Germain": ["PSG", "Paris Saint-Germain", "Paris SG"],
+            "Marseille": ["Marseille", "Olympique Marseille", "OM"],
+            # Germany
+            "Bayern": ["Bayern Munich", "Bayern München", "FC Bayern"],
+            "Dortmund": ["Borussia Dortmund", "Dortmund", "BVB"],
+            "Borussia Dortmund": ["Borussia Dortmund", "Dortmund", "BVB"],
+            "Leverkusen": ["Bayer Leverkusen", "Leverkusen", "B Leverkusen"],
+            # Brazil
+            "Flamengo": ["Flamengo", "CR Flamengo"],
+            "Palmeiras": ["Palmeiras", "SE Palmeiras"],
+            "Corinthians": ["Corinthians", "SC Corinthians"],
+        }
+        
+        # Procura por aliases
+        for key, values in aliases.items():
+            if key.lower() in team_name.lower() or team_name.lower() in key.lower():
+                return values
+        
+        # Se não encontrou alias, retorna variantes do nome original
+        words = team_name.split()
+        variants = [team_name]
+        if len(words) > 1:
+            variants.append(words[0])  # Primeiro nome
+            variants.append(" ".join(words[:2]))  # Dois primeiros nomes
+        return variants
+    
     async def _find_and_click_game(self, home_team: str, away_team: str) -> bool:
         """Encontra e clica num jogo específico na página."""
         page = self.scraper._page
@@ -521,11 +651,22 @@ Vou auditar {self.num_audits} eventos.
         try:
             body_text = await page.inner_text("body")
             
+            # Obtém aliases para ambos os times
+            home_aliases = self._get_team_aliases(home_team)
+            away_aliases = self._get_team_aliases(away_team)
+            
+            # Verifica se algum alias está na página
+            home_found = any(alias in body_text for alias in home_aliases if len(alias) > 3)
+            away_found = any(alias in body_text for alias in away_aliases if len(alias) > 3)
+            
+            # Também tenta palavras individuais
             home_words = home_team.split()[:2]
             away_words = away_team.split()[:2]
             
-            home_found = any(word in body_text for word in home_words if len(word) > 3)
-            away_found = any(word in body_text for word in away_words if len(word) > 3)
+            if not home_found:
+                home_found = any(word in body_text for word in home_words if len(word) > 3)
+            if not away_found:
+                away_found = any(word in body_text for word in away_words if len(word) > 3)
             
             if not home_found and not away_found:
                 print(f"    Times não encontrados na página")
@@ -533,41 +674,43 @@ Vou auditar {self.num_audits} eventos.
             
             print(f"    Times encontrados: home={home_found}, away={away_found}")
             
-            for team_name in [home_team, away_team]:
-                for name_variant in [team_name, team_name.split()[0] if team_name else ""]:
-                    if not name_variant or len(name_variant) < 3:
-                        continue
+            # Combina aliases de ambos os times para busca
+            all_search_terms = home_aliases + away_aliases
+            
+            for name_variant in all_search_terms:
+                if not name_variant or len(name_variant) < 3:
+                    continue
+                
+                try:
+                    selectors = [
+                        f"a:has-text('{name_variant}')",
+                        f"div:has-text('{name_variant}')",
+                        f"span:has-text('{name_variant}')",
+                    ]
                     
-                    try:
-                        selectors = [
-                            f"a:has-text('{name_variant}')",
-                            f"div:has-text('{name_variant}')",
-                            f"span:has-text('{name_variant}')",
-                        ]
-                        
-                        for selector in selectors:
-                            try:
-                                elements = await page.query_selector_all(selector)
-                                
-                                for el in elements[:5]:
-                                    try:
-                                        el_text = await el.inner_text()
+                    for selector in selectors:
+                        try:
+                            elements = await page.query_selector_all(selector)
+                            
+                            for el in elements[:5]:
+                                try:
+                                    el_text = await el.inner_text()
+                                    
+                                    if len(el_text) < 200:
+                                        await el.scroll_into_view_if_needed()
+                                        await el.click()
+                                        await page.wait_for_timeout(1500)
                                         
-                                        if len(el_text) < 200:
-                                            await el.scroll_into_view_if_needed()
-                                            await el.click()
-                                            await page.wait_for_timeout(1500)
-                                            
-                                            new_text = await page.inner_text("body")
-                                            if "Asian Handicap" in new_text or "Over/Under" in new_text:
-                                                print(f"    Clicou no jogo '{name_variant}'")
-                                                return True
-                                    except:
-                                        continue
-                            except:
-                                continue
-                    except:
-                        continue
+                                        new_text = await page.inner_text("body")
+                                        if "Asian Handicap" in new_text or "Over/Under" in new_text:
+                                            print(f"    Clicou no jogo '{name_variant}'")
+                                            return True
+                                except:
+                                    continue
+                        except:
+                            continue
+                except:
+                    continue
             
             if ("Asian Handicap" in body_text or "Over/Under" in body_text) and home_found:
                 print(f"    Jogo já está visível na página")
