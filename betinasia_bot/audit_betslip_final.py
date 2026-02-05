@@ -566,18 +566,19 @@ Vou auditar {self.num_audits} eventos.
         """
         Clica numa odd específica para abrir o betslip.
         
-        Usa a mesma abordagem do scraper principal que funciona bem:
-        1. Encontra spans com texto da odd
-        2. Verifica contexto (linha correta)
-        3. Clica no elemento pai
+        ESTRATÉGIA ROBUSTA (baseada na estrutura DOM real):
+        1. Encontra a seção Asian Handicap
+        2. Busca a LINHA específica pelo valor do handicap
+        3. Dentro da linha, clica no lado correto por POSIÇÃO (Home/Away)
+        
+        NÃO busca pelo valor da odd (que pode mudar entre WebSocket e DOM).
         """
         page = self.scraper._page
         
         try:
-            # Formata a linha para diferentes possibilidades
             line_float = float(line.replace(",", "."))
             
-            # Possíveis formatos da linha no site
+            # Gera variantes da linha (diferentes formatos possíveis)
             line_variants = []
             if line_float == int(line_float):
                 int_val = int(line_float)
@@ -588,225 +589,213 @@ Vou auditar {self.num_audits} eventos.
                 else:
                     line_variants.extend(["0", "+0", "0,0", "0.0"])
             else:
-                line_variants.append(line.replace(".", ","))
-                line_variants.append(line)
-                if line_float > 0 and not line.startswith("+"):
-                    line_variants.append("+" + line.replace(".", ","))
+                line_comma = line.replace(".", ",")
+                line_dot = line.replace(",", ".")
+                line_variants.append(line_comma)
+                line_variants.append(line_dot)
+                if line_float > 0:
+                    line_variants.append("+" + line_comma)
+                    line_variants.append("+" + line_dot)
             
             print(f"    Procurando linha: {line_variants}")
             
-            # Captura texto da página para análise
-            body_text = await page.inner_text("body")
-            
-            # Encontra a odd alvo analisando o texto
-            target_odd = None
-            for variant in line_variants:
-                for text_line in body_text.split('\n'):
-                    # Procura linha com formato: VARIANT ... Home ... ODD ... Away ... ODD
-                    if variant in text_line and 'Home' in text_line and 'Away' in text_line:
-                        # Extrai odds
-                        odds_found = re.findall(r'(\d+[.,]\d{2,3})', text_line)
-                        if len(odds_found) >= 2:
-                            home_idx = text_line.find('Home')
-                            away_idx = text_line.find('Away')
-                            
-                            home_odd = None
-                            away_odd = None
-                            
-                            for odd in odds_found:
-                                odd_idx = text_line.find(odd)
-                                if home_idx < odd_idx < away_idx and not home_odd:
-                                    home_odd = odd
-                                elif odd_idx > away_idx and not away_odd:
-                                    away_odd = odd
-                            
-                            target_odd = home_odd if side == 'home' else away_odd
-                            if target_odd:
-                                print(f"    Odd alvo identificada: {target_odd}")
-                                break
-                if target_odd:
-                    break
-            
-            if not target_odd:
-                # Extrai todas as linhas AH disponíveis (formato: +X, -X, +X.X, -X,X, 0)
-                # NÃO incluir odds (formato X.XXX com 3 casas decimais)
-                available_lines = set()
-                for l in body_text.split('\n'):
-                    l_stripped = l.strip()
-                    # Handicaps: +1,5 / -0,5 / +1.5 / -0.5 / 0 / +0 / -1 / +2,25 etc
-                    # NÃO odds: 1.850, 2.100, 6.700 (3 dígitos decimais ou valores > 1.5 sem sinal)
-                    if re.match(r'^[+-]\d+([.,]\d{1,2})?$', l_stripped):  # Com sinal: +1,5, -0,5
-                        available_lines.add(l_stripped)
-                    elif re.match(r'^0([.,]0+)?$', l_stripped):  # Zero: 0, 0.0, 0,0
-                        available_lines.add("0")
-                
-                # Ordena por valor numérico
-                def line_sort_key(x):
-                    try:
-                        return float(x.replace(',', '.').replace('+', ''))
-                    except:
-                        return 0
-                sorted_lines = sorted(available_lines, key=line_sort_key)
-                
-                print(f"    Linha não encontrada nesta tentativa")
-                print(f"    Buscando: {line_variants}")
-                print(f"    Handicaps AH disponíveis: {sorted_lines}")
-                
-                # Aviso se a linha buscada é muito extrema
-                try:
-                    line_val = abs(float(line.replace(',', '.')))
-                    if line_val > 5:
-                        print(f"    AVISO: Linha {line} é muito extrema - pode não estar visível na interface")
-                except:
-                    pass
-                
-                # Retorna False para tentar novamente (não LINE_NOT_AVAILABLE ainda)
-                return False
-            
-            # === ESTRATÉGIA 1: Query selector direto + clique no pai (como no scraper) ===
-            print(f"    Estratégia 1: buscando span com texto '{target_odd}'")
-            
-            # Busca todos os spans
-            elements = await page.query_selector_all('span')
-            
-            # Filtra elementos com o texto da odd e contexto correto
-            candidates = []
-            for el in elements:
-                try:
-                    el_text = await el.inner_text()
-                    if el_text.strip() == target_odd:
-                        # Verifica contexto - precisa ter a variante da linha no pai
-                        parent = await el.evaluate_handle("el => el.parentElement.parentElement.parentElement")
-                        parent_text = await parent.evaluate("el => el.innerText || ''")
-                        
-                        for variant in line_variants:
-                            if variant in parent_text and 'Home' in parent_text and 'Away' in parent_text:
-                                # Determina se é home ou away pela posição
-                                box = await el.bounding_box()
-                                if box:
-                                    candidates.append((el, box['x']))
-                                break
-                except:
-                    continue
-            
-            # Ordena por posição X (home = esquerda, away = direita)
-            if candidates:
-                candidates.sort(key=lambda x: x[1])
-                
-                # Home é o primeiro (mais à esquerda), Away é o segundo
-                if side == 'home' and len(candidates) >= 1:
-                    el = candidates[0][0]
-                elif side == 'away' and len(candidates) >= 2:
-                    el = candidates[1][0]
-                elif len(candidates) == 1:
-                    el = candidates[0][0]  # Só tem um, usa esse
-                else:
-                    el = None
-                
-                if el:
-                    print(f"    Encontrou {len(candidates)} candidatos, clicando...")
-                    try:
-                        await el.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(300)
-                        
-                        # Clica no elemento pai (mais confiável)
-                        parent = await el.evaluate_handle("el => el.parentElement")
-                        await parent.click()
-                        await page.wait_for_timeout(1500)
-                        return True
-                    except Exception as e1:
-                        print(f"    Clique no pai falhou: {e1}")
-                        try:
-                            # Fallback: clica direto
-                            await el.click()
-                            await page.wait_for_timeout(1500)
-                            return True
-                        except Exception as e2:
-                            print(f"    Clique direto falhou: {e2}")
-                            # Fallback: JavaScript
-                            try:
-                                await el.evaluate("el => el.parentElement.click()")
-                                await page.wait_for_timeout(1500)
-                                return True
-                            except:
-                                pass
-            
-            # === ESTRATÉGIA 2: Locator do Playwright com texto exato ===
-            print(f"    Estratégia 2: locator com texto exato")
-            
-            try:
-                # Busca por texto exato da odd
-                locator = page.locator(f"span:text-is('{target_odd}')")
-                count = await locator.count()
-                
-                if count > 0:
-                    print(f"    Encontrou {count} elementos")
-                    
-                    for i in range(min(count, 5)):
-                        try:
-                            el = locator.nth(i)
-                            await el.scroll_into_view_if_needed()
-                            await page.wait_for_timeout(200)
-                            
-                            # Verifica se está no contexto certo
-                            parent_text = await el.evaluate("el => el.parentElement.parentElement.parentElement.innerText || ''")
-                            
-                            is_correct_context = False
-                            for variant in line_variants:
-                                if variant in parent_text:
-                                    is_correct_context = True
-                                    break
-                            
-                            if is_correct_context:
-                                print(f"    Clicando no elemento {i}...")
-                                await el.evaluate("el => el.parentElement.click()")
-                                await page.wait_for_timeout(1500)
-                                return True
-                        except:
-                            continue
-            except Exception as e:
-                logger.debug(f"Estratégia 2 falhou: {e}")
-            
-            # === ESTRATÉGIA 3: JavaScript força bruta ===
-            print(f"    Estratégia 3: JavaScript força bruta")
+            # === ESTRATÉGIA PRINCIPAL: JavaScript robusto baseado na estrutura DOM ===
+            # Estrutura: LINHA | Home | ODD_HOME | Away | ODD_AWAY
             
             clicked = await page.evaluate("""
                 (params) => {
-                    const targetOdd = params.targetOdd;
+                    const lineVariants = params.lineVariants;
+                    const side = params.side;
                     
-                    // Encontra todos os spans
-                    const spans = document.querySelectorAll('span');
+                    // Função para normalizar texto de linha
+                    function normalizeLineText(text) {
+                        return text.trim().replace(/\\s+/g, '').replace('.', ',');
+                    }
                     
-                    for (const span of spans) {
-                        const text = (span.innerText || '').trim();
-                        if (text === targetOdd) {
-                            try {
-                                span.scrollIntoView({block: 'center'});
-                                // Tenta clicar no pai
-                                span.parentElement.click();
-                                return true;
-                            } catch (e) {
-                                try {
-                                    span.click();
-                                    return true;
-                                } catch (e2) {}
+                    // Encontra a seção Asian Handicap
+                    let sectionContainer = null;
+                    const headers = document.querySelectorAll('div, span, h3, h4');
+                    
+                    for (const h of headers) {
+                        const text = (h.innerText || '').trim();
+                        if (text.includes('Handicap') || text.includes('Asian')) {
+                            let parent = h.parentElement;
+                            for (let i = 0; i < 10 && parent; i++) {
+                                const parentText = parent.innerText || '';
+                                if (parentText.includes('Home') && parentText.includes('Away')) {
+                                    sectionContainer = parent;
+                                    break;
+                                }
+                                parent = parent.parentElement;
                             }
+                            if (sectionContainer) break;
                         }
                     }
                     
-                    return false;
+                    if (!sectionContainer) {
+                        sectionContainer = document.body;
+                    }
+                    
+                    // Encontra elementos que podem ser a linha de handicap
+                    const allElements = sectionContainer.querySelectorAll('span, div');
+                    
+                    for (const el of allElements) {
+                        const elText = (el.innerText || '').trim();
+                        
+                        // Verifica se este elemento é a linha que procuramos
+                        let isLineMatch = false;
+                        for (const variant of lineVariants) {
+                            if (elText === variant || normalizeLineText(elText) === normalizeLineText(variant)) {
+                                isLineMatch = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!isLineMatch) continue;
+                        
+                        // Encontrou a linha! Busca o container ROW
+                        let rowContainer = el.parentElement;
+                        for (let i = 0; i < 6 && rowContainer; i++) {
+                            const rowText = rowContainer.innerText || '';
+                            
+                            if (rowText.includes('Home') && rowText.includes('Away')) {
+                                // Encontra os elementos clicáveis (odds)
+                                const clickableElements = rowContainer.querySelectorAll('div, span');
+                                const oddElements = [];
+                                
+                                for (const child of clickableElements) {
+                                    const childText = (child.innerText || '').trim();
+                                    
+                                    // Verifica se é uma odd (formato X.XXX ou X,XXX)
+                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText)) {
+                                        const rect = child.getBoundingClientRect();
+                                        if (rect.width > 0 && rect.height > 0) {
+                                            oddElements.push({
+                                                el: child,
+                                                x: rect.x,
+                                                text: childText
+                                            });
+                                        }
+                                    }
+                                }
+                                
+                                if (oddElements.length >= 2) {
+                                    // Ordena por posição X
+                                    oddElements.sort((a, b) => a.x - b.x);
+                                    
+                                    // Home = primeiro (esquerda), Away = segundo (direita)
+                                    const targetIdx = (side === 'home') ? 0 : 1;
+                                    const targetEl = oddElements[targetIdx];
+                                    
+                                    if (targetEl) {
+                                        targetEl.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        
+                                        try {
+                                            const parent = targetEl.el.parentElement;
+                                            if (parent) {
+                                                parent.click();
+                                                return { success: true, clickedOdd: targetEl.text, method: 'parent' };
+                                            }
+                                        } catch (e) {}
+                                        
+                                        try {
+                                            targetEl.el.click();
+                                            return { success: true, clickedOdd: targetEl.text, method: 'direct' };
+                                        } catch (e) {}
+                                    }
+                                }
+                            }
+                            rowContainer = rowContainer.parentElement;
+                        }
+                    }
+                    
+                    return { success: false, reason: 'LINE_NOT_FOUND' };
                 }
-            """, {"targetOdd": target_odd})
+            """, {"lineVariants": line_variants, "side": side})
             
-            if clicked:
+            if clicked and clicked.get('success'):
+                print(f"    Clicou na odd {clicked.get('clickedOdd')} ({clicked.get('method')})")
                 await page.wait_for_timeout(1500)
                 return True
             
-            print(f"    Nenhuma estratégia funcionou")
+            # === FALLBACK: Busca alternativa ===
+            print(f"    Estratégia principal falhou, tentando fallback...")
+            
+            for variant in line_variants:
+                try:
+                    line_elements = await page.query_selector_all(f"span:text-is('{variant}'), div:text-is('{variant}')")
+                    
+                    for line_el in line_elements:
+                        try:
+                            for _ in range(5):
+                                parent = await line_el.evaluate_handle("el => el.parentElement")
+                                parent_text = await parent.evaluate("el => el.innerText || ''")
+                                
+                                if 'Home' in parent_text and 'Away' in parent_text:
+                                    odd_spans = await parent.evaluate_handle(
+                                        "el => Array.from(el.querySelectorAll('span, div')).filter(s => /^\\d+[.,]\\d{2,3}$/.test(s.innerText.trim()))"
+                                    )
+                                    
+                                    count = await odd_spans.evaluate("arr => arr.length")
+                                    
+                                    if count >= 2:
+                                        idx = 0 if side == 'home' else 1
+                                        
+                                        result = await odd_spans.evaluate(f"""
+                                            (arr) => {{
+                                                const el = arr[{idx}];
+                                                if (el) {{
+                                                    el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                                                    try {{
+                                                        el.parentElement.click();
+                                                        return {{ success: true, method: 'fallback-parent' }};
+                                                    }} catch {{}}
+                                                    try {{
+                                                        el.click();
+                                                        return {{ success: true, method: 'fallback-direct' }};
+                                                    }} catch {{}}
+                                                }}
+                                                return {{ success: false }};
+                                            }}
+                                        """)
+                                        
+                                        if result and result.get('success'):
+                                            print(f"    Fallback: clicou ({result.get('method')})")
+                                            await page.wait_for_timeout(1500)
+                                            return True
+                                    break
+                                
+                                line_el = parent
+                        except:
+                            continue
+                except:
+                    continue
+            
+            # Debug: mostra linhas disponíveis
+            body_text = await page.inner_text("body")
+            available_lines = set()
+            for l in body_text.split('\n'):
+                l_stripped = l.strip()
+                if re.match(r'^[+-]?\d+([.,]\d{1,2})?$', l_stripped) and len(l_stripped) < 8:
+                    available_lines.add(l_stripped)
+            
+            def line_sort_key(x):
+                try:
+                    return float(x.replace(',', '.').replace('+', ''))
+                except:
+                    return 0
+            sorted_lines = sorted(available_lines, key=line_sort_key)
+            
+            print(f"    Linha não encontrada")
+            print(f"    Buscando: {line_variants}")
+            print(f"    Linhas AH disponíveis: {sorted_lines[:20]}")
+            
             return False
             
         except Exception as e:
             logger.error(f"Erro ao clicar: {e}")
+            import traceback
+            traceback.print_exc()
             return False
             
     def _print_results(self):

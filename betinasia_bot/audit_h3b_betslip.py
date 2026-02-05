@@ -628,12 +628,22 @@ Vou auditar {self.num_audits} eventos.
             logger.debug(f"Erro ao expandir linhas: {e}")
     
     async def _click_specific_odd(self, line: str, side: str, market_type: str = "AH") -> bool:
-        """Clica numa odd específica para abrir o betslip."""
+        """
+        Clica numa odd específica para abrir o betslip.
+        
+        ESTRATÉGIA ROBUSTA (baseada na estrutura DOM real):
+        1. Encontra a seção correta (Handicap Asiático ou Over/Under)
+        2. Busca a LINHA específica pelo valor do handicap
+        3. Dentro da linha, clica no lado correto por POSIÇÃO (Home/Away, Over/Under)
+        
+        NÃO busca pelo valor da odd (que pode mudar entre WebSocket e DOM).
+        """
         page = self.scraper._page
         
         try:
             line_float = float(line.replace(",", "."))
             
+            # Gera variantes da linha (diferentes formatos possíveis)
             line_variants = []
             if line_float == int(line_float):
                 int_val = int(line_float)
@@ -644,229 +654,253 @@ Vou auditar {self.num_audits} eventos.
                 else:
                     line_variants.extend(["0", "+0", "0,0", "0.0"])
             else:
-                line_variants.append(line.replace(".", ","))
-                line_variants.append(line)
-                if line_float > 0 and not line.startswith("+"):
-                    line_variants.append("+" + line.replace(".", ","))
+                # Linhas com decimal
+                line_comma = line.replace(".", ",")
+                line_dot = line.replace(",", ".")
+                line_variants.append(line_comma)
+                line_variants.append(line_dot)
+                if line_float > 0:
+                    line_variants.append("+" + line_comma)
+                    line_variants.append("+" + line_dot)
             
             print(f"    Procurando linha: {line_variants}")
             
-            body_text = await page.inner_text("body")
-            
-            # Determina labels baseado no tipo de mercado
+            # Determina seção e labels
             if market_type == "OU":
-                side_labels = {"over": "Over", "under": "Under"}
+                section_name = "Over/Under"
+                home_label = "Over"
+                away_label = "Under"
             else:
-                side_labels = {"home": "Home", "away": "Away"}
+                section_name = "Handicap Asiático"
+                home_label = "Home"
+                away_label = "Away"
             
-            side_label = side_labels.get(side, side.capitalize())
+            target_label = home_label if side in ['home', 'over'] else away_label
             
-            # === ESTRATÉGIA 1: Busca direta no DOM por linha + odds ===
-            # Estrutura típica: LINHA | Home | ODD | Away | ODD
+            # === ESTRATÉGIA PRINCIPAL: JavaScript robusto baseado na estrutura DOM real ===
+            # Estrutura: LINHA | Home | ODD_HOME | Away | ODD_AWAY
+            # Os elementos clicáveis são divs ao lado dos labels Home/Away
             
-            target_odd = None
-            
-            # Busca spans que contêm a linha
-            for variant in line_variants:
-                try:
-                    line_elements = await page.query_selector_all(f"span:text-is('{variant}')")
+            clicked = await page.evaluate("""
+                (params) => {
+                    const lineVariants = params.lineVariants;
+                    const side = params.side;
+                    const marketType = params.marketType;
+                    const sectionName = params.sectionName;
+                    const homeLabel = params.homeLabel;
+                    const awayLabel = params.awayLabel;
                     
-                    for line_el in line_elements:
-                        try:
-                            # Pega o container pai que contém toda a linha
-                            parent = await line_el.evaluate_handle("el => el.closest('div[class]') || el.parentElement.parentElement.parentElement")
-                            parent_text = await parent.evaluate("el => el.innerText || ''")
-                            
-                            # Verifica se tem Home e Away (ou Over e Under)
-                            if side_label in parent_text:
-                                # Extrai todas as odds do container
-                                odds_in_parent = re.findall(r'(\d+[.,]\d{2,3})', parent_text)
-                                
-                                if len(odds_in_parent) >= 2:
-                                    # Encontra a posição de cada label
-                                    home_idx = parent_text.find("Home") if market_type != "OU" else parent_text.find("Over")
-                                    away_idx = parent_text.find("Away") if market_type != "OU" else parent_text.find("Under")
-                                    
-                                    # Determina qual odd é qual
-                                    for i, odd in enumerate(odds_in_parent):
-                                        odd_idx = parent_text.find(odd)
-                                        
-                                        # Home/Over é a primeira odd após "Home"/"Over"
-                                        # Away/Under é a primeira odd após "Away"/"Under"
-                                        if side in ['home', 'over']:
-                                            if home_idx < odd_idx < away_idx:
-                                                target_odd = odd
-                                                print(f"    Odd alvo identificada (estratégia 1): {target_odd}")
-                                                break
-                                        else:  # away, under
-                                            if odd_idx > away_idx:
-                                                target_odd = odd
-                                                print(f"    Odd alvo identificada (estratégia 1): {target_odd}")
-                                                break
-                                    
-                                    if target_odd:
-                                        break
-                        except:
-                            continue
+                    // Função para normalizar texto de linha
+                    function normalizeLineText(text) {
+                        return text.trim().replace(/\\s+/g, '').replace('.', ',');
+                    }
                     
-                    if target_odd:
-                        break
-                except:
-                    continue
-            
-            # === ESTRATÉGIA 2: JavaScript para encontrar odd no contexto da linha ===
-            if not target_odd:
-                print(f"    Tentando estratégia 2 (JavaScript)...")
-                
-                js_result = await page.evaluate("""
-                    (params) => {
-                        const lineVariants = params.lineVariants;
-                        const side = params.side;
-                        const marketType = params.marketType;
-                        
-                        const sideLabel = (marketType === 'OU') 
-                            ? (side === 'over' ? 'Over' : 'Under')
-                            : (side === 'home' ? 'Home' : 'Away');
-                        
-                        // Encontra todos os elementos
-                        const allElements = document.querySelectorAll('span, div');
-                        
-                        for (const el of allElements) {
-                            const text = (el.innerText || '').trim();
-                            
-                            // Verifica se é uma das variantes da linha
-                            if (!lineVariants.includes(text)) continue;
-                            
-                            // Pega o container pai
-                            let parent = el.parentElement;
-                            for (let i = 0; i < 5 && parent; i++) {
+                    // Encontra a seção correta (Asian Handicap ou Over/Under)
+                    let sectionContainer = null;
+                    const headers = document.querySelectorAll('div, span, h3, h4');
+                    
+                    for (const h of headers) {
+                        const text = (h.innerText || '').trim();
+                        // Procura por "Handicap Asiático", "Asian Handicap", "Over/Under"
+                        if (text.includes('Handicap') || text.includes('Asian') || 
+                            (marketType === 'OU' && (text.includes('Over') || text.includes('Under')))) {
+                            // Encontra o container pai que contém todas as linhas
+                            let parent = h.parentElement;
+                            for (let i = 0; i < 10 && parent; i++) {
                                 const parentText = parent.innerText || '';
-                                
-                                if (parentText.includes(sideLabel)) {
-                                    // Encontra odds no contexto
-                                    const oddMatches = parentText.match(/\\d+[.,]\\d{2,3}/g);
-                                    if (oddMatches && oddMatches.length >= 2) {
-                                        const sideIdx = parentText.indexOf(sideLabel);
-                                        
-                                        for (const odd of oddMatches) {
-                                            const oddIdx = parentText.indexOf(odd);
-                                            
-                                            // Para home/over: primeira odd após o label
-                                            // Para away/under: segunda odd ou odd após "Away"/"Under"
-                                            if (side === 'home' || side === 'over') {
-                                                if (oddIdx > sideIdx) {
-                                                    return odd;
-                                                }
-                                            } else {
-                                                const oppositeLabel = (marketType === 'OU') ? 'Under' : 'Away';
-                                                const oppositeIdx = parentText.indexOf(oppositeLabel);
-                                                if (oddIdx > oppositeIdx) {
-                                                    return odd;
-                                                }
-                                            }
-                                        }
-                                    }
+                                // Verifica se contém múltiplas linhas de odds
+                                if (parentText.includes(homeLabel) && parentText.includes(awayLabel)) {
+                                    sectionContainer = parent;
+                                    break;
                                 }
                                 parent = parent.parentElement;
                             }
+                            if (sectionContainer) break;
+                        }
+                    }
+                    
+                    if (!sectionContainer) {
+                        // Fallback: usa todo o body
+                        sectionContainer = document.body;
+                    }
+                    
+                    // Encontra TODOS os elementos que podem ser linhas de handicap
+                    // Procura por spans/divs com texto que seja uma das variantes da linha
+                    const allElements = sectionContainer.querySelectorAll('span, div');
+                    
+                    for (const el of allElements) {
+                        const elText = (el.innerText || '').trim();
+                        
+                        // Verifica se este elemento é a linha que procuramos
+                        let isLineMatch = false;
+                        for (const variant of lineVariants) {
+                            if (elText === variant || normalizeLineText(elText) === normalizeLineText(variant)) {
+                                isLineMatch = true;
+                                break;
+                            }
                         }
                         
-                        return null;
-                    }
-                """, {"lineVariants": line_variants, "side": side, "marketType": market_type})
-                
-                if js_result:
-                    target_odd = js_result
-                    print(f"    Odd alvo identificada (estratégia 2): {target_odd}")
-            
-            # Se não encontrou odd alvo, mostra debug
-            if not target_odd:
-                available_lines = set()
-                for l in body_text.split('\n'):
-                    l_stripped = l.strip()
-                    if re.match(r'^[+-]?\d+([.,]\d{1,2})?$', l_stripped) and len(l_stripped) < 8:
-                        available_lines.add(l_stripped)
-                
-                def line_sort_key(x):
-                    try:
-                        return float(x.replace(',', '.').replace('+', ''))
-                    except:
-                        return 0
-                sorted_lines = sorted(available_lines, key=line_sort_key)
-                
-                print(f"    Linha não encontrada nesta tentativa")
-                print(f"    Buscando: {line_variants}")
-                print(f"    Linhas disponíveis: {sorted_lines[:15]}")
-                
-                return False
-            
-            # === CLICA NA ODD ===
-            print(f"    Buscando elemento com odd {target_odd}...")
-            
-            elements = await page.query_selector_all('span')
-            
-            candidates = []
-            for el in elements:
-                try:
-                    el_text = await el.inner_text()
-                    if el_text.strip() == target_odd:
-                        # Verifica se está no contexto correto (contém a linha)
-                        parent = await el.evaluate_handle("el => el.parentElement.parentElement.parentElement")
-                        parent_text = await parent.evaluate("el => el.innerText || ''")
+                        if (!isLineMatch) continue;
                         
-                        for variant in line_variants:
-                            if variant in parent_text and side_label in parent_text:
-                                box = await el.bounding_box()
-                                if box:
-                                    candidates.append((el, box['x']))
-                                break
+                        // Encontrou a linha! Agora busca o container ROW que contém Home/Away
+                        let rowContainer = el.parentElement;
+                        for (let i = 0; i < 6 && rowContainer; i++) {
+                            const rowText = rowContainer.innerText || '';
+                            
+                            // Verifica se este container tem Home e Away (ou Over e Under)
+                            if (rowText.includes(homeLabel) && rowText.includes(awayLabel)) {
+                                
+                                // Encontra os elementos clicáveis (odds) dentro desta linha
+                                // Os elementos clicáveis são divs filhos com odds numéricas
+                                const clickableElements = rowContainer.querySelectorAll('div, span');
+                                const oddElements = [];
+                                
+                                for (const child of clickableElements) {
+                                    const childText = (child.innerText || '').trim();
+                                    
+                                    // Verifica se é uma odd (formato X.XXX ou X,XXX)
+                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText)) {
+                                        const rect = child.getBoundingClientRect();
+                                        if (rect.width > 0 && rect.height > 0) {
+                                            oddElements.push({
+                                                el: child,
+                                                x: rect.x,
+                                                text: childText
+                                            });
+                                        }
+                                    }
+                                }
+                                
+                                if (oddElements.length >= 2) {
+                                    // Ordena por posição X (esquerda para direita)
+                                    oddElements.sort((a, b) => a.x - b.x);
+                                    
+                                    // Home/Over = primeiro (esquerda), Away/Under = segundo (direita)
+                                    const targetIdx = (side === 'home' || side === 'over') ? 0 : 1;
+                                    const targetEl = oddElements[targetIdx];
+                                    
+                                    if (targetEl) {
+                                        // Scroll para o elemento
+                                        targetEl.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        
+                                        // Tenta clicar - primeiro no pai, depois direto
+                                        try {
+                                            const parent = targetEl.el.parentElement;
+                                            if (parent) {
+                                                parent.click();
+                                                return { success: true, clickedOdd: targetEl.text, method: 'parent' };
+                                            }
+                                        } catch (e) {}
+                                        
+                                        try {
+                                            targetEl.el.click();
+                                            return { success: true, clickedOdd: targetEl.text, method: 'direct' };
+                                        } catch (e) {}
+                                    }
+                                }
+                            }
+                            rowContainer = rowContainer.parentElement;
+                        }
+                    }
+                    
+                    return { success: false, reason: 'LINE_NOT_FOUND' };
+                }
+            """, {
+                "lineVariants": line_variants,
+                "side": side,
+                "marketType": market_type,
+                "sectionName": section_name,
+                "homeLabel": home_label,
+                "awayLabel": away_label
+            })
+            
+            if clicked and clicked.get('success'):
+                print(f"    Clicou na odd {clicked.get('clickedOdd')} ({clicked.get('method')})")
+                await page.wait_for_timeout(1500)
+                return True
+            
+            # === FALLBACK: Busca alternativa usando seletores Playwright ===
+            print(f"    Estratégia principal falhou, tentando fallback...")
+            
+            for variant in line_variants:
+                try:
+                    # Busca elementos com o texto exato da linha
+                    line_elements = await page.query_selector_all(f"span:text-is('{variant}'), div:text-is('{variant}')")
+                    
+                    for line_el in line_elements:
+                        try:
+                            # Navega para o container pai que tem Home/Away
+                            for _ in range(5):
+                                parent = await line_el.evaluate_handle("el => el.parentElement")
+                                parent_text = await parent.evaluate("el => el.innerText || ''")
+                                
+                                if home_label in parent_text and away_label in parent_text:
+                                    # Encontrou a linha! Busca as odds
+                                    odd_spans = await parent.evaluate_handle(
+                                        "el => Array.from(el.querySelectorAll('span, div')).filter(s => /^\\d+[.,]\\d{2,3}$/.test(s.innerText.trim()))"
+                                    )
+                                    
+                                    count = await odd_spans.evaluate("arr => arr.length")
+                                    
+                                    if count >= 2:
+                                        # Clica no correto baseado na posição
+                                        idx = 0 if side in ['home', 'over'] else 1
+                                        
+                                        result = await odd_spans.evaluate(f"""
+                                            (arr) => {{
+                                                const el = arr[{idx}];
+                                                if (el) {{
+                                                    el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                                                    try {{
+                                                        el.parentElement.click();
+                                                        return {{ success: true, method: 'fallback-parent' }};
+                                                    }} catch {{}}
+                                                    try {{
+                                                        el.click();
+                                                        return {{ success: true, method: 'fallback-direct' }};
+                                                    }} catch {{}}
+                                                }}
+                                                return {{ success: false }};
+                                            }}
+                                        """)
+                                        
+                                        if result and result.get('success'):
+                                            print(f"    Fallback: clicou com sucesso ({result.get('method')})")
+                                            await page.wait_for_timeout(1500)
+                                            return True
+                                    break
+                                
+                                line_el = parent
+                        except:
+                            continue
                 except:
                     continue
             
-            if candidates:
-                candidates.sort(key=lambda x: x[1])
-                
-                # Home/Over = esquerda (primeiro), Away/Under = direita (segundo)
-                if side in ['home', 'over'] and len(candidates) >= 1:
-                    el = candidates[0][0]
-                elif side in ['away', 'under'] and len(candidates) >= 2:
-                    el = candidates[1][0]
-                elif len(candidates) == 1:
-                    el = candidates[0][0]
-                else:
-                    el = None
-                
-                if el:
-                    print(f"    Encontrou {len(candidates)} candidatos, clicando...")
-                    try:
-                        await el.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(300)
-                        
-                        # Tenta clicar no pai primeiro
-                        parent = await el.evaluate_handle("el => el.parentElement")
-                        await parent.click()
-                        await page.wait_for_timeout(1500)
-                        return True
-                    except Exception as e1:
-                        print(f"    Clique no pai falhou: {e1}")
-                        try:
-                            await el.click()
-                            await page.wait_for_timeout(1500)
-                            return True
-                        except Exception as e2:
-                            print(f"    Clique direto falhou: {e2}")
-                            try:
-                                await el.evaluate("el => el.parentElement.click()")
-                                await page.wait_for_timeout(1500)
-                                return True
-                            except:
-                                pass
+            # Debug: mostra linhas disponíveis
+            body_text = await page.inner_text("body")
+            available_lines = set()
+            for l in body_text.split('\n'):
+                l_stripped = l.strip()
+                if re.match(r'^[+-]?\d+([.,]\d{1,2})?$', l_stripped) and len(l_stripped) < 8:
+                    available_lines.add(l_stripped)
             
-            print(f"    Não encontrou elemento clicável para odd {target_odd}")
+            def line_sort_key(x):
+                try:
+                    return float(x.replace(',', '.').replace('+', ''))
+                except:
+                    return 0
+            sorted_lines = sorted(available_lines, key=line_sort_key)
+            
+            print(f"    Linha não encontrada")
+            print(f"    Buscando: {line_variants}")
+            print(f"    Linhas AH disponíveis: {sorted_lines[:20]}")
+            
             return False
             
         except Exception as e:
             logger.error(f"Erro ao clicar: {e}")
+            import traceback
+            traceback.print_exc()
             return False
             
     def _print_results(self):
