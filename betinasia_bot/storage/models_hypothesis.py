@@ -350,44 +350,70 @@ class BetslipAuditResult(Base):
     
     Compara odds do WebSocket com odds reais do betslip para
     validar a precisão dos dados coletados.
+    
+    Regra is_valid_opportunity:
+    - True se conseguiu extrair odd do betslip E diff < 2%
+    - Usado para análise de oportunidades reais vs detectadas
+    
+    Versão da auditoria deve ser documentada em:
+    /docs/audit_versions.md
     """
     
     __tablename__ = "betslip_audit_results"
     
     id = Column(Integer, primary_key=True)
     
-    # Identificação do evento
+    # ========== IDENTIFICAÇÃO DO EVENTO ==========
     hypothesis_type = Column(String(10), nullable=False)  # H1, H3, H3B, H6
-    hypothesis_event_id = Column(Integer)  # ID do evento na tabela correspondente
+    hypothesis_event_id = Column(Integer)  # ID do evento na tabela correspondente (para merge)
     event_id = Column(String(100))  # ID do evento no WebSocket
-    match_info = Column(String(200))  # "Home vs Away"
     
-    # Mercado
-    market_type = Column(String(20), nullable=False)  # AH, OU, 1X2
-    line = Column(String(20), nullable=False)
+    # ========== INFORMAÇÕES DO JOGO ==========
+    sport = Column(String(20), default="football")  # Esporte
+    league = Column(String(100))  # Liga/Competição
+    home_team = Column(String(100))  # Time da casa
+    away_team = Column(String(100))  # Time visitante
+    match_info = Column(String(200))  # "Home vs Away" (redundante mas útil)
+    match_start_time = Column(DateTime(timezone=True))  # Horário de início do jogo
+    
+    # ========== MERCADO/APOSTA ==========
+    market_type = Column(String(20), nullable=False)  # AH, AH_HT, OU, OU_HT, 1X2
+    market_period = Column(String(20), default="full_time")  # full_time, half_time
+    line = Column(String(20), nullable=False)  # Ex: "+1", "-0.5", "2.5"
     side = Column(String(10), nullable=False)  # home, away, over, under
+    bet_description = Column(String(100))  # Ex: "AH +1 home full_time"
     
-    # Odds comparação
-    websocket_odd = Column(Float, nullable=False)
-    betslip_odd = Column(Float)  # Null se não conseguiu extrair
+    # ========== ODDS COMPARAÇÃO ==========
+    websocket_odd = Column(Float, nullable=False)  # Odd no momento da detecção
+    betslip_odd = Column(Float)  # Odd real do betslip (null se não conseguiu)
     difference_pct = Column(Float)  # (betslip - websocket) / websocket * 100
+    difference_absolute = Column(Float)  # betslip - websocket
     
-    # Limites
-    betslip_limit = Column(Float)  # Limite de aposta
+    # ========== LIMITES ==========
+    betslip_limit = Column(Float)  # Limite de aposta em $
     
-    # Status e classificação
+    # ========== STATUS E CLASSIFICAÇÃO ==========
     status = Column(String(30), nullable=False)  # IDENTICAL, OK, MINOR_DIFF, MAJOR_DIFF, LINE_NOT_AVAILABLE, GAME_NOT_FOUND, ERROR
-    is_valid_opportunity = Column(Boolean, default=False)  # True se diff < 2%
+    is_valid_opportunity = Column(Boolean, default=False)  # True se extraiu odd E diff < 2%
     
-    # Contexto do evento
+    # ========== CONTEXTO DA HIPÓTESE ==========
     reversal_direction = Column(String(10))  # Para H3B: up, down
     lag_direction = Column(String(10))  # Para H6: up, down
+    hypothesis_details = Column(JSON)  # Detalhes adicionais da hipótese em JSON
     
-    # Metadados
-    audited_at = Column(DateTime(timezone=True), server_default=func.now())
-    audit_duration_ms = Column(Integer)  # Tempo que levou para auditar
+    # ========== TIMING/LAG ==========
+    hypothesis_detected_at = Column(DateTime(timezone=True))  # Quando a hipótese foi detectada
+    audited_at = Column(DateTime(timezone=True), server_default=func.now())  # Quando auditoria terminou
     
-    # Dados brutos para debug
+    # Lag times em milissegundos
+    lag_detection_to_click_ms = Column(Integer)  # Tempo entre detecção e clique na odd
+    lag_click_to_betslip_ms = Column(Integer)  # Tempo entre clique e extração do betslip
+    audit_total_duration_ms = Column(Integer)  # Tempo total da auditoria
+    
+    # ========== VERSIONAMENTO ==========
+    audit_version = Column(String(20), default="v1.0")  # Versão do script de auditoria
+    
+    # ========== DEBUG ==========
     raw_betslip_text = Column(Text)  # Texto extraído do betslip
     
     __table_args__ = (
@@ -396,4 +422,8 @@ class BetslipAuditResult(Base):
         Index("idx_audit_valid", "is_valid_opportunity"),
         Index("idx_audit_date", "audited_at"),
         Index("idx_audit_diff", "difference_pct"),
+        Index("idx_audit_match", "home_team", "away_team"),
+        Index("idx_audit_market", "market_type", "line"),
+        Index("idx_audit_version", "audit_version"),
+        Index("idx_audit_hypothesis_event", "hypothesis_type", "hypothesis_event_id"),
     )
