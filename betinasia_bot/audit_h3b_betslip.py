@@ -23,6 +23,7 @@ sys.path.insert(0, '.')
 from scraper.betinasia import BetinAsiaScraper
 from scraper.betslip_extractor import BetslipExtractor, BetslipData
 from hypothesis.detectors import HypothesisDetector
+from sqlalchemy import text
 from storage.database import Database
 from storage.models_hypothesis import BetslipAuditResult
 
@@ -57,6 +58,7 @@ class AuditResult:
     # Status
     status: str = ""
     reversal_direction: str = ""  # "up" ou "down"
+    is_live: Optional[bool] = None  # True = in-match, False = pre-match
     
     # Timing/Lag GRANULAR (em milissegundos)
     hypothesis_detected_at: Optional[datetime] = None
@@ -120,6 +122,14 @@ class H3BAuditor:
         if self.save_to_db:
             self.db = Database()
             await self.db.connect()
+            # Garante que coluna is_live existe (migration leve)
+            try:
+                async with self.db.engine.begin() as conn:
+                    await conn.execute(
+                        text("ALTER TABLE betslip_audit_results ADD COLUMN IF NOT EXISTS is_live BOOLEAN")
+                    )
+            except Exception:
+                pass  # Coluna já existe ou banco não suporta IF NOT EXISTS
             print("Conectado ao banco de dados")
         
         print("Auditor H3B iniciado e logado")
@@ -161,9 +171,11 @@ class H3BAuditor:
                 
                 # Informações do jogo
                 sport="football",
+                league=result.league,
                 home_team=result.home_team,
                 away_team=result.away_team,
                 match_info=result.match_info,
+                match_start_time=result.match_start_time,
                 
                 # Mercado/Aposta
                 market_type=result.market_type,
@@ -184,6 +196,7 @@ class H3BAuditor:
                 # Status
                 status=result.status,
                 is_valid_opportunity=is_valid,
+                is_live=result.is_live,
                 
                 # Contexto da hipótese
                 reversal_direction=result.reversal_direction,
@@ -329,12 +342,24 @@ Vou auditar {self.num_audits} eventos.
                     msg_meta = item[1]
                     msg_data = item[2] if len(item) > 2 else {}
                     
-                    # Captura info do evento
+                    # Captura info do evento (times + kickoff)
                     if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
                         if msg_meta[0] == 'fb' and 'home' in msg_data:
+                            # Parseia kickoff time
+                            kickoff = None
+                            if 'start_ts' in msg_data:
+                                try:
+                                    kickoff = datetime.fromisoformat(
+                                        msg_data['start_ts'].replace('Z', '+00:00')
+                                    )
+                                except:
+                                    pass
+                            
                             events[msg_meta[1]] = {
                                 'home': msg_data.get('home', ''),
                                 'away': msg_data.get('away', ''),
+                                'league': msg_data.get('competition_name', ''),
+                                'kickoff': kickoff,
                             }
                     
                     # Processa odds de AH e OU
@@ -408,19 +433,25 @@ Vou auditar {self.num_audits} eventos.
                                                     info = events.get(event_id, {})
                                                     home_team = info.get('home', '?')
                                                     away_team = info.get('away', '?')
+                                                    kickoff = info.get('kickoff')
+                                                    now = datetime.now(timezone.utc)
+                                                    is_live = kickoff <= now if kickoff else None
                                                     h3b_list.append({
                                                         'event_id': event_id,
                                                         'audit_key': audit_key,
                                                         'match_info': f"{home_team} vs {away_team}",
                                                         'home_team': home_team,
                                                         'away_team': away_team,
+                                                        'league': info.get('league', ''),
+                                                        'kickoff': kickoff,
+                                                        'is_live': is_live,
                                                         'market_type': 'AH',
                                                         'market_period': 'full_time',
                                                         'line': str(h3b.ah_line),
                                                         'side': h3b.side,
                                                         'websocket_odd': h3b.odd_at_reversal,
                                                         'direction': direction,
-                                                        'detected_at': datetime.now(timezone.utc),  # Timestamp de detecção
+                                                        'detected_at': datetime.now(timezone.utc),
                                                     })
                                                 else:
                                                     skipped_already_audited += 1
@@ -479,12 +510,18 @@ Vou auditar {self.num_audits} eventos.
                                                     info = events.get(event_id, {})
                                                     home_team = info.get('home', '?')
                                                     away_team = info.get('away', '?')
+                                                    kickoff = info.get('kickoff')
+                                                    now = datetime.now(timezone.utc)
+                                                    is_live = kickoff <= now if kickoff else None
                                                     h3b_list.append({
                                                         'event_id': event_id,
                                                         'audit_key': audit_key,
                                                         'match_info': f"{home_team} vs {away_team}",
                                                         'home_team': home_team,
                                                         'away_team': away_team,
+                                                        'league': info.get('league', ''),
+                                                        'kickoff': kickoff,
+                                                        'is_live': is_live,
                                                         'market_type': 'OU',
                                                         'market_period': 'full_time',
                                                         'line': str(h3b.ah_line),
@@ -552,12 +589,18 @@ Vou auditar {self.num_audits} eventos.
                                                     info = events.get(event_id, {})
                                                     home_team = info.get('home', '?')
                                                     away_team = info.get('away', '?')
+                                                    kickoff = info.get('kickoff')
+                                                    now = datetime.now(timezone.utc)
+                                                    is_live = kickoff <= now if kickoff else None
                                                     h3b_list.append({
                                                         'event_id': event_id,
                                                         'audit_key': audit_key,
                                                         'match_info': f"{home_team} vs {away_team}",
                                                         'home_team': home_team,
                                                         'away_team': away_team,
+                                                        'league': info.get('league', ''),
+                                                        'kickoff': kickoff,
+                                                        'is_live': is_live,
                                                         'market_type': 'AH',
                                                         'market_period': 'half_time',
                                                         'line': str(h3b.ah_line),
@@ -623,12 +666,18 @@ Vou auditar {self.num_audits} eventos.
                                                     info = events.get(event_id, {})
                                                     home_team = info.get('home', '?')
                                                     away_team = info.get('away', '?')
+                                                    kickoff = info.get('kickoff')
+                                                    now = datetime.now(timezone.utc)
+                                                    is_live = kickoff <= now if kickoff else None
                                                     h3b_list.append({
                                                         'event_id': event_id,
                                                         'audit_key': audit_key,
                                                         'match_info': f"{home_team} vs {away_team}",
                                                         'home_team': home_team,
                                                         'away_team': away_team,
+                                                        'league': info.get('league', ''),
+                                                        'kickoff': kickoff,
+                                                        'is_live': is_live,
                                                         'market_type': 'OU',
                                                         'market_period': 'half_time',
                                                         'line': str(h3b.ah_line),
@@ -656,6 +705,9 @@ Vou auditar {self.num_audits} eventos.
         match_info = h3b['match_info']
         home_team = h3b.get('home_team', '')
         away_team = h3b.get('away_team', '')
+        league = h3b.get('league', '')
+        kickoff = h3b.get('kickoff')
+        is_live = h3b.get('is_live')
         market_type = h3b['market_type']
         market_period = h3b.get('market_period', 'full_time')
         line = h3b['line']
@@ -670,7 +722,8 @@ Vou auditar {self.num_audits} eventos.
         # Lag desde detecção até início da auditoria (tempo na fila)
         lag_queue_wait = int((datetime.now(timezone.utc) - detected_at).total_seconds() * 1000)
         
-        print(f"\n\n>>> AUDITANDO H3B ({direction.upper()}): {match_info}")
+        live_label = "IN-MATCH" if is_live else "PRE-MATCH" if is_live is not None else "?"
+        print(f"\n\n>>> AUDITANDO H3B ({direction.upper()}) [{live_label}]: {match_info}")
         print(f"    Event ID: {event_id}")
         print(f"    Mercado: {market_type} {line} {side} ({market_period})")
         print(f"    Odd WebSocket: {ws_odd:.3f}")
@@ -732,6 +785,7 @@ Vou auditar {self.num_audits} eventos.
                     websocket_odd=ws_odd,
                     status="GAME_NOT_FOUND",
                     reversal_direction=direction,
+                    is_live=is_live,
                     hypothesis_detected_at=detected_at,
                     lag_queue_wait_ms=lag_queue_wait,
                     lag_find_game_ms=lag_find_game,
@@ -806,6 +860,7 @@ Vou auditar {self.num_audits} eventos.
                     websocket_odd=ws_odd,
                     status="LINE_NOT_AVAILABLE",
                     reversal_direction=direction,
+                    is_live=is_live,
                     hypothesis_detected_at=detected_at,
                     lag_queue_wait_ms=lag_queue_wait,
                     lag_find_game_ms=lag_find_game,
@@ -847,6 +902,7 @@ Vou auditar {self.num_audits} eventos.
                     websocket_odd=ws_odd,
                     status="EXTRACT_FAILED",
                     reversal_direction=direction,
+                    is_live=is_live,
                     hypothesis_detected_at=detected_at,
                     lag_queue_wait_ms=lag_queue_wait,
                     lag_find_game_ms=lag_find_game,
@@ -899,6 +955,8 @@ Vou auditar {self.num_audits} eventos.
                 event_id=event_id,
                 home_team=home_team,
                 away_team=away_team,
+                league=league,
+                match_start_time=kickoff,
                 market_type=market_type,
                 market_period=market_period,
                 line=line,
@@ -910,6 +968,7 @@ Vou auditar {self.num_audits} eventos.
                 difference_absolute=diff_abs,
                 status=status,
                 reversal_direction=direction,
+                is_live=is_live,
                 hypothesis_detected_at=detected_at,
                 lag_queue_wait_ms=lag_queue_wait,
                 lag_find_game_ms=lag_find_game,
@@ -939,6 +998,7 @@ Vou auditar {self.num_audits} eventos.
                 websocket_odd=ws_odd,
                 status=f"ERROR: {str(e)[:30]}",
                 reversal_direction=direction,
+                is_live=is_live,
                 hypothesis_detected_at=detected_at,
                 audit_total_duration_ms=audit_total
             )
@@ -1545,6 +1605,23 @@ Vou auditar {self.num_audits} eventos.
             print(f"\n  REVERSÃO {direction.upper()}:")
             print(f"    Total: {dir_total}")
             print(f"    Taxa de sucesso: {dir_rate:.1f}%")
+        
+        # Breakdown pre-match vs in-match
+        print("\n" + "=" * 70)
+        print("BREAKDOWN PRE-MATCH vs IN-MATCH")
+        print("=" * 70)
+        
+        prematch = [r for r in self.audit_results if r.is_live == False]
+        inmatch = [r for r in self.audit_results if r.is_live == True]
+        unknown = [r for r in self.audit_results if r.is_live is None]
+        
+        for label, results in [("PRE-MATCH", prematch), ("IN-MATCH", inmatch), ("DESCONHECIDO", unknown)]:
+            if not results:
+                continue
+            n = len(results)
+            n_real = sum(1 for r in results if r.status in ["IDENTICAL", "OK", "MINOR_DIFF", "MAJOR_DIFF"])
+            rate = n_real / n * 100 if n > 0 else 0
+            print(f"\n  {label}: {n} auditorias ({rate:.1f}% sucesso)")
 
 
 async def run_continuous(direction_filter: str = "up", batch_size: int = 50):

@@ -396,6 +396,9 @@ class BetslipAuditResult(Base):
     status = Column(String(30), nullable=False)  # IDENTICAL, OK, MINOR_DIFF, MAJOR_DIFF, LINE_NOT_AVAILABLE, GAME_NOT_FOUND, ERROR
     is_valid_opportunity = Column(Boolean, default=False)  # True se extraiu odd E diff < 2%
     
+    # ========== STATUS DO JOGO ==========
+    is_live = Column(Boolean)  # True = in-match, False = pre-match, None = desconhecido
+    
     # ========== CONTEXTO DA HIPÓTESE ==========
     reversal_direction = Column(String(10))  # Para H3B: up, down
     lag_direction = Column(String(10))  # Para H6: up, down
