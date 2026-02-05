@@ -694,11 +694,22 @@ Vou auditar {self.num_audits} eventos.
             
             print(f"    Buscando jogo: '{home_team}' vs '{away_team}'")
             
-            # === TIMING: Buscar jogo (via campo de busca do site) ===
+            # === TIMING: Buscar jogo ===
             find_game_start = time.time()
             
-            # Busca o jogo usando o campo de busca do site (rápido: ~3s)
+            # Busca o jogo na página atual
             game_found = await self._find_and_click_game(home_team, away_team)
+            
+            if not game_found:
+                print(f"    Jogo não encontrado na página atual, tentando navegar...")
+                await page.goto("https://black.betinasia.com/sportsbook/football")
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(3000)
+                
+                await self._expand_all_lines()
+                await page.wait_for_timeout(1500)
+                
+                game_found = await self._find_and_click_game(home_team, away_team)
             
             lag_find_game = int((time.time() - find_game_start) * 1000)
             
@@ -727,12 +738,13 @@ Vou auditar {self.num_audits} eventos.
                     audit_total_duration_ms=audit_total
                 )
             
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(2000)
             
             # === TIMING: Expandir linhas ===
             expand_start = time.time()
             print(f"    Expandindo linhas...")
             await self._expand_all_lines()
+            await page.wait_for_timeout(1500)
             lag_expand_lines = int((time.time() - expand_start) * 1000)
             print(f"    [LAG] Expandir linhas: {lag_expand_lines}ms")
             
@@ -979,224 +991,82 @@ Vou auditar {self.num_audits} eventos.
         return variants
     
     async def _find_and_click_game(self, home_team: str, away_team: str) -> bool:
-        """
-        Encontra e clica num jogo usando a BUSCA do site.
-        
-        Fluxo rápido:
-        1. Clica no campo de busca (topo da página)
-        2. Digita o nome de um dos times
-        3. Seleciona o jogo correto nos resultados
-        
-        Muito mais rápido que navegar/expandir todas as ligas (~3s vs ~47s).
-        """
+        """Encontra e clica num jogo específico na página."""
         page = self.scraper._page
         
-        # Monta lista de termos de busca (tenta home primeiro, depois away)
-        search_terms = []
-        
-        # Usa aliases para ter variantes
-        home_aliases = self._get_team_aliases(home_team)
-        away_aliases = self._get_team_aliases(away_team)
-        
-        # Prioriza o nome mais curto/simples de cada time
-        for aliases in [home_aliases, away_aliases]:
-            # Ordena por tamanho (nomes mais curtos primeiro = mais genéricos = melhor busca)
-            sorted_aliases = sorted(set(aliases), key=len)
-            for alias in sorted_aliases:
-                if alias and len(alias) >= 3 and alias not in search_terms:
-                    search_terms.append(alias)
-        
-        for search_term in search_terms[:4]:  # Tenta até 4 variantes
-            try:
-                result = await self._search_and_click(search_term, home_team, away_team)
-                if result:
-                    return True
-            except Exception as e:
-                logger.debug(f"Erro na busca por '{search_term}': {e}")
-                continue
-        
-        # Fallback: verifica se o jogo já está visível na página atual
         try:
             body_text = await page.inner_text("body")
-            if ("Asian Handicap" in body_text or "Over/Under" in body_text):
-                # Verifica se é o jogo certo
-                home_found = any(alias in body_text for alias in home_aliases if len(alias) > 3)
-                away_found = any(alias in body_text for alias in away_aliases if len(alias) > 3)
-                if home_found or away_found:
-                    print(f"    Jogo já visível na página atual")
-                    return True
-        except:
-            pass
-        
-        print(f"    Jogo não encontrado via busca")
-        return False
-    
-    async def _search_and_click(self, search_term: str, home_team: str, away_team: str) -> bool:
-        """Usa o campo de busca do site para encontrar e navegar para o jogo."""
-        page = self.scraper._page
-        
-        print(f"    Buscando: '{search_term}'")
-        
-        # === PASSO 1: Encontra e clica no campo de busca ===
-        search_input = None
-        
-        # Tenta seletores comuns para o campo de busca
-        search_selectors = [
-            "input[type='text'][placeholder*='earch']",
-            "input[type='text'][placeholder*='Search']",
-            "input[type='search']",
-            "input[placeholder*='league']",
-            "input[placeholder*='game']",
-            "input[autocomplete='none']",
-            "input[name*='search']",
-            "input[type='text']",
-        ]
-        
-        for selector in search_selectors:
-            try:
-                elements = await page.query_selector_all(selector)
-                for el in elements:
-                    try:
-                        if await el.is_visible():
-                            search_input = el
-                            break
-                    except:
-                        continue
-                if search_input:
-                    break
-            except:
-                continue
-        
-        if not search_input:
-            # Tenta clicar em ícone/botão de busca para abrir o campo
-            search_button_selectors = [
-                "[class*='search']",
-                "button:has-text('Search')",
-                "[aria-label*='search']",
-                "[aria-label*='Search']",
-            ]
-            for selector in search_button_selectors:
+            
+            # Obtém aliases para ambos os times
+            home_aliases = self._get_team_aliases(home_team)
+            away_aliases = self._get_team_aliases(away_team)
+            
+            # Verifica se algum alias está na página
+            home_found = any(alias in body_text for alias in home_aliases if len(alias) > 3)
+            away_found = any(alias in body_text for alias in away_aliases if len(alias) > 3)
+            
+            # Também tenta palavras individuais
+            home_words = home_team.split()[:2]
+            away_words = away_team.split()[:2]
+            
+            if not home_found:
+                home_found = any(word in body_text for word in home_words if len(word) > 3)
+            if not away_found:
+                away_found = any(word in body_text for word in away_words if len(word) > 3)
+            
+            if not home_found and not away_found:
+                print(f"    Times não encontrados na página")
+                return False
+            
+            print(f"    Times encontrados: home={home_found}, away={away_found}")
+            
+            # Combina aliases de ambos os times para busca
+            all_search_terms = home_aliases + away_aliases
+            
+            for name_variant in all_search_terms:
+                if not name_variant or len(name_variant) < 3:
+                    continue
+                
                 try:
-                    btn = await page.query_selector(selector)
-                    if btn and await btn.is_visible():
-                        await btn.click()
-                        await page.wait_for_timeout(500)
-                        # Tenta encontrar o input novamente
-                        for s in search_selectors:
-                            try:
-                                search_input = await page.query_selector(s)
-                                if search_input and await search_input.is_visible():
-                                    break
-                                search_input = None
-                            except:
-                                continue
-                        if search_input:
-                            break
+                    selectors = [
+                        f"a:has-text('{name_variant}')",
+                        f"div:has-text('{name_variant}')",
+                        f"span:has-text('{name_variant}')",
+                    ]
+                    
+                    for selector in selectors:
+                        try:
+                            elements = await page.query_selector_all(selector)
+                            
+                            for el in elements[:5]:
+                                try:
+                                    el_text = await el.inner_text()
+                                    
+                                    if len(el_text) < 200:
+                                        await el.scroll_into_view_if_needed()
+                                        await el.click()
+                                        await page.wait_for_timeout(1500)
+                                        
+                                        new_text = await page.inner_text("body")
+                                        if "Asian Handicap" in new_text or "Over/Under" in new_text:
+                                            print(f"    Clicou no jogo '{name_variant}'")
+                                            return True
+                                except:
+                                    continue
+                        except:
+                            continue
                 except:
                     continue
-        
-        if not search_input:
-            print(f"    Campo de busca não encontrado")
+            
+            if ("Asian Handicap" in body_text or "Over/Under" in body_text) and home_found:
+                print(f"    Jogo já está visível na página")
+                return True
+            
             return False
-        
-        # === PASSO 2: Limpa e digita o termo de busca ===
-        try:
-            await search_input.click()
-            await page.wait_for_timeout(300)
-            
-            # Limpa campo (seleciona tudo e apaga)
-            await search_input.fill("")
-            await page.wait_for_timeout(200)
-            
-            # Digita o termo de busca
-            await search_input.type(search_term, delay=50)
-            await page.wait_for_timeout(1500)  # Espera resultados aparecerem
             
         except Exception as e:
-            logger.debug(f"Erro ao digitar no campo de busca: {e}")
+            logger.debug(f"Erro ao buscar jogo: {e}")
             return False
-        
-        # === PASSO 3: Encontra e clica no resultado correto ===
-        # Procura links/elementos que contenham ambos os times (ou pelo menos um)
-        home_aliases = self._get_team_aliases(home_team)
-        away_aliases = self._get_team_aliases(away_team)
-        
-        clicked = await page.evaluate("""
-            (params) => {
-                const homeAliases = params.homeAliases;
-                const awayAliases = params.awayAliases;
-                
-                function textContainsTeam(text, aliases) {
-                    const lower = text.toLowerCase();
-                    for (const alias of aliases) {
-                        if (alias.length >= 3 && lower.includes(alias.toLowerCase())) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                
-                // Procura links (a) nos resultados da busca
-                const links = document.querySelectorAll('a');
-                let bestMatch = null;
-                let bestScore = 0;
-                
-                for (const link of links) {
-                    const text = link.innerText || '';
-                    if (text.length < 5 || text.length > 200) continue;
-                    
-                    const hasHome = textContainsTeam(text, homeAliases);
-                    const hasAway = textContainsTeam(text, awayAliases);
-                    
-                    // Score: 2 = ambos os times, 1 = um time + "vs" ou "v"
-                    let score = 0;
-                    if (hasHome && hasAway) score = 2;
-                    else if ((hasHome || hasAway) && (text.includes(' vs ') || text.includes(' v '))) score = 1;
-                    
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestMatch = link;
-                    }
-                }
-                
-                if (bestMatch) {
-                    bestMatch.click();
-                    return { success: true, text: bestMatch.innerText.substring(0, 100), score: bestScore };
-                }
-                
-                return { success: false };
-            }
-        """, {
-            "homeAliases": home_aliases,
-            "awayAliases": away_aliases
-        })
-        
-        if clicked and clicked.get('success'):
-            print(f"    Busca: clicou em '{clicked.get('text', '?').strip()}'")
-            
-            # Espera a página do jogo carregar
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(2000)
-            
-            # Verifica se carregou a página do jogo (deve ter Asian Handicap ou Over/Under)
-            body_text = await page.inner_text("body")
-            if "Asian Handicap" in body_text or "Over/Under" in body_text or "Handicap" in body_text:
-                return True
-            
-            # Pode precisar de mais tempo
-            await page.wait_for_timeout(2000)
-            body_text = await page.inner_text("body")
-            if "Asian Handicap" in body_text or "Over/Under" in body_text or "Handicap" in body_text:
-                return True
-            
-            print(f"    Página carregou mas não tem odds de Asian Handicap")
-            return False
-        
-        # Fecha a busca (ESC)
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
-        
-        return False
     
     async def _expand_all_lines(self):
         """Expande todas as linhas clicando em 'Show all lines' via JavaScript (rápido)."""
