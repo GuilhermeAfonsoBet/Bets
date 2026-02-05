@@ -1557,13 +1557,172 @@ Vou auditar {self.num_audits} eventos.
             print(f"    Taxa de sucesso: {dir_rate:.1f}%")
 
 
-async def main():
-    logger.remove()
-    logger.add(sys.stderr, level="WARNING")
+async def run_continuous(direction_filter: str = "up", batch_size: int = 50):
+    """
+    Modo contínuo: roda auditoria indefinidamente, salvando resultados no banco.
     
-    # Audita eventos H3B com reversão UP (odd subiu = melhorou)
-    auditor = H3BAuditor(num_audits=50, direction_filter="up")
-    await auditor.run_audit()
+    Projetado para rodar por dias/semanas em background no VPS.
+    Após cada batch de N auditorias, loga um resumo e continua.
+    Reconecta automaticamente em caso de erro.
+    """
+    import signal
+    
+    running = True
+    
+    def signal_handler(signum, frame):
+        nonlocal running
+        logger.info(f"Sinal {signum} recebido, encerrando após batch atual...")
+        running = False
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    total_audits = 0
+    total_batches = 0
+    total_errors = 0
+    start_time = datetime.now(timezone.utc)
+    
+    # Acumuladores globais de resultados
+    global_counts = {"IDENTICAL": 0, "OK": 0, "MINOR_DIFF": 0, "MAJOR_DIFF": 0, "LINE_NOT_AVAILABLE": 0, "OTHER": 0}
+    global_diffs = []
+    
+    logger.info("=" * 70)
+    logger.info("AUDITORIA H3B - MODO CONTÍNUO")
+    logger.info("=" * 70)
+    logger.info(f"Direção: {direction_filter}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Salva resultados no banco de dados")
+    logger.info(f"Para parar: Ctrl+C ou kill -TERM <pid>")
+    logger.info("=" * 70)
+    
+    while running:
+        total_batches += 1
+        batch_start = datetime.now(timezone.utc)
+        
+        logger.info(f"\n--- BATCH #{total_batches} iniciando (total acumulado: {total_audits} auditorias) ---")
+        
+        try:
+            auditor = H3BAuditor(
+                num_audits=batch_size, 
+                direction_filter=direction_filter, 
+                save_to_db=True
+            )
+            await auditor.run_audit()
+            
+            # Acumula resultados
+            for r in auditor.audit_results:
+                total_audits += 1
+                if r.status in global_counts:
+                    global_counts[r.status] += 1
+                else:
+                    global_counts["OTHER"] += 1
+                if r.difference_pct is not None:
+                    global_diffs.append(abs(r.difference_pct))
+            
+            # Log resumo do batch
+            batch_duration = (datetime.now(timezone.utc) - batch_start).total_seconds()
+            uptime = datetime.now(timezone.utc) - start_time
+            days = uptime.days
+            hours, remainder = divmod(uptime.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            
+            real_opps = global_counts["IDENTICAL"] + global_counts["OK"] + global_counts["MINOR_DIFF"] + global_counts["MAJOR_DIFF"]
+            rate = (real_opps / total_audits * 100) if total_audits > 0 else 0
+            avg_diff = (sum(global_diffs) / len(global_diffs)) if global_diffs else 0
+            
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"RESUMO CONTÍNUO - Batch #{total_batches}")
+            logger.info(f"  Uptime: {days}d {hours}h {minutes}m")
+            logger.info(f"  Total auditorias: {total_audits}")
+            logger.info(f"  Oportunidades reais: {real_opps} ({rate:.1f}%)")
+            logger.info(f"  Diferença média: {avg_diff:.3f}%")
+            logger.info(f"  Linhas indisponíveis: {global_counts['LINE_NOT_AVAILABLE']}")
+            logger.info(f"  Erros reconexão: {total_errors}")
+            logger.info(f"  Batch duration: {batch_duration:.0f}s")
+            logger.info(f"{'=' * 60}")
+            
+        except KeyboardInterrupt:
+            logger.info("Interrupção recebida (Ctrl+C)")
+            running = False
+            break
+            
+        except Exception as e:
+            total_errors += 1
+            logger.error(f"Erro no batch #{total_batches}: {e}")
+            logger.info(f"Aguardando 60s antes de reconectar... (erro {total_errors})")
+            
+            # Pausa antes de reconectar
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                running = False
+                break
+        
+        if running:
+            # Pausa entre batches (deixa WebSocket "esfriar")
+            logger.info("Pausa de 10s entre batches...")
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                running = False
+                break
+    
+    # Resumo final
+    uptime = datetime.now(timezone.utc) - start_time
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"ENCERRADO - Resumo final")
+    logger.info(f"  Uptime total: {uptime}")
+    logger.info(f"  Batches: {total_batches}")
+    logger.info(f"  Total auditorias: {total_audits}")
+    
+    real_opps = global_counts["IDENTICAL"] + global_counts["OK"] + global_counts["MINOR_DIFF"] + global_counts["MAJOR_DIFF"]
+    if total_audits > 0:
+        logger.info(f"  Taxa sucesso: {real_opps / total_audits * 100:.1f}%")
+    if global_diffs:
+        logger.info(f"  Diferença média: {sum(global_diffs)/len(global_diffs):.3f}%")
+    logger.info(f"  Erros reconexão: {total_errors}")
+    logger.info(f"{'=' * 70}")
+
+
+async def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Auditoria H3B: WebSocket vs Betslip")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Modo contínuo: roda indefinidamente (dias/semanas)")
+    parser.add_argument("--num-audits", type=int, default=50,
+                        help="Número de auditorias por batch (default: 50)")
+    parser.add_argument("--direction", choices=["up", "down", "all"], default="up",
+                        help="Filtro de direção da reversão (default: up)")
+    args = parser.parse_args()
+    
+    # Configura logging
+    logger.remove()
+    
+    if args.continuous:
+        # Modo contínuo: log em arquivo + stderr
+        logger.add(
+            sys.stderr,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+            level="INFO"
+        )
+        logger.add(
+            "logs/audit_h3b_{time:YYYY-MM-DD}.log",
+            rotation="00:00",
+            retention="60 days",
+            level="DEBUG",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
+        )
+        
+        await run_continuous(
+            direction_filter=args.direction,
+            batch_size=args.num_audits
+        )
+    else:
+        # Modo original: N auditorias e sai
+        logger.add(sys.stderr, level="WARNING")
+        auditor = H3BAuditor(num_audits=args.num_audits, direction_filter=args.direction)
+        await auditor.run_audit()
 
 
 if __name__ == "__main__":
