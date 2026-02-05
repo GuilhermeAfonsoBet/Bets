@@ -173,11 +173,15 @@ class BetslipExtractor:
                         const panels = document.querySelectorAll(selector);
                         for (const panel of panels) {
                             const text = panel.innerText || '';
-                            // Verifica se contém indicadores do betslip
+                            // Verifica se contém indicadores do betslip (PT ou EN)
                             if (text.includes('Todos Os Agentes') || 
+                                text.includes('All Betting Agents') ||
                                 text.includes('MELHOR') ||
+                                text.includes('BEST') ||
                                 text.includes('TOTAL') ||
-                                text.includes('Tempo Limite')) {
+                                text.includes('AVERAGE') ||
+                                text.includes('Tempo Limite') ||
+                                text.includes('Time Limit')) {
                                 return text;
                             }
                         }
@@ -233,13 +237,25 @@ class BetslipExtractor:
             # Padrão: número decimal seguido de mais números
             # Esperado: TOTAL MÉDIA MELHOR (3 valores)
             
-            # Procura pela seção "Todos Os Agentes"
+            # Procura pela seção "Todos Os Agentes" (PT) ou "All Betting Agents" (EN)
             todos_idx = text.find('Todos Os Agentes')
             if todos_idx == -1:
                 todos_idx = text.find('Todos os Agentes')
+            if todos_idx == -1:
+                todos_idx = text.find('All Betting Agents')
+            if todos_idx == -1:
+                todos_idx = text.find('All betting agents')
+            if todos_idx == -1:
+                # Fallback: procura por padrão de 3 números decimais seguidos (TOTAL MÉDIA MELHOR)
+                odds_pattern = r'(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})'
+                match = re.search(odds_pattern, text)
+                if match:
+                    todos_idx = match.start() - 50  # Pega um pouco antes para contexto
+                    if todos_idx < 0:
+                        todos_idx = 0
             
             if todos_idx == -1:
-                logger.warning("Não encontrou 'Todos Os Agentes De Apostas'")
+                logger.warning("Não encontrou 'Todos Os Agentes De Apostas' ou 'All Betting Agents'")
                 return None
             
             # Pega texto após "Todos Os Agentes"

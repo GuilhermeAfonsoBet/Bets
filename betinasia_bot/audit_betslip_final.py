@@ -599,6 +599,9 @@ Vou auditar {self.num_audits} eventos.
             
             print(f"    Procurando linha: {line_variants}")
             
+            # Nomes de seção (PT e EN)
+            section_names = ["Asian Handicap", "Handicap Asiático", "Handicap"]
+            
             # === ESTRATÉGIA PRINCIPAL: JavaScript robusto baseado na estrutura DOM ===
             # Estrutura: LINHA | Home | ODD_HOME | Away | ODD_AWAY
             
@@ -606,19 +609,28 @@ Vou auditar {self.num_audits} eventos.
                 (params) => {
                     const lineVariants = params.lineVariants;
                     const side = params.side;
+                    const sectionNames = params.sectionNames;
                     
                     // Função para normalizar texto de linha
                     function normalizeLineText(text) {
                         return text.trim().replace(/\\s+/g, '').replace('.', ',');
                     }
                     
-                    // Encontra a seção Asian Handicap
+                    // Função para verificar se texto contém algum dos nomes de seção
+                    function matchesSection(text) {
+                        for (const name of sectionNames) {
+                            if (text.includes(name)) return true;
+                        }
+                        return false;
+                    }
+                    
+                    // Encontra a seção Asian Handicap (PT ou EN)
                     let sectionContainer = null;
                     const headers = document.querySelectorAll('div, span, h3, h4');
                     
                     for (const h of headers) {
                         const text = (h.innerText || '').trim();
-                        if (text.includes('Handicap') || text.includes('Asian')) {
+                        if (matchesSection(text) || text.includes('Handicap') || text.includes('Asian')) {
                             let parent = h.parentElement;
                             for (let i = 0; i < 10 && parent; i++) {
                                 const parentText = parent.innerText || '';
@@ -639,26 +651,49 @@ Vou auditar {self.num_audits} eventos.
                     // Encontra elementos que podem ser a linha de handicap
                     const allElements = sectionContainer.querySelectorAll('span, div');
                     
+                    let foundLineText = null;
+                    
                     for (const el of allElements) {
                         const elText = (el.innerText || '').trim();
                         
                         // Verifica se este elemento é a linha que procuramos
+                        // IMPORTANTE: O texto deve ser EXATAMENTE a linha
                         let isLineMatch = false;
                         for (const variant of lineVariants) {
                             if (elText === variant || normalizeLineText(elText) === normalizeLineText(variant)) {
                                 isLineMatch = true;
+                                foundLineText = elText;
                                 break;
                             }
                         }
                         
                         if (!isLineMatch) continue;
                         
+                        // Verifica se este elemento é pequeno (só a linha, não um container grande)
+                        if (elText.length > 10) continue;
+                        
                         // Encontrou a linha! Busca o container ROW
                         let rowContainer = el.parentElement;
                         for (let i = 0; i < 6 && rowContainer; i++) {
                             const rowText = rowContainer.innerText || '';
                             
-                            if (rowText.includes('Home') && rowText.includes('Away')) {
+                            // Verifica se tem Home e Away e não é muito grande
+                            if (rowText.includes('Home') && rowText.includes('Away') &&
+                                rowText.split('\\n').length < 15) {
+                                
+                                // Verifica se contém a nossa linha
+                                let hasOurLine = false;
+                                for (const variant of lineVariants) {
+                                    if (rowText.includes(variant)) {
+                                        hasOurLine = true;
+                                        break;
+                                    }
+                                }
+                                if (!hasOurLine) {
+                                    rowContainer = rowContainer.parentElement;
+                                    continue;
+                                }
+                                
                                 // Encontra os elementos clicáveis (odds)
                                 const clickableElements = rowContainer.querySelectorAll('div, span');
                                 const oddElements = [];
@@ -667,9 +702,9 @@ Vou auditar {self.num_audits} eventos.
                                     const childText = (child.innerText || '').trim();
                                     
                                     // Verifica se é uma odd (formato X.XXX ou X,XXX)
-                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText)) {
+                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText) && childText.length < 10) {
                                         const rect = child.getBoundingClientRect();
-                                        if (rect.width > 0 && rect.height > 0) {
+                                        if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
                                             oddElements.push({
                                                 el: child,
                                                 x: rect.x,
@@ -679,13 +714,24 @@ Vou auditar {self.num_audits} eventos.
                                     }
                                 }
                                 
-                                if (oddElements.length >= 2) {
+                                // Remove duplicatas
+                                const uniqueOdds = [];
+                                const seenKeys = new Set();
+                                for (const odd of oddElements) {
+                                    const key = Math.round(odd.x) + '|' + odd.text;
+                                    if (!seenKeys.has(key)) {
+                                        seenKeys.add(key);
+                                        uniqueOdds.push(odd);
+                                    }
+                                }
+                                
+                                if (uniqueOdds.length >= 2) {
                                     // Ordena por posição X
-                                    oddElements.sort((a, b) => a.x - b.x);
+                                    uniqueOdds.sort((a, b) => a.x - b.x);
                                     
                                     // Home = primeiro (esquerda), Away = segundo (direita)
                                     const targetIdx = (side === 'home') ? 0 : 1;
-                                    const targetEl = oddElements[targetIdx];
+                                    const targetEl = uniqueOdds[targetIdx];
                                     
                                     if (targetEl) {
                                         targetEl.el.scrollIntoView({ behavior: 'instant', block: 'center' });
@@ -694,13 +740,25 @@ Vou auditar {self.num_audits} eventos.
                                             const parent = targetEl.el.parentElement;
                                             if (parent) {
                                                 parent.click();
-                                                return { success: true, clickedOdd: targetEl.text, method: 'parent' };
+                                                return { 
+                                                    success: true, 
+                                                    clickedOdd: targetEl.text, 
+                                                    method: 'parent',
+                                                    lineFound: foundLineText,
+                                                    allOdds: uniqueOdds.map(o => o.text)
+                                                };
                                             }
                                         } catch (e) {}
                                         
                                         try {
                                             targetEl.el.click();
-                                            return { success: true, clickedOdd: targetEl.text, method: 'direct' };
+                                            return { 
+                                                success: true, 
+                                                clickedOdd: targetEl.text, 
+                                                method: 'direct',
+                                                lineFound: foundLineText,
+                                                allOdds: uniqueOdds.map(o => o.text)
+                                            };
                                         } catch (e) {}
                                     }
                                 }
@@ -709,11 +767,19 @@ Vou auditar {self.num_audits} eventos.
                         }
                     }
                     
-                    return { success: false, reason: 'LINE_NOT_FOUND' };
+                    return { 
+                        success: false, 
+                        reason: 'LINE_NOT_FOUND',
+                        foundLineText: foundLineText
+                    };
                 }
-            """, {"lineVariants": line_variants, "side": side})
+            """, {"lineVariants": line_variants, "side": side, "sectionNames": section_names})
             
             if clicked and clicked.get('success'):
+                line_found = clicked.get('lineFound', '?')
+                all_odds = clicked.get('allOdds', [])
+                print(f"    Linha encontrada: {line_found}")
+                print(f"    Odds na linha: {all_odds}")
                 print(f"    Clicou na odd {clicked.get('clickedOdd')} ({clicked.get('method')})")
                 await page.wait_for_timeout(1500)
                 return True

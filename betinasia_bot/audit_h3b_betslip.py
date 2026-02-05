@@ -665,13 +665,13 @@ Vou auditar {self.num_audits} eventos.
             
             print(f"    Procurando linha: {line_variants}")
             
-            # Determina seção e labels
+            # Determina seção e labels (suporta PT e EN)
             if market_type == "OU":
-                section_name = "Over/Under"
+                section_names = ["Over/Under", "Mais/Menos"]
                 home_label = "Over"
                 away_label = "Under"
             else:
-                section_name = "Handicap Asiático"
+                section_names = ["Asian Handicap", "Handicap Asiático", "Handicap"]
                 home_label = "Home"
                 away_label = "Away"
             
@@ -686,7 +686,7 @@ Vou auditar {self.num_audits} eventos.
                     const lineVariants = params.lineVariants;
                     const side = params.side;
                     const marketType = params.marketType;
-                    const sectionName = params.sectionName;
+                    const sectionNames = params.sectionNames;
                     const homeLabel = params.homeLabel;
                     const awayLabel = params.awayLabel;
                     
@@ -695,14 +695,22 @@ Vou auditar {self.num_audits} eventos.
                         return text.trim().replace(/\\s+/g, '').replace('.', ',');
                     }
                     
-                    // Encontra a seção correta (Asian Handicap ou Over/Under)
+                    // Função para verificar se texto contém algum dos nomes de seção
+                    function matchesSection(text) {
+                        for (const name of sectionNames) {
+                            if (text.includes(name)) return true;
+                        }
+                        return false;
+                    }
+                    
+                    // Encontra a seção correta (Asian Handicap ou Over/Under) - suporta PT e EN
                     let sectionContainer = null;
                     const headers = document.querySelectorAll('div, span, h3, h4');
                     
                     for (const h of headers) {
                         const text = (h.innerText || '').trim();
-                        // Procura por "Handicap Asiático", "Asian Handicap", "Over/Under"
-                        if (text.includes('Handicap') || text.includes('Asian') || 
+                        // Procura por nomes de seção em PT ou EN
+                        if (matchesSection(text) || text.includes('Handicap') || text.includes('Asian') || 
                             (marketType === 'OU' && (text.includes('Over') || text.includes('Under')))) {
                             // Encontra o container pai que contém todas as linhas
                             let parent = h.parentElement;
@@ -728,19 +736,29 @@ Vou auditar {self.num_audits} eventos.
                     // Procura por spans/divs com texto que seja uma das variantes da linha
                     const allElements = sectionContainer.querySelectorAll('span, div');
                     
+                    let foundLineElement = null;
+                    let foundLineText = null;
+                    
                     for (const el of allElements) {
                         const elText = (el.innerText || '').trim();
                         
                         // Verifica se este elemento é a linha que procuramos
+                        // IMPORTANTE: O texto deve ser EXATAMENTE a linha, não pode conter outras coisas
                         let isLineMatch = false;
                         for (const variant of lineVariants) {
                             if (elText === variant || normalizeLineText(elText) === normalizeLineText(variant)) {
                                 isLineMatch = true;
+                                foundLineText = elText;
                                 break;
                             }
                         }
                         
                         if (!isLineMatch) continue;
+                        
+                        // Verifica se este elemento é pequeno (só a linha, não um container grande)
+                        if (elText.length > 10) continue;
+                        
+                        foundLineElement = el;
                         
                         // Encontrou a linha! Agora busca o container ROW que contém Home/Away
                         let rowContainer = el.parentElement;
@@ -748,7 +766,22 @@ Vou auditar {self.num_audits} eventos.
                             const rowText = rowContainer.innerText || '';
                             
                             // Verifica se este container tem Home e Away (ou Over e Under)
-                            if (rowText.includes(homeLabel) && rowText.includes(awayLabel)) {
+                            // E não é muito grande (deve ser só uma linha)
+                            if (rowText.includes(homeLabel) && rowText.includes(awayLabel) && 
+                                rowText.split('\\n').length < 15) {
+                                
+                                // Verifica se contém a nossa linha específica
+                                let hasOurLine = false;
+                                for (const variant of lineVariants) {
+                                    if (rowText.includes(variant)) {
+                                        hasOurLine = true;
+                                        break;
+                                    }
+                                }
+                                if (!hasOurLine) {
+                                    rowContainer = rowContainer.parentElement;
+                                    continue;
+                                }
                                 
                                 // Encontra os elementos clicáveis (odds) dentro desta linha
                                 // Os elementos clicáveis são divs filhos com odds numéricas
@@ -759,9 +792,10 @@ Vou auditar {self.num_audits} eventos.
                                     const childText = (child.innerText || '').trim();
                                     
                                     // Verifica se é uma odd (formato X.XXX ou X,XXX)
-                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText)) {
+                                    // Deve ser APENAS a odd, não um container
+                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText) && childText.length < 10) {
                                         const rect = child.getBoundingClientRect();
-                                        if (rect.width > 0 && rect.height > 0) {
+                                        if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
                                             oddElements.push({
                                                 el: child,
                                                 x: rect.x,
@@ -771,13 +805,24 @@ Vou auditar {self.num_audits} eventos.
                                     }
                                 }
                                 
-                                if (oddElements.length >= 2) {
+                                // Remove duplicatas (mesmo x, mesmo texto)
+                                const uniqueOdds = [];
+                                const seenKeys = new Set();
+                                for (const odd of oddElements) {
+                                    const key = Math.round(odd.x) + '|' + odd.text;
+                                    if (!seenKeys.has(key)) {
+                                        seenKeys.add(key);
+                                        uniqueOdds.push(odd);
+                                    }
+                                }
+                                
+                                if (uniqueOdds.length >= 2) {
                                     // Ordena por posição X (esquerda para direita)
-                                    oddElements.sort((a, b) => a.x - b.x);
+                                    uniqueOdds.sort((a, b) => a.x - b.x);
                                     
                                     // Home/Over = primeiro (esquerda), Away/Under = segundo (direita)
                                     const targetIdx = (side === 'home' || side === 'over') ? 0 : 1;
-                                    const targetEl = oddElements[targetIdx];
+                                    const targetEl = uniqueOdds[targetIdx];
                                     
                                     if (targetEl) {
                                         // Scroll para o elemento
@@ -788,13 +833,25 @@ Vou auditar {self.num_audits} eventos.
                                             const parent = targetEl.el.parentElement;
                                             if (parent) {
                                                 parent.click();
-                                                return { success: true, clickedOdd: targetEl.text, method: 'parent' };
+                                                return { 
+                                                    success: true, 
+                                                    clickedOdd: targetEl.text, 
+                                                    method: 'parent',
+                                                    lineFound: foundLineText,
+                                                    allOdds: uniqueOdds.map(o => o.text)
+                                                };
                                             }
                                         } catch (e) {}
                                         
                                         try {
                                             targetEl.el.click();
-                                            return { success: true, clickedOdd: targetEl.text, method: 'direct' };
+                                            return { 
+                                                success: true, 
+                                                clickedOdd: targetEl.text, 
+                                                method: 'direct',
+                                                lineFound: foundLineText,
+                                                allOdds: uniqueOdds.map(o => o.text)
+                                            };
                                         } catch (e) {}
                                     }
                                 }
@@ -803,18 +860,27 @@ Vou auditar {self.num_audits} eventos.
                         }
                     }
                     
-                    return { success: false, reason: 'LINE_NOT_FOUND' };
+                    return { 
+                        success: false, 
+                        reason: 'LINE_NOT_FOUND',
+                        foundLineElement: foundLineElement ? true : false,
+                        foundLineText: foundLineText
+                    };
                 }
             """, {
                 "lineVariants": line_variants,
                 "side": side,
                 "marketType": market_type,
-                "sectionName": section_name,
+                "sectionNames": section_names,
                 "homeLabel": home_label,
                 "awayLabel": away_label
             })
             
             if clicked and clicked.get('success'):
+                line_found = clicked.get('lineFound', '?')
+                all_odds = clicked.get('allOdds', [])
+                print(f"    Linha encontrada: {line_found}")
+                print(f"    Odds na linha: {all_odds}")
                 print(f"    Clicou na odd {clicked.get('clickedOdd')} ({clicked.get('method')})")
                 await page.wait_for_timeout(1500)
                 return True
