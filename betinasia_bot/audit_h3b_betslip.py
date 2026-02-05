@@ -262,9 +262,9 @@ Vou auditar {self.num_audits} eventos.
                 timing_stats['page_load'].append(load_time)
                 
                 # === ETAPA 2: Espera WebSocket coletar dados ===
-                # OTIMIZAÇÃO: Reduzido de 8s para 5s (mínimo para WebSocket popular)
+                # 8 segundos para garantir que WebSocket popule todos os dados
                 ws_start = time.time()
-                await self.scraper._page.wait_for_timeout(5000)
+                await self.scraper._page.wait_for_timeout(8000)
                 ws_time = int((time.time() - ws_start) * 1000)
                 timing_stats['websocket_wait'].append(ws_time)
                 
@@ -300,8 +300,8 @@ Vou auditar {self.num_audits} eventos.
                       f"Auditados: {len(self.audit_results)}/{self.num_audits}", 
                       end="", flush=True)
                 
-                # Pequena pausa entre ciclos
-                await asyncio.sleep(2)
+                # Pausa entre ciclos
+                await asyncio.sleep(3)
                 
         finally:
             await self.close()
@@ -704,10 +704,10 @@ Vou auditar {self.num_audits} eventos.
                 print(f"    Jogo não encontrado na página atual, tentando navegar...")
                 await page.goto("https://black.betinasia.com/sportsbook/football")
                 await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(2000)  # Reduzido de 3000
+                await page.wait_for_timeout(3000)
                 
                 await self._expand_all_lines()
-                await page.wait_for_timeout(1000)  # Reduzido de 1500
+                await page.wait_for_timeout(1500)
                 
                 game_found = await self._find_and_click_game(home_team, away_team)
             
@@ -738,13 +738,13 @@ Vou auditar {self.num_audits} eventos.
                     audit_total_duration_ms=audit_total
                 )
             
-            await page.wait_for_timeout(1000)  # Reduzido de 2000
+            await page.wait_for_timeout(2000)
             
             # === TIMING: Expandir linhas ===
             expand_start = time.time()
             print(f"    Expandindo linhas...")
             await self._expand_all_lines()
-            await page.wait_for_timeout(500)  # Reduzido de 1500
+            await page.wait_for_timeout(1500)
             lag_expand_lines = int((time.time() - expand_start) * 1000)
             print(f"    [LAG] Expandir linhas: {lag_expand_lines}ms")
             
@@ -754,9 +754,9 @@ Vou auditar {self.num_audits} eventos.
             
             line_display = line.replace(".", ",")
             
-            # Tenta clicar com retry (máximo 3 tentativas para ser mais rápido)
+            # Tenta clicar com retry (5 tentativas para máxima chance de sucesso)
             click_result = None
-            max_attempts = 3  # Reduzido de 5
+            max_attempts = 5
             
             for attempt in range(max_attempts):
                 click_result = await self._click_specific_odd(line_display, side, market_type)
@@ -767,23 +767,23 @@ Vou auditar {self.num_audits} eventos.
                 remaining = max_attempts - attempt - 1
                 if remaining > 0:
                     print(f"    Tentativa {attempt + 1}/{max_attempts} falhou, aguardando...")
-                    await page.wait_for_timeout(1000)  # Reduzido de 2000
+                    await page.wait_for_timeout(2000)
                     
-                    if attempt > 0:
+                    if attempt > 0 and attempt % 2 == 0:
                         print(f"    Recarregando página...")
                         await page.reload()
                         await page.wait_for_load_state("domcontentloaded")
-                        await page.wait_for_timeout(1500)
+                        await page.wait_for_timeout(2000)
                         
                         game_found = await self._find_and_click_game(home_team, away_team)
                         if not game_found:
                             continue
                         
-                        await page.wait_for_timeout(500)
+                        await page.wait_for_timeout(1500)
                     
                     print(f"    Re-expandindo linhas...")
                     await self._expand_all_lines()
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(1000)
             
             lag_click_odd = int((time.time() - click_start) * 1000)
             lag_detection_to_click = lag_queue_wait + lag_find_game + lag_expand_lines + lag_click_odd
@@ -819,7 +819,7 @@ Vou auditar {self.num_audits} eventos.
             
             # === TIMING: Espera betslip abrir ===
             betslip_open_start = time.time()
-            await page.wait_for_timeout(1500)  # Reduzido de 2000
+            await page.wait_for_timeout(2000)
             lag_betslip_open = int((time.time() - betslip_open_start) * 1000)
             
             # === TIMING: Extrai dados do betslip ===
