@@ -174,14 +174,14 @@ class BetslipExtractor:
                         for (const panel of panels) {
                             const text = panel.innerText || '';
                             // Verifica se contém indicadores do betslip (PT ou EN)
-                            if (text.includes('Todos Os Agentes') || 
-                                text.includes('All Betting Agents') ||
-                                text.includes('MELHOR') ||
+                            if (text.includes('All Bookies') ||
+                                text.includes('Todos Os Agentes') || 
                                 text.includes('BEST') ||
+                                text.includes('MELHOR') ||
                                 text.includes('TOTAL') ||
                                 text.includes('AVERAGE') ||
-                                text.includes('Tempo Limite') ||
-                                text.includes('Time Limit')) {
+                                text.includes('Timeout') ||
+                                text.includes('Tempo Limite')) {
                                 return text;
                             }
                         }
@@ -237,16 +237,18 @@ class BetslipExtractor:
             # Padrão: número decimal seguido de mais números
             # Esperado: TOTAL MÉDIA MELHOR (3 valores)
             
-            # Procura pela seção "Todos Os Agentes" (PT) ou "All Betting Agents" (EN)
-            todos_idx = text.find('Todos Os Agentes')
+            # Procura pela seção agregada (PT ou EN)
+            # PT: "Todos Os Agentes De Apostas"
+            # EN: "All Bookies"
+            todos_idx = text.find('All Bookies')
+            if todos_idx == -1:
+                todos_idx = text.find('All bookies')
+            if todos_idx == -1:
+                todos_idx = text.find('Todos Os Agentes')
             if todos_idx == -1:
                 todos_idx = text.find('Todos os Agentes')
             if todos_idx == -1:
-                todos_idx = text.find('All Betting Agents')
-            if todos_idx == -1:
-                todos_idx = text.find('All betting agents')
-            if todos_idx == -1:
-                # Fallback: procura por padrão de 3 números decimais seguidos (TOTAL MÉDIA MELHOR)
+                # Fallback: procura por padrão de 3 números decimais seguidos (TOTAL AVERAGE BEST)
                 odds_pattern = r'(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})'
                 match = re.search(odds_pattern, text)
                 if match:
@@ -255,7 +257,7 @@ class BetslipExtractor:
                         todos_idx = 0
             
             if todos_idx == -1:
-                logger.warning("Não encontrou 'Todos Os Agentes De Apostas' ou 'All Betting Agents'")
+                logger.warning("Não encontrou 'All Bookies' ou 'Todos Os Agentes De Apostas'")
                 return None
             
             # Pega texto após "Todos Os Agentes"
