@@ -1,7 +1,8 @@
 # Simulação: Tamanho Potencial da Oportunidade H3B
 
 **Data:** 06 de Fevereiro de 2026  
-**Tipo:** Estimativa exploratória (alto grau de incerteza)
+**Versão:** 2.0  
+**Tipo:** Estimativa exploratória para mesa quant
 
 ---
 
@@ -10,55 +11,64 @@
 | Parâmetro | Valor | Fonte |
 |-----------|-------|-------|
 | CLV adicional H3B UP (WebSocket) | +1.116% | Análise v6, N=273 |
-| Eventos H3B UP detectados por dia | ~100-200 | Logs do audit |
+| Eventos H3B detectados por ciclo (~10s) | ~5-10 | Logs: ~600 em ~60 ciclos |
+| Ciclos por dia | ~8,640 (24h) | 10s por ciclo |
 | Taxa de execução (betslip extraído) | ~40% | Audit, 115/287 |
 | Odds média no momento do sinal | ~1.85 | Dados audit |
 | Lag médio detecção -> betslip | ~15-20s | Dados audit |
-| Linhas extremas (|AH| > 2) na amostra | ~40% | Estimativa dos logs |
+
+### Volume Bruto Estimado
+
+```
+Eventos H3B por dia (observado):
+  ~600 H3B em ~8 horas de monitoramento
+  Extrapolando para 24h: ~1,800 H3B/dia
+  ~50% são UP: ~900 H3B UP/dia
+
+Nota: o detector roda sobre TODOS os jogos de futebol
+simultaneamente (WebSocket captura ~250 jogos por ciclo).
+```
 
 ---
 
-## 2. Cenários de CLV Realizável
+## 2. Parâmetros Operacionais
 
-O CLV de 1.116% é do WebSocket. Na prática, há erosão pelo lag e pela diferença betslip. Estimamos 3 cenários:
-
-### Cenário A: Pessimista (erosão alta)
-- CLV realizável com scoring: **+0.3%**
-- Premissa: lag consome ~70% do valor, scoring recupera pouco
-
-### Cenário B: Base (erosão moderada)
-- CLV realizável com scoring: **+1.5%**
-- Premissa: scoring filtra melhores sinais, lag consome ~30%, scoring adiciona valor
-
-### Cenário C: Otimista (scoring eficaz + lag reduzido)
-- CLV realizável com scoring: **+3.0%**
-- Premissa: scoring seleciona top 20% dos sinais, otimização reduz lag para ~5s
-
----
-
-## 3. Parâmetros da Simulação
-
-### Volume de Apostas
-
-| Parâmetro | Pessimista | Base | Otimista |
-|-----------|-----------|------|----------|
-| Sinais H3B UP / dia | 150 | 150 | 150 |
-| Filtro linhas razoáveis (|AH| <= 1.5) | 60% | 60% | 60% |
-| Sinais utilizáveis / dia | 90 | 90 | 90 |
-| Taxa execução betslip | 40% | 40% | 50% |
-| Filtro scoring (aprovados) | 50% | 30% | 20% |
-| **Apostas executadas / dia** | **18** | **11** | **9** |
-| **Apostas executadas / mês (30d)** | **540** | **330** | **270** |
-
-### Stake e Banca
+### Stake e Estrutura
 
 | Parâmetro | Valor |
 |-----------|-------|
-| Banca inicial | $5,000 |
-| Stake por aposta (flat) | $50 (1% da banca) |
-| Stake por aposta (Kelly fracionário) | Variável, ~0.5-2% da banca |
+| Stake por aposta (flat) | $500 |
+| Odds média | 1.85 |
+| Mercado | Asian Handicap (principalmente) |
+| Operação | 24/7 automatizada via VPS |
 
-Para simplificar, usaremos **flat stake de $50** (1% da banca).
+### Funil de Sinais (3 cenários)
+
+| Etapa do Funil | Pessimista | Base | Otimista |
+|----------------|-----------|------|----------|
+| Sinais H3B UP brutos / dia | 900 | 900 | 900 |
+| Filtro linhas razoáveis (excl. AH > 2) | 60% | 60% | 60% |
+| Sinais filtrados / dia | 540 | 540 | 540 |
+| Taxa de execução betslip | 40% | 50% | 60% |
+| Sinais executáveis / dia | 216 | 270 | 324 |
+| Filtro scoring (aprovados) | 60% | 50% | 40% |
+| **Apostas executadas / dia** | **130** | **135** | **130** |
+| **Apostas executadas / mês (30d)** | **3,900** | **4,050** | **3,900** |
+
+**Racional do filtro scoring:**
+- Pessimista: scoring permissivo (60%), aceita mais apostas com edge menor
+- Base: scoring moderado (50%), equilibra volume e qualidade
+- Otimista: scoring restritivo (40%), apenas melhores sinais mas com CLV mais alto
+
+---
+
+## 3. Cenários de CLV Realizável
+
+| Cenário | CLV com Scoring | Premissa |
+|---------|----------------|----------|
+| Pessimista | +0.5% | Lag consome parte do valor, scoring filtra pouco |
+| Base | +1.5% | Scoring seleciona bons sinais, lag parcialmente mitigado |
+| Otimista | +3.0% | Scoring eficaz + lag reduzido a ~5s + linhas líquidas |
 
 ---
 
@@ -66,171 +76,179 @@ Para simplificar, usaremos **flat stake de $50** (1% da banca).
 
 ### 4.1. Lucro por Aposta
 
-O CLV representa a vantagem sobre a closing line. Em apostas Asian Handicap com odds ~1.85, o lucro esperado por aposta é:
+| Cenário | CLV | Stake | Lucro esperado/aposta |
+|---------|-----|-------|----------------------|
+| Pessimista | 0.5% | $500 | $2.50 |
+| Base | 1.5% | $500 | $7.50 |
+| Otimista | 3.0% | $500 | $15.00 |
 
-```
-Lucro esperado por aposta = Stake x CLV / 100
+### 4.2. Resultados Mensais
 
-Onde CLV é a vantagem percentual sobre o mercado.
-Nota: em AH com odds ~1.85, o vig (margem da casa) é ~2-3%.
-CLV positivo significa que estamos do lado certo do vig.
-```
+| Cenário | Apostas/mês | Lucro/aposta | Turnover mensal | **Lucro mensal** | **ROI por $** |
+|---------|------------|-------------|----------------|-----------------|---------------|
+| Pessimista | 3,900 | $2.50 | $1,950,000 | **$9,750** | **0.50%** |
+| Base | 4,050 | $7.50 | $2,025,000 | **$30,375** | **1.50%** |
+| Otimista | 3,900 | $15.00 | $1,950,000 | **$58,500** | **3.00%** |
 
-| Cenário | CLV | Lucro/aposta ($50) | Lucro/aposta (%) |
-|---------|-----|-------------------|-----------------|
-| Pessimista | 0.3% | $0.15 | 0.3% |
-| Base | 1.5% | $0.75 | 1.5% |
-| Otimista | 3.0% | $1.50 | 3.0% |
+### 4.3. Resultados Anuais
 
-### 4.2. Lucro Mensal (Flat Stake $50)
-
-| Cenário | Apostas/mês | Lucro/aposta | **Lucro mensal** | **ROI por $** |
-|---------|------------|-------------|-----------------|---------------|
-| Pessimista | 540 | $0.15 | **$81** | **0.30%** |
-| Base | 330 | $0.75 | **$248** | **1.50%** |
-| Otimista | 270 | $1.50 | **$405** | **3.00%** |
-
-### 4.3. ROI sobre Banca ($5,000)
-
-| Cenário | Lucro mensal | **ROI mensal (banca)** | **ROI anual (banca)** |
-|---------|-------------|----------------------|---------------------|
-| Pessimista | $81 | **1.6%** | **19.4%** |
-| Base | $248 | **5.0%** | **59.4%** |
-| Otimista | $405 | **8.1%** | **97.2%** |
-
-### 4.4. Turnover (Volume Apostado)
-
-| Cenário | Apostas/mês | Stake | **Turnover mensal** | **Turnover anual** |
-|---------|------------|-------|--------------------|--------------------|
-| Pessimista | 540 | $50 | $27,000 | $324,000 |
-| Base | 330 | $50 | $16,500 | $198,000 |
-| Otimista | 270 | $50 | $13,500 | $162,000 |
+| Cenário | Lucro mensal | **Lucro anual** | Turnover anual |
+|---------|-------------|----------------|----------------|
+| Pessimista | $9,750 | **$117,000** | $23,400,000 |
+| Base | $30,375 | **$364,500** | $24,300,000 |
+| Otimista | $58,500 | **$702,000** | $23,400,000 |
 
 ---
 
-## 5. Análise de Risco
+## 5. Banca Necessária (output)
 
-### 5.1. Drawdown Esperado
+A banca mínima é determinada pelo drawdown máximo esperado e a tolerância a risco.
 
-Em apostas com edge pequeno e odds ~1.85, a variância é alta. Simulando com distribuição binomial:
-
-| Parâmetro | Valor |
-|-----------|-------|
-| Probabilidade implícita (odds 1.85) | ~54% |
-| Com CLV 1.5%, prob real estimada | ~55.5% |
-| Desvio padrão por aposta ($50) | ~$49.70 |
-| Desvio padrão mensal (330 apostas) | ~$903 |
+### 5.1. Cálculo da Variância
 
 ```
-Drawdown máximo esperado (95% confiança):
-  = -2 x desvio_padrão_mensal
-  = -2 x $903
-  = -$1,806
+Para cada aposta AH com odds ~1.85:
+  Prob vitória ≈ 55% (com CLV 1.5%)
+  Variância por aposta = p(1-p) × stake² × odds²
+  σ por aposta ≈ $495
 
-Isso representa ~36% da banca de $5,000.
+Para N apostas/mês:
+  σ mensal = σ_aposta × √N
+
+  Pessimista (3,900): σ_mensal = $495 × √3,900 = $30,900
+  Base (4,050):       σ_mensal = $495 × √4,050 = $31,500
+  Otimista (3,900):   σ_mensal = $495 × √3,900 = $30,900
 ```
 
-### 5.2. Risco de Ruína
+### 5.2. Drawdown Máximo Esperado
 
-| Banca | Stake (1%) | Risco de ruína (CLV 1.5%) |
-|-------|-----------|--------------------------|
-| $5,000 | $50 | Muito baixo (< 1%) |
-| $2,000 | $50 (2.5%) | Baixo (~3-5%) |
-| $1,000 | $50 (5%) | Moderado (~10-15%) |
+| Cenário | σ mensal | Drawdown 95% (-2σ) | Drawdown 99% (-2.5σ) |
+|---------|---------|--------------------|-----------------------|
+| Pessimista | $30,900 | -$52,050 | -$67,500 |
+| Base | $31,500 | -$32,625 | -$48,375 |
+| Otimista | $30,900 | -$3,300 | -$19,050 |
 
-**Recomendação:** Manter stake <= 1% da banca. Com $5,000 e stake de $50, o risco de ruína é negligível para CLV >= 1%.
+**Nota:** Drawdown 95% = lucro esperado - 2σ. Mês pessimista com CLV 0.5%: $9,750 - 2×$30,900 = -$52,050.
 
-### 5.3. Tempo para Lucro Estável
+### 5.3. Banca Recomendada
 
-| Cenário | Apostas p/ 95% certeza de lucro |
-|---------|-------------------------------|
-| CLV 0.3% | ~44,000 apostas (~7 anos) |
-| CLV 1.5% | ~1,800 apostas (~5 meses) |
-| CLV 3.0% | ~440 apostas (~2 meses) |
+Critério: banca deve suportar 3 meses de drawdown 95% sem ruir.
 
-Formula: N = (Z x sigma / CLV)^2, Z=1.96 para 95%.
+| Cenário | Drawdown 95% mensal | **Banca mínima (3 meses)** | **Banca recomendada (margem)** |
+|---------|---------------------|---------------------------|-------------------------------|
+| Pessimista | -$52,050 | $156,150 | **$200,000** |
+| Base | -$32,625 | $97,875 | **$125,000** |
+| Otimista | -$3,300 | $9,900 | **$50,000** |
+
+### 5.4. ROI sobre Banca
+
+| Cenário | Banca recomendada | Lucro mensal | **ROI mensal** | **ROI anual** |
+|---------|-------------------|-------------|---------------|--------------|
+| Pessimista | $200,000 | $9,750 | 4.9% | 58.5% |
+| Base | $125,000 | $30,375 | **24.3%** | **291.6%** |
+| Otimista | $50,000 | $58,500 | **117.0%** | **1,404%** |
 
 ---
 
 ## 6. Sensibilidade ao CLV
 
-O CLV é a variável mais importante. Pequenas diferenças mudam tudo:
+O CLV realizável é a variável que determina tudo. Com 4,050 apostas/mês e stake $500:
 
-| CLV realizável | Lucro mensal ($50 flat) | ROI anual (banca $5k) | Viabilidade |
-|---------------|------------------------|-----------------------|------------|
-| 0.0% (sem edge) | $0 | 0% | Inviável |
-| 0.3% | $81 | 19% | Marginal |
-| 0.5% | $135 | 32% | Viável |
-| 1.0% | $248 | 59% | Bom |
-| 1.5% | $371 | 89% | Muito bom |
-| 2.0% | $495 | 119% | Excelente |
-| 3.0% | $743 | 178% | Excepcional |
-
----
-
-## 7. Comparação com Benchmarks
-
-| Estratégia | ROI típico | Volume necessário |
-|-----------|-----------|-------------------|
-| Apostador recreativo | -5% a -10% | Qualquer |
-| Value betting manual | +1% a +3% | 500+ apostas/mês |
-| **Nossa estimativa (base)** | **+1.5%** | **330 apostas/mês** |
-| Fundos profissionais (Pinnacle) | +2% a +5% | 10,000+/mês |
-| Arbitragem pura | +0.5% a +1.5% | 1,000+/mês |
-
-A estratégia H3B com scoring estaria no range de **value betting**, o que é realista para uma operação semi-automatizada.
+| CLV | Lucro mensal | Lucro anual | Banca necessária | ROI anual (banca) |
+|-----|-------------|-------------|------------------|-------------------|
+| 0.0% | $0 | $0 | N/A | 0% |
+| 0.3% | $6,075 | $72,900 | $220,000 | 33% |
+| 0.5% | $10,125 | $121,500 | $200,000 | 61% |
+| 1.0% | $20,250 | $243,000 | $150,000 | 162% |
+| **1.5%** | **$30,375** | **$364,500** | **$125,000** | **292%** |
+| 2.0% | $40,500 | $486,000 | $100,000 | 486% |
+| 3.0% | $60,750 | $729,000 | $50,000 | 1,458% |
+| 5.0% | $101,250 | $1,215,000 | $30,000 | 4,050% |
 
 ---
 
-## 8. Fatores Não Modelados (riscos adicionais)
+## 7. Sensibilidade ao Volume de Apostas
 
-| Fator | Impacto | Probabilidade |
-|-------|---------|---------------|
-| Limites da casa (conta limitada) | Alto — reduz volume | Média-Alta |
-| Mudança de estrutura do site | Alto — para operação | Baixa |
-| Eficiência crescente do mercado | Médio — reduz CLV ao longo do tempo | Média |
-| Custos VPS e API | Baixo — ~$30-50/mês | Certo |
-| Erros de execução (clique errado, etc) | Baixo — perdas pontuais | Baixa |
-| Correlação entre apostas | Médio — drawdowns maiores | Média |
+Com CLV 1.5% e stake $500:
+
+| Apostas/mês | Lucro mensal | Lucro anual | σ mensal | Banca necessária |
+|------------|-------------|-------------|---------|------------------|
+| 1,000 | $7,500 | $90,000 | $15,650 | $60,000 |
+| 2,000 | $15,000 | $180,000 | $22,130 | $85,000 |
+| 3,000 | $22,500 | $270,000 | $27,100 | $100,000 |
+| **4,000** | **$30,000** | **$360,000** | **$31,300** | **$125,000** |
+| 6,000 | $45,000 | $540,000 | $38,350 | $155,000 |
+| 10,000 | $75,000 | $900,000 | $49,500 | $200,000 |
 
 ---
 
-## 9. Resumo: O Tamanho da Oportunidade
+## 8. Comparação com Benchmarks (mesa quant)
 
-### Faixa Estimada (mensal, banca $5,000, stake $50)
+| Operação | ROI sobre turnover | Lucro anual típico | Capital necessário |
+|----------|-------------------|-------------------|--------------------|
+| Market making esportivo | 0.5-2% | $200k-$2M | $100k-$500k |
+| Value betting (sharp) | 1-3% | $100k-$500k | $50k-$200k |
+| Arbitragem pura | 0.3-1% | $50k-$300k | $50k-$200k |
+| **H3B + Scoring (est. base)** | **1.5%** | **$364k** | **$125k** |
+| CLV betting (Pinnacle) | 2-5% | $500k-$2M+ | $200k+ |
+
+A estimativa base situa a operação H3B no range de uma **operação de value betting sharp**, que é realista e comparável ao mercado.
+
+---
+
+## 9. Fatores Multiplicadores de Escala
+
+### Formas de Aumentar o Volume
+
+| Alavanca | Impacto estimado | Complexidade |
+|----------|-----------------|-------------|
+| Adicionar mais esportes (basquete, tênis) | +50-100% sinais | Média |
+| Múltiplas contas BetinAsia | +100% execução | Alta (custo + risco) |
+| Outros agregadores (além do BetinAsia) | +200-500% sinais | Alta |
+| Mercados adicionais (1X2, BTTS) | +30-50% sinais | Baixa |
+| Operação 24/7 em múltiplos fusos | +20-40% sinais | Baixa (já é 24/7) |
+
+### Limites de Escala
+
+| Fator | Limite |
+|-------|--------|
+| Limite por conta BetinAsia | ~$500-$2,000/aposta dependendo do mercado |
+| Risco de conta limitada | Alto após $50k+ turnover/mês em 1 conta |
+| Liquidez do mercado AH | Limitada em ligas menores |
+| Capacidade computacional | Baixa (1 VPS é suficiente) |
+
+---
+
+## 10. Resumo Executivo para Investidores
+
+### A Oportunidade
 
 | Métrica | Pessimista | Base | Otimista |
 |---------|-----------|------|----------|
-| **Lucro mensal** | $81 | $248 | $405 |
-| **ROI por $ apostado** | 0.3% | 1.5% | 3.0% |
-| **ROI sobre banca (mensal)** | 1.6% | 5.0% | 8.1% |
-| **ROI sobre banca (anual)** | 19% | 59% | 97% |
-| **Apostas por mês** | 540 | 330 | 270 |
-| **Turnover mensal** | $27,000 | $16,500 | $13,500 |
-| **Drawdown máx esperado** | -$1,200 | -$1,800 | -$1,500 |
+| **Lucro mensal** | $9,750 | $30,375 | $58,500 |
+| **Lucro anual** | $117,000 | $364,500 | $702,000 |
+| **ROI por $ apostado** | 0.50% | 1.50% | 3.00% |
+| **ROI sobre banca (anual)** | 59% | 292% | 1,404% |
+| **Apostas por mês** | 3,900 | 4,050 | 3,900 |
+| **Turnover mensal** | $1.95M | $2.03M | $1.95M |
+| **Banca recomendada** | $200,000 | $125,000 | $50,000 |
+| **Stake por aposta** | $500 | $500 | $500 |
 
-### Interpretação
+### Próximos Passos para Validação
 
-- **Se o scoring funcionar** (cenário base): ~$250/mês com risco controlado. É uma operação viável mas modesta.
-- **Se otimizarmos velocidade + scoring** (cenário otimista): ~$400/mês, ROI quase 100% anual. Seria excelente.
-- **Se o lag consumir o valor** (cenário pessimista): ~$80/mês. Marginal — pode não compensar o esforço.
+| Etapa | Prazo | Objetivo |
+|-------|-------|----------|
+| Coleta de dados audit H3B | 2-4 semanas | N>500 com closing line para CLV Betslip |
+| Modelo de scoring | 4-6 semanas | Estimar CLV realizável com features combinadas |
+| Teste de velocidade (1 liga) | 1-2 semanas | Medir impacto de reduzir lag para ~5s |
+| Dry-run automatizado | 6-8 semanas | Simular apostas reais em tempo real |
+| Go-live | 8-12 semanas | Operação real com capital |
 
-### O Que Decide o Cenário
+### O Que Precisa Ser Verdade
 
-1. **CLV realizável com scoring** — Dado mais importante, ainda não temos. Precisamos de 2-4 semanas de dados.
-2. **Otimização do lag** — Reduzir de 20s para 5s pode ser a diferença entre cenário pessimista e base.
-3. **Qualidade do filtro de linhas** — Excluir linhas extremas e focar em mercados líquidos.
+Para o cenário base ($364k/ano) se materializar:
 
----
-
-## 10. Escalabilidade
-
-Se a estratégia se confirmar viável:
-
-| Escala | Banca | Stake | Lucro mensal (base) | Considerações |
-|--------|-------|-------|--------------------|----|
-| Inicial | $5,000 | $50 | $248 | 1 conta, 1 VPS |
-| Média | $15,000 | $150 | $743 | Possível limite de conta |
-| Avançada | $50,000 | $500 | $2,475 | Múltiplas contas necessárias |
-
-**Limitante principal:** Limites impostos pela casa de apostas. Com volume alto, contas tendem a ser limitadas em semanas/meses.
+1. CLV realizável com scoring >= 1.5%
+2. Volume de 4,000+ apostas/mês sustentável
+3. Contas não limitadas rapidamente
+4. Mercado não se torna eficiente demais nos próximos 12 meses
