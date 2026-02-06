@@ -215,12 +215,15 @@ class H3BAuditor:
                 raw_betslip_text=raw_text
             )
             
-            async with self.db.get_session() as session:
+            async with self.db.async_session() as session:
                 session.add(audit_record)
                 await session.commit()
                 
+            print(f"    💾 Salvo no banco de dados")
+                
         except Exception as e:
-            logger.debug(f"Erro ao salvar auditoria no banco: {e}")
+            print(f"    ⚠️ Erro ao salvar no banco: {e}")
+            logger.error(f"Erro ao salvar auditoria no banco: {e}")
 
     async def run_audit(self):
         """Executa ciclos de auditoria."""
