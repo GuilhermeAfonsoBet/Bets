@@ -137,6 +137,9 @@ class FastAuditTest:
         self.events_processed: int = 0
         self.h3b_detected: int = 0
 
+        # Lock: evita manutenção e executor acessarem mesma aba
+        self._audit_lock = asyncio.Lock()
+
     async def start(self):
         """Inicia browser, login, abre monitor e abas dos jogos."""
         logger.info("=" * 60)
@@ -381,20 +384,23 @@ class FastAuditTest:
         while True:
             await asyncio.sleep(EXPAND_CHECK_INTERVAL)
 
-            # Re-expande linhas em todas as abas
-            total_expanded = 0
-            for eid, tab in self.game_tabs.items():
-                try:
-                    expanded = await self._expand_lines(tab.page)
-                    total_expanded += expanded
-                    if expanded > 0:
-                        logger.info(f"  Re-expandiu {expanded} seções: {tab.home_team} vs {tab.away_team}")
-                        tab.lines_expanded = True
-                        tab.last_expand = time.time()
-                except Exception as e:
-                    logger.warning(f"  Erro re-expandindo {tab.home_team} vs {tab.away_team}: {e}")
-            if total_expanded > 0:
-                logger.info(f"  Total re-expandido: {total_expanded} seções em {len(self.game_tabs)} abas")
+            # Re-expande linhas (apenas se executor não está rodando)
+            if not self._audit_lock.locked():
+                total_expanded = 0
+                for eid, tab in self.game_tabs.items():
+                    try:
+                        expanded = await self._expand_lines(tab.page)
+                        total_expanded += expanded
+                        if expanded > 0:
+                            logger.info(f"  Re-expandiu {expanded} seções: {tab.home_team} vs {tab.away_team}")
+                            tab.lines_expanded = True
+                            tab.last_expand = time.time()
+                    except Exception as e:
+                        logger.warning(f"  Erro re-expandindo {tab.home_team} vs {tab.away_team}: {e}")
+                if total_expanded > 0:
+                    logger.info(f"  Total re-expandido: {total_expanded} seções")
+            else:
+                logger.debug("  Manutencao pulada (executor ativo)")
 
             # Verifica saúde do WebSocket
             ws_age = time.time() - self._last_ws_message_time if self._last_ws_message_time > 0 else 999
@@ -570,7 +576,8 @@ class FastAuditTest:
             except asyncio.TimeoutError:
                 continue
 
-            result = await self._execute_audit(h3b)
+            async with self._audit_lock:
+                result = await self._execute_audit(h3b)
             self.results.append(result)
 
             # Salva no banco
@@ -578,16 +585,25 @@ class FastAuditTest:
                 await self._save_result(result)
 
             # Log
-            status_icon = "OK" if result.betslip_odd else "FAIL"
-            logger.info(
-                f"[{status_icon}] {result.home_team} vs {result.away_team} | "
-                f"AH {result.line} {result.side} | "
-                f"ws={result.websocket_odd:.3f} bs={result.betslip_odd or 0:.3f} | "
-                f"lag={result.lag_total_ms}ms "
-                f"(switch={result.lag_detect_to_switch_ms} click={result.lag_switch_to_click_ms} "
-                f"slip={result.lag_click_to_betslip_ms}) | "
-                f"{len(self.results)}/{self.num_audits}"
-            )
+            if result.status == "OK":
+                logger.info(
+                    f"[OK] {result.home_team} vs {result.away_team} | "
+                    f"AH {result.line} {result.side} | "
+                    f"ws={result.websocket_odd:.3f} bs={result.betslip_odd:.3f} diff={result.difference_pct:+.2f}% | "
+                    f"lag={result.lag_total_ms}ms "
+                    f"(sw={result.lag_detect_to_switch_ms} cl={result.lag_switch_to_click_ms} "
+                    f"bs={result.lag_click_to_betslip_ms}) | "
+                    f"{len(self.results)}/{self.num_audits}"
+                )
+            else:
+                logger.warning(
+                    f"[{result.status}] {result.home_team} vs {result.away_team} | "
+                    f"AH {result.line} {result.side} | ws={result.websocket_odd:.3f} | "
+                    f"lag={result.lag_total_ms}ms "
+                    f"(sw={result.lag_detect_to_switch_ms} cl={result.lag_switch_to_click_ms} "
+                    f"bs={result.lag_click_to_betslip_ms}) | "
+                    f"{len(self.results)}/{self.num_audits}"
+                )
 
     async def _execute_audit(self, h3b: dict) -> FastAuditResult:
         """Executa auditoria: switch tab → click odd → extract betslip."""
@@ -608,9 +624,11 @@ class FastAuditTest:
         # === CLICK na odd ===
         line = h3b['line']
         side = h3b['side']
+        logger.debug(f"Clicando AH {line} {side} em {tab.home_team} vs {tab.away_team}")
         clicked = await self._click_odd(tab.page, line, side)
         t_click = time.time()
         lag_click = int((t_click - t_switch) * 1000)
+        logger.debug(f"Click resultado: {clicked}, lag={lag_click}ms")
 
         if not clicked:
             lag_total = int((time.time() - detected_at) * 1000)
@@ -632,9 +650,10 @@ class FastAuditTest:
             )
 
         # === BETSLIP ===
-        await tab.page.wait_for_timeout(1500)
+        await tab.page.wait_for_timeout(2000)
         extractor = BetslipExtractor(tab.page)
         betslip = await extractor.extract_best_odd()
+        logger.debug(f"Betslip extraido: {betslip is not None}, data={betslip}")
         t_betslip = time.time()
         lag_betslip = int((t_betslip - t_click) * 1000)
         lag_total = int((t_betslip - detected_at) * 1000)
