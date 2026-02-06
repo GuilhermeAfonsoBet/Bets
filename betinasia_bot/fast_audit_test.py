@@ -110,9 +110,10 @@ class FastAuditResult:
 class FastAuditTest:
     """Teste de velocidade com abas pré-abertas."""
 
-    def __init__(self, league: str, num_audits: int = 50, save_to_db: bool = True):
+    def __init__(self, league: str, num_audits: int = 50, max_tabs: int = 8, save_to_db: bool = True):
         self.league = league
         self.league_code = LEAGUE_CODES.get(league)
+        self.max_tabs = max_tabs
         self.num_audits = num_audits
         self.save_to_db = save_to_db
 
@@ -271,13 +272,24 @@ class FastAuditTest:
             except:
                 continue
 
-        # Filtra pela liga
-        target_league = self.league.lower()
+        # Filtra pela liga — match preciso
+        target_league = self.league.lower().strip()
         for eid, info in events.items():
-            league = info.get('league', '').lower()
-            # Match flexível: contém palavras-chave da liga
-            league_words = target_league.split()
-            if all(w.lower() in league.lower() for w in league_words if len(w) > 3):
+            ws_league = info.get('league', '').lower().strip()
+            # Match: nome exato OU nome do WS contém nome do target E vice-versa
+            is_match = (
+                ws_league == target_league
+                or target_league in ws_league
+                or ws_league in target_league
+            )
+            # Exclui segunda divisão se buscamos primeira
+            if is_match and 'second' in ws_league and 'second' not in target_league:
+                is_match = False
+            if is_match and 'segunda' in ws_league and 'segunda' not in target_league:
+                is_match = False
+            if is_match and 'rfef' in ws_league:
+                is_match = False
+            if is_match:
                 # Constroi URL do jogo
                 # Formato: /sportsbook/football/{league_code}/{event_id}
                 url = f"{FOOTBALL_URL}/{self.league_code}/{eid}"
@@ -294,12 +306,15 @@ class FastAuditTest:
 
     async def _open_game_tabs(self, games: list):
         """Abre uma aba para cada jogo e expande linhas."""
-        for game in games:
+        for i, game in enumerate(games):
+            if len(self.game_tabs) >= self.max_tabs:
+                logger.info(f"Limite de {self.max_tabs} abas atingido, parando abertura")
+                break
             try:
                 page = await self.context.new_page()
-                await page.goto(game['url'])
-                await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(2000)
+                page.set_default_timeout(15000)  # 15s timeout (não 30s)
+                await page.goto(game['url'], wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(3000)  # Espera JS carregar odds
 
                 # Verifica se carregou
                 body = await page.inner_text("body")
@@ -864,6 +879,8 @@ async def main():
                         help="Liga para monitorar")
     parser.add_argument("--num-audits", type=int, default=20,
                         help="Número de auditorias (default: 20)")
+    parser.add_argument("--max-tabs", type=int, default=8,
+                        help="Máximo de abas de jogos (default: 8)")
     parser.add_argument("--no-db", action="store_true",
                         help="Não salvar no banco")
     args = parser.parse_args()
@@ -877,6 +894,7 @@ async def main():
     test = FastAuditTest(
         league=args.league,
         num_audits=args.num_audits,
+        max_tabs=args.max_tabs,
         save_to_db=not args.no_db,
     )
     await test.run()
