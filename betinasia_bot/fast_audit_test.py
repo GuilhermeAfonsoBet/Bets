@@ -741,82 +741,163 @@ class FastAuditTest:
             lag_total_ms=lag_total,
         )
 
-    async def _click_odd(self, page: Page, line: str, side: str) -> bool:
-        """Clica numa odd específica via JavaScript (rápido)."""
-        line_float = float(line.replace(",", "."))
-        line_variants = []
-        if line_float == int(line_float):
-            iv = int(line_float)
-            if iv > 0: line_variants = [f"+{iv}", f"+{iv},0", f"+{iv}.0", str(iv)]
-            elif iv < 0: line_variants = [str(iv), f"{iv},0", f"{iv}.0"]
-            else: line_variants = ["0", "+0", "0,0", "0.0"]
-        else:
-            lc = line.replace(".", ",")
-            ld = line.replace(",", ".")
-            line_variants = [lc, ld]
-            if line_float > 0:
-                line_variants += ["+" + lc, "+" + ld]
+    async def _click_odd(self, page: Page, line: str, side: str, market_type: str = "AH") -> bool:
+        """
+        Clica numa odd específica para abrir o betslip.
+        CÓPIA EXATA da lógica _click_specific_odd do audit_h3b_betslip.py (que funciona).
+        """
+        try:
+            line_float = float(line.replace(",", "."))
+            line_variants = []
+            if line_float == int(line_float):
+                int_val = int(line_float)
+                if int_val > 0:
+                    line_variants.extend([f"+{int_val}", f"+{int_val},0", f"+{int_val}.0", str(int_val)])
+                elif int_val < 0:
+                    line_variants.extend([str(int_val), f"{int_val},0", f"{int_val}.0"])
+                else:
+                    line_variants.extend(["0", "+0", "0,0", "0.0"])
+            else:
+                line_comma = line.replace(".", ",")
+                line_dot = line.replace(",", ".")
+                line_variants.append(line_comma)
+                line_variants.append(line_dot)
+                if line_float > 0:
+                    line_variants.append("+" + line_comma)
+                    line_variants.append("+" + line_dot)
 
-        result = await page.evaluate("""
-            (params) => {
-                const lineVariants = params.lineVariants;
-                const side = params.side;
+            if market_type == "OU":
+                section_names = ["Over/Under", "Mais/Menos"]
+                home_label = "Over"
+                away_label = "Under"
+            else:
+                section_names = ["Asian Handicap", "Handicap Asiático", "Handicap"]
+                home_label = "Home"
+                away_label = "Away"
 
-                function norm(t) { return t.trim().replace(/\\s+/g, '').replace('.', ','); }
+            clicked = await page.evaluate("""
+                (params) => {
+                    const lineVariants = params.lineVariants;
+                    const side = params.side;
+                    const sectionNames = params.sectionNames;
+                    const homeLabel = params.homeLabel;
+                    const awayLabel = params.awayLabel;
 
-                const allEls = document.querySelectorAll('span, div');
-                for (const el of allEls) {
-                    const t = (el.innerText || '').trim();
-                    if (t.length > 10) continue;
-
-                    let match = false;
-                    for (const v of lineVariants) {
-                        if (t === v || norm(t) === norm(v)) { match = true; break; }
+                    function normalizeLineText(text) {
+                        return text.trim().replace(/\\s+/g, '').replace('.', ',');
                     }
-                    if (!match) continue;
 
-                    // Encontrou a linha. Busca row container com Home/Away
-                    let row = el.parentElement;
-                    for (let i = 0; i < 6 && row; i++) {
-                        const rt = row.innerText || '';
-                        if (rt.includes('Home') && rt.includes('Away') && rt.split('\\n').length < 15) {
-                            // Busca odds clicáveis
-                            const odds = [];
-                            const seen = new Set();
-                            for (const c of row.querySelectorAll('span, div')) {
-                                const ct = (c.innerText || '').trim();
-                                if (/^\\d+[.,]\\d{2,3}$/.test(ct) && ct.length < 10) {
-                                    const rect = c.getBoundingClientRect();
-                                    if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
-                                        const key = Math.round(rect.x) + '|' + ct;
-                                        if (!seen.has(key)) {
-                                            seen.add(key);
-                                            odds.push({ el: c, x: rect.x, text: ct });
+                    function matchesSection(text) {
+                        for (const name of sectionNames) {
+                            if (text.includes(name)) return true;
+                        }
+                        return false;
+                    }
+
+                    // Encontra seção Asian Handicap ou Over/Under
+                    let sectionContainer = null;
+                    const headers = document.querySelectorAll('div, span, h3, h4');
+                    for (const h of headers) {
+                        const text = (h.innerText || '').trim();
+                        if (matchesSection(text) || text.includes('Handicap') || text.includes('Asian')) {
+                            let parent = h.parentElement;
+                            for (let i = 0; i < 10 && parent; i++) {
+                                const parentText = parent.innerText || '';
+                                if (parentText.includes(homeLabel) && parentText.includes(awayLabel)) {
+                                    sectionContainer = parent;
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                            }
+                            if (sectionContainer) break;
+                        }
+                    }
+                    if (!sectionContainer) sectionContainer = document.body;
+
+                    // Encontra a linha específica
+                    const allElements = sectionContainer.querySelectorAll('span, div');
+                    for (const el of allElements) {
+                        const elText = (el.innerText || '').trim();
+                        if (elText.length > 10) continue;
+
+                        let isLineMatch = false;
+                        for (const variant of lineVariants) {
+                            if (elText === variant || normalizeLineText(elText) === normalizeLineText(variant)) {
+                                isLineMatch = true;
+                                break;
+                            }
+                        }
+                        if (!isLineMatch) continue;
+
+                        // Busca row container com Home/Away
+                        let rowContainer = el.parentElement;
+                        for (let i = 0; i < 6 && rowContainer; i++) {
+                            const rowText = rowContainer.innerText || '';
+                            if (rowText.includes(homeLabel) && rowText.includes(awayLabel) &&
+                                rowText.split('\\n').length < 15) {
+
+                                let hasOurLine = false;
+                                for (const variant of lineVariants) {
+                                    if (rowText.includes(variant)) { hasOurLine = true; break; }
+                                }
+                                if (!hasOurLine) { rowContainer = rowContainer.parentElement; continue; }
+
+                                // Encontra odds clicáveis
+                                const clickableElements = rowContainer.querySelectorAll('div, span');
+                                const oddElements = [];
+                                for (const child of clickableElements) {
+                                    const childText = (child.innerText || '').trim();
+                                    if (/^\\d+[.,]\\d{2,3}$/.test(childText) && childText.length < 10) {
+                                        const rect = child.getBoundingClientRect();
+                                        if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
+                                            oddElements.push({ el: child, x: rect.x, text: childText });
                                         }
                                     }
                                 }
-                            }
-                            if (odds.length >= 2) {
-                                odds.sort((a, b) => a.x - b.x);
-                                const idx = (side === 'home') ? 0 : 1;
-                                const target = odds[idx];
-                                if (target) {
-                                    target.el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                    try { target.el.parentElement.click(); return true; }
-                                    catch(e) {}
-                                    try { target.el.click(); return true; }
-                                    catch(e) {}
+
+                                // Remove duplicatas
+                                const uniqueOdds = [];
+                                const seenKeys = new Set();
+                                for (const odd of oddElements) {
+                                    const key = Math.round(odd.x) + '|' + odd.text;
+                                    if (!seenKeys.has(key)) { seenKeys.add(key); uniqueOdds.push(odd); }
+                                }
+
+                                if (uniqueOdds.length >= 2) {
+                                    uniqueOdds.sort((a, b) => a.x - b.x);
+                                    const targetIdx = (side === 'home' || side === 'over') ? 0 : 1;
+                                    const targetEl = uniqueOdds[targetIdx];
+                                    if (targetEl) {
+                                        targetEl.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        try { targetEl.el.parentElement.click(); return { success: true, odd: targetEl.text }; }
+                                        catch(e) {}
+                                        try { targetEl.el.click(); return { success: true, odd: targetEl.text }; }
+                                        catch(e) {}
+                                    }
                                 }
                             }
+                            rowContainer = rowContainer.parentElement;
                         }
-                        row = row.parentElement;
                     }
+                    return { success: false };
                 }
-                return false;
-            }
-        """, {"lineVariants": line_variants, "side": side})
+            """, {
+                "lineVariants": line_variants,
+                "side": side,
+                "sectionNames": section_names,
+                "homeLabel": home_label,
+                "awayLabel": away_label
+            })
 
-        return bool(result)
+            if clicked and clicked.get('success'):
+                logger.debug(f"Click OK: odd={clicked.get('odd')}")
+                await page.wait_for_timeout(1500)
+                return True
+            return False
+
+        except Exception as e:
+            logger.error(f"Erro click: {e}")
+            return False
 
     async def _save_result(self, r: FastAuditResult):
         """Salva resultado no banco."""
