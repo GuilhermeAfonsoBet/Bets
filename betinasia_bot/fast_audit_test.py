@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TESTE DE VELOCIDADE: Audit H3B com abas pré-abertas (1 liga)
+
+Arquitetura:
+  - Tab 0 (MONITOR): Fica em /sportsbook/football, escuta WebSocket permanente
+  - Tab 1..N (JOGOS): Uma aba por jogo da liga, pré-aberta e linhas expandidas
+  - Task MANUTENÇÃO: Re-expande linhas periodicamente (a cada 60s)
+  - Task EXECUTOR: Quando H3B detectado, clica direto na aba do jogo
+
+Fluxo rápido:
+  1. Monitor detecta H3B via WS      →  0ms (contínuo)
+  2. Switch para aba do jogo          →  ~100ms
+  3. Click na odd (já expandida)      →  ~500ms
+  4. Betslip carrega                  →  ~1.5s
+  5. Extrai dados                     →  ~5ms
+  TOTAL ESTIMADO:                     ~2-3s
+
+Uso:
+    DISPLAY=:99 python fast_audit_test.py --league "England Premier League"
+    DISPLAY=:99 python fast_audit_test.py --league "Spain La Liga" --num-audits 20
+"""
+
+import asyncio
+import argparse
+import json
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
+from loguru import logger
+
+sys.path.insert(0, '.')
+
+from playwright.async_api import Page
+from scraper.betinasia import BetinAsiaScraper
+from scraper.betslip_extractor import BetslipExtractor, BetslipData
+from hypothesis.detectors import HypothesisDetector
+from sqlalchemy import text
+from storage.database import Database
+from storage.models_hypothesis import BetslipAuditResult
+
+
+# URLs do BetinAsia
+BASE_URL = "https://black.betinasia.com"
+FOOTBALL_URL = f"{BASE_URL}/sportsbook/football"
+
+# Mapeamento de ligas
+LEAGUE_CODES = {
+    "England Premier League": "XE/1",
+    "England Championship": "XE/2",
+    "Germany Bundesliga": "DE/12",
+    "Spain La Liga": "ES/16",
+    "Italy Serie A": "IT/19",
+    "France Ligue 1": "FR/38",
+    "Netherlands Eredivisie": "NL/1",
+    "Portugal Primeira Liga": "PT/1",
+    "UEFA Champions League": "XE/5",
+    "UEFA Europa League": "XE/6",
+}
+
+# Config
+WS_HEALTH_CHECK_INTERVAL = 30  # Segundos: verifica se WS ainda está vivo
+WS_RELOAD_INTERVAL = 300  # Segundos: reload forçado do monitor (safety net)
+EXPAND_CHECK_INTERVAL = 60  # Segundos: re-expande linhas nas abas
+MAX_AH_LINE = 2.0  # Filtro de linhas extremas
+
+
+@dataclass
+class GameTab:
+    """Representa uma aba com um jogo pré-aberto."""
+    page: Page
+    event_id: str
+    home_team: str
+    away_team: str
+    league: str
+    url: str
+    kickoff: Optional[datetime] = None
+    lines_expanded: bool = False
+    last_expand: float = 0
+
+
+@dataclass
+class FastAuditResult:
+    """Resultado de uma auditoria rápida."""
+    timestamp: datetime
+    event_id: str
+    home_team: str
+    away_team: str
+    league: str
+    market_type: str
+    line: str
+    side: str
+    websocket_odd: float
+    betslip_odd: Optional[float] = None
+    betslip_limit: Optional[float] = None
+    difference_pct: Optional[float] = None
+    status: str = ""
+    is_live: Optional[bool] = None
+    # Timing granular (ms)
+    lag_detect_to_switch_ms: int = 0
+    lag_switch_to_click_ms: int = 0
+    lag_click_to_betslip_ms: int = 0
+    lag_total_ms: int = 0
+
+
+class FastAuditTest:
+    """Teste de velocidade com abas pré-abertas."""
+
+    def __init__(self, league: str, num_audits: int = 50, save_to_db: bool = True):
+        self.league = league
+        self.league_code = LEAGUE_CODES.get(league)
+        self.num_audits = num_audits
+        self.save_to_db = save_to_db
+
+        self.scraper: Optional[BetinAsiaScraper] = None
+        self.monitor_page: Optional[Page] = None
+        self.game_tabs: Dict[str, GameTab] = {}  # event_id → GameTab
+        self.context = None
+        self.db: Optional[Database] = None
+
+        # WebSocket state
+        self._ws_messages: List[str] = []
+        self._ws_connected = False
+        self._last_ws_message_time: float = 0
+        self._ws_message_count: int = 0
+
+        # Hypothesis detector
+        self.detector = HypothesisDetector()
+
+        # Results
+        self.results: List[FastAuditResult] = []
+        self.events_processed: int = 0
+        self.h3b_detected: int = 0
+
+    async def start(self):
+        """Inicia browser, login, abre monitor e abas dos jogos."""
+        logger.info("=" * 60)
+        logger.info(f"TESTE DE VELOCIDADE - {self.league}")
+        logger.info("=" * 60)
+
+        # Browser
+        self.scraper = BetinAsiaScraper()
+        await self.scraper.start()
+        await self.scraper.login()
+        self.context = self.scraper._context
+        logger.info("Login OK")
+
+        # Banco de dados
+        if self.save_to_db:
+            self.db = Database()
+            await self.db.connect()
+            try:
+                async with self.db.engine.begin() as conn:
+                    await conn.execute(
+                        text("ALTER TABLE betslip_audit_results ADD COLUMN IF NOT EXISTS is_live BOOLEAN")
+                    )
+            except:
+                pass
+            logger.info("Banco conectado")
+
+        # Monitor page (Tab 0) — fica na página de futebol escutando WS
+        self.monitor_page = self.scraper._page
+        await self._setup_ws_listener(self.monitor_page)
+        await self.monitor_page.goto(FOOTBALL_URL)
+        await self.monitor_page.wait_for_load_state("domcontentloaded")
+        logger.info("Monitor page: aguardando WebSocket...")
+        await self.monitor_page.wait_for_timeout(5000)
+        logger.info(f"Monitor page: {self._ws_message_count} mensagens WS recebidas")
+
+        # Descobre jogos da liga via WebSocket
+        game_urls = await self._discover_game_urls()
+
+        if not game_urls:
+            logger.error(f"Nenhum jogo encontrado para {self.league}")
+            return False
+
+        logger.info(f"Encontrados {len(game_urls)} jogos para {self.league}")
+
+        # Abre abas dos jogos
+        await self._open_game_tabs(game_urls)
+
+        logger.info(f"{len(self.game_tabs)} abas de jogos abertas e expandidas")
+        return True
+
+    async def _setup_ws_listener(self, page: Page):
+        """Configura listener de WebSocket numa página."""
+        def on_ws(ws):
+            self._ws_connected = True
+
+            def on_frame(data):
+                self._ws_messages.append(str(data))
+                self._last_ws_message_time = time.time()
+                self._ws_message_count += 1
+
+            ws.on('framereceived', on_frame)
+            ws.on('close', lambda: setattr(self, '_ws_connected', False))
+
+        page.on('websocket', on_ws)
+
+    async def _discover_game_urls(self) -> List[dict]:
+        """Descobre URLs dos jogos da liga a partir dos dados do WebSocket."""
+        games = []
+        events = {}
+
+        # Parseia mensagens WS para encontrar jogos da liga
+        for msg in self._ws_messages:
+            try:
+                data = json.loads(msg)
+                if not isinstance(data, list):
+                    continue
+                for item in data:
+                    if not isinstance(item, list) or len(item) < 2:
+                        continue
+                    msg_type = item[0]
+                    msg_meta = item[1]
+                    msg_data = item[2] if len(item) > 2 else {}
+
+                    if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
+                        if msg_meta[0] == 'fb' and 'home' in msg_data:
+                            event_id = msg_meta[1]
+                            league = msg_data.get('competition_name', '')
+                            kickoff = None
+                            if 'start_ts' in msg_data:
+                                try:
+                                    kickoff = datetime.fromisoformat(
+                                        msg_data['start_ts'].replace('Z', '+00:00')
+                                    )
+                                except:
+                                    pass
+
+                            events[event_id] = {
+                                'event_id': event_id,
+                                'home': msg_data.get('home', ''),
+                                'away': msg_data.get('away', ''),
+                                'league': league,
+                                'kickoff': kickoff,
+                            }
+            except:
+                continue
+
+        # Filtra pela liga
+        target_league = self.league.lower()
+        for eid, info in events.items():
+            league = info.get('league', '').lower()
+            # Match flexível: contém palavras-chave da liga
+            league_words = target_league.split()
+            if all(w.lower() in league.lower() for w in league_words if len(w) > 3):
+                # Constroi URL do jogo
+                # Formato: /sportsbook/football/{league_code}/{event_id}
+                url = f"{FOOTBALL_URL}/{self.league_code}/{eid}"
+                games.append({
+                    'event_id': eid,
+                    'home': info['home'],
+                    'away': info['away'],
+                    'league': info['league'],
+                    'kickoff': info.get('kickoff'),
+                    'url': url,
+                })
+
+        return games
+
+    async def _open_game_tabs(self, games: list):
+        """Abre uma aba para cada jogo e expande linhas."""
+        for game in games:
+            try:
+                page = await self.context.new_page()
+                await page.goto(game['url'])
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(2000)
+
+                # Verifica se carregou
+                body = await page.inner_text("body")
+                if "Asian Handicap" not in body and "Over/Under" not in body:
+                    logger.warning(f"Jogo nao carregou: {game['home']} vs {game['away']}")
+                    await page.close()
+                    continue
+
+                # Expande linhas
+                expanded = await self._expand_lines(page)
+
+                tab = GameTab(
+                    page=page,
+                    event_id=game['event_id'],
+                    home_team=game['home'],
+                    away_team=game['away'],
+                    league=game['league'],
+                    url=game['url'],
+                    kickoff=game.get('kickoff'),
+                    lines_expanded=expanded > 0,
+                    last_expand=time.time(),
+                )
+                self.game_tabs[game['event_id']] = tab
+
+                logger.info(f"  Tab aberta: {game['home']} vs {game['away']} ({expanded} seções expandidas)")
+
+            except Exception as e:
+                logger.warning(f"Erro abrindo tab {game['home']} vs {game['away']}: {e}")
+
+    async def _expand_lines(self, page: Page) -> int:
+        """Expande todas as linhas via JavaScript. Retorna quantas expandiu."""
+        try:
+            result = await page.evaluate("""
+                () => {
+                    let clicked = 0;
+                    const els = document.querySelectorAll('span, button, div, a, [role="button"]');
+                    for (const el of els) {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        if ((text === 'show all lines' || text === 'show all' ||
+                             text === 'mostrar todas as linhas' || text === 'mostrar') &&
+                            el.offsetParent !== null) {
+                            try { el.click(); clicked++; } catch(e) {}
+                        }
+                    }
+                    return clicked;
+                }
+            """)
+            if result > 0:
+                await page.wait_for_timeout(1000)
+            return result
+        except:
+            return 0
+
+    async def _maintenance_loop(self):
+        """Loop de manutenção: re-expande linhas e verifica saúde do WS."""
+        while True:
+            await asyncio.sleep(EXPAND_CHECK_INTERVAL)
+
+            # Re-expande linhas em todas as abas
+            for eid, tab in self.game_tabs.items():
+                try:
+                    expanded = await self._expand_lines(tab.page)
+                    if expanded > 0:
+                        logger.debug(f"Re-expandiu {expanded} seções em {tab.home_team} vs {tab.away_team}")
+                        tab.last_expand = time.time()
+                except Exception as e:
+                    logger.debug(f"Erro re-expandindo {eid}: {e}")
+
+            # Verifica saúde do WebSocket
+            ws_age = time.time() - self._last_ws_message_time if self._last_ws_message_time > 0 else 999
+            if ws_age > WS_HEALTH_CHECK_INTERVAL:
+                logger.warning(f"WebSocket sem mensagens há {ws_age:.0f}s — pode estar desconectado")
+
+            # Reload forçado do monitor se WS parou
+            if ws_age > WS_RELOAD_INTERVAL:
+                logger.warning("WebSocket morto — recarregando monitor...")
+                try:
+                    self._ws_messages.clear()
+                    await self.monitor_page.reload()
+                    await self.monitor_page.wait_for_load_state("domcontentloaded")
+                    await self.monitor_page.wait_for_timeout(3000)
+                    logger.info(f"Monitor recarregado. WS conectado: {self._ws_connected}")
+                except Exception as e:
+                    logger.error(f"Erro recarregando monitor: {e}")
+
+    async def _monitor_loop(self, audit_queue: asyncio.Queue, audited: set):
+        """Loop do monitor: processa WS e detecta H3B continuamente."""
+        logger.info("Monitor loop iniciado — escutando WebSocket...")
+
+        last_process_idx = 0
+
+        while len(self.results) < self.num_audits:
+            # Processa apenas mensagens novas (desde último check)
+            new_messages = self._ws_messages[last_process_idx:]
+            last_process_idx = len(self._ws_messages)
+
+            if not new_messages:
+                await asyncio.sleep(0.1)  # 100ms polling
+                continue
+
+            # Parseia e detecta H3B
+            events_info = {}
+            for msg in new_messages:
+                try:
+                    data = json.loads(msg)
+                    if not isinstance(data, list):
+                        continue
+                    for item in data:
+                        if not isinstance(item, list) or len(item) < 2:
+                            continue
+
+                        msg_type = item[0]
+                        msg_meta = item[1]
+                        msg_data = item[2] if len(item) > 2 else {}
+
+                        # Info do evento
+                        if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
+                            if msg_meta[0] == 'fb' and 'home' in msg_data:
+                                eid = msg_meta[1]
+                                kickoff = None
+                                if 'start_ts' in msg_data:
+                                    try:
+                                        kickoff = datetime.fromisoformat(
+                                            msg_data['start_ts'].replace('Z', '+00:00')
+                                        )
+                                    except:
+                                        pass
+                                events_info[eid] = {
+                                    'home': msg_data.get('home', ''),
+                                    'away': msg_data.get('away', ''),
+                                    'league': msg_data.get('competition_name', ''),
+                                    'kickoff': kickoff,
+                                }
+
+                        # Odds AH
+                        if msg_type in ['offers_hcap', 'offers_event']:
+                            if isinstance(msg_meta, list) and len(msg_meta) >= 3 and msg_meta[1] == 'fb':
+                                eid = msg_meta[2]
+                                if 'ah' in msg_data:
+                                    self._process_ah_odds(eid, msg_data['ah'], events_info, audit_queue, audited)
+                except:
+                    continue
+
+            # Status periódico
+            if self.events_processed % 500 == 0 and self.events_processed > 0:
+                logger.info(
+                    f"Processados: {self.events_processed} | "
+                    f"H3B: {self.h3b_detected} | "
+                    f"Auditados: {len(self.results)}/{self.num_audits} | "
+                    f"WS msgs: {self._ws_message_count}"
+                )
+
+    def _process_ah_odds(self, event_id: str, ah_data, events_info: dict,
+                         audit_queue: asyncio.Queue, audited: set):
+        """Processa odds AH e detecta H3B."""
+        lines = []
+        if isinstance(ah_data, list) and len(ah_data) >= 2:
+            if isinstance(ah_data[0], (int, float)):
+                lines = [ah_data]
+            elif isinstance(ah_data[0], list):
+                lines = ah_data
+
+        for line_data in lines:
+            if len(line_data) < 2:
+                continue
+            line_val = line_data[0]
+            odds_list = line_data[1] if len(line_data) > 1 else []
+
+            home_odds = away_odds = 0
+            if isinstance(odds_list, list):
+                for o in odds_list:
+                    if isinstance(o, list) and len(o) >= 2:
+                        if o[0] == 'h': home_odds = float(o[1])
+                        elif o[0] == 'a': away_odds = float(o[1])
+
+            if home_odds <= 0 or away_odds <= 0:
+                continue
+
+            self.events_processed += 1
+
+            # Filtro de linha extrema
+            try:
+                if abs(float(line_val)) > MAX_AH_LINE:
+                    continue
+            except:
+                pass
+
+            # Detecta H3B
+            det = self.detector.process_market_update(
+                match_id=hash(event_id) % 1000000,
+                market_type="AH",
+                line=str(line_val),
+                home_odd=home_odds,
+                away_odd=away_odds,
+            )
+
+            for h3b in det.get("h3b_events", []):
+                self.h3b_detected += 1
+
+                if h3b.direction_after != "up":
+                    continue
+
+                # Só audita se temos aba aberta para este jogo
+                if event_id not in self.game_tabs:
+                    continue
+
+                audit_key = f"{event_id}|AH|{h3b.ah_line}|{h3b.side}"
+                if audit_key in audited:
+                    continue
+
+                info = events_info.get(event_id, {})
+                kickoff = info.get('kickoff') or self.game_tabs[event_id].kickoff
+                now = datetime.now(timezone.utc)
+                is_live = kickoff <= now if kickoff else None
+
+                audit_queue.put_nowait({
+                    'event_id': event_id,
+                    'audit_key': audit_key,
+                    'line': str(h3b.ah_line),
+                    'side': h3b.side,
+                    'websocket_odd': h3b.odd_at_reversal,
+                    'is_live': is_live,
+                    'detected_at': time.time(),
+                })
+                audited.add(audit_key)
+
+    async def _executor_loop(self, audit_queue: asyncio.Queue):
+        """Loop do executor: processa fila de H3Bs, clica nas abas pré-abertas."""
+        logger.info("Executor loop iniciado")
+
+        while len(self.results) < self.num_audits:
+            try:
+                h3b = await asyncio.wait_for(audit_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            result = await self._execute_audit(h3b)
+            self.results.append(result)
+
+            # Salva no banco
+            if self.save_to_db:
+                await self._save_result(result)
+
+            # Log
+            status_icon = "OK" if result.betslip_odd else "FAIL"
+            logger.info(
+                f"[{status_icon}] {result.home_team} vs {result.away_team} | "
+                f"AH {result.line} {result.side} | "
+                f"ws={result.websocket_odd:.3f} bs={result.betslip_odd or 0:.3f} | "
+                f"lag={result.lag_total_ms}ms "
+                f"(switch={result.lag_detect_to_switch_ms} click={result.lag_switch_to_click_ms} "
+                f"slip={result.lag_click_to_betslip_ms}) | "
+                f"{len(self.results)}/{self.num_audits}"
+            )
+
+    async def _execute_audit(self, h3b: dict) -> FastAuditResult:
+        """Executa auditoria: switch tab → click odd → extract betslip."""
+        event_id = h3b['event_id']
+        tab = self.game_tabs[event_id]
+        detected_at = h3b['detected_at']
+
+        t0 = time.time()
+
+        # === SWITCH para aba do jogo ===
+        try:
+            await tab.page.bring_to_front()
+        except:
+            pass
+        t_switch = time.time()
+        lag_switch = int((t_switch - detected_at) * 1000)
+
+        # === CLICK na odd ===
+        line = h3b['line']
+        side = h3b['side']
+        clicked = await self._click_odd(tab.page, line, side)
+        t_click = time.time()
+        lag_click = int((t_click - t_switch) * 1000)
+
+        if not clicked:
+            lag_total = int((time.time() - detected_at) * 1000)
+            return FastAuditResult(
+                timestamp=datetime.now(timezone.utc),
+                event_id=event_id,
+                home_team=tab.home_team,
+                away_team=tab.away_team,
+                league=tab.league,
+                market_type="AH",
+                line=line,
+                side=side,
+                websocket_odd=h3b['websocket_odd'],
+                status="CLICK_FAILED",
+                is_live=h3b.get('is_live'),
+                lag_detect_to_switch_ms=lag_switch,
+                lag_switch_to_click_ms=lag_click,
+                lag_total_ms=lag_total,
+            )
+
+        # === BETSLIP ===
+        await tab.page.wait_for_timeout(1500)
+        extractor = BetslipExtractor(tab.page)
+        betslip = await extractor.extract_best_odd()
+        t_betslip = time.time()
+        lag_betslip = int((t_betslip - t_click) * 1000)
+        lag_total = int((t_betslip - detected_at) * 1000)
+
+        # Fecha betslip
+        await extractor.close_betslip()
+
+        if not betslip:
+            return FastAuditResult(
+                timestamp=datetime.now(timezone.utc),
+                event_id=event_id,
+                home_team=tab.home_team,
+                away_team=tab.away_team,
+                league=tab.league,
+                market_type="AH",
+                line=line,
+                side=side,
+                websocket_odd=h3b['websocket_odd'],
+                status="EXTRACT_FAILED",
+                is_live=h3b.get('is_live'),
+                lag_detect_to_switch_ms=lag_switch,
+                lag_switch_to_click_ms=lag_click,
+                lag_click_to_betslip_ms=lag_betslip,
+                lag_total_ms=lag_total,
+            )
+
+        ws_odd = h3b['websocket_odd']
+        best_odd = betslip.best_odd
+        diff_pct = ((best_odd - ws_odd) / ws_odd) * 100
+
+        return FastAuditResult(
+            timestamp=datetime.now(timezone.utc),
+            event_id=event_id,
+            home_team=tab.home_team,
+            away_team=tab.away_team,
+            league=tab.league,
+            market_type="AH",
+            line=line,
+            side=side,
+            websocket_odd=ws_odd,
+            betslip_odd=best_odd,
+            betslip_limit=betslip.best_limit,
+            difference_pct=diff_pct,
+            status="OK",
+            is_live=h3b.get('is_live'),
+            lag_detect_to_switch_ms=lag_switch,
+            lag_switch_to_click_ms=lag_click,
+            lag_click_to_betslip_ms=lag_betslip,
+            lag_total_ms=lag_total,
+        )
+
+    async def _click_odd(self, page: Page, line: str, side: str) -> bool:
+        """Clica numa odd específica via JavaScript (rápido)."""
+        line_float = float(line.replace(",", "."))
+        line_variants = []
+        if line_float == int(line_float):
+            iv = int(line_float)
+            if iv > 0: line_variants = [f"+{iv}", f"+{iv},0", f"+{iv}.0", str(iv)]
+            elif iv < 0: line_variants = [str(iv), f"{iv},0", f"{iv}.0"]
+            else: line_variants = ["0", "+0", "0,0", "0.0"]
+        else:
+            lc = line.replace(".", ",")
+            ld = line.replace(",", ".")
+            line_variants = [lc, ld]
+            if line_float > 0:
+                line_variants += ["+" + lc, "+" + ld]
+
+        result = await page.evaluate("""
+            (params) => {
+                const lineVariants = params.lineVariants;
+                const side = params.side;
+
+                function norm(t) { return t.trim().replace(/\\s+/g, '').replace('.', ','); }
+
+                const allEls = document.querySelectorAll('span, div');
+                for (const el of allEls) {
+                    const t = (el.innerText || '').trim();
+                    if (t.length > 10) continue;
+
+                    let match = false;
+                    for (const v of lineVariants) {
+                        if (t === v || norm(t) === norm(v)) { match = true; break; }
+                    }
+                    if (!match) continue;
+
+                    // Encontrou a linha. Busca row container com Home/Away
+                    let row = el.parentElement;
+                    for (let i = 0; i < 6 && row; i++) {
+                        const rt = row.innerText || '';
+                        if (rt.includes('Home') && rt.includes('Away') && rt.split('\\n').length < 15) {
+                            // Busca odds clicáveis
+                            const odds = [];
+                            const seen = new Set();
+                            for (const c of row.querySelectorAll('span, div')) {
+                                const ct = (c.innerText || '').trim();
+                                if (/^\\d+[.,]\\d{2,3}$/.test(ct) && ct.length < 10) {
+                                    const rect = c.getBoundingClientRect();
+                                    if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
+                                        const key = Math.round(rect.x) + '|' + ct;
+                                        if (!seen.has(key)) {
+                                            seen.add(key);
+                                            odds.push({ el: c, x: rect.x, text: ct });
+                                        }
+                                    }
+                                }
+                            }
+                            if (odds.length >= 2) {
+                                odds.sort((a, b) => a.x - b.x);
+                                const idx = (side === 'home') ? 0 : 1;
+                                const target = odds[idx];
+                                if (target) {
+                                    target.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    try { target.el.parentElement.click(); return true; }
+                                    catch(e) {}
+                                    try { target.el.click(); return true; }
+                                    catch(e) {}
+                                }
+                            }
+                        }
+                        row = row.parentElement;
+                    }
+                }
+                return false;
+            }
+        """, {"lineVariants": line_variants, "side": side})
+
+        return bool(result)
+
+    async def _save_result(self, r: FastAuditResult):
+        """Salva resultado no banco."""
+        if not self.db:
+            return
+        try:
+            record = BetslipAuditResult(
+                hypothesis_type="H3B",
+                event_id=r.event_id,
+                sport="football",
+                league=r.league,
+                home_team=r.home_team,
+                away_team=r.away_team,
+                match_info=f"{r.home_team} vs {r.away_team}",
+                market_type=r.market_type,
+                market_period="full_time",
+                line=r.line,
+                side=r.side,
+                bet_description=f"AH {r.line} {r.side}",
+                websocket_odd=r.websocket_odd,
+                betslip_odd=r.betslip_odd,
+                difference_pct=r.difference_pct,
+                difference_absolute=(r.betslip_odd - r.websocket_odd) if r.betslip_odd else None,
+                betslip_limit=r.betslip_limit,
+                status=r.status,
+                is_valid_opportunity=r.betslip_odd is not None,
+                is_live=r.is_live,
+                reversal_direction="up",
+                lag_detection_to_click_ms=r.lag_detect_to_switch_ms + r.lag_switch_to_click_ms,
+                lag_click_to_betslip_ms=r.lag_click_to_betslip_ms,
+                audit_total_duration_ms=r.lag_total_ms,
+                audit_version="v2.0-fast",
+            )
+            async with self.db.async_session() as session:
+                session.add(record)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Erro salvando: {e}")
+
+    def _print_summary(self):
+        """Imprime resumo dos resultados."""
+        print("\n" + "=" * 70)
+        print("RESULTADOS - TESTE DE VELOCIDADE")
+        print("=" * 70)
+
+        ok = [r for r in self.results if r.status == "OK"]
+        failed = [r for r in self.results if r.status != "OK"]
+
+        print(f"\n  Total auditorias: {len(self.results)}")
+        print(f"  Com betslip (OK): {len(ok)}")
+        print(f"  Falhas: {len(failed)}")
+        print(f"  WS msgs processadas: {self._ws_message_count}")
+        print(f"  Eventos processados: {self.events_processed}")
+        print(f"  H3B detectados: {self.h3b_detected}")
+
+        if ok:
+            lags_total = [r.lag_total_ms for r in ok]
+            lags_switch = [r.lag_detect_to_switch_ms for r in ok]
+            lags_click = [r.lag_switch_to_click_ms for r in ok]
+            lags_betslip = [r.lag_click_to_betslip_ms for r in ok]
+            diffs = [r.difference_pct for r in ok if r.difference_pct is not None]
+
+            print(f"\n  --- TIMING (apenas OK, N={len(ok)}) ---")
+            print(f"  LAG TOTAL:     min={min(lags_total)}ms  med={sorted(lags_total)[len(lags_total)//2]}ms  max={max(lags_total)}ms  avg={sum(lags_total)/len(lags_total):.0f}ms")
+            print(f"  Detect→Switch: min={min(lags_switch)}ms  med={sorted(lags_switch)[len(lags_switch)//2]}ms  max={max(lags_switch)}ms  avg={sum(lags_switch)/len(lags_switch):.0f}ms")
+            print(f"  Switch→Click:  min={min(lags_click)}ms  med={sorted(lags_click)[len(lags_click)//2]}ms  max={max(lags_click)}ms  avg={sum(lags_click)/len(lags_click):.0f}ms")
+            print(f"  Click→Betslip: min={min(lags_betslip)}ms  med={sorted(lags_betslip)[len(lags_betslip)//2]}ms  max={max(lags_betslip)}ms  avg={sum(lags_betslip)/len(lags_betslip):.0f}ms")
+
+            if diffs:
+                print(f"\n  --- DIFERENÇA WS vs BETSLIP (N={len(diffs)}) ---")
+                print(f"  Média:  {sum(diffs)/len(diffs):+.3f}%")
+                print(f"  Mediana: {sorted(diffs)[len(diffs)//2]:+.3f}%")
+                print(f"  Min/Max: {min(diffs):+.3f}% / {max(diffs):+.3f}%")
+
+        if failed:
+            by_status = {}
+            for r in failed:
+                by_status[r.status] = by_status.get(r.status, 0) + 1
+            print(f"\n  --- FALHAS ---")
+            for s, n in sorted(by_status.items(), key=lambda x: -x[1]):
+                print(f"  {s}: {n}")
+
+        print("\n" + "=" * 70)
+
+    async def run(self):
+        """Executa o teste completo."""
+        ok = await self.start()
+        if not ok:
+            return
+
+        audit_queue = asyncio.Queue()
+        audited = set()
+
+        # Inicia tasks em paralelo
+        tasks = [
+            asyncio.create_task(self._monitor_loop(audit_queue, audited)),
+            asyncio.create_task(self._executor_loop(audit_queue)),
+            asyncio.create_task(self._maintenance_loop()),
+        ]
+
+        try:
+            # Aguarda até completar auditorias
+            while len(self.results) < self.num_audits:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Interrompido")
+        finally:
+            for t in tasks:
+                t.cancel()
+
+        self._print_summary()
+
+        # Cleanup
+        for tab in self.game_tabs.values():
+            try:
+                await tab.page.close()
+            except:
+                pass
+        if self.scraper:
+            await self.scraper.close()
+        if self.db:
+            await self.db.close()
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Teste de velocidade H3B")
+    parser.add_argument("--league", default="England Premier League",
+                        help="Liga para monitorar")
+    parser.add_argument("--num-audits", type=int, default=20,
+                        help="Número de auditorias (default: 20)")
+    parser.add_argument("--no-db", action="store_true",
+                        help="Não salvar no banco")
+    args = parser.parse_args()
+
+    logger.remove()
+    logger.add(sys.stderr,
+               format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level:<7}</level> | <level>{message}</level>",
+               level="INFO")
+    logger.add("logs/fast_audit_{time:YYYY-MM-DD}.log", rotation="00:00", retention="30 days", level="DEBUG")
+
+    test = FastAuditTest(
+        league=args.league,
+        num_audits=args.num_audits,
+        save_to_db=not args.no_db,
+    )
+    await test.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
