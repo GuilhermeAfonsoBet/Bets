@@ -312,16 +312,24 @@ class FastAuditTest:
                 break
             try:
                 page = await self.context.new_page()
-                page.set_default_timeout(15000)  # 15s timeout (não 30s)
+                page.set_default_timeout(15000)
                 await page.goto(game['url'], wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(3000)  # Espera JS carregar odds
 
-                # Verifica se carregou
+                # Espera até Asian Handicap aparecer (máx 8s)
+                try:
+                    await page.wait_for_selector("text=Asian Handicap", timeout=8000)
+                except:
+                    # Fallback: espera fixa
+                    await page.wait_for_timeout(3000)
+
                 body = await page.inner_text("body")
                 if "Asian Handicap" not in body and "Over/Under" not in body:
                     logger.warning(f"Jogo nao carregou: {game['home']} vs {game['away']}")
                     await page.close()
                     continue
+
+                # Espera mais um pouco para botões "Show all" renderizarem
+                await page.wait_for_timeout(1500)
 
                 # Expande linhas
                 expanded = await self._expand_lines(page)
@@ -374,14 +382,19 @@ class FastAuditTest:
             await asyncio.sleep(EXPAND_CHECK_INTERVAL)
 
             # Re-expande linhas em todas as abas
+            total_expanded = 0
             for eid, tab in self.game_tabs.items():
                 try:
                     expanded = await self._expand_lines(tab.page)
+                    total_expanded += expanded
                     if expanded > 0:
-                        logger.debug(f"Re-expandiu {expanded} seções em {tab.home_team} vs {tab.away_team}")
+                        logger.info(f"  Re-expandiu {expanded} seções: {tab.home_team} vs {tab.away_team}")
+                        tab.lines_expanded = True
                         tab.last_expand = time.time()
                 except Exception as e:
-                    logger.debug(f"Erro re-expandindo {eid}: {e}")
+                    logger.warning(f"  Erro re-expandindo {tab.home_team} vs {tab.away_team}: {e}")
+            if total_expanded > 0:
+                logger.info(f"  Total re-expandido: {total_expanded} seções em {len(self.game_tabs)} abas")
 
             # Verifica saúde do WebSocket
             ws_age = time.time() - self._last_ws_message_time if self._last_ws_message_time > 0 else 999
@@ -886,9 +899,11 @@ async def main():
     args = parser.parse_args()
 
     logger.remove()
+    # Filtra mensagens H6 do console (muito spam)
     logger.add(sys.stderr,
                format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level:<7}</level> | <level>{message}</level>",
-               level="INFO")
+               level="INFO",
+               filter=lambda record: "H6:" not in record["message"] and "H1:" not in record["message"])
     logger.add("logs/fast_audit_{time:YYYY-MM-DD}.log", rotation="00:00", retention="30 days", level="DEBUG")
 
     test = FastAuditTest(
