@@ -651,6 +651,42 @@ class FastAuditTest:
 
         # === BETSLIP ===
         await tab.page.wait_for_timeout(2000)
+
+        # Dump do conteúdo do betslip para debug
+        betslip_dump = await tab.page.evaluate("""
+            () => {
+                // Procura painéis candidatos
+                const selectors = ['[class*="betslip"]', '[class*="slip"]', '[class*="sidebar"]', '[class*="panel"]', 'aside'];
+                let found = [];
+                for (const sel of selectors) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const t = (el.innerText || '').trim();
+                        if (t.length > 20 && t.length < 5000) {
+                            found.push({selector: sel, className: el.className, length: t.length, text: t.substring(0, 500)});
+                        }
+                    }
+                }
+                // Se nada encontrou nos seletores, pega a parte direita da página
+                if (found.length === 0) {
+                    const body = document.body.innerText || '';
+                    const betslipIdx = body.indexOf('Betslip');
+                    if (betslipIdx > -1) {
+                        found.push({selector: 'body-betslip', className: '', length: 2000, text: body.substring(betslipIdx, betslipIdx + 1000)});
+                    } else {
+                        // Últimos 1000 chars do body (betslip geralmente está no final)
+                        found.push({selector: 'body-tail', className: '', length: body.length, text: body.substring(Math.max(0, body.length - 1000))});
+                    }
+                }
+                return found;
+            }
+        """)
+        logger.info(f"  BETSLIP DUMP ({len(betslip_dump)} painéis encontrados):")
+        for panel in betslip_dump[:3]:
+            logger.info(f"    Selector: {panel['selector']} | Class: {panel['className'][:50]} | Len: {panel['length']}")
+            # Mostra primeiras 200 chars do texto
+            text_preview = panel['text'][:200].replace('\n', ' | ')
+            logger.info(f"    Texto: {text_preview}")
+
         extractor = BetslipExtractor(tab.page)
         betslip = await extractor.extract_best_odd()
         logger.debug(f"Betslip extraido: {betslip is not None}, data={betslip}")
