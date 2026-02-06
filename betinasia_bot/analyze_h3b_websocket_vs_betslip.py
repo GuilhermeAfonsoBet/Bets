@@ -1,147 +1,73 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Análise H3B: Valor REALISTA (WebSocket + Betslip)
+Análise H3B REALISTA: CLV com odd do Betslip (execução real)
 
-Pergunta central:
-  O valor detectado no WebSocket (CLV +1.116% para H3B UP)
-  SOBREVIVE quando consideramos a odd REAL do betslip?
+Compara:
+  - CLV WebSocket: (odd_websocket - closing_odd) / closing_odd
+  - CLV Betslip:   (odd_betslip   - closing_odd) / closing_odd
 
-Lógica:
-  - CLV_websocket = 1.116% (medido na análise anterior)
-  - Diferença betslip = (betslip_odd - websocket_odd) / websocket_odd
-  - CLV_realizável ≈ CLV_websocket + diferença_betslip
-
-Se diferença_betslip é negativa (betslip < websocket),
-o lag "come" parte do valor. Se for muito negativa, come TUDO.
+Se o valor sobrevive na prática, o CLV Betslip deve ser significativo
+e positivo, com a mesma metodologia da análise v6.
 
 Uso:
-    cd ~/Bets/betinasia_bot
-    source ../venv/bin/activate  # ou venv/bin/activate
     python analyze_h3b_websocket_vs_betslip.py
 """
 
 import asyncio
 import sys
 import math
-from datetime import datetime, timezone
-from collections import defaultdict
 
 sys.path.insert(0, '.')
 
-from sqlalchemy import select, func, text
+from sqlalchemy import text
 from storage.database import Database
-from storage.models_hypothesis import BetslipAuditResult
 
 
-# CLV do WebSocket (da análise anterior)
-CLV_WEBSOCKET_UP = 1.116  # %
-CLV_WEBSOCKET_DOWN = -1.359  # %
-
-# Z-scores para intervalos de confiança
 Z_90 = 1.645
 Z_95 = 1.960
 
 
-def calc_stats(values: list) -> dict:
-    """Calcula estatísticas descritivas e IC."""
-    if not values:
-        return None
-    
-    n = len(values)
-    mean = sum(values) / n
-    
-    if n < 2:
-        return {"n": n, "mean": mean, "std": 0, "se": 0, "ic90_low": mean, "ic90_high": mean}
-    
-    variance = sum((x - mean) ** 2 for x in values) / (n - 1)
-    std = math.sqrt(variance)
-    se = std / math.sqrt(n)  # Erro padrão
-    
-    ic90_low = mean - Z_90 * se
-    ic90_high = mean + Z_90 * se
-    
-    ic95_low = mean - Z_95 * se
-    ic95_high = mean + Z_95 * se
-    
-    # Mediana
-    sorted_vals = sorted(values)
-    if n % 2 == 0:
-        median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
-    else:
-        median = sorted_vals[n // 2]
-    
-    # Percentis
-    p25 = sorted_vals[max(0, int(n * 0.25))]
-    p75 = sorted_vals[min(n - 1, int(n * 0.75))]
-    
-    return {
-        "n": n,
-        "mean": mean,
-        "median": median,
-        "std": std,
-        "se": se,
-        "p25": p25,
-        "p75": p75,
-        "min": sorted_vals[0],
-        "max": sorted_vals[-1],
-        "ic90_low": ic90_low,
-        "ic90_high": ic90_high,
-        "ic95_low": ic95_low,
-        "ic95_high": ic95_high,
-    }
+def calc_ci(mean: float, std: float, n: int, z: float = 1.645) -> tuple:
+    """Calcula intervalo de confiança."""
+    if n <= 1:
+        return (None, None)
+    se = std / math.sqrt(n)
+    return (mean - z * se, mean + z * se)
 
 
-def is_significant_90(stats: dict) -> bool:
-    """Verifica se é significativo a 90% (IC não inclui zero)."""
-    if not stats:
-        return False
-    return stats["ic90_low"] > 0 or stats["ic90_high"] < 0
-
-
-def print_stats_block(title: str, stats: dict, clv_websocket: float = None):
-    """Imprime um bloco formatado de estatísticas."""
-    if not stats:
-        print(f"\n  {title}: Sem dados suficientes")
+def format_result(label: str, n: int, mean: float, std: float):
+    """Formata resultado com IC."""
+    if n <= 1:
+        print(f"\n   {label}: N={n} (insuficiente)")
         return
     
-    n = stats["n"]
+    se = std / math.sqrt(n)
+    ci90_low, ci90_high = calc_ci(mean, std, n, Z_90)
+    ci95_low, ci95_high = calc_ci(mean, std, n, Z_95)
     
-    print(f"\n  {title}:")
-    print(f"    N = {n}")
-    print(f"    Diferença média (betslip - ws) = {stats['mean']:+.3f}%")
-    print(f"    Mediana                        = {stats['median']:+.3f}%")
-    print(f"    Desvio padrão                  = {stats['std']:.3f}%")
-    print(f"    Erro padrão                    = {stats['se']:.3f}%")
-    print(f"    IC 90%  = [{stats['ic90_low']:+.3f}%, {stats['ic90_high']:+.3f}%]")
-    print(f"    IC 95%  = [{stats['ic95_low']:+.3f}%, {stats['ic95_high']:+.3f}%]")
-    print(f"    Range   = [{stats['min']:+.3f}%, {stats['max']:+.3f}%]")
-    print(f"    P25/P75 = [{stats['p25']:+.3f}%, {stats['p75']:+.3f}%]")
+    if ci90_low > 0:
+        sig = "✅ SIGNIFICATIVO (p<0.10)"
+    elif ci90_high < 0:
+        sig = "❌ SIGNIFICATIVO NEGATIVO"
+    else:
+        sig = "⚪ Não significativo"
     
-    if clv_websocket is not None:
-        realized_clv = clv_websocket + stats["mean"]
-        realized_se = stats["se"]  # Aproximação (ignora erro do CLV websocket)
-        realized_ic90_low = realized_clv - Z_90 * realized_se
-        realized_ic90_high = realized_clv + Z_90 * realized_se
-        
-        print(f"\n    --- CLV REALIZÁVEL ---")
-        print(f"    CLV WebSocket original     = {clv_websocket:+.3f}%")
-        print(f"    Erosão média (betslip lag) = {stats['mean']:+.3f}%")
-        print(f"    CLV REALIZÁVEL estimado    = {realized_clv:+.3f}%")
-        print(f"    IC 90% do CLV realizável   = [{realized_ic90_low:+.3f}%, {realized_ic90_high:+.3f}%]")
-        
-        if realized_ic90_low > 0:
-            print(f"    ✅ SIGNIFICATIVO POSITIVO - Valor SOBREVIVE na prática!")
-        elif realized_ic90_high < 0:
-            print(f"    ❌ SIGNIFICATIVO NEGATIVO - Lag CONSUME todo o valor")
-        else:
-            print(f"    ⚪ Não significativo - Precisa mais dados")
-            
-            # Estimativa de N necessário para significância
-            if realized_clv > 0 and stats["std"] > 0:
-                # n_needed tal que Z * std/sqrt(n) < realized_clv
-                n_needed = math.ceil((Z_90 * stats["std"] / realized_clv) ** 2)
-                print(f"    📊 N estimado p/ significância = ~{n_needed} auditorias")
+    print(f"""
+   {label}:
+
+   N = {n}
+   CLV adicional = {mean:.3f}%
+   Erro padrão   = {se:.3f}%
+   IC 90%        = [{ci90_low:.3f}%, {ci90_high:.3f}%]
+   IC 95%        = [{ci95_low:.3f}%, {ci95_high:.3f}%]
+   {sig}
+""")
+    
+    # Estimativa de N para significância (se positivo mas não significativo)
+    if mean > 0 and ci90_low <= 0 and std > 0:
+        n_needed = math.ceil((Z_90 * std / mean) ** 2)
+        print(f"   📊 N estimado p/ significância (IC 90%): ~{n_needed}")
 
 
 async def main():
@@ -149,269 +75,382 @@ async def main():
     await db.connect()
     
     print("=" * 70)
-    print("ANÁLISE H3B: VALOR REALISTA (WebSocket + Betslip)")
+    print("ANÁLISE H3B REALISTA: CLV COM ODD DO BETSLIP")
     print("=" * 70)
-    print(f"""
-Pergunta: O valor detectado no WebSocket sobrevive na prática?
+    print("""
+Metodologia IDÊNTICA à análise v6, mas com a odd REAL do betslip:
 
-Método:
-  CLV_realizável = CLV_websocket + diferença_betslip
-  
-  Onde:
-    CLV_websocket = {CLV_WEBSOCKET_UP:+.3f}% (H3B UP, da análise anterior)
-    diferença_betslip = (betslip_odd - websocket_odd) / websocket_odd × 100
+  CLV_websocket = (odd_websocket - closing_odd) / closing_odd × 100
+  CLV_betslip   = (odd_betslip   - closing_odd) / closing_odd × 100
 
-  Se diferença_betslip < 0: o lag entre detecção e execução "come" valor
-  Se diferença_betslip > 0: o betslip tem odd MELHOR que o websocket
+  CLV adicional = CLV do evento - CLV baseline (outras linhas)
+
+Assim comparamos DIRETAMENTE se o valor existe quando apostamos
+na odd real disponível no betslip, não na odd do WebSocket.
 """)
     
-    # === Carrega dados ===
-    async with db.async_session() as session:
-        result = await session.execute(
-            select(BetslipAuditResult).where(
-                BetslipAuditResult.hypothesis_type == "H3B"
-            )
-        )
-        audits = result.scalars().all()
-    
-    if not audits:
-        print("❌ Nenhum dado de auditoria encontrado!")
-        print("   O script audit_h3b_betslip.py precisa rodar primeiro.")
-        await db.close()
-        return
-    
-    # === Classificação dos dados ===
-    all_results = []
-    successful = []  # Betslip odd extraído com sucesso
-    failed = []      # Não conseguiu extrair (game not found, line not available, etc)
-    
-    by_status = defaultdict(list)
-    by_direction = defaultdict(list)
-    by_live = {"pre_match": [], "in_match": [], "unknown": []}
-    by_lag_bucket = defaultdict(list)
-    by_market = defaultdict(list)
-    
-    for a in audits:
-        all_results.append(a)
-        by_status[a.status].append(a)
-        
-        direction = a.reversal_direction or "unknown"
-        by_direction[direction].append(a)
-        
-        if a.betslip_odd is not None and a.difference_pct is not None:
-            successful.append(a)
+    try:
+        async with db.async_session() as session:
             
-            # Por pre-match / in-match
-            if a.is_live is True:
-                by_live["in_match"].append(a)
-            elif a.is_live is False:
-                by_live["pre_match"].append(a)
-            else:
-                by_live["unknown"].append(a)
+            # ============================================================
+            # PARTE 1: Análise com ODD DO WEBSOCKET (referência)
+            # Exatamente como v6, para comparação lado a lado
+            # ============================================================
+            print("=" * 70)
+            print("PARTE 1: CLV COM ODD DO WEBSOCKET (referência v6)")
+            print("=" * 70)
             
-            # Por bucket de lag total
-            lag = a.audit_total_duration_ms or 0
-            if lag < 5000:
-                by_lag_bucket["< 5s"].append(a)
-            elif lag < 10000:
-                by_lag_bucket["5-10s"].append(a)
-            elif lag < 20000:
-                by_lag_bucket["10-20s"].append(a)
-            elif lag < 30000:
-                by_lag_bucket["20-30s"].append(a)
-            else:
-                by_lag_bucket["> 30s"].append(a)
+            for direcao, label in [('up', 'REVERSÃO UP'), ('down', 'REVERSÃO DOWN')]:
+                result = await session.execute(text(f"""
+                    WITH evento_com_baseline AS (
+                        SELECT 
+                            e.id,
+                            e.clv_pct as clv_evento,
+                            (
+                                SELECT AVG(clv_calc)
+                                FROM (
+                                    SELECT 
+                                        CASE WHEN closing.best_home_odds > 0 
+                                        THEN (snapshot.best_home_odds - closing.best_home_odds) 
+                                             / closing.best_home_odds * 100
+                                        ELSE NULL END as clv_calc
+                                    FROM best_odds_history snapshot
+                                    JOIN matches m ON snapshot.match_id = m.id
+                                    LEFT JOIN LATERAL (
+                                        SELECT best_home_odds 
+                                        FROM best_odds_history c
+                                        WHERE c.match_id = snapshot.match_id 
+                                          AND c.ah_line = snapshot.ah_line
+                                          AND c.scraped_at < m.kickoff_time
+                                        ORDER BY c.scraped_at DESC
+                                        LIMIT 1
+                                    ) closing ON TRUE
+                                    WHERE snapshot.match_id = e.match_id
+                                      AND snapshot.ah_line != e.ah_line
+                                      AND ABS(EXTRACT(EPOCH FROM (snapshot.scraped_at - e.detected_at))) < 30
+                                      AND closing.best_home_odds > 0
+                                ) sub
+                                WHERE clv_calc BETWEEN -50 AND 50
+                            ) as clv_baseline
+                        FROM h3b_temporal_reversal_events e
+                        WHERE e.clv_pct IS NOT NULL
+                          AND e.clv_pct BETWEEN -50 AND 50
+                          AND e.direction_after = '{direcao}'
+                    )
+                    SELECT 
+                        COUNT(*) as n,
+                        AVG(clv_evento - COALESCE(clv_baseline, 0)) as clv_adicional,
+                        STDDEV(clv_evento - COALESCE(clv_baseline, 0)) as clv_adicional_std
+                    FROM evento_com_baseline
+                    WHERE clv_baseline IS NOT NULL
+                """))
+                row = result.fetchone()
+                if row and row[0] > 0:
+                    format_result(f"WEBSOCKET - {label}", row[0], row[1], row[2])
             
-            # Por tipo de mercado
-            by_market[a.market_type or "AH"].append(a)
-        else:
-            failed.append(a)
-    
-    # === 1. VISÃO GERAL ===
-    print("=" * 70)
-    print("1. VISÃO GERAL DOS DADOS")
-    print("=" * 70)
-    print(f"\n  Total de auditorias: {len(all_results)}")
-    print(f"  Com betslip extraído (sucesso): {len(successful)} ({len(successful)/len(all_results)*100:.1f}%)")
-    print(f"  Sem betslip (falha): {len(failed)} ({len(failed)/len(all_results)*100:.1f}%)")
-    
-    print(f"\n  Por status:")
-    for status, items in sorted(by_status.items(), key=lambda x: -len(x[1])):
-        print(f"    {status}: {len(items)}")
-    
-    print(f"\n  Por direção da reversão:")
-    for direction, items in sorted(by_direction.items()):
-        n_success = sum(1 for a in items if a.betslip_odd is not None)
-        print(f"    {direction.upper()}: {len(items)} total, {n_success} com betslip")
-    
-    # === 2. ANÁLISE DA DIFERENÇA BETSLIP vs WEBSOCKET ===
-    print("\n" + "=" * 70)
-    print("2. DIFERENÇA BETSLIP vs WEBSOCKET (todos os eventos com betslip)")
-    print("=" * 70)
-    
-    if successful:
-        diffs_all = [a.difference_pct for a in successful]
-        stats_all = calc_stats(diffs_all)
-        print_stats_block("TODOS OS EVENTOS", stats_all)
-    
-    # === 3. POR DIREÇÃO DA REVERSÃO (o mais importante) ===
-    print("\n" + "=" * 70)
-    print("3. POR DIREÇÃO DA REVERSÃO")
-    print("=" * 70)
-    
-    for direction in ["up", "down"]:
-        items = [a for a in successful if a.reversal_direction == direction]
-        if not items:
-            continue
-        
-        diffs = [a.difference_pct for a in items]
-        stats = calc_stats(diffs)
-        
-        clv_ws = CLV_WEBSOCKET_UP if direction == "up" else CLV_WEBSOCKET_DOWN
-        label = f"REVERSÃO {direction.upper()} (N={len(items)})"
-        print_stats_block(label, stats, clv_websocket=clv_ws)
-    
-    # === 4. POR PRE-MATCH vs IN-MATCH ===
-    print("\n" + "=" * 70)
-    print("4. PRE-MATCH vs IN-MATCH")
-    print("=" * 70)
-    
-    for label, items in [("PRE-MATCH", by_live["pre_match"]), 
-                          ("IN-MATCH", by_live["in_match"]),
-                          ("DESCONHECIDO", by_live["unknown"])]:
-        if not items:
-            continue
-        
-        diffs = [a.difference_pct for a in items]
-        stats = calc_stats(diffs)
-        print_stats_block(label, stats)
-    
-    # === 5. POR BUCKET DE LAG ===
-    print("\n" + "=" * 70)
-    print("5. IMPACTO DO LAG TIME")
-    print("=" * 70)
-    print("\n  Quanto mais rápido (menor lag), menor a erosão do valor?")
-    
-    lag_order = ["< 5s", "5-10s", "10-20s", "20-30s", "> 30s"]
-    for bucket in lag_order:
-        items = by_lag_bucket.get(bucket, [])
-        if not items:
-            continue
-        
-        diffs = [a.difference_pct for a in items]
-        stats = calc_stats(diffs)
-        print_stats_block(f"Lag {bucket} (N={len(items)})", stats)
-    
-    # === 6. POR TIPO DE MERCADO ===
-    if len(by_market) > 1:
-        print("\n" + "=" * 70)
-        print("6. POR TIPO DE MERCADO")
-        print("=" * 70)
-        
-        for market, items in sorted(by_market.items()):
-            diffs = [a.difference_pct for a in items]
-            stats = calc_stats(diffs)
-            print_stats_block(f"{market} (N={len(items)})", stats)
-    
-    # === 7. ANÁLISE H3B UP COMBINADA (a que mais importa) ===
-    print("\n" + "=" * 70)
-    print("7. CONCLUSÃO: H3B UP - VALE A PENA NA PRÁTICA?")
-    print("=" * 70)
-    
-    up_items = [a for a in successful if a.reversal_direction == "up"]
-    
-    if up_items:
-        diffs_up = [a.difference_pct for a in up_items]
-        stats_up = calc_stats(diffs_up)
-        
-        realized_clv = CLV_WEBSOCKET_UP + stats_up["mean"]
-        erosion = stats_up["mean"]
-        
-        print(f"""
-  DADOS:
-    Auditorias H3B UP com betslip: {stats_up['n']}
-    CLV WebSocket (análise anterior): {CLV_WEBSOCKET_UP:+.3f}%
-    Erosão média pelo lag: {erosion:+.3f}%
-    
-  RESULTADO:
-    CLV realizável estimado: {realized_clv:+.3f}%""")
-        
-        if realized_clv > 0:
-            # Calcula N necessário para significância do CLV realizável
-            if stats_up["std"] > 0:
-                n_needed_90 = math.ceil((Z_90 * stats_up["std"] / realized_clv) ** 2)
-                n_needed_95 = math.ceil((Z_95 * stats_up["std"] / realized_clv) ** 2)
+            # ============================================================
+            # PARTE 2: Análise com ODD DO BETSLIP (realista)
+            # Substitui odd_at_reversal pela betslip_odd
+            # ============================================================
+            print("\n" + "=" * 70)
+            print("PARTE 2: CLV COM ODD DO BETSLIP (realista)")
+            print("=" * 70)
+            
+            for direcao, label in [('up', 'REVERSÃO UP'), ('down', 'REVERSÃO DOWN')]:
+                # O CLV do betslip = (betslip_odd - closing_odd) / closing_odd × 100
+                # 
+                # Sabemos que:
+                #   clv_pct (do evento) = (odd_at_reversal - closing_odd) / closing_odd × 100
+                #   closing_odd = odd_at_reversal / (1 + clv_pct/100)
+                #
+                # Então:
+                #   clv_betslip = (betslip_odd / closing_odd - 1) × 100
+                #               = (betslip_odd × (1 + clv_pct/100) / odd_at_reversal - 1) × 100
+                #
+                # Onde: odd_at_reversal = e.odd_at_reversal (websocket)
+                #       betslip_odd = a.betslip_odd (real)
+                #       clv_pct = e.clv_pct (do evento original)
                 
-                realized_se = stats_up["se"]
-                realized_ic90_low = realized_clv - Z_90 * realized_se
-                realized_ic90_high = realized_clv + Z_90 * realized_se
+                result = await session.execute(text(f"""
+                    WITH audit_com_clv AS (
+                        SELECT 
+                            a.id as audit_id,
+                            a.websocket_odd,
+                            a.betslip_odd,
+                            a.is_live,
+                            a.audit_total_duration_ms,
+                            e.id as event_id,
+                            e.match_id,
+                            e.ah_line,
+                            e.clv_pct as clv_websocket,
+                            e.closing_odd,
+                            e.odd_at_reversal,
+                            -- CLV calculado com a odd do BETSLIP
+                            CASE WHEN e.closing_odd > 0 
+                                THEN (a.betslip_odd - e.closing_odd) / e.closing_odd * 100
+                                ELSE NULL 
+                            END as clv_betslip
+                        FROM betslip_audit_results a
+                        JOIN h3b_temporal_reversal_events e 
+                            ON a.event_id = (
+                                e.match_id::text || '_' || e.ah_line || '_' || e.side
+                            )
+                        WHERE a.betslip_odd IS NOT NULL
+                          AND a.hypothesis_type = 'H3B'
+                          AND a.reversal_direction = '{direcao}'
+                          AND e.clv_pct IS NOT NULL
+                          AND e.closing_odd > 0
+                          AND e.direction_after = '{direcao}'
+                    ),
+                    -- Também calcula via fórmula derivada (para eventos sem join direto)
+                    audit_derivado AS (
+                        SELECT 
+                            a.id as audit_id,
+                            a.websocket_odd,
+                            a.betslip_odd,
+                            a.is_live,
+                            a.audit_total_duration_ms,
+                            -- Closing odd derivada: ws_odd / (1 + clv_ws/100)
+                            -- Mas precisamos do clv_pct do evento original
+                            -- Se não temos o join, usamos a diferença direta
+                            a.difference_pct
+                        FROM betslip_audit_results a
+                        WHERE a.betslip_odd IS NOT NULL
+                          AND a.hypothesis_type = 'H3B'
+                          AND a.reversal_direction = '{direcao}'
+                    )
+                    SELECT 
+                        COUNT(*) as n,
+                        AVG(clv_betslip) as clv_medio,
+                        STDDEV(clv_betslip) as clv_std
+                    FROM audit_com_clv
+                    WHERE clv_betslip BETWEEN -50 AND 50
+                """))
+                row = result.fetchone()
                 
-                print(f"    IC 90% = [{realized_ic90_low:+.3f}%, {realized_ic90_high:+.3f}%]")
-                
-                if realized_ic90_low > 0:
-                    print(f"""
-    ✅ CONCLUSÃO: VALOR SOBREVIVE NA PRÁTICA!
-    
-    O CLV realizável é positivo E significativo.
-    A estratégia H3B UP tem valor mesmo após o lag do betslip.""")
+                if row and row[0] and row[0] > 0:
+                    format_result(f"BETSLIP - {label} (join direto)", row[0], row[1], row[2])
                 else:
-                    print(f"""
-    ⚪ CONCLUSÃO: VALOR PROMISSOR MAS INCONCLUSIVO
-    
-    O CLV realizável é positivo mas não significativo ainda.
-    N atual: {stats_up['n']}
-    N estimado para significância (IC 90%): ~{n_needed_90}
-    N estimado para significância (IC 95%): ~{n_needed_95}
-    
-    Continue coletando dados com o audit_h3b_betslip.py.""")
-        else:
-            print(f"""
-    ❌ CONCLUSÃO: LAG CONSOME O VALOR
-    
-    A erosão pelo lag ({erosion:+.3f}%) é maior que o CLV original ({CLV_WEBSOCKET_UP:+.3f}%).
-    Na prática, a estratégia H3B UP NÃO tem valor.""")
-        
-        # Insight: qual seria o lag máximo aceitável?
-        print(f"\n  INSIGHT - LAG MÁXIMO ACEITÁVEL:")
-        print(f"    Para manter CLV > 0, a erosão precisa ser < {CLV_WEBSOCKET_UP:+.3f}%")
-        
-        for bucket in lag_order:
-            items = by_lag_bucket.get(bucket, [])
-            up_in_bucket = [a for a in items if a.reversal_direction == "up"]
-            if up_in_bucket:
-                bucket_diffs = [a.difference_pct for a in up_in_bucket]
-                bucket_mean = sum(bucket_diffs) / len(bucket_diffs)
-                bucket_clv = CLV_WEBSOCKET_UP + bucket_mean
-                marker = "✅" if bucket_clv > 0 else "❌"
-                print(f"    {marker} Lag {bucket}: erosão {bucket_mean:+.3f}% → CLV realizável {bucket_clv:+.3f}% (N={len(up_in_bucket)})")
-    else:
-        print("\n  ❌ Sem dados de H3B UP com betslip para análise.")
-    
-    # === 8. TAXA DE OPORTUNIDADES REAIS ===
-    print("\n" + "=" * 70)
-    print("8. TAXA DE OPORTUNIDADES REAIS")
-    print("=" * 70)
-    
-    total = len(all_results)
-    up_total = len([a for a in all_results if a.reversal_direction == "up"])
-    up_with_betslip = len([a for a in successful if a.reversal_direction == "up"])
-    up_ok = len([a for a in successful if a.reversal_direction == "up" and 
-                 a.status in ["IDENTICAL", "OK", "MINOR_DIFF", "MAJOR_DIFF"]])
-    
-    if up_total > 0:
-        execution_rate = up_with_betslip / up_total * 100
-        print(f"""
-  H3B UP:
-    Total detectados: {up_total}
-    Com betslip extraído: {up_with_betslip} ({execution_rate:.1f}%)
-    
-    Para cada 100 sinais H3B UP no WebSocket:
-    → ~{int(execution_rate)} conseguem abrir betslip e verificar odd
-    → ~{100 - int(execution_rate)} falham (jogo não encontrado, linha indisponível, etc)
-    
-    Isso significa que a taxa de execução real é {execution_rate:.1f}%.""")
-    
-    await db.close()
+                    print(f"\n   BETSLIP - {label} (join direto): N=0")
+                    print(f"   Join por event_id falhou - tentando método alternativo...")
+                    
+                    # Método alternativo: usa event_id do audit para buscar no h3b
+                    # O event_id no audit é tipo "2026-02-05,25788,26061"
+                    # Precisa fazer match por match external_id, line e side
+                    result2 = await session.execute(text(f"""
+                        WITH audit_matched AS (
+                            SELECT 
+                                a.id,
+                                a.websocket_odd,
+                                a.betslip_odd,
+                                a.is_live,
+                                a.audit_total_duration_ms,
+                                a.line as audit_line,
+                                a.side as audit_side,
+                                a.event_id as audit_event_id,
+                                -- Busca closing odd do best_odds_history
+                                (
+                                    SELECT boh.best_home_odds
+                                    FROM best_odds_history boh
+                                    JOIN matches m ON boh.match_id = m.id
+                                    WHERE m.external_id = a.event_id
+                                      AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time
+                                    ORDER BY boh.scraped_at DESC
+                                    LIMIT 1
+                                ) as closing_home,
+                                (
+                                    SELECT boh.best_away_odds
+                                    FROM best_odds_history boh
+                                    JOIN matches m ON boh.match_id = m.id
+                                    WHERE m.external_id = a.event_id
+                                      AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time
+                                    ORDER BY boh.scraped_at DESC
+                                    LIMIT 1
+                                ) as closing_away
+                            FROM betslip_audit_results a
+                            WHERE a.betslip_odd IS NOT NULL
+                              AND a.hypothesis_type = 'H3B'
+                              AND a.reversal_direction = '{direcao}'
+                              AND a.difference_pct BETWEEN -80 AND 80
+                        )
+                        SELECT 
+                            COUNT(*) as n,
+                            AVG(
+                                CASE 
+                                    WHEN audit_side = 'home' AND closing_home > 0
+                                    THEN (betslip_odd - closing_home) / closing_home * 100
+                                    WHEN audit_side = 'away' AND closing_away > 0
+                                    THEN (betslip_odd - closing_away) / closing_away * 100
+                                    ELSE NULL
+                                END
+                            ) as clv_betslip_medio,
+                            STDDEV(
+                                CASE 
+                                    WHEN audit_side = 'home' AND closing_home > 0
+                                    THEN (betslip_odd - closing_home) / closing_home * 100
+                                    WHEN audit_side = 'away' AND closing_away > 0
+                                    THEN (betslip_odd - closing_away) / closing_away * 100
+                                    ELSE NULL
+                                END
+                            ) as clv_betslip_std
+                        FROM audit_matched
+                        WHERE (audit_side = 'home' AND closing_home > 0)
+                           OR (audit_side = 'away' AND closing_away > 0)
+                    """))
+                    row2 = result2.fetchone()
+                    
+                    if row2 and row2[0] and row2[0] > 0:
+                        format_result(f"BETSLIP - {label} (via closing line)", row2[0], row2[1], row2[2])
+                    else:
+                        print(f"   Método alternativo: N=0 (sem closing lines disponíveis)")
+                        print(f"   Os jogos auditados provavelmente ainda não tiveram kickoff.")
+            
+            # ============================================================
+            # PARTE 3: Análise com baseline (CLV adicional do Betslip)
+            # Mesmo cálculo do v6, mas com betslip_odd
+            # ============================================================
+            print("\n" + "=" * 70)
+            print("PARTE 3: CLV ADICIONAL DO BETSLIP (com baseline)")
+            print("=" * 70)
+            print("  (Mesmo método v6: CLV do evento - CLV baseline de outras linhas)")
+            
+            for direcao, label in [('up', 'REVERSÃO UP'), ('down', 'REVERSÃO DOWN')]:
+                result = await session.execute(text(f"""
+                    WITH audit_with_closing AS (
+                        SELECT 
+                            a.id,
+                            a.betslip_odd,
+                            a.websocket_odd,
+                            a.is_live,
+                            a.audit_total_duration_ms,
+                            a.line as audit_line,
+                            a.side as audit_side,
+                            a.event_id as audit_event_id,
+                            m.id as match_id,
+                            m.kickoff_time,
+                            -- Closing odd do lado correto
+                            CASE 
+                                WHEN a.side = 'home' THEN (
+                                    SELECT boh.best_home_odds FROM best_odds_history boh
+                                    WHERE boh.match_id = m.id AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time
+                                    ORDER BY boh.scraped_at DESC LIMIT 1
+                                )
+                                WHEN a.side = 'away' THEN (
+                                    SELECT boh.best_away_odds FROM best_odds_history boh
+                                    WHERE boh.match_id = m.id AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time
+                                    ORDER BY boh.scraped_at DESC LIMIT 1
+                                )
+                            END as closing_odd,
+                            -- CLV betslip
+                            CASE 
+                                WHEN a.side = 'home' THEN (
+                                    SELECT (a.betslip_odd - boh.best_home_odds) / boh.best_home_odds * 100
+                                    FROM best_odds_history boh
+                                    WHERE boh.match_id = m.id AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time AND boh.best_home_odds > 0
+                                    ORDER BY boh.scraped_at DESC LIMIT 1
+                                )
+                                WHEN a.side = 'away' THEN (
+                                    SELECT (a.betslip_odd - boh.best_away_odds) / boh.best_away_odds * 100
+                                    FROM best_odds_history boh
+                                    WHERE boh.match_id = m.id AND boh.ah_line = a.line
+                                      AND boh.scraped_at < m.kickoff_time AND boh.best_away_odds > 0
+                                    ORDER BY boh.scraped_at DESC LIMIT 1
+                                )
+                            END as clv_betslip,
+                            -- Baseline CLV (mesma lógica v6: média de CLV de outras linhas no mesmo momento)
+                            (
+                                SELECT AVG(clv_calc)
+                                FROM (
+                                    SELECT 
+                                        CASE WHEN closing_boh.best_home_odds > 0 
+                                        THEN (snapshot.best_home_odds - closing_boh.best_home_odds) 
+                                             / closing_boh.best_home_odds * 100
+                                        ELSE NULL END as clv_calc
+                                    FROM best_odds_history snapshot
+                                    LEFT JOIN LATERAL (
+                                        SELECT best_home_odds 
+                                        FROM best_odds_history c
+                                        WHERE c.match_id = snapshot.match_id 
+                                          AND c.ah_line = snapshot.ah_line
+                                          AND c.scraped_at < m.kickoff_time
+                                        ORDER BY c.scraped_at DESC
+                                        LIMIT 1
+                                    ) closing_boh ON TRUE
+                                    WHERE snapshot.match_id = m.id
+                                      AND snapshot.ah_line != a.line
+                                      AND snapshot.scraped_at BETWEEN a.audited_at - interval '30 seconds' 
+                                                                  AND a.audited_at + interval '30 seconds'
+                                      AND closing_boh.best_home_odds > 0
+                                ) sub
+                                WHERE clv_calc BETWEEN -50 AND 50
+                            ) as clv_baseline
+                        FROM betslip_audit_results a
+                        JOIN matches m ON m.external_id = a.event_id
+                        WHERE a.betslip_odd IS NOT NULL
+                          AND a.hypothesis_type = 'H3B'
+                          AND a.reversal_direction = '{direcao}'
+                          AND a.difference_pct BETWEEN -80 AND 80
+                          AND m.kickoff_time < NOW()
+                    )
+                    SELECT 
+                        COUNT(*) as n,
+                        AVG(clv_betslip - COALESCE(clv_baseline, 0)) as clv_adicional,
+                        STDDEV(clv_betslip - COALESCE(clv_baseline, 0)) as clv_adicional_std
+                    FROM audit_with_closing
+                    WHERE clv_betslip IS NOT NULL
+                      AND clv_betslip BETWEEN -50 AND 50
+                """))
+                row = result.fetchone()
+                if row and row[0] and row[0] > 0:
+                    format_result(f"BETSLIP ADICIONAL - {label}", row[0], row[1], row[2])
+                else:
+                    print(f"\n   BETSLIP ADICIONAL - {label}: N={row[0] if row else 0}")
+                    print(f"   Possíveis causas: jogos ainda sem kickoff, ou event_id não faz match.")
+            
+            # ============================================================
+            # PARTE 4: Visão geral dos dados
+            # ============================================================
+            print("\n" + "=" * 70)
+            print("VISÃO GERAL DOS DADOS DE AUDITORIA")
+            print("=" * 70)
+            
+            result = await session.execute(text("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN betslip_odd IS NOT NULL THEN 1 ELSE 0 END) as com_betslip,
+                    SUM(CASE WHEN is_live = true THEN 1 ELSE 0 END) as in_match,
+                    SUM(CASE WHEN is_live = false THEN 1 ELSE 0 END) as pre_match,
+                    AVG(audit_total_duration_ms) as avg_lag_ms
+                FROM betslip_audit_results
+                WHERE hypothesis_type = 'H3B'
+            """))
+            row = result.fetchone()
+            if row:
+                total, com_betslip, in_match, pre_match, avg_lag = row
+                print(f"\n  Total auditorias: {total}")
+                print(f"  Com betslip: {com_betslip} ({com_betslip/total*100:.1f}%)" if total > 0 else "")
+                print(f"  Pre-match: {pre_match or 0}")
+                print(f"  In-match: {in_match or 0}")
+                print(f"  Lag médio: {avg_lag:.0f}ms" if avg_lag else "  Lag médio: N/A")
+            
+            # Contagem de jogos que já tiveram kickoff (closing line disponível)
+            result = await session.execute(text("""
+                SELECT COUNT(DISTINCT a.event_id)
+                FROM betslip_audit_results a
+                JOIN matches m ON m.external_id = a.event_id
+                WHERE a.betslip_odd IS NOT NULL
+                  AND m.kickoff_time < NOW()
+            """))
+            row = result.fetchone()
+            print(f"  Jogos com kickoff passado (closing line disponível): {row[0] if row else 0}")
+            
+    finally:
+        await db.close()
     
     print("\n" + "=" * 70)
     print("FIM DA ANÁLISE")
