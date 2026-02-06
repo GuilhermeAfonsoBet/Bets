@@ -63,9 +63,9 @@ LEAGUE_CODES = {
 }
 
 # Config
-WS_HEALTH_CHECK_INTERVAL = 30  # Segundos: verifica se WS ainda está vivo
-WS_RELOAD_INTERVAL = 300  # Segundos: reload forçado do monitor (safety net)
-EXPAND_CHECK_INTERVAL = 60  # Segundos: re-expande linhas nas abas
+WS_HEALTH_CHECK_INTERVAL = 10  # Segundos: alerta se WS sem mensagens
+WS_RELOAD_INTERVAL = 30  # Segundos: reload se WS morreu (odds mudam a cada segundo)
+EXPAND_CHECK_INTERVAL = 15  # Segundos: re-expande linhas nas abas
 MAX_AH_LINE = 2.0  # Filtro de linhas extremas
 
 
@@ -169,7 +169,11 @@ class FastAuditTest:
         await self.monitor_page.wait_for_load_state("domcontentloaded")
         logger.info("Monitor page: aguardando WebSocket...")
         await self.monitor_page.wait_for_timeout(5000)
+        self._start_time = time.time()
         logger.info(f"Monitor page: {self._ws_message_count} mensagens WS recebidas")
+
+        # Lista todas as ligas disponíveis (para ajudar na escolha)
+        await self._list_available_leagues()
 
         # Descobre jogos da liga via WebSocket
         game_urls = await self._discover_game_urls()
@@ -200,6 +204,31 @@ class FastAuditTest:
             ws.on('close', lambda: setattr(self, '_ws_connected', False))
 
         page.on('websocket', on_ws)
+
+    async def _list_available_leagues(self):
+        """Lista todas as ligas com jogos no WebSocket (ajuda a escolher)."""
+        leagues = {}
+        for msg in self._ws_messages:
+            try:
+                data = json.loads(msg)
+                if not isinstance(data, list):
+                    continue
+                for item in data:
+                    if not isinstance(item, list) or len(item) < 3:
+                        continue
+                    if item[0] == 'event' and isinstance(item[1], list) and len(item[1]) >= 2:
+                        if item[1][0] == 'fb' and 'competition_name' in item[2]:
+                            league = item[2]['competition_name']
+                            if league:
+                                leagues[league] = leagues.get(league, 0) + 1
+            except:
+                continue
+
+        sorted_leagues = sorted(leagues.items(), key=lambda x: -x[1])
+        logger.info(f"Ligas disponiveis ({len(sorted_leagues)} total):")
+        for league, count in sorted_leagues[:25]:
+            marker = " <<<" if self.league.lower() in league.lower() or league.lower() in self.league.lower() else ""
+            logger.info(f"  {count:3d} jogos: {league}{marker}")
 
     async def _discover_game_urls(self) -> List[dict]:
         """Descobre URLs dos jogos da liga a partir dos dados do WebSocket."""
@@ -341,8 +370,14 @@ class FastAuditTest:
 
             # Verifica saúde do WebSocket
             ws_age = time.time() - self._last_ws_message_time if self._last_ws_message_time > 0 else 999
+            msgs_per_sec = self._ws_message_count / max(1, time.time() - self._start_time) if hasattr(self, '_start_time') else 0
+            logger.info(
+                f"[MANUTENCAO] WS: {self._ws_message_count} msgs total, "
+                f"{msgs_per_sec:.1f} msg/s, ultima msg {ws_age:.0f}s atras | "
+                f"Abas: {len(self.game_tabs)} | Auditados: {len(self.results)}/{self.num_audits}"
+            )
             if ws_age > WS_HEALTH_CHECK_INTERVAL:
-                logger.warning(f"WebSocket sem mensagens há {ws_age:.0f}s — pode estar desconectado")
+                logger.warning(f"WebSocket sem mensagens ha {ws_age:.0f}s — POSSIVEL MORTE SILENCIOSA")
 
             # Reload forçado do monitor se WS parou
             if ws_age > WS_RELOAD_INTERVAL:
