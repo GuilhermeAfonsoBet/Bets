@@ -285,7 +285,7 @@ class FastAuditContinuous:
                         msg_type, msg_meta = item[0], item[1]
                         msg_data = item[2] if len(item) > 2 else {}
 
-                        # Event info
+                        # Event info — captura TODOS os campos úteis
                         if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
                             if msg_meta[0] == 'fb' and 'home' in msg_data:
                                 eid = msg_meta[1]
@@ -299,8 +299,16 @@ class FastAuditContinuous:
                                     'home': msg_data.get('home', ''),
                                     'away': msg_data.get('away', ''),
                                     'league': msg_data.get('competition_name', ''),
+                                    'country': msg_data.get('country', ''),
+                                    'competition_id': msg_data.get('competition_id', ''),
+                                    'sport_id': msg_data.get('sport_id', ''),
                                     'kickoff': kickoff,
+                                    # Guarda todos os campos para debug
+                                    '_raw_keys': list(msg_data.keys()),
                                 }
+                                # Log primeira vez que vemos um evento (debug)
+                                if self.events_processed < 3:
+                                    logger.debug(f"WS Event keys: {list(msg_data.keys())}")
 
                         # Odds
                         if msg_type in ['offers_hcap', 'offers_event']:
@@ -446,7 +454,9 @@ class FastAuditContinuous:
                 logger.warning(
                     f"[{result.status}][{live_label}] {result.home_team} vs {result.away_team} | "
                     f"{result.market_type} {result.line} {result.side} | "
-                    f"ws={result.websocket_odd:.3f} | lag={result.lag_total_ms}ms | "
+                    f"ws={result.websocket_odd:.3f} | lag={result.lag_total_ms}ms "
+                    f"(nav={result.lag_navigate_ms} exp={result.lag_expand_ms} "
+                    f"cl={result.lag_click_ms} bs={result.lag_betslip_ms}) | "
                     f"{len(self.results)}")
 
             # Stats periódicas
@@ -460,10 +470,21 @@ class FastAuditContinuous:
 
         # Determina URL do jogo
         # Formato: /sportsbook/football/{league_code}/{event_id}
+        info = self._events_info.get(event_id, {})
         league_name = h3b.get('league', '').lower().strip()
-        league_code = LEAGUE_CODE_MAP.get(league_name)
-
-        # Se não encontrou match exato, tenta match parcial
+        country = info.get('country', '').upper()
+        comp_id = info.get('competition_id', '')
+        
+        # Método 1: country + competition_id do WS (mais confiável)
+        league_code = None
+        if country and comp_id:
+            league_code = f"{country}/{comp_id}"
+        
+        # Método 2: mapa estático por nome
+        if not league_code:
+            league_code = LEAGUE_CODE_MAP.get(league_name)
+        
+        # Método 3: match parcial no mapa
         if not league_code:
             for key, code in LEAGUE_CODE_MAP.items():
                 if key in league_name or league_name in key:
@@ -473,9 +494,10 @@ class FastAuditContinuous:
         if league_code:
             game_url = f"{FOOTBALL_URL}/{league_code}/{event_id}"
         else:
-            # Fallback: tenta URL genérica (pode não funcionar)
-            game_url = f"{FOOTBALL_URL}/-/1/{event_id}"
-            logger.debug(f"Liga sem código mapeado: '{h3b.get('league', '')}', usando URL genérica")
+            # Fallback: pula este evento (URL genérica não funciona)
+            logger.debug(f"Liga sem código: '{h3b.get('league', '')}' country={country} comp={comp_id}")
+            lag_total = int((time.time() - detected_at) * 1000)
+            return AuditResult(**base_result, status="NO_LEAGUE_CODE", lag_total_ms=lag_total)
 
         base_result = {
             'timestamp': datetime.now(timezone.utc),
