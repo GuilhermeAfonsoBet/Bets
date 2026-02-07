@@ -110,8 +110,17 @@ async def main():
             print("    Nenhum jogo encontrado. Navegue manualmente para um jogo.")
             input("    Pressione Enter quando estiver na pagina de um jogo...")
 
-        # === 3. EXPANDE LINHAS ===
-        print("\n[4] Expandindo linhas...")
+        # === 3. ESPERA ASIAN HANDICAP CARREGAR ===
+        print("\n[4] Esperando Asian Handicap carregar...")
+        try:
+            await page.wait_for_selector("text=Asian Handicap", timeout=10000)
+            print("    Asian Handicap encontrado")
+        except:
+            print("    Timeout esperando Asian Handicap, continuando...")
+        await page.wait_for_timeout(2000)
+
+        # === 4. EXPANDE LINHAS ===
+        print("\n[5] Expandindo linhas...")
         expanded = await page.evaluate("""
             () => {
                 let clicked = 0;
@@ -128,25 +137,48 @@ async def main():
         print(f"    Expandiu {expanded} secoes")
         await page.wait_for_timeout(2000)
 
-        # === 4. CLICA NUMA ODD ===
-        print("\n[5] Clicando na primeira odd disponivel...")
+        # === 5. CLICA NUMA ODD DO ASIAN HANDICAP ===
+        print("\n[6] Clicando numa odd do Asian Handicap...")
 
         clicked_odd = await page.evaluate("""
             () => {
-                // Procura seção Asian Handicap
-                const allEls = document.querySelectorAll('span, div');
+                // Primeiro encontra a seção Asian Handicap
+                let ahSection = null;
+                const headers = document.querySelectorAll('div, span, h3, h4');
+                for (const h of headers) {
+                    const text = (h.innerText || '').trim();
+                    if (text.includes('Asian Handicap') || text.includes('Handicap')) {
+                        let parent = h.parentElement;
+                        for (let i = 0; i < 10 && parent; i++) {
+                            const pt = parent.innerText || '';
+                            if (pt.includes('Home') && pt.includes('Away')) {
+                                ahSection = parent;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        if (ahSection) break;
+                    }
+                }
+                
+                if (!ahSection) ahSection = document.body;
+                
+                // Dentro da seção AH, encontra a primeira odd clicável
+                const allEls = ahSection.querySelectorAll('span, div');
                 for (const el of allEls) {
                     const t = (el.innerText || '').trim();
-                    // Procura odd (formato X.XXX)
-                    if (/^\\d+[.,]\\d{2,3}$/.test(t) && t.length < 10) {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width > 20 && rect.height > 10 && rect.width < 200) {
-                            try {
+                    // Odd: formato X.XXX (1.500 a 9.999)
+                    if (/^[1-9]\\d*[.,]\\d{2,3}$/.test(t) && t.length < 8) {
+                        const val = parseFloat(t.replace(',', '.'));
+                        // Filtra: odds razoáveis (1.1 a 15.0)
+                        if (val >= 1.1 && val <= 15.0) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 20 && rect.height > 10 && rect.width < 200) {
                                 el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                el.parentElement.click();
-                                return t;
-                            } catch(e) {
-                                try { el.click(); return t; } catch(e2) {}
+                                try { el.parentElement.click(); return {odd: t, method: 'parent'}; }
+                                catch(e) {}
+                                try { el.click(); return {odd: t, method: 'direct'}; }
+                                catch(e) {}
                             }
                         }
                     }
@@ -156,14 +188,14 @@ async def main():
         """)
 
         if clicked_odd:
-            print(f"    Clicou na odd: {clicked_odd}")
+            print(f"    Clicou na odd: {clicked_odd['odd']} (metodo: {clicked_odd['method']})")
         else:
-            print("    Nao encontrou odd para clicar. Clique manualmente numa odd no browser.")
-            input("    Pressione Enter após clicar numa odd...")
+            print("    Nao encontrou odd AH para clicar. Clique manualmente numa odd no browser.")
+            input("    Pressione Enter apos clicar numa odd...")
 
-        # === 5. ESPERA BETSLIP E TIRA SCREENSHOT ===
-        print("\n[6] Aguardando betslip abrir...")
-        await page.wait_for_timeout(3000)
+        # === 6. ESPERA BETSLIP E TIRA SCREENSHOT ===
+        print("\n[7] Aguardando betslip abrir...")
+        await page.wait_for_timeout(4000)
 
         # Screenshot da pagina inteira
         await page.screenshot(path="betslip_screenshot_full.png", full_page=False)
