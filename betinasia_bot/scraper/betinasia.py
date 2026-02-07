@@ -186,10 +186,6 @@ class BetinAsiaScraper:
             "ignore_https_errors": True,
         }
         
-        # Proxy no contexto (necessário para alguns provedores)
-        if self.proxy:
-            context_options["proxy"] = self.proxy
-        
         # Carrega sessão salva se existir
         if storage_state:
             context_options["storage_state"] = storage_state
