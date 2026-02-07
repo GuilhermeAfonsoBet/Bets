@@ -153,12 +153,6 @@ class BetinAsiaScraper:
         # Proxy residencial (Bright Data, IPRoyal, etc)
         if self.proxy:
             launch_options["proxy"] = self.proxy
-            # Chromium args necessários para proxy HTTPS funcionar
-            launch_options["args"] = [
-                "--ignore-certificate-errors",
-                "--ignore-certificate-errors-spki-list",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
             logger.info(f"Usando proxy: {self.proxy.get('server', '?')}")
         
         self._browser = await self._playwright.chromium.launch(**launch_options)
