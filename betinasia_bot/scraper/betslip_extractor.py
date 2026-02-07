@@ -3,16 +3,17 @@
 Extrator de Best Odds do Betslip BetinAsia
 
 Estrutura do betslip (painel direito):
-- Título: "AC Pisa 1909 +1.5/2 (Asian)"
-- Tabela com colunas: TOTAL | MÉDIA | MELHOR
-- Linha "Todos Os Agentes De Apostas" contém a best odd agregada
-- Abaixo de cada odd tem o limite em $
-- Lista de bookmakers individuais: bdaq, bf, molly, etc.
+- Cabeçalho: "Classic | Exchange | Start Acca"
+- Seleção: "Girona FC +2.0 (Asian)"
+- Jogo: "Sevilla vs. Girona FC"
+- Seção "All Bookies" com colunas: TOTAL | AVERAGE | BEST
+  - Cada coluna: odd (ex: 1.030) e limite (ex: $1,310)
+- Bookmakers individuais: bdaq, bf, etc.
 
 Uso:
     extractor = BetslipExtractor(page)
     result = await extractor.extract_best_odd()
-    print(f"Best odd: {result.best_odd}, Limite: {result.limit}")
+    print(f"Best odd: {result.best_odd}, Limite: {result.best_limit}")
 """
 
 import re
@@ -37,10 +38,10 @@ class BookmakerOdd:
 @dataclass
 class BetslipData:
     """Dados extraídos do betslip."""
-    selection: str  # Ex: "AC Pisa 1909 +1.5/2 (Asian)"
-    match: str  # Ex: "Verona vs. AC Pisa 1909"
+    selection: str  # Ex: "Girona FC +2.0 (Asian)"
+    match: str  # Ex: "Sevilla vs. Girona FC"
     
-    # Aggregated "Todos Os Agentes De Apostas"
+    # Aggregated "All Bookies"
     total_odd: float
     avg_odd: float
     best_odd: float  # <-- A BEST ODD que queremos
@@ -58,378 +59,279 @@ class BetslipData:
 class BetslipExtractor:
     """Extrai dados do betslip do BetinAsia."""
     
-    # Bookmakers conhecidos
-    KNOWN_BOOKMAKERS = [
-        'bdaq', 'bf', 'molly', '3et', '4casters', 
-        'ibc', 'isn', 'pin', 'pinnacle', 'sbo', 
-        'sing', 'mbook', 'sharp', 'isn88', 'pin88'
-    ]
-    
     def __init__(self, page: Page):
         self.page = page
         
-    async def click_odd_to_open_betslip(
-        self, 
-        line: str, 
-        side: str,
-        market_type: str = "AH"
-    ) -> bool:
-        """
-        Clica numa odd específica para abrir o betslip.
-        
-        Args:
-            line: Linha do mercado (ex: "-0.5", "+1.5")
-            side: "home" ou "away" (ou "over"/"under" para OU)
-            market_type: "AH", "OU", ou "1X2"
-            
-        Returns:
-            True se conseguiu abrir o betslip
-        """
-        try:
-            # Primeiro, encontra a linha correta
-            # A estrutura é: LINHA | Home | ODD | Away | ODD
-            
-            # Procura pelo texto da linha no DOM
-            line_text = line.replace(".", ",")  # BetinAsia usa vírgula
-            
-            # JavaScript para encontrar e clicar na odd correta
-            clicked = await self.page.evaluate(f"""
-                () => {{
-                    const lineText = "{line_text}";
-                    const side = "{side}";
-                    
-                    // Encontra todas as linhas de handicap
-                    const rows = document.querySelectorAll('div, tr');
-                    
-                    for (const row of rows) {{
-                        const text = row.innerText || '';
-                        
-                        // Verifica se esta linha contém o handicap
-                        if (text.includes(lineText) && text.includes('Home') && text.includes('Away')) {{
-                            // Encontra os elementos clicáveis (odds)
-                            const clickables = row.querySelectorAll('span, button, div');
-                            
-                            for (const el of clickables) {{
-                                const elText = (el.innerText || '').trim();
-                                
-                                // Verifica se é uma odd (número decimal)
-                                if (/^\\d+[.,]\\d{{2,3}}$/.test(elText)) {{
-                                    // Determina se é home ou away baseado na posição
-                                    const rect = el.getBoundingClientRect();
-                                    const rowRect = row.getBoundingClientRect();
-                                    const isLeftSide = rect.left < (rowRect.left + rowRect.width / 2);
-                                    
-                                    const elSide = isLeftSide ? 'home' : 'away';
-                                    
-                                    if (elSide === side) {{
-                                        el.click();
-                                        return true;
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
-                    
-                    return false;
-                }}
-            """)
-            
-            if clicked:
-                await self.page.wait_for_timeout(1500)  # Espera betslip abrir
-                return True
-            
-            # Fallback: procura pela odd específica e clica
-            # Isso é menos preciso mas pode funcionar
-            logger.warning(f"Método principal falhou, tentando fallback para {line} {side}")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Erro ao clicar na odd: {e}")
-            return False
-    
     async def extract_best_odd(self) -> Optional[BetslipData]:
         """
-        Extrai dados do betslip aberto.
+        Extrai dados do betslip via JavaScript estruturado.
         
-        Assume que o betslip já está aberto (após clicar numa odd).
-        
-        Returns:
-            BetslipData com best odd e limite, ou None se falhar
+        Estratégia: em vez de parsear texto (ambíguo),
+        extrai diretamente do DOM usando a estrutura visual:
+        - Encontra "All Bookies" 
+        - Pega os 3 pares (odd, limite) na mesma linha
         """
         try:
-            # Extrai texto do painel direito (betslip)
-            betslip_text = await self.page.evaluate("""
+            data = await self.page.evaluate("""
                 () => {
-                    // Procura pelo painel do betslip
-                    // Geralmente está no lado direito com classe contendo "betslip" ou "sidebar"
-                    const selectors = [
-                        '[class*="betslip"]',
-                        '[class*="sidebar"]',
-                        '[class*="panel"]',
-                        'aside',
-                    ];
+                    // === 1. Encontra o painel do betslip ===
+                    let betslipPanel = null;
+                    const asides = document.querySelectorAll('aside');
+                    for (const aside of asides) {
+                        const text = aside.innerText || '';
+                        if (text.includes('Betslip') && (text.includes('Stake') || text.includes('Place'))) {
+                            betslipPanel = aside;
+                            break;
+                        }
+                    }
+                    if (!betslipPanel) return null;
                     
-                    for (const selector of selectors) {
-                        const panels = document.querySelectorAll(selector);
-                        for (const panel of panels) {
-                            const text = panel.innerText || '';
-                            // Verifica se contém indicadores do betslip (PT ou EN)
-                            if (text.includes('All Bookies') ||
-                                text.includes('Todos Os Agentes') || 
-                                text.includes('BEST') ||
-                                text.includes('MELHOR') ||
-                                text.includes('TOTAL') ||
-                                text.includes('AVERAGE') ||
-                                text.includes('Timeout') ||
-                                text.includes('Tempo Limite')) {
-                                return text;
-                            }
+                    const fullText = betslipPanel.innerText || '';
+                    
+                    // === 2. Extrai seleção e jogo ===
+                    let selection = '';
+                    let match = '';
+                    
+                    const asianMatch = fullText.match(/([^\n]+\(Asian[^)]*\))/);
+                    if (asianMatch) selection = asianMatch[1].trim();
+                    
+                    const vsMatch = fullText.match(/([^\n]+)\s+vs\.?\s+([^\n]+)/);
+                    if (vsMatch) match = vsMatch[0].trim();
+                    
+                    // === 3. Encontra "All Bookies" e extrai dados ===
+                    // Procura o elemento que contém "All Bookies"
+                    let allBookiesEl = null;
+                    const allEls = betslipPanel.querySelectorAll('*');
+                    for (const el of allEls) {
+                        const t = (el.innerText || '').trim();
+                        if (t === 'All Bookies' || t === 'All bookies' || 
+                            t === 'Todos Os Agentes De Apostas' || t === 'Todos os agentes') {
+                            allBookiesEl = el;
+                            break;
                         }
                     }
                     
-                    // Fallback: pega texto do body e procura seção do betslip
-                    const bodyText = document.body.innerText;
-                    const betslipStart = bodyText.indexOf('Betslip');
-                    if (betslipStart > -1) {
-                        return bodyText.substring(betslipStart, betslipStart + 2000);
+                    if (!allBookiesEl) {
+                        // Fallback: procura no texto
+                        const abIdx = fullText.indexOf('All Bookies');
+                        if (abIdx === -1) return { error: 'All Bookies not found', text: fullText.substring(0, 500) };
                     }
                     
-                    return bodyText;
+                    // === 4. Navega para o container da linha "All Bookies" ===
+                    // A estrutura é: [All Bookies] [odd1] [limit1] [odd2] [limit2] [odd3] [limit3]
+                    // Procuramos o container que contém "All Bookies" e os números
+                    let rowContainer = allBookiesEl ? allBookiesEl.parentElement : null;
+                    let rowText = '';
+                    
+                    // Sobe na árvore até encontrar um container com odds
+                    for (let i = 0; i < 5 && rowContainer; i++) {
+                        rowText = rowContainer.innerText || '';
+                        // Verifica se tem pelo menos 3 números decimais (odds)
+                        const oddMatches = rowText.match(/\d+\.\d{3}/g);
+                        if (oddMatches && oddMatches.length >= 3) break;
+                        rowContainer = rowContainer.parentElement;
+                    }
+                    
+                    // === 5. Extrai odds e limites da linha All Bookies ===
+                    // Método: encontra todos os elementos com odds (X.XXX) e limites ($X,XXX)
+                    // Odds: 3 dígitos decimais (1.030, 1.016, 1.109)
+                    // Limites: precedidos por $ (podem ter vírgula como separador de milhar)
+                    
+                    const lines = (rowContainer ? rowContainer.innerText : fullText).split('\\n');
+                    
+                    // Encontra o índice da linha "All Bookies"
+                    let abLineIdx = -1;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].trim().includes('All Bookies') || lines[i].trim().includes('All bookies')) {
+                            abLineIdx = i;
+                            break;
+                        }
+                    }
+                    
+                    // Pega as linhas relevantes após "All Bookies" (odds e limites)
+                    // Estrutura típica no innerText (separado por \\n):
+                    // "All Bookies"
+                    // "1.030"      <- TOTAL odd
+                    // "$1,310"     <- TOTAL limit
+                    // "1.016"      <- AVERAGE odd
+                    // "$840"       <- AVERAGE limit
+                    // "1.109"      <- BEST odd
+                    // "$329"       <- BEST limit
+                    
+                    let odds = [];
+                    let limits = [];
+                    
+                    // Método robusto: percorre todas as linhas após "All Bookies"
+                    // e classifica cada valor como odd ou limite
+                    const startIdx = abLineIdx >= 0 ? abLineIdx : 0;
+                    const searchText = lines.slice(startIdx, startIdx + 20).join('\\n');
+                    
+                    for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 15); i++) {
+                        const line = lines[i].trim();
+                        
+                        // É um limite? ($XXX ou $X,XXX)
+                        const limitMatch = line.match(/^\$\s*([\d,]+(?:\.\d+)?)/);
+                        if (limitMatch) {
+                            limits.push(parseFloat(limitMatch[1].replace(/,/g, '')));
+                            continue;
+                        }
+                        
+                        // É uma odd? (X.XXX - 1 a 3 dígitos, ponto, 2-3 decimais)
+                        const oddMatch = line.match(/^(\d{1,3}\.\d{2,3})$/);
+                        if (oddMatch) {
+                            const val = parseFloat(oddMatch[1]);
+                            // Odd razoável: entre 1.001 e 500
+                            if (val >= 1.001 && val <= 500) {
+                                odds.push(val);
+                                continue;
+                            }
+                        }
+                        
+                        // Se encontrou um bookmaker (bdaq, bf, etc), para de buscar All Bookies
+                        if (/^(bdaq|bf|18bet|mbook|pin88|sbo|sharp|sing|lbc|molly|isn|ibc|overtime|punter)/i.test(line)) {
+                            break;
+                        }
+                    }
+                    
+                    // === 6. Extrai bookmakers individuais ===
+                    const bookmakers = [];
+                    const bkNames = ['18bet', 'bdaq', 'bf', 'lbc', 'mbook', 'overtime', 'pin88', 'punter_lo', 'sbo', 'sharp', 'sing', 'sing2', 'molly', 'isn', 'ibc', '3et', '4casters'];
+                    
+                    for (const bkName of bkNames) {
+                        let bkIdx = -1;
+                        for (let i = 0; i < lines.length; i++) {
+                            if (lines[i].trim().toLowerCase().startsWith(bkName.toLowerCase())) {
+                                bkIdx = i;
+                                break;
+                            }
+                        }
+                        if (bkIdx === -1) continue;
+                        
+                        const bkOdds = [];
+                        const bkLimits = [];
+                        for (let j = bkIdx + 1; j < Math.min(lines.length, bkIdx + 10); j++) {
+                            const line = lines[j].trim();
+                            const lm = line.match(/^\$\s*([\d,]+(?:\.\d+)?)/);
+                            if (lm) { bkLimits.push(parseFloat(lm[1].replace(/,/g, ''))); continue; }
+                            const om = line.match(/^(\d{1,3}\.\d{2,3})$/);
+                            if (om) { const v = parseFloat(om[1]); if (v >= 1.001 && v <= 500) bkOdds.push(v); continue; }
+                            if (/^(bdaq|bf|18bet|mbook|pin88|sbo|sharp|sing|lbc|molly|isn|ibc|overtime|punter|All Bookies)/i.test(line)) break;
+                        }
+                        
+                        bookmakers.push({
+                            name: bkName,
+                            odds: bkOdds,
+                            limits: bkLimits,
+                        });
+                    }
+                    
+                    return {
+                        selection: selection,
+                        match: match,
+                        odds: odds,           // [TOTAL, AVERAGE, BEST]
+                        limits: limits,       // [TOTAL_limit, AVERAGE_limit, BEST_limit]
+                        bookmakers: bookmakers,
+                        raw: searchText.substring(0, 500),
+                    };
                 }
             """)
             
-            if not betslip_text:
-                logger.warning("Não encontrou texto do betslip")
+            if not data:
+                logger.warning("Betslip: nenhum dado extraído")
                 return None
             
-            # Parse do texto do betslip
-            return self._parse_betslip_text(betslip_text)
-            
-        except Exception as e:
-            logger.error(f"Erro ao extrair betslip: {e}")
-            return None
-    
-    def _parse_betslip_text(self, text: str) -> Optional[BetslipData]:
-        """
-        Parseia o texto do betslip para extrair dados.
-        
-        Estrutura esperada:
-        - "Todos Os Agentes De Apostas" seguido de 3 valores (TOTAL, MÉDIA, MELHOR)
-        - Abaixo, 3 valores de limite ($X,XXX)
-        - Lista de bookmakers com suas odds
-        """
-        try:
-            # Extrai seleção e jogo
-            selection = ""
-            match = ""
-            
-            # Procura por padrão de seleção: "Time +X.X/Y (Asian)"
-            selection_match = re.search(r'([A-Za-z\s\d]+\s+[+-]?\d+[.,]?\d*/?\d*\s*\(Asian\))', text)
-            if selection_match:
-                selection = selection_match.group(1).strip()
-            
-            # Procura por padrão de jogo: "Time vs. Time"
-            match_match = re.search(r'([A-Za-z\s\d]+)\s+vs\.?\s+([A-Za-z\s\d]+)', text)
-            if match_match:
-                match = f"{match_match.group(1).strip()} vs {match_match.group(2).strip()}"
-            
-            # Extrai odds agregadas (Todos Os Agentes De Apostas)
-            # Padrão: número decimal seguido de mais números
-            # Esperado: TOTAL MÉDIA MELHOR (3 valores)
-            
-            # Procura pela seção agregada (PT ou EN)
-            # PT: "Todos Os Agentes De Apostas"
-            # EN: "All Bookies"
-            todos_idx = text.find('All Bookies')
-            if todos_idx == -1:
-                todos_idx = text.find('All bookies')
-            if todos_idx == -1:
-                todos_idx = text.find('Todos Os Agentes')
-            if todos_idx == -1:
-                todos_idx = text.find('Todos os Agentes')
-            if todos_idx == -1:
-                # Fallback: procura por padrão de 3 números decimais seguidos (TOTAL AVERAGE BEST)
-                odds_pattern = r'(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})\s+(\d+[.,]\d{2,3})'
-                match = re.search(odds_pattern, text)
-                if match:
-                    todos_idx = match.start() - 50  # Pega um pouco antes para contexto
-                    if todos_idx < 0:
-                        todos_idx = 0
-            
-            if todos_idx == -1:
-                logger.warning("Não encontrou 'All Bookies' ou 'Todos Os Agentes De Apostas'")
+            if 'error' in data:
+                logger.warning(f"Betslip: {data['error']}")
                 return None
             
-            # Pega texto após "Todos Os Agentes"
-            section = text[todos_idx:todos_idx + 500]
+            odds = data.get('odds', [])
+            limits = data.get('limits', [])
             
-            # Extrai números decimais (odds)
-            odds_pattern = r'(\d+[.,]\d{2,3})'
-            odds_matches = re.findall(odds_pattern, section)
+            logger.debug(f"Betslip extraído: odds={odds}, limits={limits}")
             
-            # Extrai valores monetários (limites) - diferentes formatos possíveis
-            # Formato: $2,474 ou $600 ou $ 1,500
-            limit_pattern = r'\$\s*([\d,]+(?:\.\d+)?)'
-            limit_matches = re.findall(limit_pattern, section)
+            if len(odds) < 3:
+                logger.warning(f"Betslip: apenas {len(odds)} odds encontradas, esperava 3 (TOTAL/AVG/BEST)")
+                # Se tem pelo menos 1 odd, usa como best
+                if len(odds) >= 1:
+                    best_odd = odds[-1]  # Última odd é provavelmente a BEST
+                    best_limit = limits[-1] if limits else 0
+                else:
+                    return None
+            else:
+                best_odd = odds[2]  # BEST é a terceira
+                best_limit = limits[2] if len(limits) >= 3 else 0
             
-            # Debug: mostra o que encontrou
-            if not limit_matches:
-                logger.debug(f"Limites não encontrados. Seção: {section[:200]}")
+            total_odd = odds[0] if len(odds) >= 1 else 0
+            avg_odd = odds[1] if len(odds) >= 2 else 0
+            total_limit = limits[0] if len(limits) >= 1 else 0
+            avg_limit = limits[1] if len(limits) >= 2 else 0
             
-            if len(odds_matches) < 3:
-                logger.warning(f"Encontrou apenas {len(odds_matches)} odds, esperava 3+")
-                return None
-            
-            # Converte odds
-            def parse_odd(s):
-                return float(s.replace(',', '.'))
-            
-            def parse_limit(s):
-                return float(s.replace(',', ''))
-            
-            total_odd = parse_odd(odds_matches[0])
-            avg_odd = parse_odd(odds_matches[1])
-            best_odd = parse_odd(odds_matches[2])  # <-- A BEST ODD
-            
-            # Limites (podem não existir ou estar em ordem diferente)
-            total_limit = parse_limit(limit_matches[0]) if len(limit_matches) > 0 else 0
-            avg_limit = parse_limit(limit_matches[1]) if len(limit_matches) > 1 else 0
-            best_limit = parse_limit(limit_matches[2]) if len(limit_matches) > 2 else 0
-            
-            # Extrai bookmakers individuais
-            bookmakers = self._extract_bookmakers(section)
+            # Converte bookmakers
+            bk_list = []
+            for bk in data.get('bookmakers', []):
+                bk_odds = bk.get('odds', [])
+                bk_limits = bk.get('limits', [])
+                bk_list.append(BookmakerOdd(
+                    name=bk['name'],
+                    total_odd=bk_odds[0] if len(bk_odds) >= 1 else None,
+                    avg_odd=bk_odds[1] if len(bk_odds) >= 2 else None,
+                    best_odd=bk_odds[2] if len(bk_odds) >= 3 else None,
+                    total_limit=bk_limits[0] if len(bk_limits) >= 1 else None,
+                    avg_limit=bk_limits[1] if len(bk_limits) >= 2 else None,
+                    best_limit=bk_limits[2] if len(bk_limits) >= 3 else None,
+                ))
             
             return BetslipData(
-                selection=selection,
-                match=match,
+                selection=data.get('selection', ''),
+                match=data.get('match', ''),
                 total_odd=total_odd,
                 avg_odd=avg_odd,
                 best_odd=best_odd,
                 total_limit=total_limit,
                 avg_limit=avg_limit,
                 best_limit=best_limit,
-                bookmakers=bookmakers,
-                raw_text=section[:500]
+                bookmakers=bk_list,
+                raw_text=data.get('raw', ''),
             )
             
         except Exception as e:
-            logger.error(f"Erro ao parsear betslip: {e}")
+            logger.error(f"Erro ao extrair betslip: {e}")
             return None
-    
-    def _extract_bookmakers(self, text: str) -> List[BookmakerOdd]:
-        """Extrai odds individuais de cada bookmaker."""
-        bookmakers = []
-        text_lower = text.lower()
-        
-        for bk_name in self.KNOWN_BOOKMAKERS:
-            if bk_name in text_lower:
-                # Encontra a posição do bookmaker
-                idx = text_lower.find(bk_name)
-                section = text[idx:idx + 200]
-                
-                # Extrai odds após o nome do bookmaker
-                odds_pattern = r'(\d+[.,]\d{2,3})'
-                odds = re.findall(odds_pattern, section)
-                
-                # Extrai limites
-                limit_pattern = r'\$\s*([\d,]+)'
-                limits = re.findall(limit_pattern, section)
-                
-                bk = BookmakerOdd(name=bk_name)
-                
-                if len(odds) >= 1:
-                    bk.total_odd = float(odds[0].replace(',', '.'))
-                if len(odds) >= 2:
-                    bk.avg_odd = float(odds[1].replace(',', '.'))
-                if len(odds) >= 3:
-                    bk.best_odd = float(odds[2].replace(',', '.'))
-                
-                if len(limits) >= 1:
-                    bk.total_limit = float(limits[0].replace(',', ''))
-                if len(limits) >= 2:
-                    bk.avg_limit = float(limits[1].replace(',', ''))
-                if len(limits) >= 3:
-                    bk.best_limit = float(limits[2].replace(',', ''))
-                
-                bookmakers.append(bk)
-        
-        return bookmakers
     
     async def close_betslip(self):
         """Fecha o betslip."""
         try:
-            # Tenta clicar no X ou pressionar Escape
-            close_selectors = [
-                '[class*="close"]',
-                'button:has-text("×")',
-                'button:has-text("X")',
-            ]
+            # Tenta clicar no X de fechar
+            closed = await self.page.evaluate("""
+                () => {
+                    // Procura botão de fechar dentro do betslip aside
+                    const asides = document.querySelectorAll('aside');
+                    for (const aside of asides) {
+                        const text = aside.innerText || '';
+                        if (text.includes('Betslip') && text.includes('Stake')) {
+                            // Encontra o X (botão de fechar a seleção)
+                            const closeButtons = aside.querySelectorAll('button, [role="button"], span');
+                            for (const btn of closeButtons) {
+                                const t = (btn.innerText || '').trim();
+                                if (t === '×' || t === 'X' || t === '✕') {
+                                    btn.click();
+                                    return true;
+                                }
+                            }
+                            // Tenta pelo SVG/ícone de fechar
+                            const svgButtons = aside.querySelectorAll('svg, [class*="close"], [class*="remove"]');
+                            for (const btn of svgButtons) {
+                                try { btn.click(); return true; } catch(e) {}
+                                try { btn.parentElement.click(); return true; } catch(e) {}
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
             
-            for selector in close_selectors:
-                try:
-                    btn = await self.page.query_selector(selector)
-                    if btn and await btn.is_visible():
-                        await btn.click()
-                        return
-                except:
-                    continue
-            
-            # Fallback: pressiona Escape
-            await self.page.keyboard.press('Escape')
-            
+            if not closed:
+                await self.page.keyboard.press('Escape')
+                
         except Exception as e:
             logger.debug(f"Erro ao fechar betslip: {e}")
-
-
-async def test_betslip_extractor():
-    """Testa o extrator de betslip."""
-    from playwright.async_api import async_playwright
-    
-    print("=" * 60)
-    print("TESTE DO EXTRATOR DE BETSLIP")
-    print("=" * 60)
-    
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=False)  # headless=False para ver
-    context = await browser.new_context()
-    page = await context.new_page()
-    
-    try:
-        # Login
-        print("\n[1] Fazendo login...")
-        page.goto("https://black.betinasia.com/login")
-        # ... código de login ...
-        
-        # Navega para um jogo
-        print("\n[2] Navegando para jogo...")
-        # ... 
-        
-        # Extrai betslip
-        extractor = BetslipExtractor(page)
-        
-        # Clica numa odd
-        clicked = await extractor.click_odd_to_open_betslip("-0.5", "home")
-        
-        if clicked:
-            data = await extractor.extract_best_odd()
-            
-            if data:
-                print(f"\n[3] Dados extraídos:")
-                print(f"    Seleção: {data.selection}")
-                print(f"    Jogo: {data.match}")
-                print(f"    Best Odd: {data.best_odd}")
-                print(f"    Limite: ${data.best_limit}")
-                print(f"    Bookmakers: {len(data.bookmakers)}")
-            else:
-                print("    Falha ao extrair dados")
-        else:
-            print("    Falha ao abrir betslip")
-            
-    finally:
-        await browser.close()
-        await p.stop()
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(test_betslip_extractor())
