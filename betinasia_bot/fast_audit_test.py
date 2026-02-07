@@ -687,6 +687,14 @@ class FastAuditTest:
             text_preview = panel['text'][:200].replace('\n', ' | ')
             logger.info(f"    Texto: {text_preview}")
 
+        # Screenshot para debug
+        try:
+            screenshot_name = f"logs/betslip_debug_{event_id.replace(',','_')}_{int(time.time())}.png"
+            await tab.page.screenshot(path=screenshot_name, full_page=False)
+            logger.info(f"  Screenshot salvo: {screenshot_name}")
+        except Exception as e:
+            logger.debug(f"Erro screenshot: {e}")
+
         extractor = BetslipExtractor(tab.page)
         betslip = await extractor.extract_best_odd()
         logger.debug(f"Betslip extraido: {betslip is not None}, data={betslip}")
