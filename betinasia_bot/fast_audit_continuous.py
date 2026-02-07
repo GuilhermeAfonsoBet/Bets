@@ -397,6 +397,10 @@ class FastAuditContinuous:
                 now = datetime.now(timezone.utc)
                 is_live = kickoff <= now if kickoff else None
 
+                # Filtra jogos que provavelmente já acabaram (kickoff > 2h30 atrás)
+                if kickoff and (now - kickoff).total_seconds() > 9000:
+                    continue
+
                 queue.put_nowait({
                     'event_id': event_id,
                     'audit_key': audit_key,
@@ -523,6 +527,20 @@ class FastAuditContinuous:
             except:
                 await page.wait_for_timeout(2000)
             lag_nav = int((time.time() - t_nav) * 1000)
+
+            # === VERIFICA SE JOGO AINDA ESTÁ ATIVO ===
+            body_text = await page.inner_text("body")
+            if "event has finished" in body_text.lower() or "evento finalizado" in body_text.lower():
+                lag_total = int((time.time() - detected_at) * 1000)
+                lag_nav = int((time.time() - t_nav) * 1000)
+                return AuditResult(**base_result, status="GAME_FINISHED",
+                                   lag_total_ms=lag_total, lag_navigate_ms=lag_nav)
+
+            if "Asian Handicap" not in body_text and "Handicap" not in body_text:
+                lag_total = int((time.time() - detected_at) * 1000)
+                lag_nav = int((time.time() - t_nav) * 1000)
+                return AuditResult(**base_result, status="NO_AH_ON_PAGE",
+                                   lag_total_ms=lag_total, lag_navigate_ms=lag_nav)
 
             # === EXPAND ===
             t_exp = time.time()
