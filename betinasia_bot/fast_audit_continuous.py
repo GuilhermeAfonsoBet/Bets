@@ -526,7 +526,7 @@ class FastAuditContinuous:
 
             # === EXPAND ===
             t_exp = time.time()
-            await page.evaluate("""
+            expanded = await page.evaluate("""
                 () => {
                     let c = 0;
                     for (const el of document.querySelectorAll('span, button, div, a, [role="button"]')) {
@@ -538,7 +538,8 @@ class FastAuditContinuous:
                     return c;
                 }
             """)
-            await page.wait_for_timeout(1000)
+            # Espera linhas renderizarem (proxy adiciona latência na resposta)
+            await page.wait_for_timeout(2500)
             lag_exp = int((time.time() - t_exp) * 1000)
 
             # === CLICK ===
@@ -547,6 +548,13 @@ class FastAuditContinuous:
             lag_click = int((time.time() - t_click) * 1000)
 
             if not clicked:
+                # Screenshot para diagnóstico (apenas 1 a cada 10 falhas)
+                if len(self.results) % 10 == 0:
+                    try:
+                        ss = f"logs/click_failed_{int(time.time())}.png"
+                        await page.screenshot(path=ss, full_page=False)
+                        logger.info(f"  Screenshot: {ss}")
+                    except: pass
                 lag_total = int((time.time() - detected_at) * 1000)
                 return AuditResult(**base_result, status="CLICK_FAILED",
                                    lag_total_ms=lag_total, lag_navigate_ms=lag_nav,
