@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     telegram_chat_id: Optional[str] = Field(default=None, env="TELEGRAM_CHAT_ID")
     
     # ===========================================
+    # Proxy Residencial (Bright Data, IPRoyal, etc)
+    # ===========================================
+    proxy_server: Optional[str] = Field(default=None, env="PROXY_SERVER")
+    proxy_username: Optional[str] = Field(default=None, env="PROXY_USERNAME")
+    proxy_password: Optional[str] = Field(default=None, env="PROXY_PASSWORD")
+    
+    # ===========================================
     # Scraping
     # ===========================================
     scrape_interval_tier1: int = Field(default=30, env="SCRAPE_INTERVAL_TIER1")
@@ -72,6 +79,18 @@ class Settings(BaseSettings):
     # Ambiente
     # ===========================================
     environment: str = Field(default="development", env="ENVIRONMENT")
+    
+    @property
+    def proxy_config(self) -> dict:
+        """Retorna config de proxy para Playwright, ou None se não configurado."""
+        if self.proxy_server:
+            config = {"server": self.proxy_server}
+            if self.proxy_username:
+                config["username"] = self.proxy_username
+            if self.proxy_password:
+                config["password"] = self.proxy_password
+            return config
+        return None
     
     class Config:
         env_file = ".env"

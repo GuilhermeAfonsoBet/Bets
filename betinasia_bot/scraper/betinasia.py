@@ -107,6 +107,7 @@ class BetinAsiaScraper:
         headless: bool = None,
         slow_mo: int = 0,
         session_file: str = "betinasia_session.json",
+        proxy: dict = None,
     ):
         """
         Inicializa o scraper.
@@ -115,10 +116,15 @@ class BetinAsiaScraper:
             headless: Se True, browser roda sem interface gráfica.
             slow_mo: Milissegundos de delay entre ações (útil para debug).
             session_file: Arquivo para salvar/carregar sessão (cookies).
+            proxy: Dict com config de proxy. Ex:
+                {"server": "http://brd.superproxy.io:33335",
+                 "username": "brd-customer-XXX-zone-YYY",
+                 "password": "ZZZ"}
         """
         self.headless = headless if headless is not None else settings.browser_headless
         self.slow_mo = slow_mo
         self.session_file = session_file
+        self.proxy = proxy if proxy is not None else settings.proxy_config
         
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -138,10 +144,18 @@ class BetinAsiaScraper:
         logger.info("Iniciando browser...")
         
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-        )
+        
+        launch_options = {
+            "headless": self.headless,
+            "slow_mo": self.slow_mo,
+        }
+        
+        # Proxy residencial (Bright Data, IPRoyal, etc)
+        if self.proxy:
+            launch_options["proxy"] = self.proxy
+            logger.info(f"Usando proxy: {self.proxy.get('server', '?')}")
+        
+        self._browser = await self._playwright.chromium.launch(**launch_options)
         
         # Verifica se existe sessão salva
         # Não expiramos por tempo - apenas verificamos se ainda é válida ao usar
