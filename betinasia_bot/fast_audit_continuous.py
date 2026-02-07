@@ -45,6 +45,46 @@ from storage.models_hypothesis import BetslipAuditResult
 BASE_URL = "https://black.betinasia.com"
 FOOTBALL_URL = f"{BASE_URL}/sportsbook/football"
 
+# Mapa de competition_name (WS) → league_code (URL)
+# Chaves normalizadas (lower)
+LEAGUE_CODE_MAP = {
+    "england premier league": "XE/1",
+    "english premier league": "XE/1",
+    "england football league championship": "XE/2",
+    "england championship": "XE/2",
+    "england fa cup": "XE/132",
+    "germany bundesliga": "DE/12",
+    "germany 2. bundesliga": "DE/13",
+    "germany bundesliga 2": "DE/13",
+    "spain la liga": "ES/16",
+    "spain second division a (liga adelante)": "ES/17",
+    "italy serie a": "IT/19",
+    "italy serie b": "IT/20",
+    "france ligue 1": "FR/38",
+    "france ligue 2": "FR/39",
+    "netherlands premier division (eredivisie)": "NL/1",
+    "netherlands eredivisie": "NL/1",
+    "portugal primeira liga": "PT/1",
+    "belgium 1st division a": "BE/1",
+    "turkey super league": "TR/160",
+    "brazil campeonato brasiliero série a": "BR/1",
+    "brazil campeonato brasiliero serie a": "BR/1",
+    "argentina liga profesional": "AR/1",
+    "argentina primera division": "AR/1",
+    "uefa champions league": "XE/5",
+    "uefa europa league": "XE/6",
+    "usa major league soccer": "US/23",
+    "colombia primera a": "CO/1",
+    "saudi arabia pro league": "SA/1",
+    "japan j-league division 1": "JP/1",
+    "japan j-league division 2": "JP/36",
+    "england league 1": "XE/3",
+    "england league 2": "XE/4",
+    "conmebol copa sudamericana": "XS/21",
+    "fifa world cup": "XW/65",
+    "scotland premiership": "XS/1",
+}
+
 # Config
 WS_HEALTH_CHECK_INTERVAL = 15
 WS_RELOAD_INTERVAL = 60
@@ -420,8 +460,22 @@ class FastAuditContinuous:
 
         # Determina URL do jogo
         # Formato: /sportsbook/football/{league_code}/{event_id}
-        # Como não sabemos o league_code exato, usamos a URL genérica
-        game_url = f"{FOOTBALL_URL}/-/1/{event_id}"
+        league_name = h3b.get('league', '').lower().strip()
+        league_code = LEAGUE_CODE_MAP.get(league_name)
+
+        # Se não encontrou match exato, tenta match parcial
+        if not league_code:
+            for key, code in LEAGUE_CODE_MAP.items():
+                if key in league_name or league_name in key:
+                    league_code = code
+                    break
+
+        if league_code:
+            game_url = f"{FOOTBALL_URL}/{league_code}/{event_id}"
+        else:
+            # Fallback: tenta URL genérica (pode não funcionar)
+            game_url = f"{FOOTBALL_URL}/-/1/{event_id}"
+            logger.debug(f"Liga sem código mapeado: '{h3b.get('league', '')}', usando URL genérica")
 
         base_result = {
             'timestamp': datetime.now(timezone.utc),
