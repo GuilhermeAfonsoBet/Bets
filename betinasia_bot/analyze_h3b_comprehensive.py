@@ -118,8 +118,8 @@ async def main():
                 a.market_period,
                 m.id as match_id,
                 m.kickoff_time,
-                m.home_goals,
-                m.away_goals,
+                m.home_score,
+                m.away_score,
                 m.status as match_status,
                 -- Closing odd (lado correto)
                 CASE 
@@ -165,7 +165,7 @@ async def main():
             'lag_click': row[15] or 0, 'lag_bs': row[16] or 0,
             'direction': row[17], 'period': row[18],
             'match_id': row[19], 'kickoff': row[20],
-            'home_goals': row[21], 'away_goals': row[22],
+            'home_score': row[21], 'away_score': row[22],
             'match_status': row[23], 'closing_odd': row[24],
         }
         
@@ -183,8 +183,8 @@ async def main():
         # Calcula ROI (se temos resultado do jogo)
         d['roi_ws'] = None
         d['roi_bs'] = None
-        if d['home_goals'] is not None and d['away_goals'] is not None:
-            goal_diff = d['home_goals'] - d['away_goals']
+        if d['home_score'] is not None and d['away_score'] is not None:
+            goal_diff = d['home_score'] - d['away_score']
             try:
                 ah_line = float(d['line'].replace(',', '.'))
             except:
@@ -481,7 +481,7 @@ async def main():
         print(f"  Diffs > +30%: {extreme_pos} ({extreme_pos/len(diffs)*100:.1f}%)")
         
         # Jogos com resultado
-        with_result = len([d for d in all_data if d['home_goals'] is not None])
+        with_result = len([d for d in all_data if d['home_score'] is not None])
         print(f"\n  Jogos com resultado (gols): {with_result}/{len(all_data)}")
     
     await db.close()
