@@ -497,6 +497,7 @@ class FastAuditContinuous:
 
         if league_code:
             game_url = f"{FOOTBALL_URL}/{league_code}/{event_id}"
+            logger.debug(f"URL: {game_url} (league={league_name}, country={country}, comp={comp_id})")
         else:
             # Fallback: pula este evento (URL genérica não funciona)
             logger.debug(f"Liga sem código: '{h3b.get('league', '')}' country={country} comp={comp_id}")
@@ -530,6 +531,10 @@ class FastAuditContinuous:
 
             # === VERIFICA SE JOGO AINDA ESTÁ ATIVO ===
             body_text = await page.inner_text("body")
+            # Log diagnóstico: primeiros 200 chars do body
+            body_preview = body_text[:200].replace('\n', ' | ')
+            logger.debug(f"Page body preview: {body_preview}")
+            
             if "event has finished" in body_text.lower() or "evento finalizado" in body_text.lower():
                 lag_total = int((time.time() - detected_at) * 1000)
                 lag_nav = int((time.time() - t_nav) * 1000)
@@ -566,6 +571,22 @@ class FastAuditContinuous:
             lag_click = int((time.time() - t_click) * 1000)
 
             if not clicked:
+                # Log das linhas AH visíveis na página para diagnóstico
+                available_lines = await page.evaluate("""
+                    () => {
+                        const lines = [];
+                        for (const el of document.querySelectorAll('span, div')) {
+                            const t = (el.innerText || '').trim();
+                            if (/^[+-]?\\d+([.,]\\d{1,2})?$/.test(t) && t.length < 8) {
+                                if (!lines.includes(t) && lines.length < 20) lines.push(t);
+                            }
+                        }
+                        return lines;
+                    }
+                """)
+                logger.info(f"  Linhas disponíveis na página: {available_lines}")
+                logger.info(f"  Buscando: AH {h3b['line']} {h3b['side']} ({h3b['market_type']})")
+                
                 # Screenshot para diagnóstico (apenas 1 a cada 10 falhas)
                 if len(self.results) % 10 == 0:
                     try:
