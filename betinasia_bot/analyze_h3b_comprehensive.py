@@ -65,14 +65,22 @@ def print_stats(label, values, indent=3):
     else:
         sig = "[~] Nao significativo"
     
+    # Significancia da mediana (sign test simplificado)
+    n_pos = sum(1 for v in values if v > 0)
+    n_neg = sum(1 for v in values if v < 0)
+    n_zero = sum(1 for v in values if v == 0)
+    
     print(f"{pad}{label}:")
     print(f"{pad}  N = {s['n']}")
-    print(f"{pad}  Media = {s['mean']:+.3f}%")
+    print(f"{pad}  Media   = {s['mean']:+.3f}%")
     print(f"{pad}  Mediana = {s['median']:+.3f}%")
+    print(f"{pad}  P25/P75 = [{s['p25']:+.3f}%, {s['p75']:+.3f}%]")
     print(f"{pad}  Erro padrao = {s['se']:.3f}%")
-    print(f"{pad}  IC 90% = [{s['ic90'][0]:+.3f}%, {s['ic90'][1]:+.3f}%]")
-    print(f"{pad}  IC 95% = [{s['ic95'][0]:+.3f}%, {s['ic95'][1]:+.3f}%]")
+    print(f"{pad}  IC 90% media = [{s['ic90'][0]:+.3f}%, {s['ic90'][1]:+.3f}%]")
     print(f"{pad}  {sig}")
+    print(f"{pad}  Win/Loss/Push = {n_pos}/{n_neg}/{n_zero}")
+    if n_pos + n_neg > 0:
+        print(f"{pad}  Win rate = {n_pos/(n_pos+n_neg)*100:.1f}%")
     
     if s['mean'] > 0 and s['ic90'][0] <= 0 and s['std'] > 0:
         n_needed = math.ceil((Z_90 * s['std'] / s['mean']) ** 2)
@@ -276,6 +284,17 @@ async def main():
     print(f"    Betslip total (bruto): {len(with_bs_raw)}")
     print(f"    Com diff entre -10% e +10% (confiavel): {len(with_bs)}")
     print(f"    Descartados (diff fora do range): {len(with_bs_raw) - len(with_bs)}")
+    
+    # Contagem de jogos únicos vs observações (para análise de correlação)
+    unique_matches_all = len(set(d['match_id'] for d in all_data))
+    unique_matches_bs = len(set(d['match_id'] for d in with_bs))
+    avg_obs_per_match = len(all_data) / unique_matches_all if unique_matches_all > 0 else 0
+    
+    print(f"\n  CORRELACAO INTRA-JOGO:")
+    print(f"    Jogos unicos: {unique_matches_all}")
+    print(f"    Observacoes: {len(all_data)}")
+    print(f"    Media obs/jogo: {avg_obs_per_match:.1f}")
+    print(f"    Jogos unicos (betslip): {unique_matches_bs}")
     with_clv_ws = [d for d in all_data if d['clv_ws'] is not None and -50 < d['clv_ws'] < 50]
     with_clv_bs = [d for d in with_bs if d['clv_bs'] is not None and -50 < d['clv_bs'] < 50]
     with_roi_ws = [d for d in all_data if d['roi_ws'] is not None]
@@ -284,11 +303,48 @@ async def main():
     prematch = [d for d in all_data if d['is_live'] == False]
     inmatch = [d for d in all_data if d['is_live'] == True]
     
+    # === CLV ADICIONAL (com baseline, como v6) ===
+    # Calcula CLV baseline: média do CLV de OUTRAS linhas do mesmo jogo no mesmo momento
+    # Agrupa por match_id
+    by_match = defaultdict(list)
+    for d in all_data:
+        if d['clv_ws'] is not None:
+            by_match[d['match_id']].append(d)
+    
+    for match_id, entries in by_match.items():
+        if len(entries) < 2:
+            for d in entries:
+                d['clv_baseline'] = None
+                d['clv_ws_adicional'] = d['clv_ws']
+                d['clv_bs_adicional'] = d.get('clv_bs')
+            continue
+        
+        # Para cada entrada, baseline = média dos CLVs das OUTRAS entradas do mesmo jogo
+        for d in entries:
+            others = [e['clv_ws'] for e in entries if e['id'] != d['id'] and e['clv_ws'] is not None]
+            if others:
+                d['clv_baseline'] = sum(others) / len(others)
+                d['clv_ws_adicional'] = d['clv_ws'] - d['clv_baseline']
+                if d.get('clv_bs') is not None:
+                    d['clv_bs_adicional'] = d['clv_bs'] - d['clv_baseline']
+                else:
+                    d['clv_bs_adicional'] = None
+            else:
+                d['clv_baseline'] = None
+                d['clv_ws_adicional'] = d['clv_ws']
+                d['clv_bs_adicional'] = d.get('clv_bs')
+    
+    # Recalcula subconjuntos com CLV adicional
+    with_clv_ws_adic = [d for d in all_data if d.get('clv_ws_adicional') is not None and -50 < d['clv_ws_adicional'] < 50]
+    with_clv_bs_adic = [d for d in with_bs if d.get('clv_bs_adicional') is not None and -50 < d['clv_bs_adicional'] < 50]
+    
     print(f"\nResumo:")
     print(f"  Total com match+kickoff: {len(all_data)}")
     print(f"  Com betslip: {len(with_bs)}")
-    print(f"  Com CLV WS: {len(with_clv_ws)}")
-    print(f"  Com CLV BS: {len(with_clv_bs)}")
+    print(f"  Com CLV WS bruto: {len(with_clv_ws)}")
+    print(f"  Com CLV WS adicional: {len(with_clv_ws_adic)}")
+    print(f"  Com CLV BS bruto: {len(with_clv_bs)}")
+    print(f"  Com CLV BS adicional: {len(with_clv_bs_adic)}")
     print(f"  Com ROI WS (resultado do jogo): {len(with_roi_ws)}")
     print(f"  Com ROI BS: {len(with_roi_bs)}")
     print(f"  Pre-match: {len(prematch)}")
@@ -301,27 +357,42 @@ async def main():
     print("(vii) REVALIDACAO CLV WEBSOCKET (todos os dados atuais)")
     print("=" * 70)
     
+    print("\n  --- CLV BRUTO ---")
     print("\n  PRE-MATCH:")
     pm_clv = [d['clv_ws'] for d in with_clv_ws if d['is_live'] == False]
-    print_stats("CLV WS Pre-Match", pm_clv)
+    print_stats("CLV Bruto WS Pre-Match", pm_clv)
     
     print("\n  IN-MATCH:")
     im_clv = [d['clv_ws'] for d in with_clv_ws if d['is_live'] == True]
-    print_stats("CLV WS In-Match", im_clv)
+    print_stats("CLV Bruto WS In-Match", im_clv)
     
-    print("\n  TODOS:")
-    print_stats("CLV WS Total", [d['clv_ws'] for d in with_clv_ws])
+    print("\n  --- CLV ADICIONAL (com baseline v6) ---")
+    print("\n  PRE-MATCH:")
+    pm_clv_adic = [d['clv_ws_adicional'] for d in with_clv_ws_adic if d['is_live'] == False]
+    print_stats("CLV Adicional WS Pre-Match", pm_clv_adic)
+    
+    print("\n  IN-MATCH:")
+    im_clv_adic = [d['clv_ws_adicional'] for d in with_clv_ws_adic if d['is_live'] == True]
+    print_stats("CLV Adicional WS In-Match", im_clv_adic)
     
     # ============================================================
-    # (i) CLV ADICIONAL + ROI ADICIONAL (BETSLIP)
+    # (i) CLV ADICIONAL + ROI (BETSLIP)
     # ============================================================
     print("\n" + "=" * 70)
-    print("(i) CLV E ROI COM ODD BETSLIP")
+    print("(i) CLV BRUTO, CLV ADICIONAL E ROI COM ODD BETSLIP")
     print("=" * 70)
     
-    print("\n  --- CLV BETSLIP (pre-match apenas) ---")
+    print("\n  --- CLV BRUTO BETSLIP (pre-match apenas) ---")
     pm_clv_bs = [d['clv_bs'] for d in with_clv_bs if d['is_live'] == False]
-    print_stats("CLV Betslip Pre-Match", pm_clv_bs)
+    print_stats("CLV Bruto BS Pre-Match", pm_clv_bs)
+    
+    print("\n  --- CLV ADICIONAL BETSLIP (pre-match, com baseline v6) ---")
+    pm_clv_bs_adic = [d['clv_bs_adicional'] for d in with_clv_bs_adic if d['is_live'] == False]
+    print_stats("CLV Adicional BS Pre-Match", pm_clv_bs_adic)
+    
+    print("\n  --- CLV ADICIONAL WS (pre-match, com baseline v6) ---")
+    pm_clv_ws_adic = [d['clv_ws_adicional'] for d in with_clv_ws_adic if d['is_live'] == False]
+    print_stats("CLV Adicional WS Pre-Match", pm_clv_ws_adic)
     
     print("\n  --- ROI BETSLIP (pre-match) ---")
     pm_roi_bs = [d['roi_bs'] for d in with_roi_bs if d['is_live'] == False]
