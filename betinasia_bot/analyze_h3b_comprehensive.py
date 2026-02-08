@@ -267,7 +267,15 @@ async def main():
         all_data.append(d)
     
     # Subconjuntos
-    with_bs = [d for d in all_data if d['bs_odd'] and d['bs_odd'] > 0]
+    # Filtra apenas betslip odds com diferença razoável (-10% a +10%)
+    # Registros fora deste range provavelmente têm erro de extração
+    with_bs_raw = [d for d in all_data if d['bs_odd'] and d['bs_odd'] > 0]
+    with_bs = [d for d in with_bs_raw if d['diff_pct'] is not None and -10 <= d['diff_pct'] <= 10]
+    
+    print(f"\n  FILTRO DE QUALIDADE:")
+    print(f"    Betslip total (bruto): {len(with_bs_raw)}")
+    print(f"    Com diff entre -10% e +10% (confiavel): {len(with_bs)}")
+    print(f"    Descartados (diff fora do range): {len(with_bs_raw) - len(with_bs)}")
     with_clv_ws = [d for d in all_data if d['clv_ws'] is not None and -50 < d['clv_ws'] < 50]
     with_clv_bs = [d for d in with_bs if d['clv_bs'] is not None and -50 < d['clv_bs'] < 50]
     with_roi_ws = [d for d in all_data if d['roi_ws'] is not None]
