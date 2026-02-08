@@ -189,12 +189,19 @@ class ApiBetslipClient:
             
             result.request_time_ms = int((time.time() - t_post) * 1000)
             
+            logger.info(f"POST /v1/betslips/: status={response.get('status') if response else 'none'}, "
+                        f"ok={response.get('ok') if response else False}, "
+                        f"time={result.request_time_ms}ms, "
+                        f"data_keys={list(response.get('data', {}).keys()) if response and isinstance(response.get('data'), dict) else 'n/a'}")
+            
             if not response or not response.get('ok'):
                 result.error = response.get('error', 'POST failed') if response else 'No response'
+                logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
                 return result
             
             # Extrai betslip_id da resposta
             resp_data = response.get('data', {})
+            logger.debug(f"POST data: status={response.get('status')}, resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
             betslip_id = resp_data.get('betslip_id', '')
             
             if not betslip_id:
