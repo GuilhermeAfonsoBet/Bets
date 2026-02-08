@@ -522,11 +522,17 @@ class FastAuditContinuous:
         try:
             # === NAVIGATE ===
             t_nav = time.time()
-            await page.goto(game_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             try:
-                await page.wait_for_selector("text=Asian Handicap", timeout=5000)
+                await page.goto(game_url, wait_until="networkidle", timeout=20000)
             except:
-                await page.wait_for_timeout(2000)
+                # Fallback: se networkidle timeout, espera mais
+                await page.wait_for_timeout(3000)
+            
+            # Espera Asian Handicap aparecer (confirmação que conteúdo carregou)
+            try:
+                await page.wait_for_selector("text=Asian Handicap", timeout=8000)
+            except:
+                await page.wait_for_timeout(3000)
             lag_nav = int((time.time() - t_nav) * 1000)
 
             # === VERIFICA SE JOGO AINDA ESTÁ ATIVO ===
