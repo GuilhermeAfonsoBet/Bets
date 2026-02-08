@@ -168,9 +168,26 @@ class ApiBetslipClient:
             response = await self.page.evaluate("""
                 async (params) => {
                     try {
+                        // Extrai session token do cookie root-session
+                        const cookies = document.cookie.split(';');
+                        let sessionToken = '';
+                        for (const c of cookies) {
+                            const [name, val] = c.trim().split('=');
+                            if (name === 'root-session') {
+                                sessionToken = val;
+                                break;
+                            }
+                        }
+                        
                         const resp = await fetch('/v1/betslips/', {
                             method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json, text/plain, */*',
+                                'session': sessionToken,
+                                'x-molly-client-name': 'sonic',
+                                'x-molly-client-version': '2.5.34'
+                            },
                             body: JSON.stringify({
                                 sport: 'fb',
                                 event_id: params.event_id,
@@ -180,7 +197,7 @@ class ApiBetslipClient:
                             })
                         });
                         const data = await resp.json();
-                        return {ok: true, status: resp.status, data: data};
+                        return {ok: true, status: resp.status, data: data, session: sessionToken};
                     } catch(e) {
                         return {ok: false, error: e.message};
                     }
