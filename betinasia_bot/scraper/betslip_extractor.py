@@ -92,11 +92,24 @@ class BetslipExtractor:
                     let selection = '';
                     let match = '';
                     
-                    const asianMatch = fullText.match(/([^\n]+\(Asian[^)]*\))/);
-                    if (asianMatch) selection = asianMatch[1].trim();
+                    // Extrai seleção (Asian)
+                    const asianIdx = fullText.indexOf('(Asian');
+                    if (asianIdx > -1) {
+                        let start = fullText.lastIndexOf('\\n', asianIdx);
+                        if (start === -1) start = 0; else start++;
+                        let end = fullText.indexOf(')', asianIdx);
+                        if (end > -1) selection = fullText.substring(start, end + 1).trim();
+                    }
                     
-                    const vsMatch = fullText.match(/([^\n]+)\s+vs\.?\s+([^\n]+)/);
-                    if (vsMatch) match = vsMatch[0].trim();
+                    // Extrai jogo (vs)
+                    const vsIdx = fullText.indexOf(' vs');
+                    if (vsIdx > -1) {
+                        let start = fullText.lastIndexOf('\\n', vsIdx);
+                        if (start === -1) start = 0; else start++;
+                        let end = fullText.indexOf('\\n', vsIdx);
+                        if (end === -1) end = vsIdx + 60;
+                        match = fullText.substring(start, end).trim();
+                    }
                     
                     // === 3. Encontra "All Bookies" e extrai dados ===
                     // Procura o elemento que contém "All Bookies"
@@ -126,9 +139,16 @@ class BetslipExtractor:
                     // Sobe na árvore até encontrar um container com odds
                     for (let i = 0; i < 5 && rowContainer; i++) {
                         rowText = rowContainer.innerText || '';
-                        // Verifica se tem pelo menos 3 números decimais (odds)
-                        const oddMatches = rowText.match(/\d+\.\d{3}/g);
-                        if (oddMatches && oddMatches.length >= 3) break;
+                        // Verifica se tem pelo menos 3 pontos decimais (indica odds)
+                        let dotCount = 0;
+                        let searchFrom = 0;
+                        while (true) {
+                            const d = rowText.indexOf('.', searchFrom);
+                            if (d === -1) break;
+                            dotCount++;
+                            searchFrom = d + 1;
+                        }
+                        if (dotCount >= 3) break;
                         rowContainer = rowContainer.parentElement;
                     }
                     
@@ -171,7 +191,7 @@ class BetslipExtractor:
                         
                         // É um limite? ($XXX ou $X,XXX)
                         if (line.startsWith('$')) {
-                            const numStr = line.substring(1).trim().replace(/,/g, '');
+                            const numStr = line.substring(1).trim().split(',').join('');
                             const val = parseFloat(numStr);
                             if (!isNaN(val) && val > 0) {
                                 limits.push(val);
@@ -216,7 +236,7 @@ class BetslipExtractor:
                         for (let j = bkIdx + 1; j < Math.min(lines.length, bkIdx + 10); j++) {
                             const line = lines[j].trim();
                             if (line.startsWith('$')) {
-                                const v = parseFloat(line.substring(1).trim().replace(/,/g, ''));
+                                const v = parseFloat(line.substring(1).trim().split(',').join(''));
                                 if (!isNaN(v) && v > 0) bkLimits.push(v);
                                 continue;
                             }
