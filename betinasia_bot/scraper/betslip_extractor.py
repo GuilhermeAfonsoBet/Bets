@@ -170,27 +170,31 @@ class BetslipExtractor:
                         const line = lines[i].trim();
                         
                         // É um limite? ($XXX ou $X,XXX)
-                        const limitMatch = line.match(/^\$\s*([\d,]+(?:\.\d+)?)/);
-                        if (limitMatch) {
-                            limits.push(parseFloat(limitMatch[1].replace(/,/g, '')));
-                            continue;
+                        if (line.startsWith('$')) {
+                            const numStr = line.substring(1).trim().replace(/,/g, '');
+                            const val = parseFloat(numStr);
+                            if (!isNaN(val) && val > 0) {
+                                limits.push(val);
+                                continue;
+                            }
                         }
                         
-                        // É uma odd? (X.XXX - 1 a 3 dígitos, ponto, 2-3 decimais)
-                        const oddMatch = line.match(/^(\d{1,3}\.\d{2,3})$/);
-                        if (oddMatch) {
-                            const val = parseFloat(oddMatch[1]);
-                            // Odd razoável: entre 1.001 e 500
-                            if (val >= 1.001 && val <= 500) {
+                        // É uma odd? (formato X.XXX)
+                        const dotIdx = line.indexOf('.');
+                        if (dotIdx > 0 && dotIdx <= 3 && line.length <= 7) {
+                            const val = parseFloat(line);
+                            if (!isNaN(val) && val >= 1.001 && val <= 500) {
                                 odds.push(val);
                                 continue;
                             }
                         }
                         
-                        // Se encontrou um bookmaker (bdaq, bf, etc), para de buscar All Bookies
-                        if (/^(bdaq|bf|18bet|mbook|pin88|sbo|sharp|sing|lbc|molly|isn|ibc|overtime|punter)/i.test(line)) {
-                            break;
-                        }
+                        // Se encontrou um bookmaker, para de buscar All Bookies
+                        const lineLower = line.toLowerCase();
+                        const bkPrefixes = ['bdaq', 'bf', '18bet', 'mbook', 'pin88', 'sbo', 'sharp', 'sing', 'lbc', 'molly', 'isn', 'ibc', 'overtime', 'punter', '3et', '4cast'];
+                        let isBk = false;
+                        for (const p of bkPrefixes) { if (lineLower.startsWith(p)) { isBk = true; break; } }
+                        if (isBk) break;
                     }
                     
                     // === 6. Extrai bookmakers individuais ===
@@ -211,11 +215,22 @@ class BetslipExtractor:
                         const bkLimits = [];
                         for (let j = bkIdx + 1; j < Math.min(lines.length, bkIdx + 10); j++) {
                             const line = lines[j].trim();
-                            const lm = line.match(/^\$\s*([\d,]+(?:\.\d+)?)/);
-                            if (lm) { bkLimits.push(parseFloat(lm[1].replace(/,/g, ''))); continue; }
-                            const om = line.match(/^(\d{1,3}\.\d{2,3})$/);
-                            if (om) { const v = parseFloat(om[1]); if (v >= 1.001 && v <= 500) bkOdds.push(v); continue; }
-                            if (/^(bdaq|bf|18bet|mbook|pin88|sbo|sharp|sing|lbc|molly|isn|ibc|overtime|punter|All Bookies)/i.test(line)) break;
+                            if (line.startsWith('$')) {
+                                const v = parseFloat(line.substring(1).trim().replace(/,/g, ''));
+                                if (!isNaN(v) && v > 0) bkLimits.push(v);
+                                continue;
+                            }
+                            const dotI = line.indexOf('.');
+                            if (dotI > 0 && dotI <= 3 && line.length <= 7) {
+                                const v = parseFloat(line);
+                                if (!isNaN(v) && v >= 1.001 && v <= 500) { bkOdds.push(v); continue; }
+                            }
+                            const ll = line.toLowerCase();
+                            let stop = false;
+                            for (const p of ['bdaq','bf','18bet','mbook','pin88','sbo','sharp','sing','lbc','molly','isn','ibc','overtime','punter','all bookies']) {
+                                if (ll.startsWith(p)) { stop = true; break; }
+                            }
+                            if (stop) break;
                         }
                         
                         bookmakers.push({
