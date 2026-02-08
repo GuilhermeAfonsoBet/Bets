@@ -94,11 +94,12 @@ class ApiBetslipClient:
     
     def setup_listener(self):
         """Configura listener de WebSocket para PMM messages.
-        Deve ser chamado UMA VEZ após o WS conectar."""
+        Deve ser chamado UMA VEZ após o WS conectar.
+        Captura tanto WS existentes quanto novos."""
         if self._listening:
             return
         
-        def on_ws(ws):
+        def _attach_frame_listener(ws):
             def on_frame(data):
                 try:
                     msg = json.loads(str(data))
@@ -119,7 +120,9 @@ class ApiBetslipClient:
                     pass
             ws.on('framereceived', on_frame)
         
-        self.page.on('websocket', on_ws)
+        # Captura WS novos
+        self.page.on('websocket', _attach_frame_listener)
+        
         self._listening = True
         logger.debug("ApiBetslipClient: listener WS configurado")
     
@@ -195,18 +198,28 @@ class ApiBetslipClient:
             betslip_id = resp_data.get('betslip_id', '')
             
             if not betslip_id:
-                # Betslip_id pode vir via WebSocket em vez da resposta HTTP
-                # Espera um pouco
-                await asyncio.sleep(0.3)
-                # Tenta encontrar o betslip_id mais recente
-                for bid in reversed(list(self._betslip_info.keys())):
-                    info = self._betslip_info[bid]
-                    if info.get('event_id') == event_id:
-                        betslip_id = bid
+                # Betslip_id vem via WebSocket ["betslip", {betslip_id: "..."}]
+                # Espera até 3 segundos pelo WS message
+                wait_start = time.time()
+                while time.time() - wait_start < 3.0:
+                    for bid in reversed(list(self._betslip_info.keys())):
+                        info = self._betslip_info[bid]
+                        if info.get('event_id') == event_id:
+                            betslip_id = bid
+                            break
+                    if betslip_id:
                         break
+                    await asyncio.sleep(0.05)
             
             if not betslip_id:
-                result.error = 'No betslip_id received'
+                # Último fallback: pega o betslip_id mais recente (qualquer evento)
+                # Os PMMs podem já estar chegando
+                if self._betslip_info:
+                    betslip_id = list(self._betslip_info.keys())[-1]
+                    logger.debug(f"Usando último betslip_id: {betslip_id}")
+            
+            if not betslip_id:
+                result.error = 'No betslip_id received after 3s'
                 return result
             
             result.betslip_id = betslip_id

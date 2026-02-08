@@ -88,17 +88,31 @@ class H3bApiAudit:
         page = self.scraper._page
         self.api_client = ApiBetslipClient(page)
 
-        # WS listener (para odds + PMM)
+        # WS listener único (para odds + PMM + betslip)
         def on_ws(ws):
             def on_frame(data):
-                self._ws_messages.append(str(data))
+                data_str = str(data)
+                self._ws_messages.append(data_str)
                 self._last_ws_time = time.time()
                 self._ws_msg_count += 1
+                
+                # Também processa PMM/betslip para o API client
+                try:
+                    msg = json.loads(data_str)
+                    if isinstance(msg, list):
+                        for item in msg:
+                            if isinstance(item, list) and len(item) >= 2:
+                                if item[0] == 'api' and isinstance(item[1], dict):
+                                    for entry in item[1].get('data', []):
+                                        if isinstance(entry, list) and len(entry) >= 2:
+                                            if entry[0] == 'pmm':
+                                                self.api_client._handle_pmm(entry[1])
+                                            elif entry[0] == 'betslip':
+                                                self.api_client._handle_betslip(entry[1])
+                except:
+                    pass
             ws.on('framereceived', on_frame)
         page.on('websocket', on_ws)
-
-        # API client WS listener (para PMM responses)
-        self.api_client.setup_listener()
 
         # Navega para football (ativa WS)
         await page.goto(FOOTBALL_URL)
