@@ -1650,6 +1650,7 @@ async def run_continuous(direction_filter: str = "up", batch_size: int = 50):
     total_audits = 0
     total_batches = 0
     total_errors = 0
+    consecutive_errors = 0
     start_time = datetime.now(timezone.utc)
     
     # Acumuladores globais de resultados
@@ -1689,6 +1690,9 @@ async def run_continuous(direction_filter: str = "up", batch_size: int = 50):
                 if r.difference_pct is not None:
                     global_diffs.append(abs(r.difference_pct))
             
+            # Reset erros consecutivos (batch funcionou)
+            consecutive_errors = 0
+            
             # Log resumo do batch
             batch_duration = (datetime.now(timezone.utc) - batch_start).total_seconds()
             uptime = datetime.now(timezone.utc) - start_time
@@ -1718,12 +1722,21 @@ async def run_continuous(direction_filter: str = "up", batch_size: int = 50):
             
         except Exception as e:
             total_errors += 1
+            consecutive_errors = consecutive_errors + 1 if 'consecutive_errors' in dir() else 1
             logger.error(f"Erro no batch #{total_batches}: {e}")
-            logger.info(f"Aguardando 60s antes de reconectar... (erro {total_errors})")
             
-            # Pausa antes de reconectar
+            # Backoff exponencial: 60s, 120s, 240s, 480s (max 10 min)
+            wait_time = min(60 * (2 ** min(consecutive_errors - 1, 3)), 600)
+            logger.info(f"Aguardando {wait_time}s antes de reconectar... (erro {total_errors}, consecutivos: {consecutive_errors})")
+            
+            # Se muitos erros consecutivos, para o loop para não queimar proxy
+            if consecutive_errors >= 10:
+                logger.error(f"10 erros consecutivos — parando para não consumir proxy. Verifique manualmente.")
+                running = False
+                break
+            
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(wait_time)
             except asyncio.CancelledError:
                 running = False
                 break
