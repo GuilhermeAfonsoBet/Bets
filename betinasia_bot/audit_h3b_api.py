@@ -35,7 +35,7 @@ from storage.database import Database
 from storage.models_hypothesis import BetslipAuditResult
 
 FOOTBALL_URL = "https://black.betinasia.com/sportsbook/football"
-MAX_AH_LINE = 2.0
+MAX_AH_LINE = 10.0  # Amplo: captura todas as linhas relevantes
 WS_HEALTH_INTERVAL = 15
 WS_RELOAD_INTERVAL = 120
 STATS_INTERVAL = 50
