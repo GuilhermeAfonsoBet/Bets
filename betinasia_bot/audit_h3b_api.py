@@ -338,13 +338,16 @@ class H3bApiAudit:
             live = "LIVE" if result.get('is_live') else "PRE" if result.get('is_live') is not None else "?"
             if result.get('success'):
                 self.consecutive_errors = 0
+                lay_str = ""
+                if result.get('lay_odd'):
+                    lay_str = f" lay={result['lay_odd']:.3f}({result.get('lay_bookie','')})"
                 logger.info(
                     f"[OK][{live}] {result['home_team']} vs {result['away_team']} | "
                     f"{result['market_type']} {result['line']} {result['side']} | "
                     f"ws={result['ws_odd']:.3f} bs={result['bs_odd']:.3f} "
                     f"diff={result['diff_pct']:+.2f}% lim=${result['bs_limit']:,.0f} "
-                    f"({result['num_bk']} bk) | "
-                    f"lag={result['total_ms']}ms (post={result['post_ms']}ms pmm={result['pmm_ms']}ms) | "
+                    f"({result['num_bk']} bk){lay_str} | "
+                    f"lag={result['total_ms']}ms | "
                     f"{len(self.results)}")
             else:
                 self.total_errors += 1
@@ -361,22 +364,27 @@ class H3bApiAudit:
         detected_at = h3b['detected_at']
         t0 = time.time()
 
-        # Constrói bet_type
-        bet_type = ApiBetslipClient.build_bet_type(
+        # Constrói bet_types
+        back_bet_type = ApiBetslipClient.build_bet_type(
+            market_type=h3b['market_type'],
+            side=h3b['side'],
+            line=h3b['line'],
+        )
+        lay_bet_type = ApiBetslipClient.build_lay_bet_type(
             market_type=h3b['market_type'],
             side=h3b['side'],
             line=h3b['line'],
         )
 
-        # Chama API
-        api_result = await self.api_client.get_betslip_odds(
+        # === T+0: BACK ===
+        back_result = await self.api_client.get_betslip_odds(
             event_id=h3b['event_id'],
-            bet_type=bet_type,
+            bet_type=back_bet_type,
         )
 
         total_ms = int((time.time() - detected_at) * 1000)
-        post_ms = api_result.request_time_ms
-        pmm_ms = api_result.total_time_ms - post_ms
+        post_ms = back_result.request_time_ms
+        pmm_ms = back_result.total_time_ms - post_ms
 
         base = {
             'event_id': h3b['event_id'],
@@ -395,27 +403,86 @@ class H3bApiAudit:
             'pmm_ms': pmm_ms,
         }
 
-        if api_result.success:
-            diff = ((api_result.best_odd - h3b['websocket_odd']) / h3b['websocket_odd']) * 100
-            base.update({
-                'success': True,
-                'bs_odd': api_result.best_odd,
-                'bs_bookie': api_result.best_bookie,
-                'bs_limit': api_result.best_limit,
-                'second_odd': api_result.second_odd,
-                'second_bookie': api_result.second_bookie,
-                'highest_limit': api_result.highest_limit,
-                'highest_limit_bookie': api_result.highest_limit_bookie,
-                'num_bk': api_result.num_bookmakers,
-                'diff_pct': diff,
-            })
-        else:
+        if not back_result.success:
             base.update({
                 'success': False,
                 'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
-                'error': api_result.error,
+                'error': back_result.error,
             })
+            return base
 
+        ws_odd = h3b['websocket_odd']
+        diff = ((back_result.best_odd - ws_odd) / ws_odd) * 100
+
+        base.update({
+            'success': True,
+            'bs_odd': back_result.best_odd,
+            'bs_bookie': back_result.best_bookie,
+            'bs_limit': back_result.best_limit,
+            'second_odd': back_result.second_odd,
+            'second_bookie': back_result.second_bookie,
+            'highest_limit': back_result.highest_limit,
+            'highest_limit_bookie': back_result.highest_limit_bookie,
+            'num_bk': back_result.num_bookmakers,
+            'diff_pct': diff,
+        })
+
+        # === T+0: LAY ===
+        try:
+            lay_result = await self.api_client.get_betslip_odds(
+                event_id=h3b['event_id'],
+                bet_type=lay_bet_type,
+                betslip_type="lay",
+            )
+            if lay_result.success:
+                # Para lay, a melhor odd é a MAIS BAIXA (menos liability)
+                lay_odds = sorted([b.best_price for b in lay_result.bookmakers if b.best_price > 0])
+                if lay_odds:
+                    base['lay_odd'] = lay_odds[0]  # Melhor (mais baixa) para layer
+                    base['lay_bookie'] = next(b.bookie for b in lay_result.bookmakers if b.best_price == lay_odds[0])
+                    base['lay_limit'] = next(b.max_stake for b in lay_result.bookmakers if b.best_price == lay_odds[0])
+                    base['lay_num_bk'] = len(lay_odds)
+        except Exception as e:
+            logger.debug(f"Lay falhou: {e}")
+
+        # === MONITORAMENTO TEMPORAL (refresh a t+3, t+6, t+10, t+15, t+20) ===
+        refresh_times = [3, 6, 10, 15, 20]
+        temporal = []
+        betslip_id = back_result.betslip_id
+
+        if betslip_id and back_result.success:
+            t_start = time.time()
+            for target_t in refresh_times:
+                # Espera até o momento certo
+                elapsed = time.time() - t_start
+                wait = target_t - elapsed
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
+                # Refresh
+                try:
+                    ref = await self.api_client.refresh_betslip(betslip_id)
+                    actual_t = time.time() - t_start
+                    if ref.success:
+                        ref_diff = ((ref.best_odd - ws_odd) / ws_odd) * 100
+                        temporal.append({
+                            't': round(actual_t, 1),
+                            'bs_odd': ref.best_odd,
+                            'diff_pct': round(ref_diff, 3),
+                            'bookie': ref.best_bookie,
+                            'limit': ref.best_limit,
+                            'num_bk': ref.num_bookmakers,
+                        })
+                except Exception as e:
+                    logger.debug(f"Refresh t+{target_t} falhou: {e}")
+
+        if temporal:
+            base['temporal'] = temporal
+            # Log evolução
+            evol = " → ".join([f"t+{t['t']:.0f}s:{t['bs_odd']:.3f}({t['diff_pct']:+.1f}%)" for t in temporal])
+            logger.info(f"  Temporal: {evol}")
+
+        base['total_ms'] = int((time.time() - detected_at) * 1000)
         return base
 
     # ================================================================

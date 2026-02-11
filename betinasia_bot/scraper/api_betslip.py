@@ -142,7 +142,7 @@ class ApiBetslipClient:
                 self._pmm_messages[betslip_id] = []
             self._pmm_messages[betslip_id].append(data)
     
-    async def get_betslip_odds(self, event_id: str, bet_type: str) -> BetslipApiResult:
+    async def get_betslip_odds(self, event_id: str, bet_type: str, betslip_type: str = "normal") -> BetslipApiResult:
         """
         Obtém odds do betslip via API.
         
@@ -192,7 +192,7 @@ class ApiBetslipClient:
                                 sport: 'fb',
                                 event_id: params.event_id,
                                 bet_type: params.bet_type,
-                                betslip_type: 'normal',
+                                betslip_type: params.betslip_type,
                                 equivalent_bets: true
                             })
                         });
@@ -202,7 +202,7 @@ class ApiBetslipClient:
                         return {ok: false, error: e.message};
                     }
                 }
-            """, {"event_id": event_id, "bet_type": bet_type})
+            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type})
             
             result.request_time_ms = int((time.time() - t_post) * 1000)
             
@@ -382,6 +382,109 @@ class ApiBetslipClient:
             logger.error(f"ApiBetslipClient erro: {e}")
             return result
     
+    async def refresh_betslip(self, betslip_id: str) -> BetslipApiResult:
+        """Atualiza odds de um betslip existente sem criar novo."""
+        result = BetslipApiResult(event_id="", bet_type="")
+        result.betslip_id = betslip_id
+        t0 = time.time()
+        
+        try:
+            # Limpa PMMs antigos para este betslip
+            self._pmm_messages[betslip_id] = []
+            
+            response = await self.page.evaluate("""
+                async (params) => {
+                    try {
+                        const cookies = document.cookie.split(';');
+                        let sessionToken = '';
+                        for (const c of cookies) {
+                            const [name, val] = c.trim().split('=');
+                            if (name === 'root-session') { sessionToken = val; break; }
+                        }
+                        const resp = await fetch('/v1/betslips/' + params.betslip_id + '/refresh/', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'session': sessionToken,
+                                'x-molly-client-name': 'sonic',
+                                'x-molly-client-version': '2.5.35'
+                            },
+                            body: JSON.stringify({betslipId: params.betslip_id})
+                        });
+                        const data = await resp.json();
+                        return {ok: true, status: resp.status, data: data};
+                    } catch(e) { return {ok: false, error: e.message}; }
+                }
+            """, {"betslip_id": betslip_id})
+            
+            result.request_time_ms = int((time.time() - t0) * 1000)
+            
+            if not response or not response.get('ok'):
+                result.error = response.get('error', 'Refresh failed') if response else 'No response'
+                return result
+            
+            # Espera PMMs atualizados
+            start_wait = time.time()
+            last_count = 0
+            while time.time() - start_wait < self.PMM_TIMEOUT:
+                current = len(self._pmm_messages.get(betslip_id, []))
+                if current > last_count:
+                    last_count = current
+                if current > 0 and time.time() - start_wait > self.PMM_MIN_WAIT:
+                    break
+                await asyncio.sleep(0.05)
+            
+            # Processa PMMs (mesma lógica de get_betslip_odds)
+            pmm_list = self._pmm_messages.get(betslip_id, [])
+            if not pmm_list:
+                result.error = 'No PMMs after refresh'
+                result.total_time_ms = int((time.time() - t0) * 1000)
+                return result
+            
+            # Reusar lógica de processamento
+            bookie_latest = {}
+            for pmm in pmm_list:
+                bookie = pmm.get('bookie', '')
+                if bookie:
+                    key = f"{bookie}_{pmm.get('username', '')}"
+                    bookie_latest[key] = pmm
+            
+            for key, pmm in bookie_latest.items():
+                if pmm.get('status', {}).get('code') != 'success':
+                    continue
+                price_list = pmm.get('price_list', [])
+                if not price_list:
+                    continue
+                effective = price_list[0].get('effective', {})
+                price = effective.get('price', 0)
+                max_stake_data = effective.get('max', [])
+                if not price or price <= 0:
+                    continue
+                max_stake = float(max_stake_data[1]) if isinstance(max_stake_data, list) and len(max_stake_data) >= 2 else 0
+                
+                result.bookmakers.append(BookmakerPrice(
+                    bookie=pmm.get('bookie', ''),
+                    best_price=price,
+                    max_stake=max_stake,
+                ))
+            
+            result.bookmakers.sort(key=lambda b: b.best_price, reverse=True)
+            result.num_bookmakers = len(result.bookmakers)
+            if result.bookmakers:
+                result.best_odd = result.bookmakers[0].best_price
+                result.best_bookie = result.bookmakers[0].bookie
+                result.best_limit = result.bookmakers[0].max_stake
+                result.success = True
+            
+            result.total_time_ms = int((time.time() - t0) * 1000)
+            return result
+            
+        except Exception as e:
+            result.error = str(e)
+            result.total_time_ms = int((time.time() - t0) * 1000)
+            return result
+    
     @staticmethod
     def build_bet_type(market_type: str, side: str, line: str = None) -> str:
         """
@@ -416,3 +519,21 @@ class ApiBetslipClient:
                 return "for,d"
         else:
             return f"for,{side[0]}"
+    
+    @staticmethod
+    def build_lay_bet_type(market_type: str, side: str, line: str = None) -> str:
+        """Constrói bet_type para LAY (exchange). Inverte o lado."""
+        if market_type == "AH":
+            h_or_a = "h" if side == "home" else "a"
+            if line is not None:
+                return f"against,ah,{h_or_a},{line}"
+            else:
+                return f"against,{h_or_a}"
+        elif market_type == "OU":
+            o_or_u = "o" if side in ("over", "home") else "u"
+            if line is not None:
+                return f"against,ou,{o_or_u},{line}"
+            else:
+                return f"against,{o_or_u}"
+        else:
+            return f"against,{side[0]}"

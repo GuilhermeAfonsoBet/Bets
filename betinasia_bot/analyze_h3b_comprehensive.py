@@ -124,6 +124,7 @@ async def main():
                 a.lag_click_to_betslip_ms,
                 a.reversal_direction,
                 a.market_period,
+                a.audit_version,
                 m.id as match_id,
                 m.kickoff_time,
                 m.home_score,
@@ -172,9 +173,10 @@ async def main():
             'lag_total': row[14] or 0,
             'lag_click': row[15] or 0, 'lag_bs': row[16] or 0,
             'direction': row[17], 'period': row[18],
-            'match_id': row[19], 'kickoff': row[20],
-            'home_score': row[21], 'away_score': row[22],
-            'match_status': row[23], 'closing_odd': row[24],
+            'version': row[19],
+            'match_id': row[20], 'kickoff': row[21],
+            'home_score': row[22], 'away_score': row[23],
+            'match_status': row[24], 'closing_odd': row[25],
         }
         
         # Calcula CLV WS e CLV BS
@@ -246,6 +248,15 @@ async def main():
                 d['diff_bucket'] = 'BS >> WS (> +10%)'
         else:
             d['diff_bucket'] = None
+        
+        # Classifica versão (modelo rápido vs lento)
+        v = d.get('version', '')
+        if v == 'v4.0-api':
+            d['model'] = 'API (2-4s)'
+        elif v in ('v1.0', 'v1.0-recovered'):
+            d['model'] = 'DOM (15-30s)'
+        else:
+            d['model'] = 'Outro'
         
         # Classifica linha AH
         try:
@@ -534,6 +545,71 @@ async def main():
             print_stats(f"ROI Betslip", roi, indent=5)
         if diff:
             print_stats(f"Diff BS vs WS", diff, indent=5)
+    
+    # ============================================================
+    # (viii) POR MODELO: API (2-4s) vs DOM (15-30s)
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("(viii) POR MODELO: API (2-4s) vs DOM (15-30s)")
+    print("=" * 70)
+    
+    for model in ['API (2-4s)', 'DOM (15-30s)']:
+        subset_all = [d for d in all_data if d['model'] == model]
+        subset_bs = [d for d in with_bs if d['model'] == model]
+        
+        if not subset_all:
+            continue
+        
+        n_bs = len(subset_bs)
+        n_clv = len([d for d in subset_bs if d.get('clv_bs') is not None and -50 < d['clv_bs'] < 50 and d['is_live'] == False])
+        n_roi = len([d for d in subset_bs if d.get('roi_bs') is not None])
+        
+        print(f"\n  === {model} ===")
+        print(f"    Total observacoes: {len(subset_all)}")
+        print(f"    Com betslip: {n_bs}")
+        print(f"    Com CLV (pre-match): {n_clv}")
+        print(f"    Com ROI: {n_roi}")
+        
+        if n_bs > 0:
+            avg_lag = sum(d['lag_total'] for d in subset_bs) / n_bs
+            print(f"    Lag medio: {avg_lag:.0f}ms")
+        
+        # CLV Bruto BS pre-match
+        clv_bs = [d['clv_bs'] for d in subset_bs if d.get('clv_bs') is not None and -50 < d['clv_bs'] < 50 and d['is_live'] == False]
+        if clv_bs:
+            print_stats(f"CLV Bruto BS Pre-Match ({model})", clv_bs, indent=5)
+        
+        # CLV Adicional BS pre-match
+        clv_bs_adic = [d['clv_bs_adicional'] for d in subset_bs if d.get('clv_bs_adicional') is not None and -50 < d['clv_bs_adicional'] < 50 and d['is_live'] == False]
+        if clv_bs_adic:
+            print_stats(f"CLV Adicional BS Pre-Match ({model})", clv_bs_adic, indent=5)
+        
+        # CLV Bruto WS pre-match
+        clv_ws = [d['clv_ws'] for d in subset_all if d.get('clv_ws') is not None and -50 < d['clv_ws'] < 50 and d['is_live'] == False]
+        if clv_ws:
+            print_stats(f"CLV Bruto WS Pre-Match ({model})", clv_ws, indent=5)
+        
+        # ROI BS
+        roi_bs = [d['roi_bs'] for d in subset_bs if d.get('roi_bs') is not None]
+        if roi_bs:
+            print_stats(f"ROI Betslip ({model})", roi_bs, indent=5)
+        
+        # ROI WS
+        roi_ws = [d['roi_ws'] for d in subset_all if d.get('roi_ws') is not None]
+        if roi_ws:
+            print_stats(f"ROI Websocket ({model})", roi_ws, indent=5)
+        
+        # Diff BS vs WS
+        diffs = [d['diff_pct'] for d in subset_bs if d['diff_pct'] is not None]
+        if diffs:
+            print_stats(f"Diff BS vs WS ({model})", diffs, indent=5)
+        
+        # BS > WS rate
+        if diffs:
+            bs_gt_ws = sum(1 for d in diffs if d > 0)
+            bs_gt_ws_2 = sum(1 for d in diffs if d > 2)
+            print(f"     BS > WS: {bs_gt_ws}/{len(diffs)} ({bs_gt_ws/len(diffs)*100:.1f}%)")
+            print(f"     BS > WS +2%: {bs_gt_ws_2}/{len(diffs)} ({bs_gt_ws_2/len(diffs)*100:.1f}%)")
     
     # ============================================================
     # DIAGNOSTICO DE QUALIDADE DOS DADOS
