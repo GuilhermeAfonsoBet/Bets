@@ -376,15 +376,28 @@ class H3bApiAudit:
             line=h3b['line'],
         )
 
-        # === T+0: BACK ===
-        back_result = await self.api_client.get_betslip_odds(
+        # === T+0: BACK + LAY SIMULTÂNEOS ===
+        back_task = self.api_client.get_betslip_odds(
             event_id=h3b['event_id'],
             bet_type=back_bet_type,
         )
+        lay_task = self.api_client.get_betslip_odds(
+            event_id=h3b['event_id'],
+            bet_type=lay_bet_type,
+            betslip_type="lay",
+        )
+        
+        back_result, lay_result = await asyncio.gather(back_task, lay_task, return_exceptions=True)
+        
+        # Trata exceções
+        if isinstance(back_result, Exception):
+            back_result = None
+        if isinstance(lay_result, Exception):
+            lay_result = None
 
         total_ms = int((time.time() - detected_at) * 1000)
-        post_ms = back_result.request_time_ms
-        pmm_ms = back_result.total_time_ms - post_ms
+        post_ms = back_result.request_time_ms if back_result else 0
+        pmm_ms = (back_result.total_time_ms - post_ms) if back_result else 0
 
         base = {
             'event_id': h3b['event_id'],
@@ -403,11 +416,11 @@ class H3bApiAudit:
             'pmm_ms': pmm_ms,
         }
 
-        if not back_result.success:
+        if not back_result or not back_result.success:
             base.update({
                 'success': False,
                 'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
-                'error': back_result.error,
+                'error': back_result.error if back_result else 'Back failed',
             })
             return base
 
@@ -427,23 +440,14 @@ class H3bApiAudit:
             'diff_pct': diff,
         })
 
-        # === T+0: LAY ===
-        try:
-            lay_result = await self.api_client.get_betslip_odds(
-                event_id=h3b['event_id'],
-                bet_type=lay_bet_type,
-                betslip_type="lay",
-            )
-            if lay_result.success:
-                # Para lay, a melhor odd é a MAIS BAIXA (menos liability)
-                lay_odds = sorted([b.best_price for b in lay_result.bookmakers if b.best_price > 0])
-                if lay_odds:
-                    base['lay_odd'] = lay_odds[0]  # Melhor (mais baixa) para layer
-                    base['lay_bookie'] = next(b.bookie for b in lay_result.bookmakers if b.best_price == lay_odds[0])
-                    base['lay_limit'] = next(b.max_stake for b in lay_result.bookmakers if b.best_price == lay_odds[0])
-                    base['lay_num_bk'] = len(lay_odds)
-        except Exception as e:
-            logger.debug(f"Lay falhou: {e}")
+        # Lay (capturado simultaneamente ao back)
+        if lay_result and lay_result.success:
+            lay_odds = sorted([b.best_price for b in lay_result.bookmakers if b.best_price > 0])
+            if lay_odds:
+                base['lay_odd'] = lay_odds[0]
+                base['lay_bookie'] = next(b.bookie for b in lay_result.bookmakers if b.best_price == lay_odds[0])
+                base['lay_limit'] = next(b.max_stake for b in lay_result.bookmakers if b.best_price == lay_odds[0])
+                base['lay_num_bk'] = len(lay_odds)
 
         # === MONITORAMENTO TEMPORAL (refresh a t+3, t+6, t+10, t+15, t+20) ===
         refresh_times = [3, 6, 10, 15, 20]
