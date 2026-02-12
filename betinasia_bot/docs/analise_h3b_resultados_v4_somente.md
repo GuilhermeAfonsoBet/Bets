@@ -149,37 +149,70 @@ Observação importante:
 Base usada para estimativa:
 - Bucket: **BS > WS (+2% a +10%)**
 - ROI Betslip (todos): média **+4,208%**, IC90 **[-9,433%, +17,848%]**, N=139 (não significativo).
+- Câmbio de referência: **USD/BRL = 5,20**.
 
-Premissas para conversão financeira:
-- Stake flat por aposta: **USD 500**
-- Cenários de volume mensal do combo: **150 / 340 / 500** apostas/mês
-  - 340/mês é cenário base de ritmo operacional atual do corte v4.
+Premissa de stake (ajustada):
+- **Não usar stake flat.**
+- Para cada aposta: `stake_i = f × stake_max_i`, onde `f` é a fração de execução sobre o stake máximo disponível no betslip.
+- Referência empírica de stake máximo (histórico operacional em planilhas da operação): média aproximada **USD 440** por oportunidade elegível.
 
-### 7.1 Lucro potencial e turnover mensal (com IC90)
+### 7.1 Validação da estimativa de volume (N/mês)
 
-| Cenário de volume | Turnover mensal (USD) | Lucro esperado (USD) | IC90 do lucro mensal (USD) |
-|---|---:|---:|---:|
-| 150 apostas/mês | 75.000 | +3.156 | [-7.075, +13.386] |
-| 340 apostas/mês (base) | 170.000 | +7.154 | [-16.036, +30.342] |
-| 500 apostas/mês | 250.000 | +10.520 | [-23.583, +44.620] |
+No corte atual, o bucket BS > WS +2% tem **N=150** ocorrências no período observado.  
+A projeção mensal depende diretamente da duração efetiva dessa janela:
+
+`N_mensal ≈ 150 × (30 / dias_da_janela_observada)`
+
+| Janela observada (dias) | Projeção N/mês | Apostas/dia |
+|---|---:|---:|
+| 10 | 450 | 15,0 |
+| 14 | 321 | 10,7 |
+| 21 | 214 | 7,1 |
+| 30 | 150 | 5,0 |
+| 45 | 100 | 3,3 |
 
 Leitura:
-- O upside potencial existe, mas o intervalo ainda cruza negativo de forma ampla.
-- Portanto, o combo é promissor, porém ainda sem robustez estatística para escalar agressivamente.
+- O cenário de **340/mês (~11/dia)** é coerente se a janela efetiva do N=150 for próxima de **13-14 dias**.
+- Se a janela real for mais longa (ex.: 30 dias), o volume esperado cai para ~150/mês.
 
-### 7.2 Banca exigida (estimativa de risco)
+### 7.2 Lucro potencial e turnover mensal (stake dinâmico)
 
-Método:
-- Aproximação normal do retorno por aposta (a partir do erro padrão observado no bucket).
-- Cálculo de downside mensal em p95/p99 e stress de 3 meses.
+Cenário base de volume: **340 apostas/mês**  
+Stake médio executado por aposta: `f × 440`
 
-Resultado para cenário base (340 apostas/mês, stake USD 500):
-- Downside mensal p95: **-USD 7.673**
-- Downside mensal p99: **-USD 13.810**
-- Stress p99 em 3 meses: **~USD 41.431**
-- Stress pelo limite inferior do IC90 (3 meses): **~USD 48.108**
+| Fração do stake máximo (f) | Stake médio (USD) | Turnover/mês (USD) | Lucro esperado/mês (USD) | IC90 lucro/mês (USD) | Lucro esperado/mês (BRL) | IC90 lucro/mês (BRL) |
+|---|---:|---:|---:|---:|---:|---:|
+| 25% | 110 | 37.400 | +1.574 | [-3.528, +6.675] | +8.184 | [-18.345, +34.712] |
+| 35% (base) | 154 | 52.360 | +2.203 | [-4.939, +9.345] | +11.457 | [-25.683, +48.595] |
+| 50% | 220 | 74.800 | +3.148 | [-7.056, +13.350] | +16.367 | [-36.691, +69.420] |
 
-**Banca sugerida para esta sleeve (combo BS > WS +2%): USD 50k a 65k**
+Leitura:
+- Mesmo com stake dinâmico, o intervalo ainda cruza negativo de forma ampla.
+- O combo tem upside, mas continua sem robustez estatística para escalar agressivamente.
+
+### 7.3 Sensibilidade por volume (f = 35% do stake máximo)
+
+| Apostas/mês | Turnover/mês (USD) | Lucro esperado/mês (USD) | IC90 lucro/mês (USD) | Lucro esperado/mês (BRL) | IC90 lucro/mês (BRL) |
+|---|---:|---:|---:|---:|---:|
+| 150 | 23.100 | +972 | [-2.179, +4.123] | +5.055 | [-11.331, +21.439] |
+| 340 | 52.360 | +2.203 | [-4.939, +9.345] | +11.457 | [-25.683, +48.595] |
+| 500 | 77.000 | +3.240 | [-7.263, +13.743] | +16.849 | [-37.769, +71.463] |
+| 800 | 123.200 | +5.184 | [-11.621, +21.989] | +26.958 | [-60.431, +114.342] |
+
+### 7.4 Banca exigida (sleeve do combo)
+
+Método (aproximação de risco):
+- Escalonamento da volatilidade mensal pela stake média executada.
+- Referência de downside mensal p99 no cenário base histórico ajustado para stake dinâmico.
+- Stress de 3 meses + fator de segurança.
+
+Para 340 apostas/mês:
+- `f=25%` -> downside mensal p99 ≈ **-USD 3.038**, stress 3m ≈ **USD 9.115**  
+- `f=35%` -> downside mensal p99 ≈ **-USD 4.254**, stress 3m ≈ **USD 12.761**  
+- `f=50%` -> downside mensal p99 ≈ **-USD 6.077**, stress 3m ≈ **USD 18.230**
+
+Faixa sugerida de banca (sleeve dedicada):
+- **USD 20k a 30k** (aprox. **BRL 104k a 156k**)
 
 Observação:
 - Essa faixa é para operar o combo como sleeve dedicada, não para banca total da operação.
