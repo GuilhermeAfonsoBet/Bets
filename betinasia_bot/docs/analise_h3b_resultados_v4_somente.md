@@ -22,17 +22,35 @@
 
 ## 2) Base comparativa v4: API vs DOM
 
-| Métrica | API (2-4s) | DOM (15-30s) |
+| Métrica | API (rótulo histórico 2-4s) | DOM (15-30s) |
 |---|---:|---:|
 | Total de observações | 1053 | 2843 |
 | Com betslip | 763 | 129 |
 | Com CLV pre-match | 35 | 45 |
 | Com ROI | 680 | 105 |
-| Lag médio | 11522 ms | 15170 ms |
+| Lag médio observado (fim-a-fim) | 11522 ms | 15170 ms |
 
 Leitura rápida:
 - API tem muito mais cobertura útil de betslip.
 - DOM concentra poucos casos com forte erosão de preço.
+
+Nota importante sobre lag:
+- O nome "API (2-4s)" é um rótulo operacional legado da arquitetura.
+- O valor de 11,5s é o **lag fim-a-fim observado** (detecção -> abertura -> extração no betslip), já incluindo overhead de fila, navegação e latência de execução.
+- Ou seja, o sistema API é mais rápido que DOM, mas hoje ainda acima do alvo teórico de 2-4s em média.
+
+### 2.1) Cobertura temporal (pre-match vs in-match) na rodada v4
+
+| Métrica | Pre-match | In-match | Observação |
+|---|---:|---:|---|
+| Observações totais com classificação temporal | 1568 | 1652 | Contagem bruta do corte v4 |
+| ROI Betslip | 379 | 403 | Amostra com resultado de aposta |
+| ROI WebSocket | 1430 | 1250 | Referência de mercado |
+| CLV Betslip (informativo) | 80 | 42 | Decisão prioriza CLV pre-match |
+
+Leitura:
+- Neste corte específico do v4, in-match ficou ligeiramente acima de pre-match no bruto (1652 vs 1568).
+- Isso pode ocorrer por cobertura de jogos ao vivo em ciclos longos e por filtros de disponibilidade (betslip/closing/resultados), não necessariamente por maior "densidade de oportunidade" intrínseca.
 
 ---
 
@@ -126,7 +144,49 @@ Observação importante:
 
 ---
 
-## 7) Conclusão objetiva da versão v4
+## 7) Estimativa econômica do combo BS > WS +2% (v4)
+
+Base usada para estimativa:
+- Bucket: **BS > WS (+2% a +10%)**
+- ROI Betslip (todos): média **+4,208%**, IC90 **[-9,433%, +17,848%]**, N=139 (não significativo).
+
+Premissas para conversão financeira:
+- Stake flat por aposta: **USD 500**
+- Cenários de volume mensal do combo: **150 / 340 / 500** apostas/mês
+  - 340/mês é cenário base de ritmo operacional atual do corte v4.
+
+### 7.1 Lucro potencial e turnover mensal (com IC90)
+
+| Cenário de volume | Turnover mensal (USD) | Lucro esperado (USD) | IC90 do lucro mensal (USD) |
+|---|---:|---:|---:|
+| 150 apostas/mês | 75.000 | +3.156 | [-7.075, +13.386] |
+| 340 apostas/mês (base) | 170.000 | +7.154 | [-16.036, +30.342] |
+| 500 apostas/mês | 250.000 | +10.520 | [-23.583, +44.620] |
+
+Leitura:
+- O upside potencial existe, mas o intervalo ainda cruza negativo de forma ampla.
+- Portanto, o combo é promissor, porém ainda sem robustez estatística para escalar agressivamente.
+
+### 7.2 Banca exigida (estimativa de risco)
+
+Método:
+- Aproximação normal do retorno por aposta (a partir do erro padrão observado no bucket).
+- Cálculo de downside mensal em p95/p99 e stress de 3 meses.
+
+Resultado para cenário base (340 apostas/mês, stake USD 500):
+- Downside mensal p95: **-USD 7.673**
+- Downside mensal p99: **-USD 13.810**
+- Stress p99 em 3 meses: **~USD 41.431**
+- Stress pelo limite inferior do IC90 (3 meses): **~USD 48.108**
+
+**Banca sugerida para esta sleeve (combo BS > WS +2%): USD 50k a 65k**
+
+Observação:
+- Essa faixa é para operar o combo como sleeve dedicada, não para banca total da operação.
+
+---
+
+## 8) Conclusão objetiva da versão v4
 
 1. **API (2-4s) é superior ao DOM (15-30s)** em qualidade de execução.
 2. **DOM permanece negativo em CLV de betslip pre-match** com significância estatística.
@@ -136,7 +196,7 @@ Observação importante:
 
 ---
 
-## 8) Recomendação operacional (somente v4)
+## 9) Recomendação operacional (somente v4)
 
 - Manter API como trilha principal.
 - Reduzir ainda mais latência e aumentar N de CLV pre-match no API.
