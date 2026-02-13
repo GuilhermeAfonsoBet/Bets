@@ -65,11 +65,20 @@ done
 
 run_psql() {
   local sql="$1"
+  local out rc
   if [[ "$USE_SUDO_PSQL" -eq 1 ]] && [[ "$(id -un)" != "$DB_USER" ]] && command -v sudo >/dev/null 2>&1; then
-    sudo -u "$DB_USER" psql "$DB_NAME" -c "$sql"
+    out="$(sudo -u "$DB_USER" psql -v ON_ERROR_STOP=1 "$DB_NAME" -c "$sql" 2>&1)"
+    rc=$?
   else
-    psql "$DB_NAME" -c "$sql"
+    out="$(psql -v ON_ERROR_STOP=1 "$DB_NAME" -c "$sql" 2>&1)"
+    rc=$?
   fi
+  if [[ "$rc" -ne 0 ]]; then
+    echo "[ERRO SQL] consulta falhou"
+    echo "$out"
+    return "$rc"
+  fi
+  printf "%s\n" "$out"
 }
 
 resolve_since_utc() {
@@ -123,10 +132,25 @@ WITH base AS (
 s AS (
   SELECT
     *,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms'),'')::numeric AS q_ms,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms'),'')::numeric AS pipe_ms,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms'),'')::numeric AS t_async_ms,
-    COALESCE((hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_deferred'),'false')::boolean AS temporal_deferred
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric
+      ELSE NULL
+    END AS q_ms,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
+      ELSE NULL
+    END AS pipe_ms,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms')::numeric
+      ELSE NULL
+    END AS t_async_ms,
+    CASE
+      WHEN LOWER(COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_deferred','false')) = 'true' THEN true
+      ELSE false
+    END AS temporal_deferred
   FROM base
 )
 SELECT
@@ -169,8 +193,16 @@ s AS (
     (hypothesis_details::jsonb -> 'lay') IS NOT NULL AS has_lay_t0,
     (hypothesis_details::jsonb -> 'lay_temporal') IS NOT NULL AS has_lay_temporal,
     (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL AS has_telemetry,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms'),'')::numeric AS q_ms,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms'),'')::numeric AS pipe_ms
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric
+      ELSE NULL
+    END AS q_ms,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
+      ELSE NULL
+    END AS pipe_ms
   FROM base
 )
 SELECT
@@ -217,8 +249,16 @@ tagged AS (
     END AS faixa,
     x.status,
     x.difference_pct,
-    NULLIF((x.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms'),'')::numeric AS q_ms,
-    NULLIF((x.hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms'),'')::numeric AS pipe_ms
+    CASE
+      WHEN COALESCE(x.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (x.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric
+      ELSE NULL
+    END AS q_ms,
+    CASE
+      WHEN COALESCE(x.hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (x.hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
+      ELSE NULL
+    END AS pipe_ms
   FROM base x
   CROSS JOIN bounds b
 )
@@ -289,10 +329,17 @@ WITH base AS (
 s AS (
   SELECT
     audited_at,
-    COALESCE((hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_deferred'),'false')::boolean AS temporal_deferred,
+    CASE
+      WHEN LOWER(COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_deferred','false')) = 'true' THEN true
+      ELSE false
+    END AS temporal_deferred,
     (hypothesis_details::jsonb -> 'temporal') IS NOT NULL AS has_back_temporal,
     (hypothesis_details::jsonb -> 'lay_temporal') IS NOT NULL AS has_lay_temporal,
-    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms'),'')::numeric AS temporal_async_ms
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_async_latency_ms')::numeric
+      ELSE NULL
+    END AS temporal_async_ms
   FROM base
 )
 SELECT
