@@ -250,7 +250,7 @@ SELECT
   COUNT(*) AS n_com_telemetry,
   ROUND(AVG(queue_wait_ms),1) AS queue_wait_ms,
   ROUND(AVG(queue_depth_at_enqueue),2) AS queue_depth_enq_avg,
-  ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_depth_at_enqueue),2) AS queue_depth_enq_p90,
+  ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_depth_at_enqueue))::numeric,2) AS queue_depth_enq_p90,
   ROUND(AVG(queue_depth_after_dequeue),2) AS queue_depth_deq_avg,
   ROUND(AVG(back_post_ms),1) AS back_post_ms,
   ROUND(AVG(back_pmm_ms),1) AS back_pmm_ms,
@@ -260,7 +260,7 @@ SELECT
   ROUND(AVG(db_save_ms),1) AS db_save_ms,
   ROUND(AVG(pipeline_total_ms),1) AS pipeline_total_ms,
   ROUND(AVG(queue_jobs_ahead_est),2) AS queue_jobs_ahead_est_avg,
-  ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_jobs_ahead_est),2) AS queue_jobs_ahead_est_p90
+  ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_jobs_ahead_est))::numeric,2) AS queue_jobs_ahead_est_p90
 FROM calc;
 "
 echo
