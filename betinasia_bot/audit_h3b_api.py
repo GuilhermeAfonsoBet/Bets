@@ -49,12 +49,14 @@ class H3bApiAudit:
         num_audits: int = 0,
         direction: str = "up",
         save_to_db: bool = True,
-        executor_workers: int = 2,
+        executor_workers: int = 4,
+        temporal_workers: int = 2,
     ):
         self.num_audits = num_audits
         self.direction = direction
         self.save_to_db = save_to_db
         self.executor_workers = max(1, int(executor_workers))
+        self.temporal_workers = max(0, int(temporal_workers))
 
         self.scraper: Optional[BetinAsiaScraper] = None
         self.api_client: Optional[ApiBetslipClient] = None
@@ -80,6 +82,8 @@ class H3bApiAudit:
         self.telemetry_file = "logs/audit_api_telemetry.jsonl"
         self.max_queue_depth_observed = 0
         self._queue_ref: Optional[asyncio.Queue] = None
+        self.max_temporal_queue_depth_observed = 0
+        self._temporal_queue_ref: Optional[asyncio.Queue] = None
 
     @staticmethod
     def _avg(values: List[float]) -> float:
@@ -187,13 +191,17 @@ class H3bApiAudit:
 
         audit_queue = asyncio.Queue()
         self._queue_ref = audit_queue
+        temporal_queue = asyncio.Queue()
+        self._temporal_queue_ref = temporal_queue
         audited = set()
 
         tasks = [asyncio.create_task(self._monitor_loop(audit_queue, audited))]
         for wid in range(1, self.executor_workers + 1):
             tasks.append(asyncio.create_task(self._executor_loop(audit_queue, worker_id=wid)))
+        for twid in range(1, self.temporal_workers + 1):
+            tasks.append(asyncio.create_task(self._temporal_loop(temporal_queue, worker_id=twid)))
         tasks.append(asyncio.create_task(self._maintenance_loop()))
-        logger.info(f"Executores API ativos: {self.executor_workers}")
+        logger.info(f"Executores T+0 ativos: {self.executor_workers} | Temporal workers: {self.temporal_workers}")
 
         try:
             while self.running:
@@ -378,19 +386,40 @@ class H3bApiAudit:
 
             h3b['dequeued_at'] = time.time()
             h3b['queue_depth_after_dequeue'] = queue.qsize()
-            result = await self._execute_api_audit(h3b)
+            defer_temporal = self.save_to_db and self.temporal_workers > 0
+            result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
             telemetry = result.setdefault('telemetry', {})
             telemetry['worker_id'] = worker_id
             telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
             telemetry['executor_total_ms_pre_db'] = int((time.time() - h3b['dequeued_at']) * 1000)
             db_t0 = time.time()
+            record_id = None
             if self.save_to_db:
-                await self._save_result(result)
+                record_id = await self._save_result(result)
             telemetry['db_save_ms'] = int((time.time() - db_t0) * 1000) if self.save_to_db else 0
             telemetry['pipeline_total_ms'] = int((time.time() - h3b['detected_at']) * 1000)
             telemetry['executor_total_ms'] = int((time.time() - h3b['dequeued_at']) * 1000)
             self._emit_audit_telemetry(result)
             self.results.append(result)
+
+            temporal_refs = result.get('_temporal_refs')
+            if defer_temporal and record_id and temporal_refs and self._temporal_queue_ref:
+                temporal_job = {
+                    'record_id': record_id,
+                    'event_id': result.get('event_id'),
+                    'home_team': result.get('home_team'),
+                    'away_team': result.get('away_team'),
+                    'ws_odd': temporal_refs.get('ws_odd'),
+                    'back_betslip_id': temporal_refs.get('back_betslip_id', ''),
+                    'lay_betslip_id': temporal_refs.get('lay_betslip_id', ''),
+                    'telemetry_base': dict(telemetry),
+                    'queued_at': time.time(),
+                }
+                self._temporal_queue_ref.put_nowait(temporal_job)
+                self.max_temporal_queue_depth_observed = max(
+                    self.max_temporal_queue_depth_observed,
+                    self._temporal_queue_ref.qsize()
+                )
 
             # Log
             live = "LIVE" if result.get('is_live') else "PRE" if result.get('is_live') is not None else "?"
@@ -401,13 +430,14 @@ class H3bApiAudit:
                     lay_str = f" lay={result['lay_odd']:.3f}({result.get('lay_bookie','')})"
                 q_ms = telemetry.get('queue_wait_ms', 0)
                 temp_ms = telemetry.get('temporal_total_ms', 0)
+                temp_part = "deferred" if telemetry.get('temporal_deferred') else f"{temp_ms}ms"
                 logger.info(
                     f"[OK][{live}] {result['home_team']} vs {result['away_team']} | "
                     f"{result['market_type']} {result['line']} {result['side']} | "
                     f"ws={result['ws_odd']:.3f} bs={result['bs_odd']:.3f} "
                     f"diff={result['diff_pct']:+.2f}% lim=${result['bs_limit']:,.0f} "
                     f"({result['num_bk']} bk){lay_str} | "
-                    f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_ms}ms w={worker_id} | "
+                    f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_part} w={worker_id} | "
                     f"{len(self.results)}")
             else:
                 self.total_errors += 1
@@ -420,7 +450,168 @@ class H3bApiAudit:
             if len(self.results) % STATS_INTERVAL == 0:
                 self._log_stats()
 
-    async def _execute_api_audit(self, h3b: dict) -> dict:
+    async def _collect_temporal_series(self, ws_odd: float, back_betslip_id: str, lay_betslip_id: str):
+        refresh_times = [3, 6, 10, 15, 20]
+        back_temporal = []
+        lay_temporal = []
+        temporal_points = []
+        temporal_refresh_durations = []
+        temporal_wait_ms = 0
+
+        def _extract_lay_snapshot(api_result: Optional[BetslipApiResult]) -> Optional[dict]:
+            if not api_result or not api_result.success:
+                return None
+            lay_bookmakers = [b for b in api_result.bookmakers if b.best_price > 0]
+            if not lay_bookmakers:
+                return None
+            best = min(lay_bookmakers, key=lambda b: b.best_price)
+            return {
+                'odd': best.best_price,
+                'bookie': best.bookie,
+                'limit': best.max_stake,
+                'num_bk': len(lay_bookmakers),
+            }
+
+        temporal_start = time.time()
+        if back_betslip_id or lay_betslip_id:
+            t_start = time.time()
+            for target_t in refresh_times:
+                elapsed = time.time() - t_start
+                wait = target_t - elapsed
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    temporal_wait_ms += int(wait * 1000)
+
+                labels = []
+                refresh_calls = []
+                if back_betslip_id:
+                    labels.append("back")
+                    refresh_calls.append(self.api_client.refresh_betslip(back_betslip_id))
+                if lay_betslip_id:
+                    labels.append("lay")
+                    refresh_calls.append(self.api_client.refresh_betslip(lay_betslip_id))
+
+                if not refresh_calls:
+                    break
+
+                refresh_t0 = time.time()
+                refresh_results = await asyncio.gather(*refresh_calls, return_exceptions=True)
+                refresh_ms = int((time.time() - refresh_t0) * 1000)
+                temporal_refresh_durations.append(refresh_ms)
+                actual_t = round(time.time() - t_start, 1)
+                point_meta = {
+                    'target_s': target_t,
+                    'actual_s': actual_t,
+                    'refresh_ms': refresh_ms,
+                    'back_ok': False,
+                    'lay_ok': False,
+                }
+
+                for label, ref in zip(labels, refresh_results):
+                    if isinstance(ref, Exception):
+                        logger.debug(f"Refresh {label} t+{target_t} falhou: {ref}")
+                        continue
+                    if not ref or not ref.success:
+                        continue
+
+                    if label == "back":
+                        ref_diff = ((ref.best_odd - ws_odd) / ws_odd) * 100 if ws_odd else 0
+                        back_temporal.append({
+                            't': actual_t,
+                            'bs_odd': ref.best_odd,
+                            'diff_pct': round(ref_diff, 3),
+                            'bookie': ref.best_bookie,
+                            'limit': ref.best_limit,
+                            'num_bk': ref.num_bookmakers,
+                        })
+                        point_meta['back_ok'] = True
+                    else:
+                        lay_ref = _extract_lay_snapshot(ref)
+                        if lay_ref:
+                            lay_diff = ((lay_ref['odd'] - ws_odd) / ws_odd) * 100 if ws_odd else 0
+                            lay_temporal.append({
+                                't': actual_t,
+                                'lay_odd': lay_ref['odd'],
+                                'diff_pct': round(lay_diff, 3),
+                                'bookie': lay_ref['bookie'],
+                                'limit': lay_ref['limit'],
+                                'num_bk': lay_ref['num_bk'],
+                            })
+                            point_meta['lay_ok'] = True
+
+                temporal_points.append(point_meta)
+
+        temporal_total_ms = int((time.time() - temporal_start) * 1000) if (back_betslip_id or lay_betslip_id) else 0
+        telemetry_patch = {
+            'temporal_total_ms': temporal_total_ms,
+            'temporal_wait_ms': temporal_wait_ms,
+            'temporal_refresh_mean_ms': int(self._avg(temporal_refresh_durations)) if temporal_refresh_durations else 0,
+            'temporal_points_back': len(back_temporal),
+            'temporal_points_lay': len(lay_temporal),
+            'temporal_points': temporal_points,
+            'temporal_deferred': False,
+        }
+        return back_temporal, lay_temporal, telemetry_patch
+
+    async def _patch_temporal_result(self, record_id: int, back_temporal: list, lay_temporal: list, telemetry: dict):
+        if not self.db or not record_id:
+            return
+        patch = {'telemetry': telemetry}
+        if back_temporal:
+            patch['temporal'] = back_temporal
+        if lay_temporal:
+            patch['lay_temporal'] = lay_temporal
+
+        async with self.db.async_session() as session:
+            await session.execute(
+                text("""
+                    UPDATE betslip_audit_results
+                    SET hypothesis_details = (
+                        COALESCE(hypothesis_details::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)
+                    )::json
+                    WHERE id = :id
+                """),
+                {"id": record_id, "patch": json.dumps(patch, ensure_ascii=False)},
+            )
+            await session.commit()
+
+    async def _temporal_loop(self, queue: asyncio.Queue, worker_id: int = 1):
+        logger.info(f"Temporal worker iniciado (worker={worker_id})")
+        while self.running:
+            try:
+                job = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                back_temporal, lay_temporal, telemetry_patch = await self._collect_temporal_series(
+                    ws_odd=job.get('ws_odd', 0) or 0,
+                    back_betslip_id=job.get('back_betslip_id', ''),
+                    lay_betslip_id=job.get('lay_betslip_id', ''),
+                )
+                telemetry_final = dict(job.get('telemetry_base') or {})
+                telemetry_final.update(telemetry_patch)
+                telemetry_final['temporal_worker_id'] = worker_id
+                telemetry_final['temporal_async_latency_ms'] = int((time.time() - job.get('queued_at', time.time())) * 1000)
+                await self._patch_temporal_result(
+                    record_id=job.get('record_id'),
+                    back_temporal=back_temporal,
+                    lay_temporal=lay_temporal,
+                    telemetry=telemetry_final,
+                )
+
+                if back_temporal or lay_temporal:
+                    logger.info(
+                        f"[TEMPORAL][w={worker_id}] id={job.get('record_id')} "
+                        f"back_pts={len(back_temporal)} lay_pts={len(lay_temporal)} "
+                        f"ms={telemetry_patch.get('temporal_total_ms', 0)}"
+                    )
+            except Exception as e:
+                logger.warning(f"[TEMPORAL][w={worker_id}] falha no processamento: {e}")
+            finally:
+                queue.task_done()
+
+    async def _execute_api_audit(self, h3b: dict, run_temporal: bool = True) -> dict:
         detected_at = h3b['detected_at']
         execution_start = time.time()
         queue_wait_ms = int((execution_start - detected_at) * 1000)
@@ -571,102 +762,38 @@ class H3bApiAudit:
             base['lay_limit'] = lay_snapshot['limit']
             base['lay_num_bk'] = lay_snapshot['num_bk']
 
-        # === MONITORAMENTO TEMPORAL (BACK + LAY) ===
-        refresh_times = [3, 6, 10, 15, 20]
-        back_temporal = []
-        lay_temporal = []
-        temporal_points = []
-        temporal_refresh_durations = []
-        temporal_wait_ms = 0
-
         back_betslip_id = back_result.betslip_id if back_result and back_result.success else ""
         lay_betslip_id = lay_result.betslip_id if lay_result and lay_result.success else ""
-
-        temporal_start = time.time()
-        if back_betslip_id or lay_betslip_id:
-            t_start = time.time()
-            for target_t in refresh_times:
-                elapsed = time.time() - t_start
-                wait = target_t - elapsed
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                    temporal_wait_ms += int(wait * 1000)
-
-                labels = []
-                refresh_calls = []
-                if back_betslip_id:
-                    labels.append("back")
-                    refresh_calls.append(self.api_client.refresh_betslip(back_betslip_id))
-                if lay_betslip_id:
-                    labels.append("lay")
-                    refresh_calls.append(self.api_client.refresh_betslip(lay_betslip_id))
-
-                if not refresh_calls:
-                    break
-
-                refresh_t0 = time.time()
-                refresh_results = await asyncio.gather(*refresh_calls, return_exceptions=True)
-                refresh_ms = int((time.time() - refresh_t0) * 1000)
-                temporal_refresh_durations.append(refresh_ms)
-                actual_t = round(time.time() - t_start, 1)
-                point_meta = {
-                    'target_s': target_t,
-                    'actual_s': actual_t,
-                    'refresh_ms': refresh_ms,
-                    'back_ok': False,
-                    'lay_ok': False,
+        has_temporal_refs = bool(back_betslip_id or lay_betslip_id)
+        if run_temporal and has_temporal_refs:
+            back_temporal, lay_temporal, telemetry_patch = await self._collect_temporal_series(
+                ws_odd=ws_odd,
+                back_betslip_id=back_betslip_id,
+                lay_betslip_id=lay_betslip_id,
+            )
+            telemetry.update(telemetry_patch)
+            if back_temporal:
+                base['temporal'] = back_temporal
+                evol = " -> ".join([f"t+{t['t']:.0f}s:{t['bs_odd']:.3f}({t['diff_pct']:+.1f}%)" for t in back_temporal])
+                logger.info(f"  Temporal BACK: {evol}")
+            if lay_temporal:
+                base['lay_temporal'] = lay_temporal
+                evol_lay = " -> ".join([f"t+{t['t']:.0f}s:{t['lay_odd']:.3f}({t['diff_pct']:+.1f}%)" for t in lay_temporal])
+                logger.info(f"  Temporal LAY: {evol_lay}")
+        else:
+            telemetry['temporal_total_ms'] = 0
+            telemetry['temporal_wait_ms'] = 0
+            telemetry['temporal_refresh_mean_ms'] = 0
+            telemetry['temporal_points_back'] = 0
+            telemetry['temporal_points_lay'] = 0
+            telemetry['temporal_points'] = []
+            telemetry['temporal_deferred'] = has_temporal_refs and (not run_temporal)
+            if has_temporal_refs and (not run_temporal):
+                base['_temporal_refs'] = {
+                    'ws_odd': ws_odd,
+                    'back_betslip_id': back_betslip_id,
+                    'lay_betslip_id': lay_betslip_id,
                 }
-
-                for label, ref in zip(labels, refresh_results):
-                    if isinstance(ref, Exception):
-                        logger.debug(f"Refresh {label} t+{target_t} falhou: {ref}")
-                        continue
-                    if not ref or not ref.success:
-                        continue
-
-                    if label == "back":
-                        ref_diff = ((ref.best_odd - ws_odd) / ws_odd) * 100 if ws_odd else 0
-                        back_temporal.append({
-                            't': actual_t,
-                            'bs_odd': ref.best_odd,
-                            'diff_pct': round(ref_diff, 3),
-                            'bookie': ref.best_bookie,
-                            'limit': ref.best_limit,
-                            'num_bk': ref.num_bookmakers,
-                        })
-                        point_meta['back_ok'] = True
-                    else:
-                        lay_ref = _extract_lay_snapshot(ref)
-                        if lay_ref:
-                            lay_diff = ((lay_ref['odd'] - ws_odd) / ws_odd) * 100 if ws_odd else 0
-                            lay_temporal.append({
-                                't': actual_t,
-                                'lay_odd': lay_ref['odd'],
-                                'diff_pct': round(lay_diff, 3),
-                                'bookie': lay_ref['bookie'],
-                                'limit': lay_ref['limit'],
-                                'num_bk': lay_ref['num_bk'],
-                            })
-                            point_meta['lay_ok'] = True
-
-                temporal_points.append(point_meta)
-
-        temporal_total_ms = int((time.time() - temporal_start) * 1000) if (back_betslip_id or lay_betslip_id) else 0
-        telemetry['temporal_total_ms'] = temporal_total_ms
-        telemetry['temporal_wait_ms'] = temporal_wait_ms
-        telemetry['temporal_refresh_mean_ms'] = int(self._avg(temporal_refresh_durations)) if temporal_refresh_durations else 0
-        telemetry['temporal_points_back'] = len(back_temporal)
-        telemetry['temporal_points_lay'] = len(lay_temporal)
-        telemetry['temporal_points'] = temporal_points
-
-        if back_temporal:
-            base['temporal'] = back_temporal
-            evol = " -> ".join([f"t+{t['t']:.0f}s:{t['bs_odd']:.3f}({t['diff_pct']:+.1f}%)" for t in back_temporal])
-            logger.info(f"  Temporal BACK: {evol}")
-        if lay_temporal:
-            base['lay_temporal'] = lay_temporal
-            evol_lay = " -> ".join([f"t+{t['t']:.0f}s:{t['lay_odd']:.3f}({t['diff_pct']:+.1f}%)" for t in lay_temporal])
-            logger.info(f"  Temporal LAY: {evol_lay}")
 
         end_to_end_ms = int((time.time() - detected_at) * 1000)
         telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
@@ -683,7 +810,7 @@ class H3bApiAudit:
     # ================================================================
     async def _save_result(self, r: dict):
         if not self.db:
-            return
+            return None
         try:
             detected_ts = r.get('detected_at')
             detected_dt = datetime.fromtimestamp(detected_ts, tz=timezone.utc) if detected_ts else None
@@ -739,8 +866,10 @@ class H3bApiAudit:
             async with self.db.async_session() as session:
                 session.add(record)
                 await session.commit()
+                return record.id
         except Exception as e:
             logger.warning(f"Erro salvando: {e}")
+        return None
 
     # ================================================================
     # MAINTENANCE
@@ -753,11 +882,13 @@ class H3bApiAudit:
             uptime = time.time() - self._start_time
             ok_count = sum(1 for r in self.results if r.get('success'))
             queue_now = self._queue_ref.qsize() if self._queue_ref else 0
+            temporal_queue_now = self._temporal_queue_ref.qsize() if self._temporal_queue_ref else 0
 
             logger.info(
                 f"[STATS] WS: {self._ws_msg_count} msgs, {self._ws_msg_count/max(1,uptime):.1f}/s, "
                 f"last {ws_age:.0f}s | "
-                f"Fila: now={queue_now} max={self.max_queue_depth_observed} | "
+                f"Fila T+0: now={queue_now} max={self.max_queue_depth_observed} | "
+                f"Fila temporal: now={temporal_queue_now} max={self.max_temporal_queue_depth_observed} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
                 f"H3B: {self.h3b_detected} | Erros: {self.total_errors}")
 
@@ -847,8 +978,14 @@ async def main():
     parser.add_argument(
         "--executor-workers",
         type=int,
-        default=int(os.getenv("AUDIT_EXECUTOR_WORKERS", "2")),
+        default=int(os.getenv("AUDIT_EXECUTOR_WORKERS", "4")),
         help="Quantidade de workers paralelos do executor API",
+    )
+    parser.add_argument(
+        "--temporal-workers",
+        type=int,
+        default=int(os.getenv("AUDIT_TEMPORAL_WORKERS", "2")),
+        help="Quantidade de workers paralelos para monitoramento temporal assíncrono",
     )
     args = parser.parse_args()
 
@@ -864,6 +1001,7 @@ async def main():
         direction=args.direction,
         save_to_db=not args.no_db,
         executor_workers=args.executor_workers,
+        temporal_workers=args.temporal_workers,
     )
     await audit.run()
 
