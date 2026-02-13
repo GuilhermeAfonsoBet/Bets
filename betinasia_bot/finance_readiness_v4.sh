@@ -44,11 +44,20 @@ done
 
 run_psql() {
   local sql="$1"
+  local out rc
   if [[ "$USE_SUDO_PSQL" -eq 1 ]] && [[ "$(id -un)" != "$DB_USER" ]] && command -v sudo >/dev/null 2>&1; then
-    sudo -u "$DB_USER" psql "$DB_NAME" -c "$sql"
+    out="$(sudo -u "$DB_USER" psql -v ON_ERROR_STOP=1 "$DB_NAME" -c "$sql" 2>&1)"
+    rc=$?
   else
-    psql "$DB_NAME" -c "$sql"
+    out="$(psql -v ON_ERROR_STOP=1 "$DB_NAME" -c "$sql" 2>&1)"
+    rc=$?
   fi
+  if [[ "$rc" -ne 0 ]]; then
+    echo "[ERRO SQL] consulta falhou"
+    echo "$out"
+    return "$rc"
+  fi
+  printf "%s\n" "$out"
 }
 
 echo "====================================================================="
@@ -72,7 +81,15 @@ SELECT
   COUNT(*) FILTER (WHERE betslip_odd IS NOT NULL) AS n_back_odd,
   COUNT(*) FILTER (WHERE betslip_limit IS NOT NULL AND betslip_limit > 0) AS n_back_limit,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'lay' ->> 'odd') IS NOT NULL) AS n_lay_odd,
-  COUNT(*) FILTER (WHERE COALESCE((hypothesis_details::jsonb -> 'lay' ->> 'limit')::numeric, 0) > 0) AS n_lay_limit,
+  COUNT(*) FILTER (
+    WHERE (
+      CASE
+        WHEN COALESCE(hypothesis_details::jsonb -> 'lay' ->> 'limit','') ~ '^-?[0-9]+([.][0-9]+)?$'
+        THEN (hypothesis_details::jsonb -> 'lay' ->> 'limit')::numeric
+        ELSE 0
+      END
+    ) > 0
+  ) AS n_lay_limit,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'finance') IS NOT NULL) AS n_finance_block,
   ROUND(100.0 * COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'finance') IS NOT NULL) / NULLIF(COUNT(*),0), 1) AS finance_cov_pct,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL) AS n_telemetry
