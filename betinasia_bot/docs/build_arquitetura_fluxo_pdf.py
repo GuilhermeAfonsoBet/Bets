@@ -132,9 +132,9 @@ def page_old_architecture(c: canvas.Canvas) -> None:
         "Fluxo principal antes da separacao T+0 x temporal",
     )
 
-    top_y = PAGE_H - MARGIN - 90
+    top_y = PAGE_H - MARGIN - 220  # abaixo do header com folga
     box_w = 78 * mm
-    box_h = 34 * mm
+    box_h = 28 * mm
 
     draw_box(
         c, MARGIN, top_y, box_w, box_h,
@@ -143,47 +143,47 @@ def page_old_architecture(c: canvas.Canvas) -> None:
         fill="#e0f2fe", stroke="#7dd3fc"
     )
     draw_box(
-        c, MARGIN + 92 * mm, top_y, 42 * mm, box_h,
+        c, MARGIN + 92 * mm, top_y, 40 * mm, box_h,
         "Fila unica",
         ["Eventos aguardam", "Ordem FIFO"],
         fill="#fef3c7", stroke="#fcd34d"
     )
     draw_box(
-        c, MARGIN + 140 * mm, top_y, 45 * mm, box_h,
+        c, MARGIN + 138 * mm, top_y, 48 * mm, box_h,
         "Worker",
         ["1 worker (ou poucos)", "Sem separacao de etapa"],
         fill="#fee2e2", stroke="#fca5a5"
     )
 
-    draw_arrow(c, MARGIN + box_w, top_y + 17 * mm, MARGIN + 92 * mm, top_y + 17 * mm)
-    draw_arrow(c, MARGIN + 134 * mm, top_y + 17 * mm, MARGIN + 140 * mm, top_y + 17 * mm)
+    draw_arrow(c, MARGIN + box_w, top_y + 14 * mm, MARGIN + 92 * mm, top_y + 14 * mm)
+    draw_arrow(c, MARGIN + 132 * mm, top_y + 14 * mm, MARGIN + 138 * mm, top_y + 14 * mm)
 
-    y2 = top_y - 58 * mm
+    y2 = top_y - 42 * mm
     draw_box(
-        c, MARGIN + 20 * mm, y2, 70 * mm, 46 * mm,
+        c, MARGIN + 18 * mm, y2, 72 * mm, 34 * mm,
         "Etapa T+0",
         ["Back/Lay API", "Captura odd imediata", "Rapida (segundos)"],
         fill="#dcfce7", stroke="#86efac"
     )
     draw_box(
-        c, MARGIN + 98 * mm, y2, 70 * mm, 46 * mm,
+        c, MARGIN + 98 * mm, y2, 72 * mm, 34 * mm,
         "Etapa temporal",
         ["Refresh t+3/6/10/15/20", "Acompanha curva", "Lenta (~20s+)"],
         fill="#ede9fe", stroke="#c4b5fd"
     )
-    draw_arrow(c, MARGIN + 162 * mm, top_y, MARGIN + 162 * mm, y2 + 46 * mm, "processa")
-    draw_arrow(c, MARGIN + 90 * mm, y2 + 23 * mm, MARGIN + 98 * mm, y2 + 23 * mm, "depois")
+    draw_arrow(c, MARGIN + 162 * mm, top_y, MARGIN + 162 * mm, y2 + 34 * mm, None)
+    draw_arrow(c, MARGIN + 90 * mm, y2 + 17 * mm, MARGIN + 98 * mm, y2 + 17 * mm, None)
 
-    y3 = y2 - 44 * mm
+    y3 = y2 - 30 * mm
     draw_box(
-        c, MARGIN + 52 * mm, y3, 95 * mm, 28 * mm,
+        c, MARGIN + 48 * mm, y3, 100 * mm, 22 * mm,
         "Banco de dados",
         ["Grava resultado ao final", "Fila cresce quando worker fica ocupado"],
         fill="#f1f5f9", stroke="#94a3b8"
     )
-    draw_arrow(c, MARGIN + 133 * mm, y2, MARGIN + 133 * mm, y3 + 28 * mm)
+    draw_arrow(c, MARGIN + 133 * mm, y2, MARGIN + 133 * mm, y3 + 22 * mm)
 
-    ytxt = y3 - 22
+    ytxt = y3 - 18
     ytxt = draw_paragraph(
         c,
         MARGIN,
@@ -208,60 +208,60 @@ def page_new_architecture(c: canvas.Canvas) -> None:
         "Separacao de esteiras: pool T+0 (4) e pool temporal (2)",
     )
 
-    y = PAGE_H - MARGIN - 88
+    y = PAGE_H - MARGIN - 210
     draw_box(
-        c, MARGIN, y, 68 * mm, 32 * mm,
+        c, MARGIN, y, 68 * mm, 26 * mm,
         "Detector H3B (WS)",
         ["Detecta sinal", "Envia para fila T+0"],
         fill="#e0f2fe", stroke="#7dd3fc"
     )
     draw_box(
-        c, MARGIN + 74 * mm, y, 38 * mm, 32 * mm,
+        c, MARGIN + 74 * mm, y, 38 * mm, 26 * mm,
         "Fila T+0",
         ["Critica", "Prioridade alta"],
         fill="#fef3c7", stroke="#fcd34d"
     )
     draw_box(
-        c, MARGIN + 118 * mm, y, 68 * mm, 32 * mm,
+        c, MARGIN + 118 * mm, y, 68 * mm, 26 * mm,
         "Pool T+0 (4 workers)",
         ["So captura imediata", "worker_id 1..4"],
         fill="#dcfce7", stroke="#86efac"
     )
-    draw_arrow(c, MARGIN + 68 * mm, y + 16 * mm, MARGIN + 74 * mm, y + 16 * mm)
-    draw_arrow(c, MARGIN + 112 * mm, y + 16 * mm, MARGIN + 118 * mm, y + 16 * mm)
+    draw_arrow(c, MARGIN + 68 * mm, y + 13 * mm, MARGIN + 74 * mm, y + 13 * mm)
+    draw_arrow(c, MARGIN + 112 * mm, y + 13 * mm, MARGIN + 118 * mm, y + 13 * mm)
 
-    y2 = y - 52 * mm
+    y2 = y - 40 * mm
     draw_box(
-        c, MARGIN + 12 * mm, y2, 72 * mm, 36 * mm,
+        c, MARGIN + 10 * mm, y2, 74 * mm, 30 * mm,
         "Banco: registro inicial",
         ["Resultado T+0 rapido", "telemetria de fila", "temporal_deferred=true"],
         fill="#f1f5f9", stroke="#94a3b8"
     )
     draw_box(
-        c, MARGIN + 92 * mm, y2 + 2 * mm, 34 * mm, 30 * mm,
+        c, MARGIN + 92 * mm, y2 + 2 * mm, 34 * mm, 26 * mm,
         "Fila temporal",
         ["jobs de curva"],
         fill="#fef3c7", stroke="#fcd34d"
     )
     draw_box(
-        c, MARGIN + 132 * mm, y2, 54 * mm, 36 * mm,
+        c, MARGIN + 132 * mm, y2, 54 * mm, 30 * mm,
         "Pool temporal (2)",
         ["t+3/6/10/15/20", "temporal_worker_id"],
         fill="#ede9fe", stroke="#c4b5fd"
     )
-    draw_arrow(c, MARGIN + 152 * mm, y, MARGIN + 152 * mm, y2 + 36 * mm, "enqueue")
-    draw_arrow(c, MARGIN + 126 * mm, y2 + 18 * mm, MARGIN + 132 * mm, y2 + 18 * mm)
+    draw_arrow(c, MARGIN + 152 * mm, y, MARGIN + 152 * mm, y2 + 30 * mm, None)
+    draw_arrow(c, MARGIN + 126 * mm, y2 + 15 * mm, MARGIN + 132 * mm, y2 + 15 * mm, None)
 
-    y3 = y2 - 40 * mm
+    y3 = y2 - 26 * mm
     draw_box(
-        c, MARGIN + 46 * mm, y3, 112 * mm, 28 * mm,
+        c, MARGIN + 42 * mm, y3, 116 * mm, 22 * mm,
         "Banco: patch temporal",
         ["Atualiza hypothesis_details com temporal, lay_temporal e telemetria final"],
         fill="#f1f5f9", stroke="#94a3b8"
     )
-    draw_arrow(c, MARGIN + 158 * mm, y2, MARGIN + 158 * mm, y3 + 28 * mm)
+    draw_arrow(c, MARGIN + 158 * mm, y2, MARGIN + 158 * mm, y3 + 22 * mm)
 
-    ytxt = y3 - 20
+    ytxt = y3 - 16
     ytxt = draw_paragraph(
         c,
         MARGIN,
@@ -286,9 +286,9 @@ def page_impacts(c: canvas.Canvas) -> None:
     )
 
     x = MARGIN
-    y = PAGE_H - MARGIN - 80
+    y = PAGE_H - MARGIN - 130
     col_w = [70 * mm, 48 * mm, 48 * mm]
-    row_h = 11 * mm
+    row_h = 9.5 * mm
     rows = [
         ("Indicador", "Antes", "Depois (Fase 1)"),
         ("Queue depth enq (media)", "6.93", "0.04"),
@@ -312,7 +312,7 @@ def page_impacts(c: canvas.Canvas) -> None:
             c.setFont("Helvetica-Bold" if r_idx == 0 else "Helvetica", 8.5)
             c.drawString(xx + 4, yy - row_h + 4, str(val))
 
-    ytxt = y - len(rows) * row_h - 18
+    ytxt = y - len(rows) * row_h - 14
     ytxt = draw_paragraph(
         c,
         MARGIN,
@@ -329,14 +329,15 @@ def page_impacts(c: canvas.Canvas) -> None:
         PAGE_W - 2 * MARGIN,
     )
 
+    boxes_y = ytxt - 70
     draw_box(
-        c, MARGIN, ytxt - 40, 84 * mm, 34 * mm,
+        c, MARGIN, boxes_y, 84 * mm, 28 * mm,
         "Recomendacao atual",
         ["Manter 4 workers T+0", "Manter 2 workers temporal", "Reavaliar com janela 12-24h"],
         fill="#dcfce7", stroke="#86efac"
     )
     draw_box(
-        c, MARGIN + 92 * mm, ytxt - 40, 94 * mm, 34 * mm,
+        c, MARGIN + 92 * mm, boxes_y, 94 * mm, 28 * mm,
         "Gatilhos para proxima mudanca",
         ["Se p95 fila T+0 > 1s: subir T+0", "Se temporal acumular: subir temporal", "Sempre monitorar CPU/RAM/proxy"],
         fill="#fef3c7", stroke="#fcd34d"
@@ -349,7 +350,7 @@ def page_roadmap(c: canvas.Canvas) -> None:
         "Proposta de evolucao da arquitetura (proxima versao)",
         "Roadmap simples para estabilidade + latencia baixa",
     )
-    y = PAGE_H - MARGIN - 72
+    y = PAGE_H - MARGIN - 96
     items = [
         ("Fase 1 (ja ativa)", "Separar T+0 e temporal; pools 4/2; telemetria de fila"),
         ("Fase 2", "Autoajuste de workers por meta (p95 fila T+0 < 1s)"),
@@ -357,16 +358,16 @@ def page_roadmap(c: canvas.Canvas) -> None:
         ("Fase 4", "Dashboard com p50/p90/p95/p99 e custo de proxy por worker"),
     ]
     for i, (title, desc) in enumerate(items, start=1):
-        yy = y - (i - 1) * 34 * mm
+        yy = y - (i - 1) * 30 * mm
         draw_box(
-            c, MARGIN, yy - 24 * mm, 186 * mm, 22 * mm,
+            c, MARGIN, yy - 20 * mm, 186 * mm, 18 * mm,
             f"{i}. {title}",
             [desc],
             fill="#f8fafc",
             stroke="#cbd5e1",
         )
 
-    note_y = y - len(items) * 34 * mm + 8
+    note_y = y - len(items) * 30 * mm - 8
     draw_paragraph(
         c,
         MARGIN,
