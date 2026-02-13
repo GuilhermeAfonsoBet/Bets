@@ -331,6 +331,7 @@ class H3bApiAudit:
 
                 is_live = kickoff <= datetime.now(timezone.utc) if kickoff else None
 
+                queue_depth_at_enqueue = queue.qsize()
                 queue.put_nowait({
                     'event_id': event_id,
                     'audit_key': audit_key,
@@ -346,6 +347,7 @@ class H3bApiAudit:
                     'websocket_odd': h3b.odd_at_reversal,
                     'direction': h3b.direction_after,
                     'detected_at': time.time(),
+                    'queue_depth_at_enqueue': queue_depth_at_enqueue,
                 })
                 audited.add(audit_key)
 
@@ -364,8 +366,11 @@ class H3bApiAudit:
                 continue
 
             h3b['dequeued_at'] = time.time()
+            h3b['queue_depth_after_dequeue'] = queue.qsize()
             result = await self._execute_api_audit(h3b)
             telemetry = result.setdefault('telemetry', {})
+            telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
+            telemetry['executor_total_ms_pre_db'] = int((time.time() - h3b['dequeued_at']) * 1000)
             db_t0 = time.time()
             if self.save_to_db:
                 await self._save_result(result)
@@ -407,6 +412,8 @@ class H3bApiAudit:
         detected_at = h3b['detected_at']
         execution_start = time.time()
         queue_wait_ms = int((execution_start - detected_at) * 1000)
+        queue_depth_at_enqueue = h3b.get('queue_depth_at_enqueue')
+        queue_depth_after_dequeue = h3b.get('queue_depth_after_dequeue')
 
         def _extract_lay_snapshot(api_result: Optional[BetslipApiResult]) -> Optional[dict]:
             if not api_result or not api_result.success:
@@ -467,6 +474,8 @@ class H3bApiAudit:
 
         telemetry = {
             'queue_wait_ms': queue_wait_ms,
+            'queue_depth_at_enqueue': queue_depth_at_enqueue,
+            'queue_depth_after_dequeue': queue_depth_after_dequeue,
             'build_bet_type_ms': build_bet_type_ms,
             'parallel_fetch_ms': parallel_fetch_ms,
             'back_post_ms': back_post_ms,
@@ -711,7 +720,7 @@ class H3bApiAudit:
                 hypothesis_detected_at=detected_dt,
                 lag_detection_to_click_ms=telemetry.get('queue_wait_ms', 0) + r.get('post_ms', 0),
                 lag_click_to_betslip_ms=r.get('pmm_ms', 0),
-                audit_total_duration_ms=telemetry.get('pipeline_total_ms', r.get('total_ms', 0)),
+                audit_total_duration_ms=telemetry.get('pipeline_total_ms_pre_db', telemetry.get('pipeline_total_ms', r.get('total_ms', 0))),
                 audit_version="v4.0-api",
                 hypothesis_details=hypothesis_details or None,
             )
@@ -765,10 +774,17 @@ class H3bApiAudit:
         temporal_ms = [r.get('telemetry', {}).get('temporal_total_ms', 0) for r in ok]
         db_ms = [r.get('telemetry', {}).get('db_save_ms', 0) for r in ok]
         pipeline_ms = [r.get('telemetry', {}).get('pipeline_total_ms', r['total_ms']) for r in ok]
+        qdepth_enq = [r.get('telemetry', {}).get('queue_depth_at_enqueue') for r in ok if r.get('telemetry', {}).get('queue_depth_at_enqueue') is not None]
+        qdepth_deq = [r.get('telemetry', {}).get('queue_depth_after_dequeue') for r in ok if r.get('telemetry', {}).get('queue_depth_after_dequeue') is not None]
         logger.info(f"{'=' * 50}")
         logger.info(f"STATS — {len(self.results)} auditorias ({len(ok)} OK)")
         logger.info(f"  Lag: min={min(lags)}ms med={sorted(lags)[len(lags)//2]}ms avg={sum(lags)//len(lags)}ms max={max(lags)}ms")
         logger.info(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+        if qdepth_enq:
+            logger.info(
+                f"  Fila avg(itens): enq={self._avg(qdepth_enq):.2f} "
+                f"deq={self._avg(qdepth_deq):.2f}"
+            )
         logger.info(
             "  Etapas avg(ms): "
             f"fila={int(self._avg(queue_ms))} "
@@ -795,8 +811,12 @@ class H3bApiAudit:
             pmm_ms = [r.get('telemetry', {}).get('back_pmm_ms', r.get('pmm_ms', 0)) for r in ok]
             temporal_ms = [r.get('telemetry', {}).get('temporal_total_ms', 0) for r in ok]
             pipeline_ms = [r.get('telemetry', {}).get('pipeline_total_ms', r['total_ms']) for r in ok]
+            qdepth_enq = [r.get('telemetry', {}).get('queue_depth_at_enqueue') for r in ok if r.get('telemetry', {}).get('queue_depth_at_enqueue') is not None]
+            qdepth_deq = [r.get('telemetry', {}).get('queue_depth_after_dequeue') for r in ok if r.get('telemetry', {}).get('queue_depth_after_dequeue') is not None]
             print(f"  Lag: min={min(lags)} med={sorted(lags)[len(lags)//2]} max={max(lags)}ms")
             print(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+            if qdepth_enq:
+                print(f"  Fila avg(itens): enq={self._avg(qdepth_enq):.2f} deq={self._avg(qdepth_deq):.2f}")
             print(
                 f"  Etapas avg(ms): fila={int(self._avg(queue_ms))} "
                 f"post={int(self._avg(post_ms))} pmm={int(self._avg(pmm_ms))} "

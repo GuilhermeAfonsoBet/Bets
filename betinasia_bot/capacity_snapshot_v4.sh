@@ -218,19 +218,50 @@ echo
 
 echo "7) TEMPOS MEDIOS POR ETAPA (24h, onde houver telemetry)"
 run_psql "
+WITH t AS (
+  SELECT
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric AS queue_wait_ms,
+    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue'),'')::numeric AS queue_depth_at_enqueue,
+    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_after_dequeue'),'')::numeric AS queue_depth_after_dequeue,
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'back_post_ms')::numeric AS back_post_ms,
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'back_pmm_ms')::numeric AS back_pmm_ms,
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'lay_post_ms')::numeric AS lay_post_ms,
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'lay_pmm_ms')::numeric AS lay_pmm_ms,
+    (hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_total_ms')::numeric AS temporal_total_ms,
+    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'db_save_ms'),'')::numeric AS db_save_ms,
+    NULLIF((hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms'),'')::numeric AS pipeline_total_ms
+  FROM betslip_audit_results
+  WHERE audit_version='${AUDIT_VERSION}'
+    AND audited_at >= now() - interval '24 hours'
+    AND (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL
+),
+calc AS (
+  SELECT
+    *,
+    (GREATEST(COALESCE(back_post_ms,0)+COALESCE(back_pmm_ms,0), COALESCE(lay_post_ms,0)+COALESCE(lay_pmm_ms,0)) + COALESCE(temporal_total_ms,0)) AS service_ms_est,
+    CASE
+      WHEN (GREATEST(COALESCE(back_post_ms,0)+COALESCE(back_pmm_ms,0), COALESCE(lay_post_ms,0)+COALESCE(lay_pmm_ms,0)) + COALESCE(temporal_total_ms,0)) > 0
+      THEN queue_wait_ms / (GREATEST(COALESCE(back_post_ms,0)+COALESCE(back_pmm_ms,0), COALESCE(lay_post_ms,0)+COALESCE(lay_pmm_ms,0)) + COALESCE(temporal_total_ms,0))
+      ELSE NULL
+    END AS queue_jobs_ahead_est
+  FROM t
+)
 SELECT
-  COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL) AS n_com_telemetry,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric),1) AS queue_wait_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'back_post_ms')::numeric),1) AS back_post_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'back_pmm_ms')::numeric),1) AS back_pmm_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'lay_post_ms')::numeric),1) AS lay_post_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'lay_pmm_ms')::numeric),1) AS lay_pmm_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'temporal_total_ms')::numeric),1) AS temporal_total_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'db_save_ms')::numeric),1) AS db_save_ms,
-  ROUND(AVG((hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric),1) AS pipeline_total_ms
-FROM betslip_audit_results
-WHERE audit_version='${AUDIT_VERSION}'
-  AND audited_at >= now() - interval '24 hours';
+  COUNT(*) AS n_com_telemetry,
+  ROUND(AVG(queue_wait_ms),1) AS queue_wait_ms,
+  ROUND(AVG(queue_depth_at_enqueue),2) AS queue_depth_enq_avg,
+  ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_depth_at_enqueue),2) AS queue_depth_enq_p90,
+  ROUND(AVG(queue_depth_after_dequeue),2) AS queue_depth_deq_avg,
+  ROUND(AVG(back_post_ms),1) AS back_post_ms,
+  ROUND(AVG(back_pmm_ms),1) AS back_pmm_ms,
+  ROUND(AVG(lay_post_ms),1) AS lay_post_ms,
+  ROUND(AVG(lay_pmm_ms),1) AS lay_pmm_ms,
+  ROUND(AVG(temporal_total_ms),1) AS temporal_total_ms,
+  ROUND(AVG(db_save_ms),1) AS db_save_ms,
+  ROUND(AVG(pipeline_total_ms),1) AS pipeline_total_ms,
+  ROUND(AVG(queue_jobs_ahead_est),2) AS queue_jobs_ahead_est_avg,
+  ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY queue_jobs_ahead_est),2) AS queue_jobs_ahead_est_p90
+FROM calc;
 "
 echo
 
