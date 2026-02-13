@@ -85,9 +85,109 @@ class H3bApiAudit:
         self.max_temporal_queue_depth_observed = 0
         self._temporal_queue_ref: Optional[asyncio.Queue] = None
 
+        # Política financeira (insumos para análise econômica posterior)
+        # Não afeta execução, apenas persistência de variáveis para analytics.
+        self.finance_stake_pct_of_limit = self._parse_env_float(
+            "FINANCE_STAKE_PCT_OF_LIMIT", 0.25
+        )
+        self.finance_stake_cap = self._parse_env_float(
+            "FINANCE_STAKE_CAP", 0.0
+        )
+        self.finance_fx_brl = self._parse_env_float(
+            "FINANCE_FX_BRL", 5.20
+        )
+        self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
+
+    @staticmethod
+    def _parse_env_float(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
     @staticmethod
     def _avg(values: List[float]) -> float:
         return (sum(values) / len(values)) if values else 0.0
+
+    @staticmethod
+    def _safe_num(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _build_finance_snapshot(self, r: dict) -> Optional[dict]:
+        """
+        Monta insumos financeiros por auditoria.
+        Objetivo: permitir análises futuras de turnover, lucro, ROI e drawdown
+        com stake baseada em % do limite disponível.
+        """
+        stake_pct = max(0.0, self._safe_num(self.finance_stake_pct_of_limit, 0.25))
+        stake_cap = max(0.0, self._safe_num(self.finance_stake_cap, 0.0))
+        fx_brl = max(0.0, self._safe_num(self.finance_fx_brl, 5.20))
+
+        def _stake_from_limit(limit_value: float) -> float:
+            raw_stake = max(0.0, limit_value) * stake_pct
+            if stake_cap > 0:
+                return min(raw_stake, stake_cap)
+            return raw_stake
+
+        bs_odd = self._safe_num(r.get("bs_odd"), 0.0)
+        bs_limit = self._safe_num(r.get("bs_limit"), 0.0)
+        lay_odd = self._safe_num(r.get("lay_odd"), 0.0)
+        lay_limit = self._safe_num(r.get("lay_limit"), 0.0)
+
+        back_stake = _stake_from_limit(bs_limit)
+        lay_stake = _stake_from_limit(lay_limit)
+
+        back_profit_if_win = back_stake * max(0.0, bs_odd - 1.0) if (back_stake > 0 and bs_odd > 1.0) else 0.0
+        back_loss_if_lose = -back_stake if back_stake > 0 else 0.0
+
+        lay_liability = lay_stake * max(0.0, lay_odd - 1.0) if (lay_stake > 0 and lay_odd > 1.0) else 0.0
+        lay_profit_if_win = lay_stake if lay_stake > 0 else 0.0
+        lay_loss_if_lose = -lay_liability if lay_liability > 0 else 0.0
+
+        if back_stake <= 0 and lay_stake <= 0:
+            return None
+
+        finance = {
+            "policy": {
+                "stake_pct_of_limit": stake_pct,
+                "stake_cap": stake_cap,
+                "base_currency": self.finance_base_currency,
+                "fx_brl": fx_brl,
+            },
+            "back": {
+                "available_limit": bs_limit,
+                "odd": bs_odd,
+                "suggested_stake": back_stake,
+                "profit_if_win": back_profit_if_win,
+                "loss_if_lose": back_loss_if_lose,
+            },
+            "lay": {
+                "available_limit": lay_limit,
+                "odd": lay_odd,
+                "suggested_stake": lay_stake,
+                "liability_if_lose": lay_liability,
+                "profit_if_win": lay_profit_if_win,
+                "loss_if_lose": lay_loss_if_lose,
+            },
+            "brl_preview": {
+                "back_suggested_stake_brl": back_stake * fx_brl,
+                "back_profit_if_win_brl": back_profit_if_win * fx_brl,
+                "back_loss_if_lose_brl": back_loss_if_lose * fx_brl,
+                "lay_suggested_stake_brl": lay_stake * fx_brl,
+                "lay_liability_if_lose_brl": lay_liability * fx_brl,
+                "lay_profit_if_win_brl": lay_profit_if_win * fx_brl,
+                "lay_loss_if_lose_brl": lay_loss_if_lose * fx_brl,
+            },
+        }
+        return finance
 
     def _append_jsonl(self, path: str, payload: dict):
         try:
@@ -837,6 +937,9 @@ class H3bApiAudit:
                 hypothesis_details['lay_temporal'] = r.get('lay_temporal')
             if (not r.get('success')) and r.get('error'):
                 hypothesis_details['api_error'] = r.get('error')
+            finance_snapshot = self._build_finance_snapshot(r)
+            if finance_snapshot:
+                hypothesis_details['finance'] = finance_snapshot
             if telemetry:
                 hypothesis_details['telemetry'] = telemetry
 

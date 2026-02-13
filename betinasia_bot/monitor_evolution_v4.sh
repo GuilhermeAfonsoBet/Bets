@@ -163,7 +163,22 @@ SELECT
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'lay') IS NOT NULL) AS n_lay_t0,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'temporal') IS NOT NULL) AS n_back_temporal,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'lay_temporal') IS NOT NULL) AS n_lay_temporal,
+  COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'finance') IS NOT NULL) AS n_finance_inputs,
   COUNT(*) FILTER (WHERE (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL) AS n_telemetry,
+  ROUND(AVG(
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'finance' -> 'back' ->> 'suggested_stake','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'finance' -> 'back' ->> 'suggested_stake')::numeric
+      ELSE NULL
+    END
+  ), 2) AS back_stake_suggested_avg,
+  ROUND(AVG(
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'finance' -> 'lay' ->> 'suggested_stake','') ~ '^-?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'finance' -> 'lay' ->> 'suggested_stake')::numeric
+      ELSE NULL
+    END
+  ), 2) AS lay_stake_suggested_avg,
   ROUND(AVG(q_ms), 1) AS q_avg_ms,
   ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q_ms))::numeric, 1) AS q_p95_ms,
   ROUND(AVG(pipe_ms), 1) AS pipe_avg_ms,
@@ -192,6 +207,7 @@ s AS (
     difference_pct,
     (hypothesis_details::jsonb -> 'lay') IS NOT NULL AS has_lay_t0,
     (hypothesis_details::jsonb -> 'lay_temporal') IS NOT NULL AS has_lay_temporal,
+    (hypothesis_details::jsonb -> 'finance') IS NOT NULL AS has_finance,
     (hypothesis_details::jsonb -> 'telemetry') IS NOT NULL AS has_telemetry,
     CASE
       WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^-?[0-9]+([.][0-9]+)?$'
@@ -214,6 +230,7 @@ SELECT
   COUNT(*) FILTER (WHERE status='OK' AND difference_pct <= -2) AS n_lay_edge_2p,
   ROUND(100.0 * COUNT(*) FILTER (WHERE has_lay_t0) / NULLIF(COUNT(*),0), 1) AS lay_t0_cov_pct,
   ROUND(100.0 * COUNT(*) FILTER (WHERE has_lay_temporal) / NULLIF(COUNT(*),0), 1) AS lay_temporal_cov_pct,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE has_finance) / NULLIF(COUNT(*),0), 1) AS finance_cov_pct,
   ROUND(100.0 * COUNT(*) FILTER (WHERE has_telemetry) / NULLIF(COUNT(*),0), 1) AS telemetry_cov_pct,
   ROUND(AVG(q_ms), 1) AS q_avg_ms,
   ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q_ms))::numeric, 1) AS q_p95_ms,
