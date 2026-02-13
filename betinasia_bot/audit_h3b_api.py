@@ -44,10 +44,17 @@ STATS_INTERVAL = 50
 
 class H3bApiAudit:
 
-    def __init__(self, num_audits: int = 0, direction: str = "up", save_to_db: bool = True):
+    def __init__(
+        self,
+        num_audits: int = 0,
+        direction: str = "up",
+        save_to_db: bool = True,
+        executor_workers: int = 2,
+    ):
         self.num_audits = num_audits
         self.direction = direction
         self.save_to_db = save_to_db
+        self.executor_workers = max(1, int(executor_workers))
 
         self.scraper: Optional[BetinAsiaScraper] = None
         self.api_client: Optional[ApiBetslipClient] = None
@@ -71,6 +78,8 @@ class H3bApiAudit:
         self.consecutive_errors: int = 0
         self.running = True
         self.telemetry_file = "logs/audit_api_telemetry.jsonl"
+        self.max_queue_depth_observed = 0
+        self._queue_ref: Optional[asyncio.Queue] = None
 
     @staticmethod
     def _avg(values: List[float]) -> float:
@@ -177,13 +186,14 @@ class H3bApiAudit:
             return
 
         audit_queue = asyncio.Queue()
+        self._queue_ref = audit_queue
         audited = set()
 
-        tasks = [
-            asyncio.create_task(self._monitor_loop(audit_queue, audited)),
-            asyncio.create_task(self._executor_loop(audit_queue)),
-            asyncio.create_task(self._maintenance_loop()),
-        ]
+        tasks = [asyncio.create_task(self._monitor_loop(audit_queue, audited))]
+        for wid in range(1, self.executor_workers + 1):
+            tasks.append(asyncio.create_task(self._executor_loop(audit_queue, worker_id=wid)))
+        tasks.append(asyncio.create_task(self._maintenance_loop()))
+        logger.info(f"Executores API ativos: {self.executor_workers}")
 
         try:
             while self.running:
@@ -349,13 +359,14 @@ class H3bApiAudit:
                     'detected_at': time.time(),
                     'queue_depth_at_enqueue': queue_depth_at_enqueue,
                 })
+                self.max_queue_depth_observed = max(self.max_queue_depth_observed, queue.qsize())
                 audited.add(audit_key)
 
     # ================================================================
     # EXECUTOR (via API, não DOM)
     # ================================================================
-    async def _executor_loop(self, queue: asyncio.Queue):
-        logger.info("Executor API iniciado")
+    async def _executor_loop(self, queue: asyncio.Queue, worker_id: int = 1):
+        logger.info(f"Executor API iniciado (worker={worker_id})")
 
         while self.running:
             if self.num_audits > 0 and len(self.results) >= self.num_audits:
@@ -369,6 +380,7 @@ class H3bApiAudit:
             h3b['queue_depth_after_dequeue'] = queue.qsize()
             result = await self._execute_api_audit(h3b)
             telemetry = result.setdefault('telemetry', {})
+            telemetry['worker_id'] = worker_id
             telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
             telemetry['executor_total_ms_pre_db'] = int((time.time() - h3b['dequeued_at']) * 1000)
             db_t0 = time.time()
@@ -395,7 +407,7 @@ class H3bApiAudit:
                     f"ws={result['ws_odd']:.3f} bs={result['bs_odd']:.3f} "
                     f"diff={result['diff_pct']:+.2f}% lim=${result['bs_limit']:,.0f} "
                     f"({result['num_bk']} bk){lay_str} | "
-                    f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_ms}ms | "
+                    f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_ms}ms w={worker_id} | "
                     f"{len(self.results)}")
             else:
                 self.total_errors += 1
@@ -740,10 +752,12 @@ class H3bApiAudit:
             ws_age = time.time() - self._last_ws_time if self._last_ws_time > 0 else 999
             uptime = time.time() - self._start_time
             ok_count = sum(1 for r in self.results if r.get('success'))
+            queue_now = self._queue_ref.qsize() if self._queue_ref else 0
 
             logger.info(
                 f"[STATS] WS: {self._ws_msg_count} msgs, {self._ws_msg_count/max(1,uptime):.1f}/s, "
                 f"last {ws_age:.0f}s | "
+                f"Fila: now={queue_now} max={self.max_queue_depth_observed} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
                 f"H3B: {self.h3b_detected} | Erros: {self.total_errors}")
 
@@ -830,6 +844,12 @@ async def main():
     parser.add_argument("--num-audits", type=int, default=0, help="0=infinito")
     parser.add_argument("--direction", choices=["up", "down", "all"], default="up")
     parser.add_argument("--no-db", action="store_true")
+    parser.add_argument(
+        "--executor-workers",
+        type=int,
+        default=int(os.getenv("AUDIT_EXECUTOR_WORKERS", "2")),
+        help="Quantidade de workers paralelos do executor API",
+    )
     args = parser.parse_args()
 
     logger.remove()
@@ -843,6 +863,7 @@ async def main():
         num_audits=args.num_audits,
         direction=args.direction,
         save_to_db=not args.no_db,
+        executor_workers=args.executor_workers,
     )
     await audit.run()
 
