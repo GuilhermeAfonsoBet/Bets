@@ -56,6 +56,8 @@ class ContinuousCollector:
     SESSION_REFRESH_INTERVAL = 3600  # reconecta browser a cada 1 hora
     STATS_LOG_INTERVAL = 100  # log de estatísticas a cada N ciclos
     MEMORY_CLEANUP_INTERVAL = 500  # limpeza de memória a cada N ciclos
+    COLLECT_TIMEOUT_SECONDS = int(os.getenv("COLLECT_TIMEOUT_SECONDS", "120"))
+    ZERO_ODDS_RECOVERY_THRESHOLD = int(os.getenv("COLLECT_ZERO_ODDS_RECOVERY_THRESHOLD", "3"))
     
     def __init__(self):
         self.collector: Optional[FastCollector] = None
@@ -69,6 +71,7 @@ class ContinuousCollector:
         self.last_collection_time: Optional[datetime] = None
         self.last_successful_save: Optional[datetime] = None
         self._last_browser_start: Optional[datetime] = None
+        self.consecutive_zero_odds_cycles = 0
         
         # Detector de hipóteses
         self.hypothesis_detector = HypothesisDetector()
@@ -98,6 +101,10 @@ class ContinuousCollector:
             
         logger.info("Coletor continuo iniciado com sucesso")
         logger.info(f"Ciclo de coleta: {self.CYCLE_TIME}s (tempo entre início de cada ciclo)")
+        logger.info(
+            f"Timeout coleta: {self.COLLECT_TIMEOUT_SECONDS}s | "
+            f"Auto-recovery zero-odds: {self.ZERO_ODDS_RECOVERY_THRESHOLD} ciclos"
+        )
         
     async def _start_browser(self):
         """Inicia ou reinicia o browser."""
@@ -175,10 +182,26 @@ class ContinuousCollector:
                     await self._start_browser()
                 
                 # Executa coleta
-                await self._collect_cycle()
+                cycle_metrics = await self._collect_cycle()
                 
                 # Reset contador de erros
                 self.consecutive_errors = 0
+
+                # Auto-recuperação quando a coleta "vive" mas sem odds úteis.
+                # Evita ficar horas com serviço ativo e N=0.
+                with_odds = int(cycle_metrics.get("events_with_odds", 0))
+                if with_odds <= 0:
+                    self.consecutive_zero_odds_cycles += 1
+                    logger.warning(
+                        f"Ciclo sem odds úteis ({self.consecutive_zero_odds_cycles}/"
+                        f"{self.ZERO_ODDS_RECOVERY_THRESHOLD})"
+                    )
+                    if self.consecutive_zero_odds_cycles >= self.ZERO_ODDS_RECOVERY_THRESHOLD:
+                        logger.warning("Auto-recovery: reiniciando browser por ciclos sem odds")
+                        await self._start_browser()
+                        self.consecutive_zero_odds_cycles = 0
+                else:
+                    self.consecutive_zero_odds_cycles = 0
                 
                 # Log periódico de estatísticas
                 if self.total_collections % self.STATS_LOG_INTERVAL == 0:
@@ -203,6 +226,16 @@ class ContinuousCollector:
                 self.consecutive_errors += 1
                 self.total_errors += 1
                 logger.error(f"Erro na coleta ({self.consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS}): {e}")
+
+                if "COLLECT_TIMEOUT" in str(e):
+                    logger.warning("Timeout de coleta detectado, reiniciando browser imediatamente...")
+                    try:
+                        await self._start_browser()
+                        self.consecutive_errors = 0
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception as e2:
+                        logger.error(f"Falha ao reiniciar browser após timeout: {e2}")
                 
                 if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                     logger.warning(f"Muitos erros consecutivos, pausando por {self.ERROR_PAUSE_SECONDS}s...")
@@ -270,7 +303,27 @@ class ContinuousCollector:
         
         # Coleta dados
         collect_t0 = time.time()
-        result = await self.collector.collect_all()
+        try:
+            result = await asyncio.wait_for(
+                self.collector.collect_all(),
+                timeout=self.COLLECT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            collect_ms = int((time.time() - collect_t0) * 1000)
+            timeout_payload = {
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "cycle": self.total_collections + 1,
+                "status": "COLLECT_TIMEOUT",
+                "collect_ms": collect_ms,
+                "timeout_sec": self.COLLECT_TIMEOUT_SECONDS,
+                "events_discovered": 0,
+                "events_with_odds": 0,
+                "matches_payload": 0,
+                "matches_saved": 0,
+                "save_errors": 0,
+            }
+            self._append_jsonl(self.telemetry_file, timeout_payload)
+            raise RuntimeError(f"COLLECT_TIMEOUT_{self.COLLECT_TIMEOUT_SECONDS}s")
         collect_ms = int((time.time() - collect_t0) * 1000)
         
         # Salva no banco
@@ -292,6 +345,7 @@ class ContinuousCollector:
         cycle_telemetry = {
             "ts_utc": self.last_collection_time.isoformat(),
             "cycle": self.total_collections,
+            "status": "OK",
             "cycle_total_ms": cycle_total_ms,
             "collect_ms": collect_ms,
             "save_ms": save_ms,
@@ -318,7 +372,17 @@ class ContinuousCollector:
             f"(pre={save_metrics['prematch_count']}, live={save_metrics['live_count']}, "
             f"erros_save={save_metrics['save_errors']})"
         )
-        
+        if result.total_with_odds <= 0:
+            logger.warning(
+                "Coleta retornou 0 eventos com odds; possível sessão inválida/WS inativo"
+            )
+
+        return {
+            "saved_count": saved_count,
+            "events_discovered": result.total_events,
+            "events_with_odds": result.total_with_odds,
+            "save_errors": save_metrics["save_errors"],
+        }
     async def _save_to_database(self, result: CollectionResult) -> Dict[str, int]:
         """
         Salva resultado da coleta no banco de dados.

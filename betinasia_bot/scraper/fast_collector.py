@@ -105,7 +105,9 @@ class FastCollector:
         """Inicia o coletor."""
         self.scraper = BetinAsiaScraper()
         await self.scraper.start()
-        await self.scraper.login()
+        logged = await self.scraper.login()
+        if not logged:
+            raise RuntimeError("Falha no login inicial do FastCollector")
         
         # Configura listener de WebSocket
         self.scraper._page.on('websocket', self._on_websocket)
@@ -141,6 +143,16 @@ class FastCollector:
         await self.scraper._page.goto(self.FOOTBALL_URL)
         await self.scraper._page.wait_for_load_state("networkidle")
         await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
+
+        # Sessão expirada pode redirecionar para /login sem levantar exceção.
+        if "login" in (self.scraper._page.url or "").lower():
+            logger.warning("FastCollector: sessão expirada detectada, refazendo login...")
+            relog_ok = await self.scraper.login(force=True)
+            if not relog_ok:
+                raise RuntimeError("Sessão inválida no collect_all (relogin falhou)")
+            await self.scraper._page.goto(self.FOOTBALL_URL)
+            await self.scraper._page.wait_for_load_state("networkidle")
+            await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
         
         # Parseia todas as mensagens
         all_events, events_with_odds = self._parse_all_messages()
@@ -189,6 +201,15 @@ class FastCollector:
         await self.scraper._page.goto(league_url)
         await self.scraper._page.wait_for_load_state("networkidle")
         await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
+
+        if "login" in (self.scraper._page.url or "").lower():
+            logger.warning("FastCollector: sessão expirada em collect_league, refazendo login...")
+            relog_ok = await self.scraper.login(force=True)
+            if not relog_ok:
+                raise RuntimeError("Sessão inválida no collect_league (relogin falhou)")
+            await self.scraper._page.goto(league_url)
+            await self.scraper._page.wait_for_load_state("networkidle")
+            await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
         
         # Parseia mensagens
         all_events, _ = self._parse_all_messages()

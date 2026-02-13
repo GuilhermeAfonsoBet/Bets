@@ -297,6 +297,27 @@ GROUP BY 1
 ORDER BY n DESC, 1;
 "
 run_psql "
+WITH base AS (
+  SELECT
+    COALESCE(
+      NULLIF(hypothesis_details::jsonb ->> 'api_error', ''),
+      NULLIF(hypothesis_details::jsonb -> 'telemetry' ->> 'back_error', ''),
+      'sem_motivo_registrado'
+    ) AS api_error
+  FROM betslip_audit_results
+  WHERE audit_version='${AUDIT_VERSION}'
+    AND audited_at >= timestamptz '${SINCE_UTC}'
+    AND status <> 'OK'
+)
+SELECT
+  api_error,
+  COUNT(*) AS n
+FROM base
+GROUP BY 1
+ORDER BY n DESC, 1
+LIMIT 12;
+"
+run_psql "
 SELECT
   id,
   audited_at,

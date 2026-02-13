@@ -114,6 +114,7 @@ class H3bApiAudit:
             "bs_odd": result.get("bs_odd"),
             "lay_odd": result.get("lay_odd"),
             "diff_pct": result.get("diff_pct"),
+            "error": result.get("error"),
             "telemetry": telemetry,
         }
         self._append_jsonl(self.telemetry_file, payload)
@@ -687,6 +688,10 @@ class H3bApiAudit:
             'lay_post_ms': lay_post_ms,
             'lay_pmm_ms': lay_pmm_ms,
             'lay_total_ms': lay_total_ms,
+            'back_success': bool(back_result and back_result.success),
+            'lay_success': bool(lay_result and lay_result.success),
+            'back_error': back_result.error if (back_result and not back_result.success and back_result.error) else '',
+            'lay_error': lay_result.error if (lay_result and not lay_result.success and lay_result.error) else '',
         }
 
         base = {
@@ -830,6 +835,8 @@ class H3bApiAudit:
                 hypothesis_details['temporal'] = r.get('temporal')
             if r.get('lay_temporal'):
                 hypothesis_details['lay_temporal'] = r.get('lay_temporal')
+            if (not r.get('success')) and r.get('error'):
+                hypothesis_details['api_error'] = r.get('error')
             if telemetry:
                 hypothesis_details['telemetry'] = telemetry
 
