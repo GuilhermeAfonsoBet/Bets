@@ -260,6 +260,13 @@ class BetinAsiaScraper:
         
         username = username or settings.betinasia_username
         password = password or settings.betinasia_password
+
+        if not username or not password:
+            logger.error(
+                "Credenciais BetinAsia ausentes. Defina BETINASIA_USERNAME e BETINASIA_PASSWORD no .env "
+                "ou passe username/password explicitamente."
+            )
+            return False
         
         logger.info("Tentando fazer login no BetinAsia...")
         

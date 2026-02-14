@@ -16,8 +16,12 @@ class Settings(BaseSettings):
     # ===========================================
     # BetinAsia
     # ===========================================
-    betinasia_username: str = Field(..., env="BETINASIA_USERNAME")
-    betinasia_password: str = Field(..., env="BETINASIA_PASSWORD")
+    # Observação:
+    # - Estes campos são necessários para o scraper/login, mas NÃO deveriam
+    #   impedir scripts puramente analíticos (DB-only) de rodarem.
+    # - Por isso, usamos defaults vazios e validamos no ponto de uso (login).
+    betinasia_username: str = Field(default="", env="BETINASIA_USERNAME")
+    betinasia_password: str = Field(default="", env="BETINASIA_PASSWORD")
     
     # ===========================================
     # Banco de Dados
