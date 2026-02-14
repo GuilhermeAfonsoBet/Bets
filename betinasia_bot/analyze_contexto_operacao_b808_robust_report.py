@@ -29,7 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from sqlalchemy import text
+from sqlalchemy import Integer, bindparam, text
 
 # Mantém padrão dos scripts existentes
 import sys
@@ -296,7 +296,8 @@ async def fetch_h3b_audit_rows(
     - betslip_audit_results (H3B, direction) + match (kickoff passado)
     - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
     """
-    q = text(
+    q = (
+        text(
         """
         SELECT
             a.id,
@@ -362,8 +363,14 @@ async def fetch_h3b_audit_rows(
           AND a.reversal_direction = :direction
           AND m.kickoff_time < NOW()
           AND a.audit_version = ANY(:versions)
-          AND (:lookback_days IS NULL OR a.audited_at >= NOW() - (:lookback_days * INTERVAL '1 day'))
+          AND (
+            :lookback_days IS NULL
+            OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
+          )
         """
+        )
+        # Evita AmbiguousParameterError no asyncpg (tipa explicitamente).
+        .bindparams(bindparam("lookback_days", type_=Integer))
     )
     async with db.async_session() as session:
         res = await session.execute(q, {"direction": direction, "versions": versions, "lookback_days": lookback_days})
