@@ -516,6 +516,21 @@ async def main() -> int:
     parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
     parser.add_argument("--stake-pct-of-limit", type=float, default=0.25, help="Stake fallback (% do limite), default 0.25")
     parser.add_argument("--stake-cap", type=float, default=0.0, help="Cap opcional para stake fallback (0=sem cap)")
+    parser.add_argument(
+        "--git-commit",
+        action="store_true",
+        help="Se definido, adiciona o .md/.pdf gerados ao git e cria um commit local (não faz push).",
+    )
+    parser.add_argument(
+        "--git-push",
+        action="store_true",
+        help="Se definido junto com --git-commit, faz push após o commit (usa remote/branch atuais).",
+    )
+    parser.add_argument(
+        "--git-message",
+        default=None,
+        help="Mensagem do commit (opcional). Se omitida, usa uma mensagem padrão.",
+    )
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
     args = parser.parse_args()
 
@@ -1588,6 +1603,7 @@ async def main() -> int:
 
         print(f"Relatório gerado em: {out_path}")
 
+        pdf_path = None
         if args.pdf:
             pdf_path = Path(str(args.pdf))
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1600,6 +1616,29 @@ async def main() -> int:
                 print(f"[WARN] Não achei o renderizador de PDF em: {renderer}")
             except subprocess.CalledProcessError as e:
                 print(f"[WARN] Falha ao gerar PDF (instale 'reportlab'): {e}")
+
+        if args.git_commit:
+            # Tenta versionar os artefatos gerados para facilitar download via GitHub.
+            try:
+                # Descobre root do repo
+                repo_root = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+                msg = (
+                    args.git_message
+                    or f"Adiciona relatório b808 ({args.direction}, {','.join(versions)}, lookback={args.lookback_days})"
+                )
+                paths = [str(out_path)]
+                if pdf_path and pdf_path.exists():
+                    paths.append(str(pdf_path))
+                subprocess.run(["git", "add", "--"] + paths, check=True, cwd=repo_root)
+                subprocess.run(["git", "commit", "-m", msg], check=True, cwd=repo_root)
+                print(f"[INFO] Artefatos commitados no git: {', '.join(paths)}")
+                if args.git_push:
+                    subprocess.run(["git", "push"], check=True, cwd=repo_root)
+                    print("[INFO] Push concluído.")
+            except subprocess.CalledProcessError as e:
+                print(f"[WARN] Falha ao commitar/pushar artefatos: {e}")
+            except Exception as e:
+                print(f"[WARN] Git não disponível ou não é repositório: {e}")
         return 0
 
     finally:
