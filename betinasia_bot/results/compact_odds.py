@@ -321,22 +321,28 @@ async def get_hypothesis_metrics(
     
     # ===== H6 - Correlação / Lag =====
     try:
-        # Busca eventos onde este mercado foi o líder ou o atrasado
-        result = await session.execute(
-            select(H6CorrelationLagEvent).where(
-                and_(
-                    H6CorrelationLagEvent.match_id == match_id,
-                    # Mercado como líder ou atrasado
-                    ((H6CorrelationLagEvent.leader_line == line_str) | 
-                     (H6CorrelationLagEvent.lagged_line == line_str))
-                )
-            )
+        # IMPORTANTE:
+        # Em alguns bancos, o schema de `h6_correlation_lag_events` pode estar "atrasado"
+        # em relação ao model ORM (ex.: coluna `verification_status` não existe).
+        # Um SELECT ORM referencia todas as colunas e pode ABORTAR a transação.
+        #
+        # Então fazemos SQL mínimo apenas com `lag_seconds` e isolamos em SAVEPOINT.
+        from sqlalchemy import text
+
+        sql = text(
+            """
+            SELECT lag_seconds
+            FROM h6_correlation_lag_events
+            WHERE match_id = :match_id
+              AND (leader_line = :line_str OR lagged_line = :line_str)
+            """
         )
-        h6_events = result.scalars().all()
-        
-        if h6_events:
-            metrics["h6_lag_events_count"] = len(h6_events)
-            lags = [e.lag_seconds for e in h6_events if e.lag_seconds]
+        async with session.begin_nested():
+            rows = (await session.execute(sql, {"match_id": match_id, "line_str": line_str})).fetchall()
+
+        if rows:
+            metrics["h6_lag_events_count"] = len(rows)
+            lags = [float(r[0]) for r in rows if r and r[0] is not None]
             if lags:
                 metrics["h6_avg_lag_seconds"] = sum(lags) / len(lags)
                 metrics["h6_max_lag_seconds"] = max(lags)
@@ -609,11 +615,19 @@ async def compact_odds(
             total_summaries = 0
             
             for match in matches:
-                count = await process_match(session, match, dry_run)
-                total_summaries += count
-                
-                if count > 0:
-                    print(f"  ✅ {match.home_team} vs {match.away_team}: {count} resumos")
+                try:
+                    count = await process_match(session, match, dry_run)
+                    total_summaries += count
+
+                    if count > 0:
+                        print(f"  ✅ {match.home_team} vs {match.away_team}: {count} resumos")
+                except Exception as e:
+                    # Não deixe 1 jogo quebrar o batch inteiro (e não deixe a sessão ficar em rollback pendente)
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(f"Falha ao compactar match_id={getattr(match, 'id', None)}: {e}")
             
             if not dry_run:
                 await session.commit()

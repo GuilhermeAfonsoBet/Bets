@@ -15,6 +15,7 @@ Ou com data especifica:
 import asyncio
 import argparse
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
 from loguru import logger
@@ -509,32 +510,94 @@ async def update_results(date: str = None, dry_run: bool = False):
             # Busca resultados para cada data
             updated = 0
             not_found = 0
-            
-            for match_date, date_matches in matches_by_date.items():
+            out_of_window = 0
+            skipped_unknown = 0
+
+            allowed_from: str | None = None
+            allowed_to: str | None = None
+
+            def _is_unknown_match(m: Match) -> bool:
+                ht = (m.home_team or "").strip().lower()
+                at = (m.away_team or "").strip().lower()
+                lg = (m.league or "").strip().lower()
+                if not ht or not at:
+                    return True
+                if "unknown" in ht or "unknown" in at:
+                    return True
+                if lg == "unknown":
+                    return True
+                return False
+
+            def _parse_allowed_window(errors: dict) -> tuple[str | None, str | None]:
+                """
+                Ex.: {'plan': 'Free plans do not have access to this date, try from 2026-02-13 to 2026-02-15.'}
+                """
+                try:
+                    msg = " ".join(str(v) for v in (errors or {}).values())
+                except Exception:
+                    msg = str(errors)
+                m = re.search(r"try from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", msg)
+                if not m:
+                    return None, None
+                return m.group(1), m.group(2)
+
+            def _date_outside_window(ds: str) -> bool:
+                if not allowed_from or not allowed_to:
+                    return False
+                return ds < allowed_from or ds > allowed_to
+
+            # (mantemos a ordem crescente para "descobrir" cedo a janela free e pular datas fora)
+            for match_date in sorted(matches_by_date.keys()):
+                date_matches = matches_by_date[match_date]
                 print(f"\n--- {match_date} ({len(date_matches)} jogos) ---")
-                
-                # Busca resultados da API
+
+                # Se já descobrimos a janela do plano free, não gaste requests fora dela.
+                if _date_outside_window(match_date):
+                    print(f"[SKIP] Data fora da janela do plano free ({allowed_from}..{allowed_to}).")
+                    # não conta como "não encontrado" (é indisponibilidade de dados)
+                    out_of_window += len(date_matches)
+                    continue
+
+                # Busca payload para poder detectar erro de plano/janela
+                payload = await api._request("/fixtures", {"date": match_date})
+                if not payload:
+                    print("Resultados na API: (falhou request)")
+                    continue
+
+                errors = payload.get("errors") or {}
+                if errors:
+                    af, at = _parse_allowed_window(errors)
+                    if af and at:
+                        allowed_from, allowed_to = af, at
+                        print(f"[SKIP] API bloqueou a data. Janela permitida: {allowed_from}..{allowed_to}.")
+                        out_of_window += len(date_matches)
+                        continue
+
+                # Parse normal de resultados (somente FT/AET/PEN)
                 api_results = await api.get_results_by_date(match_date)
                 print(f"Resultados na API: {len(api_results)}")
-                
+
                 for match in date_matches:
-                    # Procura resultado correspondente
+                    if _is_unknown_match(match):
+                        print(f"  ⚠️ {match.home_team} vs {match.away_team} - IGNORADO (times/league desconhecidos)")
+                        skipped_unknown += 1
+                        continue
+
                     found_result = None
-                    
                     for api_result in api_results:
                         if match_teams(
-                            match.home_team, 
+                            match.home_team,
                             match.away_team,
                             api_result.home_team,
-                            api_result.away_team
+                            api_result.away_team,
                         ):
                             found_result = api_result
                             break
-                    
+
                     if found_result:
                         print(f"  ✅ {match.home_team} vs {match.away_team}")
                         print(f"     -> {found_result.home_score} - {found_result.away_score}")
-                        
+
                         if not dry_run:
                             await session.execute(
                                 update(Match)
@@ -542,7 +605,7 @@ async def update_results(date: str = None, dry_run: bool = False):
                                 .values(
                                     home_score=found_result.home_score,
                                     away_score=found_result.away_score,
-                                    status="finished"
+                                    status="finished",
                                 )
                             )
                         updated += 1
@@ -560,6 +623,8 @@ async def update_results(date: str = None, dry_run: bool = False):
             print("=" * 70)
             print(f"Atualizados: {updated}")
             print(f"Nao encontrados: {not_found}")
+            print(f"Fora da janela do plano (skip): {out_of_window}")
+            print(f"Ignorados (Unknown): {skipped_unknown}")
             
             if dry_run:
                 print("\n[DRY RUN] Nenhuma alteracao foi salva.")
