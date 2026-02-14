@@ -426,10 +426,10 @@ def match_teams(
         return True
     
     # Tenta match invertido (caso raro de ordem trocada)
-    # home_inv = match_single_team(betinasia_home, api_away)
-    # away_inv = match_single_team(betinasia_away, api_home)
-    # if home_inv and away_inv:
-    #     return True
+    home_inv = match_single_team(betinasia_home, api_away)
+    away_inv = match_single_team(betinasia_away, api_home)
+    if home_inv and away_inv:
+        return True
     
     return False
 
@@ -546,6 +546,38 @@ async def update_results(date: str = None, dry_run: bool = False):
                     return False
                 return ds < allowed_from or ds > allowed_to
 
+            def _parse_all_fixtures(payload: dict) -> list[dict]:
+                # retorna lista crua "response" para poder checar status != FT
+                try:
+                    return list(payload.get("response", []) or [])
+                except Exception:
+                    return []
+
+            def _fixture_team_names(fixture_obj: dict) -> tuple[str, str]:
+                teams = fixture_obj.get("teams") or {}
+                home = ((teams.get("home") or {}).get("name")) or ""
+                away = ((teams.get("away") or {}).get("name")) or ""
+                return str(home), str(away)
+
+            def _fixture_status_short(fixture_obj: dict) -> str:
+                fx = fixture_obj.get("fixture") or {}
+                st = fx.get("status") or {}
+                return str(st.get("short") or "")
+
+            def _fixture_goals(fixture_obj: dict) -> tuple[int | None, int | None]:
+                goals = fixture_obj.get("goals") or {}
+                hs = goals.get("home")
+                aws = goals.get("away")
+                try:
+                    hs_i = int(hs) if hs is not None else None
+                except Exception:
+                    hs_i = None
+                try:
+                    aws_i = int(aws) if aws is not None else None
+                except Exception:
+                    aws_i = None
+                return hs_i, aws_i
+
             # (mantemos a ordem crescente para "descobrir" cedo a janela free e pular datas fora)
             for match_date in sorted(matches_by_date.keys()):
                 date_matches = matches_by_date[match_date]
@@ -573,9 +605,33 @@ async def update_results(date: str = None, dry_run: bool = False):
                         out_of_window += len(date_matches)
                         continue
 
-                # Parse normal de resultados (somente FT/AET/PEN)
-                api_results = await api.get_results_by_date(match_date)
-                print(f"Resultados na API: {len(api_results)}")
+                fixtures_all = _parse_all_fixtures(payload)
+                # resultados FT/AET/PEN (para update)
+                api_results: list[MatchResult] = []
+                for fx in fixtures_all:
+                    st = _fixture_status_short(fx)
+                    if st not in ["FT", "AET", "PEN"]:
+                        continue
+                    h, a = _fixture_team_names(fx)
+                    hs, aws = _fixture_goals(fx)
+                    if hs is None or aws is None:
+                        continue
+                    # kickoff_time/league não são essenciais para update aqui
+                    api_results.append(
+                        MatchResult(
+                            fixture_id=int(((fx.get("fixture") or {}).get("id")) or 0),
+                            home_team=h,
+                            away_team=a,
+                            home_score=int(hs),
+                            away_score=int(aws),
+                            status=st,
+                            kickoff_time=datetime.now(timezone.utc),
+                            league_name="",
+                            league_country="",
+                        )
+                    )
+
+                print(f"Fixtures na API (total): {len(fixtures_all)} | Finalizados (FT/AET/PEN): {len(api_results)}")
 
                 for match in date_matches:
                     if _is_unknown_match(match):
@@ -610,6 +666,21 @@ async def update_results(date: str = None, dry_run: bool = False):
                             )
                         updated += 1
                     else:
+                        # Pode existir na API mas ainda não estar finalizado -> não conte como "não encontrado"
+                        found_any = None
+                        found_status = None
+                        for fx in fixtures_all:
+                            h, a = _fixture_team_names(fx)
+                            if match_teams(match.home_team, match.away_team, h, a):
+                                found_any = fx
+                                found_status = _fixture_status_short(fx)
+                                break
+
+                        if found_any and found_status and found_status not in ["FT", "AET", "PEN"]:
+                            print(f"  ⏳ {match.home_team} vs {match.away_team} - ainda não finalizado na API (status={found_status})")
+                            # não soma em not_found
+                            continue
+
                         print(f"  ❌ {match.home_team} vs {match.away_team} - NAO ENCONTRADO")
                         not_found += 1
             
