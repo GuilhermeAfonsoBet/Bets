@@ -18,6 +18,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -68,6 +69,60 @@ def _safe_float(x: Any) -> Optional[float]:
         return xf
     except Exception:
         return None
+
+
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        xi = int(x)
+        return xi
+    except Exception:
+        return None
+
+
+def _as_dict(x: Any) -> Optional[dict]:
+    """
+    Normaliza hypothesis_details: pode vir como dict (JSON/JSONB) ou string JSON.
+    """
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, (str, bytes)):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def _get_path(d: Optional[dict], path: Sequence[str]) -> Any:
+    cur: Any = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _pctl(xs: Sequence[float], q: float) -> Optional[float]:
+    if not xs:
+        return None
+    return float(np.percentile(np.asarray(xs, dtype=float), q))
+
+
+def _es_tail(xs: Sequence[float], q: float = 95.0) -> Optional[float]:
+    """
+    Expected Shortfall (média da cauda acima do percentil q).
+    Usado para risco (ex.: ES95 de liability).
+    """
+    if not xs:
+        return None
+    arr = np.asarray(xs, dtype=float)
+    thr = np.percentile(arr, q)
+    tail = arr[arr >= thr]
+    return float(np.mean(tail)) if tail.size else None
 
 
 def _mean(xs: Sequence[float]) -> Optional[float]:
@@ -321,6 +376,8 @@ async def fetch_h3b_audit_rows(
             a.reversal_direction,
             a.market_period,
             a.audit_version,
+            a.audited_at,
+            a.hypothesis_details,
             m.id AS match_id,
             m.kickoff_time,
             m.home_score,
@@ -455,6 +512,10 @@ async def main() -> int:
         default=None,
         help="Se definido, renderiza o markdown para PDF (requer reportlab). Ex.: docs/relatorio.pdf",
     )
+    parser.add_argument("--back-diff-min", type=float, default=2.0, help="Corte de edge Back (default: 2.0)")
+    parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
+    parser.add_argument("--stake-pct-of-limit", type=float, default=0.25, help="Stake fallback (% do limite), default 0.25")
+    parser.add_argument("--stake-cap", type=float, default=0.0, help="Cap opcional para stake fallback (0=sem cap)")
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
     args = parser.parse_args()
 
@@ -520,12 +581,14 @@ async def main() -> int:
                 "direction": r[17],
                 "period": r[18],
                 "version": r[19],
-                "match_id": int(r[20]),
-                "kickoff": r[21],
-                "home_score": r[22],
-                "away_score": r[23],
-                "match_status": r[24],
-                "closing_odd": r[25],
+                "audited_at": r[20],
+                "hypothesis_details": _as_dict(r[21]),
+                "match_id": int(r[22]),
+                "kickoff": r[23],
+                "home_score": r[24],
+                "away_score": r[25],
+                "match_status": r[26],
+                "closing_odd": r[27],
             }
 
             # CLV (bruto)
@@ -566,6 +629,41 @@ async def main() -> int:
         unique_matches_all = len(set(d["match_id"] for d in all_data))
         unique_matches_bs = len(set(d["match_id"] for d in with_bs))
         avg_obs_per_match = (len(all_data) / unique_matches_all) if unique_matches_all else 0.0
+
+        # Cobertura de resultados (diagnóstico de ROI)
+        matches_with_scores = len(
+            {d["match_id"] for d in all_data if d.get("home_score") is not None and d.get("away_score") is not None}
+        )
+        matches_finished_flag = len({d["match_id"] for d in all_data if str(d.get("match_status", "")).lower() == "finished"})
+
+        # Coortes operacionais e coberturas (sem depender de ROI/closing)
+        back_cut = float(args.back_diff_min)
+        lay_cut = float(args.lay_diff_max)
+
+        ok_bs = [d for d in with_bs if str(d.get("status", "")).upper() == "OK" and d.get("diff_pct") is not None]
+        back_edge = [d for d in ok_bs if float(d["diff_pct"]) >= back_cut]
+        lay_edge = [d for d in ok_bs if float(d["diff_pct"]) <= lay_cut]
+        back_edge_ids = {int(d["id"]) for d in back_edge if d.get("id") is not None}
+        lay_edge_ids = {int(d["id"]) for d in lay_edge if d.get("id") is not None}
+
+        def _is_nonempty_array(x: Any) -> bool:
+            return isinstance(x, list) and len(x) > 0
+
+        n_temporal = sum(
+            1
+            for d in ok_bs
+            if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["temporal"]))
+        )
+        n_lay_temporal = sum(
+            1
+            for d in ok_bs
+            if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["lay_temporal"]))
+        )
+        n_finance = sum(
+            1
+            for d in ok_bs
+            if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
 
         # CLV adicional (baseline por jogo: média das outras observações WS do jogo)
         by_match: Dict[int, List[Dict[str, Any]]] = {}
@@ -658,6 +756,21 @@ async def main() -> int:
         lines.append(
             f"| CLV Betslip (informativo) | {len([d for d in with_bs if d.get('is_live') is False and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | {len([d for d in with_bs if d.get('is_live') is True and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | Decisão prioriza CLV pre-match |\n"
         )
+        lines.append("\n---\n")
+
+        # 2.2) Performance por regime (pre vs in)
+        lines.append("### 2.2 Performance por regime (pre-match vs in-match)\n")
+        lines.append("| Regime | N auditorias | N betslip conf. | N OK | Back edge | Lay edge | Diff médio (OK) |\n|---|---:|---:|---:|---:|---:|---:|\n")
+        for label, is_live_val in [("PRE_MATCH", False), ("IN_MATCH", True)]:
+            sub_all = [d for d in all_data if d.get("is_live") is is_live_val]
+            sub_bs = [d for d in with_bs if d.get("is_live") is is_live_val]
+            sub_ok = [d for d in ok_bs if d.get("is_live") is is_live_val]
+            sub_back = [d for d in back_edge if d.get("is_live") is is_live_val]
+            sub_lay = [d for d in lay_edge if d.get("is_live") is is_live_val]
+            diff_mean = _mean([float(d["diff_pct"]) for d in sub_ok]) if sub_ok else None
+            lines.append(
+                f"| {label} | {len(sub_all)} | {len(sub_bs)} | {len(sub_ok)} | {len(sub_back)} | {len(sub_lay)} | {_fmt_pct(diff_mean)} |\n"
+            )
         lines.append("\n---\n")
 
         # 3) CLV pre-match (robusto)
@@ -848,6 +961,15 @@ async def main() -> int:
         summary_lines.append(
             f"- **Amostra**: {len(all_data)} auditorias (jogos únicos={unique_matches_all}, média={avg_obs_per_match:.1f} obs/jogo); betslip confiável={len(with_bs)}.\n"
         )
+        summary_lines.append(
+            f"- **Coortes (status=OK, betslip confiável)**: Back (diff>={back_cut:.1f}%): **{len(back_edge)}**; Lay (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
+        )
+        summary_lines.append(
+            f"- **Coberturas em `hypothesis_details` (OK)**: temporal(back)={n_temporal}/{len(ok_bs)}; lay_temporal={n_lay_temporal}/{len(ok_bs)}; finance={n_finance}/{len(ok_bs)}.\n"
+        )
+        summary_lines.append(
+            f"- **Cobertura de placar (ROI)**: jogos com placar={matches_with_scores}/{unique_matches_all} (status finished={matches_finished_flag}).\n"
+        )
         if len(dom_all) == 0:
             summary_lines.append("- **DOM**: sem dados no recorte atual (N=0), então não há comparação API vs DOM aqui.\n")
         # CLV foco
@@ -881,27 +1003,283 @@ async def main() -> int:
         # Inserimos o sumário logo depois disso.
         lines[5:5] = summary_lines
 
-        # 7) bloco econômico (mantém forma do relatório original)
-        lines.append("## 7) Estimativa econômica (indicativa)\n")
-        lines.append("Base: bucket **BS > WS (+2% a +10%)** (betslip confiável).  \n")
-        subset_good = [d for d in with_bs if d.get("diff_bucket") == "BS > WS (+2% a +10%)"]
-        roi_good = summarize_metric(
-            [d.get("roi_bs") for d in subset_good],
-            [d.get("match_id") for d in subset_good],
-            clip_low=-100,
-            clip_high=500,
-        )
-        lines.append(f"- ROI médio (evento): {_fmt_pct(roi_good.mean_event)}; IC90 cluster {_fmt_ci(roi_good.ci90_cluster)}; N={roi_good.n_events}; jogos={roi_good.n_matches}\n")
+        # ============================================================
+        # 7) Estimativa financeira (proxy) + risco
+        # ============================================================
+        lines.append("## 7) Estimativa financeira (proxy) e risco\n")
+        lines.append("Este bloco usa `hypothesis_details.finance` quando existe; se não existir, usa stake fallback = `stake_pct_of_limit × limit`.\n\n")
+
+        stake_pct = max(0.0, float(args.stake_pct_of_limit))
+        stake_cap = max(0.0, float(args.stake_cap))
+
+        def stake_from_limit(limit_value: float) -> float:
+            s = max(0.0, limit_value) * stake_pct
+            if stake_cap > 0:
+                s = min(s, stake_cap)
+            return s
+
+        def finance_for_row(d: dict) -> Tuple[float, float, float, float]:
+            """
+            Retorna (back_stake, back_profit_if_win, lay_stake, lay_liability).
+            """
+            h = d.get("hypothesis_details") or {}
+            fin = h.get("finance") if isinstance(h, dict) else None
+            bs = bp = ls = ll = None
+            if isinstance(fin, dict):
+                bs = _safe_float(_get_path(fin, ["back", "suggested_stake"]))
+                bp = _safe_float(_get_path(fin, ["back", "profit_if_win"]))
+                ls = _safe_float(_get_path(fin, ["lay", "suggested_stake"]))
+                ll = _safe_float(_get_path(fin, ["lay", "liability_if_lose"]))
+
+            if bs is None:
+                bs = stake_from_limit(float(d.get("limit") or 0.0))
+            if bp is None:
+                odd = _safe_float(d.get("bs_odd")) or 0.0
+                bp = bs * max(0.0, odd - 1.0) if (bs and odd > 1.0) else 0.0
+
+            if ls is None:
+                # tenta usar lay.available_limit
+                lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                ls = stake_from_limit(float(lay_lim if lay_lim is not None else (d.get("limit") or 0.0)))
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or 0.0
+            if lay_odd <= 0:
+                lay_odd = _safe_float(d.get("bs_odd")) or 0.0  # proxy
+            if ll is None:
+                ll = ls * max(0.0, lay_odd - 1.0) if (ls and lay_odd > 1.0) else 0.0
+
+            return float(bs), float(bp), float(ls), float(ll)
+
+        back_stakes = []
+        back_profit_if_win = []
+        lay_stakes = []
+        lay_liability = []
+        for d in ok_bs:
+            bs, bp, ls, ll = finance_for_row(d)
+            if int(d["id"]) in back_edge_ids:
+                back_stakes.append(bs)
+                back_profit_if_win.append(bp)
+            if int(d["id"]) in lay_edge_ids:
+                lay_stakes.append(ls)
+                lay_liability.append(ll)
+
+        lines.append("### 7.1 Back (BS >> WS)\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Corte (diff_pct) | >= {back_cut:.1f}% |\n")
+        lines.append(f"| N eventos | {len(back_edge)} |\n")
+        lines.append(f"| Stake total (estimado) | {_fmt_num(sum(back_stakes) if back_stakes else None, 2)} |\n")
+        lines.append(f"| Stake médio | {_fmt_num(_mean(back_stakes), 2)} |\n")
+        lines.append(f"| Profit_if_win total (estimado) | {_fmt_num(sum(back_profit_if_win) if back_profit_if_win else None, 2)} |\n")
+        lines.append(f"| Profit_if_win médio | {_fmt_num(_mean(back_profit_if_win), 2)} |\n")
+
+        lines.append("\n### 7.2 Lay (BS << WS) — risco de cauda\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Corte (diff_pct) | <= {lay_cut:.1f}% |\n")
+        lines.append(f"| N eventos | {len(lay_edge)} |\n")
+        lines.append(f"| Stake total (estimado) | {_fmt_num(sum(lay_stakes) if lay_stakes else None, 2)} |\n")
+        lines.append(f"| Liability total (estimada) | {_fmt_num(sum(lay_liability) if lay_liability else None, 2)} |\n")
+        lines.append(f"| Liability média | {_fmt_num(_mean(lay_liability), 2)} |\n")
+        lines.append(f"| Liability p95 | {_fmt_num(_pctl(lay_liability, 95), 2)} |\n")
+        lines.append(f"| Liability p99 | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
+        lines.append(f"| ES95 (liability) | {_fmt_num(_es_tail(lay_liability, 95), 2)} |\n")
+        lines.append(f"| Liability max | {_fmt_num(max(lay_liability) if lay_liability else None, 2)} |\n")
         lines.append("\n---\n")
 
-        lines.append("## 8) Como reproduzir\n")
+        # ============================================================
+        # 8) Evolução temporal (T+0 -> último ponto)
+        # ============================================================
+        def _last_point(arr: Any) -> Tuple[Optional[float], Optional[float], int]:
+            """
+            Retorna (diff_last, t_last_s, n_pts) a partir de um array de pontos.
+            """
+            if not isinstance(arr, list) or not arr:
+                return None, None, 0
+            n_pts = len(arr)
+            diff_last = None
+            t_last = None
+            for e in reversed(arr):
+                if isinstance(e, dict):
+                    if diff_last is None:
+                        diff_last = _safe_float(e.get("diff_pct"))
+                    if t_last is None:
+                        t_last = _safe_float(e.get("t"))
+                if diff_last is not None and t_last is not None:
+                    break
+            return diff_last, t_last, n_pts
+
+        def _agg_temporal(rows_in: List[dict], mode: str) -> Dict[str, dict]:
+            """
+            mode='back' usa difference_pct como t0 e h.temporal como série.
+            mode='lay'  usa lay odd do h.lay como t0 e h.lay_temporal como série.
+            """
+            out: Dict[str, dict] = {}
+            for regime, is_live_val in [("PRE_MATCH", False), ("IN_MATCH", True)]:
+                sub = [d for d in rows_in if d.get("is_live") is is_live_val]
+                t0s = []
+                lasts = []
+                deltas = []
+                npts = []
+                tlasts = []
+                for d in sub:
+                    h = d.get("hypothesis_details") or {}
+                    if mode == "back":
+                        arr = h.get("temporal")
+                        diff_t0 = _safe_float(d.get("diff_pct"))
+                    else:
+                        arr = h.get("lay_temporal")
+                        ws_odd = _safe_float(d.get("ws_odd"))
+                        lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+                        diff_t0 = ((lay_odd - ws_odd) / ws_odd * 100.0) if (ws_odd and lay_odd) else None
+                    diff_last, t_last_s, n = _last_point(arr)
+                    if diff_t0 is None or diff_last is None:
+                        continue
+                    t0s.append(float(diff_t0))
+                    lasts.append(float(diff_last))
+                    deltas.append(float(diff_last - diff_t0))
+                    npts.append(n)
+                    if t_last_s is not None:
+                        tlasts.append(float(t_last_s))
+                if not deltas:
+                    out[regime] = {"n": 0}
+                    continue
+                m = float(np.mean(deltas))
+                sd = float(np.std(deltas, ddof=1)) if len(deltas) >= 2 else None
+                se = (sd / math.sqrt(len(deltas))) if (sd is not None and len(deltas) >= 2) else None
+                ci95 = (m - 1.96 * se, m + 1.96 * se) if se is not None else None
+
+                # retenção/perda/ganho de edge
+                if mode == "back":
+                    retain = sum(1 for a, b in zip(t0s, lasts) if a >= back_cut and b >= back_cut) / len(deltas)
+                    loss = sum(1 for a, b in zip(t0s, lasts) if a >= back_cut and b < back_cut) / len(deltas)
+                    gain = None
+                else:
+                    retain = sum(1 for a, b in zip(t0s, lasts) if a <= lay_cut and b <= lay_cut) / len(deltas)
+                    loss = sum(1 for a, b in zip(t0s, lasts) if a <= lay_cut and b > lay_cut) / len(deltas)
+                    gain = sum(1 for a, b in zip(t0s, lasts) if a > lay_cut and b <= lay_cut) / len(deltas)
+
+                out[regime] = {
+                    "n": len(deltas),
+                    "diff_t0_avg": float(np.mean(t0s)),
+                    "diff_tlast_avg": float(np.mean(lasts)),
+                    "delta_avg": m,
+                    "delta_ci95": ci95,
+                    "retain": retain,
+                    "loss": loss,
+                    "gain": gain,
+                    "avg_points": float(np.mean(npts)) if npts else None,
+                    "t_last_avg_s": float(np.mean(tlasts)) if tlasts else None,
+                }
+            return out
+
+        lines.append("## 8) Evolução temporal (T+0 -> último ponto)\n")
+        lines.append("Este bloco mede se o edge (diff_pct) **retém** ou **se perde** após alguns segundos/minutos (quando há `hypothesis_details.temporal`/`lay_temporal`).\n\n")
+
+        back_temp = _agg_temporal(ok_bs, mode="back")
+        lay_temp = _agg_temporal(ok_bs, mode="lay")
+
+        lines.append("### 8.1 Back temporal\n")
+        lines.append("| Regime | N | diff_t0_avg % | diff_tlast_avg % | delta_avg % | IC95 delta | retenção edge % | perda edge % | pts médios | t_last médio (s) |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = back_temp.get(regime, {"n": 0})
+            if s.get("n", 0) <= 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — | — | — |\n")
+                continue
+            ci = s.get("delta_ci95")
+            lines.append(
+                f"| {regime} | {s['n']} | {_fmt_pct(s['diff_t0_avg'],2)} | {_fmt_pct(s['diff_tlast_avg'],2)} | {_fmt_pct(s['delta_avg'],2)} | {_fmt_ci(ci,2)} | {s['retain']*100:.1f} | {s['loss']*100:.1f} | {_fmt_num(s.get('avg_points'),2)} | {_fmt_num(s.get('t_last_avg_s'),1)} |\n"
+            )
+        lines.append("\n### 8.2 Lay temporal\n")
+        lines.append("| Regime | N | diff_t0_avg % | diff_tlast_avg % | delta_avg % | IC95 delta | retenção edge % | perda edge % | ganho edge % | pts médios | t_last médio (s) |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = lay_temp.get(regime, {"n": 0})
+            if s.get("n", 0) <= 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — | — | — | — |\n")
+                continue
+            ci = s.get("delta_ci95")
+            gain = (s.get("gain") * 100.0) if s.get("gain") is not None else None
+            lines.append(
+                f"| {regime} | {s['n']} | {_fmt_pct(s['diff_t0_avg'],2)} | {_fmt_pct(s['diff_tlast_avg'],2)} | {_fmt_pct(s['delta_avg'],2)} | {_fmt_ci(ci,2)} | {s['retain']*100:.1f} | {s['loss']*100:.1f} | {_fmt_num(gain,1)} | {_fmt_num(s.get('avg_points'),2)} | {_fmt_num(s.get('t_last_avg_s'),1)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 9) Combinações de valor (regime x linha x lag)
+        # ============================================================
+        lines.append("## 9) Combinações de valor (regime × linha AH × lag)\n")
+        lines.append("Tabela rankeada por volume (N). Métrica: diff_pct (OK, betslip confiável).\n\n")
+
+        def top_combos(rows_in: List[dict], max_rows: int = 12) -> List[Tuple[Tuple[str, str, str], MetricSummary]]:
+            groups: Dict[Tuple[str, str, str], Tuple[List[float], List[int]]] = {}
+            for d in rows_in:
+                regime = "IN_MATCH" if d.get("is_live") is True else "PRE_MATCH"
+                key = (regime, str(d.get("line_bucket")), str(d.get("lag_bucket")))
+                groups.setdefault(key, ([], []))
+                groups[key][0].append(float(d["diff_pct"]))
+                groups[key][1].append(int(d["match_id"]))
+            summaries = []
+            for k, (vals, mids) in groups.items():
+                s = summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+                summaries.append((k, s))
+            summaries.sort(key=lambda x: x[1].n_events, reverse=True)
+            return summaries[:max_rows]
+
+        lines.append("### 9.1 Back combos (diff_pct >= corte)\n")
+        back_combo_rows = [d for d in back_edge if d.get("diff_pct") is not None]
+        lines.append("| Regime | Linha | Lag | N | Jogos | Mean diff % | IC90 cluster |\n|---|---|---|---:|---:|---:|---|\n")
+        for (reg, lb, lag), s in top_combos(back_combo_rows, 12):
+            lines.append(f"| {reg} | {lb} | {lag} | {s.n_events} | {s.n_matches} | {_fmt_pct(s.mean_event,2)} | {_fmt_ci(s.ci90_cluster,2)} |\n")
+
+        lines.append("\n### 9.2 Lay combos (diff_pct <= corte) + risco\n")
+        lay_combo_rows = [d for d in lay_edge if d.get("diff_pct") is not None]
+        lines.append("| Regime | Linha | Lag | N | Jogos | Mean diff % | IC90 cluster | Liability p95 |\n|---|---|---|---:|---:|---:|---|---:|\n")
+        # liability por grupo (usando finance_for_row)
+        lay_liab_by_group: Dict[Tuple[str, str, str], List[float]] = {}
+        for d in lay_combo_rows:
+            reg = "IN_MATCH" if d.get("is_live") is True else "PRE_MATCH"
+            key = (reg, str(d.get("line_bucket")), str(d.get("lag_bucket")))
+            _, _, _, ll = finance_for_row(d)
+            lay_liab_by_group.setdefault(key, []).append(float(ll))
+        for (reg, lb, lag), s in top_combos(lay_combo_rows, 12):
+            p95 = _pctl(lay_liab_by_group.get((reg, lb, lag), []), 95)
+            lines.append(f"| {reg} | {lb} | {lag} | {s.n_events} | {s.n_matches} | {_fmt_pct(s.mean_event,2)} | {_fmt_ci(s.ci90_cluster,2)} | {_fmt_num(p95,2)} |\n")
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 10) Diagnóstico de ROI / atualização de resultados
+        # ============================================================
+        lines.append("## 10) Diagnóstico: por que o ROI pode estar zerado\n")
+        lines.append("ROI aqui é calculado por placar do jogo (`matches.home_score/away_score`). Se os placares não estiverem preenchidos no banco, a cobertura de ROI será 0.\n\n")
+        lines.append("| Indicador | Valor |\n|---|---:|\n")
+        lines.append(f"| Jogos únicos no recorte | {unique_matches_all} |\n")
+        lines.append(f"| Jogos com placar disponível (home_score/away_score não nulos) | {matches_with_scores} |\n")
+        lines.append(f"| Jogos com status='finished' no banco | {matches_finished_flag} |\n")
+        lines.append("\nSe `placar disponível` estiver 0, isso geralmente indica que o job de resultados não rodou (ou está sem credenciais/chave da API).  \n")
+        lines.append("Sugestão (rodar no servidor): `cd betinasia_bot && python3 -m results.auto_update_results --once` (ou configure o serviço para rodar em loop).\n")
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 11) Conclusões, riscos e pontos em aberto
+        # ============================================================
+        lines.append("## 11) Conclusões, riscos e pontos em aberto\n")
+        lines.append("- **Execução (CLV)**: use as seções 3/6 para validar qualidade de execução (especialmente pre-match).\n")
+        lines.append("- **Lay**: não pode ser decidido por média. Use p95/p99/ES95 de liability (seção 7.2) e combos com risco (seção 9.2).\n")
+        lines.append("- **Temporal**: se a cobertura `temporal/lay_temporal` for baixa, a inferência de retenção de edge fica limitada (seção 8).\n")
+        lines.append("- **ROI/resultado**: se placares não estão no banco, qualquer conclusão de lucro realizado fica em aberto (seção 10).\n")
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 12) Como reproduzir
+        # ============================================================
+        lines.append("## 12) Como reproduzir\n")
         lines.append("1. Configure `betinasia_bot/.env` com `DATABASE_URL`.  \n")
-        lines.append("2. Execute (de dentro de `betinasia_bot/`):\n\n")
+        lines.append("2. (Opcional) Atualize resultados para ter ROI: `cd betinasia_bot && python3 -m results.auto_update_results --once`.  \n")
+        lines.append("3. Execute:\n\n")
         lines.append("```bash\n")
-        lines.append("python analyze_contexto_operacao_b808_robust_report.py \\\n")
+        lines.append("python3 betinasia_bot/analyze_contexto_operacao_b808_robust_report.py \\\n")
         lines.append("  --direction up \\\n")
         lines.append("  --versions v4.0-api,v1.0,v1.0-recovered \\\n")
-        lines.append("  --out docs/analise_contexto_operacao_b808_robusta.md\n")
+        lines.append("  --lookback-days 14 \\\n")
+        lines.append("  --out betinasia_bot/docs/analise_contexto_operacao_b808_robusta.md \\\n")
+        lines.append("  --pdf betinasia_bot/docs/analise_contexto_operacao_b808_robusta.pdf\n")
         lines.append("```\n")
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
