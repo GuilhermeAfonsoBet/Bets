@@ -1270,6 +1270,17 @@ async def main() -> int:
                 return None
             return (odd - clo) / clo * 100.0
 
+        def _clv_pct_lay_from_odd(lay_odd: Optional[float], closing_odd: Any) -> Optional[float]:
+            """
+            Para Lay, o sinal é invertido: é "bom" quando você LAYA barato e o closing sobe.
+            Definição: (closing - entry) / closing * 100
+            """
+            lay_odd = _safe_float(lay_odd)
+            clo = _safe_float(closing_odd)
+            if lay_odd is None or clo is None or clo <= 0:
+                return None
+            return (clo - lay_odd) / clo * 100.0
+
         def _summarize_timing(rows_in: List[dict], mode: str) -> Dict[str, Any]:
             stats = []
             for d in rows_in:
@@ -1315,7 +1326,7 @@ async def main() -> int:
             Retorna linhas por tempo: (t_label, n, mean_diff, mean_odd, mean_clv, mean_roi)
             """
             times = [0, 3, 6, 10, 15, 20]
-            buckets: Dict[int, List[Tuple[float, float, Optional[float]]]] = {t: [] for t in times}
+            buckets: Dict[int, List[Tuple[float, float, Optional[float], Optional[float]]]] = {t: [] for t in times}
             for d in rows_in:
                 series = _build_back_series(d) if mode == "back" else _build_lay_series(d)
                 if not series:
@@ -1328,7 +1339,10 @@ async def main() -> int:
                     tgt = min(times, key=lambda x: abs(x - t))
                     diff = float(p["diff_pct"])
                     odd = float(p["odd"])
-                    clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                    if mode == "back":
+                        clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                    else:
+                        clv = _clv_pct_lay_from_odd(odd, d.get("closing_odd"))
                     roi = None
                     if mult is not None:
                         if mode == "back":
@@ -1419,9 +1433,9 @@ async def main() -> int:
                 "is_live": d.get("is_live"),
                 "had_reversal": bool(a.get("had_reversal")),
                 "t_ext": a.get("t_ext"),
-                "clv_t0": _clv_pct_from_odd(p0["odd"], closing),
-                "clv_ext": _clv_pct_from_odd(a["odd_ext"], closing),
-                "clv_last": _clv_pct_from_odd(plast["odd"], closing),
+                "clv_t0": _clv_pct_lay_from_odd(p0["odd"], closing),
+                "clv_ext": _clv_pct_lay_from_odd(a["odd_ext"], closing),
+                "clv_last": _clv_pct_lay_from_odd(plast["odd"], closing),
                 "roi_t0": roi0,
                 "roi_ext": roival,
                 "roi_last": roilast,

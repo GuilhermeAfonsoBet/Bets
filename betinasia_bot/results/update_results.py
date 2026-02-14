@@ -14,6 +14,7 @@ Ou com data especifica:
 
 import asyncio
 import argparse
+import os
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
 from loguru import logger
@@ -24,8 +25,10 @@ from storage.database import Database
 from storage.models import Match, BestOddsHistory
 
 
-# API Key (pode ser sobrescrita por variavel de ambiente)
-API_KEY = "2707432f357b84409fd3212f9c1a84a5"
+# API Key (pode ser sobrescrita por variável de ambiente)
+# OBS: por segurança/portabilidade, prefira configurar via env:
+#   export API_FOOTBALL_KEY="..."
+API_KEY = os.getenv("API_FOOTBALL_KEY", "2707432f357b84409fd3212f9c1a84a5")
 
 
 import unicodedata

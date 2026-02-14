@@ -46,6 +46,7 @@ Preencha obrigatoriamente:
 - `BETINASIA_USERNAME` — Seu usuário do BetinAsia
 - `BETINASIA_PASSWORD` — Sua senha do BetinAsia
 - `DATABASE_URL` — `postgresql://betbot:betbot_secure_2026@localhost:5432/betinasia_bot`
+- `API_FOOTBALL_KEY` — chave do API-Football (api-sports.io) para sincronizar placares e habilitar ROI
 
 ### 4. Executar deploy
 
