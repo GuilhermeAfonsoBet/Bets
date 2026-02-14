@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import random
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -449,6 +450,11 @@ async def main() -> int:
         help="Se definido, filtra auditorias por janela móvel (a.audited_at >= NOW() - N dias).",
     )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
+    parser.add_argument(
+        "--pdf",
+        default=None,
+        help="Se definido, renderiza o markdown para PDF (requer reportlab). Ex.: docs/relatorio.pdf",
+    )
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
     args = parser.parse_args()
 
@@ -902,6 +908,19 @@ async def main() -> int:
         out_path.write_text("".join(lines), encoding="utf-8")
 
         print(f"Relatório gerado em: {out_path}")
+
+        if args.pdf:
+            pdf_path = Path(str(args.pdf))
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            renderer = Path(__file__).resolve().parent / "docs" / "render_markdown_to_pdf.py"
+            cmd = [sys.executable, str(renderer), str(out_path), str(pdf_path)]
+            try:
+                subprocess.run(cmd, check=True)
+                print(f"PDF gerado em: {pdf_path}")
+            except FileNotFoundError:
+                print(f"[WARN] Não achei o renderizador de PDF em: {renderer}")
+            except subprocess.CalledProcessError as e:
+                print(f"[WARN] Falha ao gerar PDF (instale 'reportlab'): {e}")
         return 0
 
     finally:
