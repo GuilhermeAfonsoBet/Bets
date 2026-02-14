@@ -24,6 +24,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -217,6 +218,25 @@ def _fmt_ci(ci: Optional[Tuple[float, float]], digits: int = 3, suffix: str = "%
     return f"[{ci[0]:+.{digits}f}{suffix}, {ci[1]:+.{digits}f}{suffix}]"
 
 
+def _redact_db_url(db_url: str) -> str:
+    """
+    Remove senha de uma URL tipo postgresql://user:pass@host:port/db.
+    """
+    try:
+        sp = urlsplit(db_url)
+        if "@" not in (sp.netloc or ""):
+            return db_url
+        creds, host = sp.netloc.rsplit("@", 1)
+        if ":" in creds:
+            user, _ = creds.split(":", 1)
+            netloc = f"{user}:***@{host}"
+        else:
+            netloc = f"{creds}@{host}"
+        return urlunsplit((sp.scheme, netloc, sp.path, sp.query, sp.fragment))
+    except Exception:
+        return "<database_url_redacted>"
+
+
 def classify_model(audit_version: str) -> str:
     v = (audit_version or "").strip()
     if v == "v4.0-api":
@@ -407,6 +427,11 @@ async def main() -> int:
         default="v4.0-api,v1.0,v1.0-recovered",
         help="Lista de audit_version separada por vírgula (default: v4.0-api,v1.0,v1.0-recovered)",
     )
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override do DATABASE_URL (útil se o .env não estiver sendo carregado ou para apontar outro host)",
+    )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
     args = parser.parse_args()
@@ -418,8 +443,21 @@ async def main() -> int:
     versions = [v.strip() for v in str(args.versions).split(",") if v.strip()]
     out_path = Path(args.out)
 
-    db = Database()
-    await db.connect()
+    db = Database(database_url=args.database_url) if args.database_url else Database()
+    try:
+        await db.connect()
+    except Exception as e:
+        # Ajuda diagnóstico do lado do usuário (sem vazar senha)
+        try:
+            from config.settings import settings
+
+            effective = args.database_url or settings.database_url
+            print("\n[ERRO] Falha ao conectar no banco.")
+            print(f"- DATABASE_URL efetivo: {_redact_db_url(str(effective))}")
+            print(f"- Erro: {e}\n")
+        except Exception:
+            pass
+        raise
 
     try:
         rows = await fetch_h3b_audit_rows(db, direction=str(args.direction), versions=versions)

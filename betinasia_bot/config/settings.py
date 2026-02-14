@@ -97,7 +97,9 @@ class Settings(BaseSettings):
         return None
     
     class Config:
-        env_file = ".env"
+        # Carrega o .env do diretório raiz do projeto (betinasia_bot/.env),
+        # mesmo quando o script é executado a partir de outro CWD (ex.: ~/Bets).
+        env_file = str(Path(__file__).resolve().parents[1] / ".env")
         env_file_encoding = "utf-8"
         case_sensitive = False
 
