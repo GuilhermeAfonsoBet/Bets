@@ -801,7 +801,15 @@ async def main() -> int:
                 subset = [d for d in subset if d.get("is_live") is False]
             vals = [d.get(key) for d in subset]
             mids = [d.get("match_id") for d in subset]
-            return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+            # IMPORTANTE:
+            # - CLV é % vs closing e pode ser sanity-clipped (evita lixo/parse errado).
+            # - ROI pode assumir -100% em loss e >50% em wins (principalmente odds altas),
+            #   então NÃO pode herdar o clip de CLV, senão distorce N e win rate.
+            if "clv" in str(key).lower():
+                return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+            if "roi" in str(key).lower():
+                return summarize_metric(vals, mids, clip_low=-100, clip_high=500)
+            return summarize_metric(vals, mids)
 
         api_clv = model_metric("API (2-4s)", "clv_bs", prematch_only=True)
         dom_clv = model_metric("DOM (15-30s)", "clv_bs", prematch_only=True)
