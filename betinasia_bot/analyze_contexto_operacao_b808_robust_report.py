@@ -1371,6 +1371,84 @@ async def main() -> int:
         for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="back"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
 
+        def _entry_metrics_back(d: dict) -> Optional[dict]:
+            series = _build_back_series(d)
+            if not series:
+                return None
+            a = _analyze_peak(series, mode="back")
+            if a.get("n", 0) <= 0:
+                return None
+            closing = d.get("closing_odd")
+            # define pontos
+            p0 = series[0]  # t=0 incluído quando houver
+            plast = series[-1]
+            # ROI por ponto (se houver placar)
+            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
+            roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
+            roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
+            return {
+                "match_id": int(d.get("match_id")),
+                "is_live": d.get("is_live"),
+                "had_reversal": bool(a.get("had_reversal")),
+                "t_ext": a.get("t_ext"),
+                "clv_t0": _clv_pct_from_odd(p0["odd"], closing),
+                "clv_ext": _clv_pct_from_odd(a["odd_ext"], closing),
+                "clv_last": _clv_pct_from_odd(plast["odd"], closing),
+                "roi_t0": roi0,
+                "roi_ext": roipeak,
+                "roi_last": roilast,
+            }
+
+        def _entry_metrics_lay(d: dict) -> Optional[dict]:
+            series = _build_lay_series(d)
+            if not series:
+                return None
+            a = _analyze_peak(series, mode="lay")
+            if a.get("n", 0) <= 0:
+                return None
+            closing = d.get("closing_odd")
+            p0 = series[0]
+            plast = series[-1]
+            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
+            roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
+            roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
+            return {
+                "match_id": int(d.get("match_id")),
+                "is_live": d.get("is_live"),
+                "had_reversal": bool(a.get("had_reversal")),
+                "t_ext": a.get("t_ext"),
+                "clv_t0": _clv_pct_from_odd(p0["odd"], closing),
+                "clv_ext": _clv_pct_from_odd(a["odd_ext"], closing),
+                "clv_last": _clv_pct_from_odd(plast["odd"], closing),
+                "roi_t0": roi0,
+                "roi_ext": roival,
+                "roi_last": roilast,
+            }
+
+        def _summarize_entry(rows: List[dict], key: str) -> MetricSummary:
+            vals = [r.get(key) for r in rows]
+            mids = [r.get("match_id") for r in rows]
+            return summarize_metric(vals, mids, clip_low=-50, clip_high=50) if "clv" in key else summarize_metric(vals, mids)
+
+        # 8.1b) impacto: t0 vs pico vs último, com/sem reversão
+        back_entries = [em for d in ok_bs for em in [_entry_metrics_back(d)] if em is not None]
+        lines.append("\n### 8.1b Back — impacto por timing (t0 vs pico vs último) e reversão\n")
+        lines.append("Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**.\n\n")
+        lines.append("| Subcoorte | N | CLV t0 | CLV pico | CLV último | ROI t0 | ROI pico | ROI último |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        for label, filt in [
+            ("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]),
+            ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]]),
+        ]:
+            clv0 = _mean([r["clv_t0"] for r in filt if r.get("clv_t0") is not None])
+            clve = _mean([r["clv_ext"] for r in filt if r.get("clv_ext") is not None])
+            clvl = _mean([r["clv_last"] for r in filt if r.get("clv_last") is not None])
+            roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
+            roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
+            roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
+            lines.append(f"| {label} | {len(filt)} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n")
+
         # LAY
         lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
         lay_agg = _agg_by_regime(lay_stats)
@@ -1389,6 +1467,22 @@ async def main() -> int:
         lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (vs closing) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
         for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="lay"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
+
+        lay_entries = [em for d in ok_bs for em in [_entry_metrics_lay(d)] if em is not None]
+        lines.append("\n### 8.2b Lay — impacto por timing (t0 vs vale vs último) e reversão\n")
+        lines.append("Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**.\n\n")
+        lines.append("| Subcoorte | N | CLV t0 | CLV vale | CLV último | ROI/liab t0 | ROI/liab vale | ROI/liab último |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        for label, filt in [
+            ("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]),
+            ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]]),
+        ]:
+            clv0 = _mean([r["clv_t0"] for r in filt if r.get("clv_t0") is not None])
+            clve = _mean([r["clv_ext"] for r in filt if r.get("clv_ext") is not None])
+            clvl = _mean([r["clv_last"] for r in filt if r.get("clv_last") is not None])
+            roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
+            roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
+            roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
+            lines.append(f"| {label} | {len(filt)} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n")
 
         lines.append("\n---\n")
 
