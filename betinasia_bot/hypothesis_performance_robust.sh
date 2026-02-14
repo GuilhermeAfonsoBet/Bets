@@ -439,10 +439,144 @@ FROM h6_correlation_lag_events;
 "
 echo
 
-echo "7) NOTAS DE LEITURA"
+echo "7) INFERENCIA ESTATISTICA (audit diff_pct por coorte)"
+run_psql "
+WITH cohorts AS (
+  SELECT
+    audit_version,
+    CASE
+      WHEN status='OK' AND difference_pct >= ${BACK_DIFF_MIN} THEN 'BACK_EDGE'
+      WHEN status='OK' AND difference_pct <= ${LAY_DIFF_MAX} THEN 'LAY_EDGE'
+      ELSE NULL
+    END AS cohort,
+    difference_pct::numeric AS metric
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+    AND difference_pct IS NOT NULL
+),
+stats AS (
+  SELECT
+    audit_version,
+    cohort,
+    COUNT(*) AS n,
+    AVG(metric) AS mean_metric,
+    STDDEV_SAMP(metric) AS sd_metric
+  FROM cohorts
+  WHERE cohort IS NOT NULL
+  GROUP BY 1,2
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n >= 2 AND sd_metric IS NOT NULL THEN sd_metric / SQRT(n::numeric) END AS se_metric
+  FROM stats
+)
+SELECT
+  audit_version,
+  cohort,
+  n,
+  ROUND(mean_metric::numeric, 3) AS mean_diff_pct,
+  ROUND(sd_metric::numeric, 3) AS sd_diff_pct,
+  ROUND(se_metric::numeric, 3) AS se_diff_pct,
+  ROUND((mean_metric - 1.645 * se_metric)::numeric, 3) AS ci90_low,
+  ROUND((mean_metric + 1.645 * se_metric)::numeric, 3) AS ci90_high,
+  ROUND((mean_metric - 1.960 * se_metric)::numeric, 3) AS ci95_low,
+  ROUND((mean_metric + 1.960 * se_metric)::numeric, 3) AS ci95_high,
+  ROUND((mean_metric / NULLIF(se_metric,0))::numeric, 2) AS t_stat_vs_0,
+  CASE
+    WHEN se_metric IS NULL THEN 'NA'
+    WHEN (mean_metric - 1.960 * se_metric) > 0 OR (mean_metric + 1.960 * se_metric) < 0 THEN 'YES'
+    ELSE 'NO'
+  END AS sig_95
+FROM calc
+ORDER BY audit_version DESC, cohort;
+"
+echo
+
+echo "8) INFERENCIA DE RESULTADO REALIZADO (profit_loss e CLV)"
+run_psql "
+WITH data AS (
+  SELECT 'h1_pricing_events' AS tabela, profit_loss::numeric AS profit_loss, clv_pct::numeric AS clv_pct
+  FROM h1_pricing_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h3_line_monotonicity_events', profit_loss::numeric, clv_pct::numeric
+  FROM h3_line_monotonicity_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h3b_temporal_reversal_events', profit_loss::numeric, clv_pct::numeric
+  FROM h3b_temporal_reversal_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h6_correlation_lag_events', profit_loss::numeric, clv_pct::numeric
+  FROM h6_correlation_lag_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+),
+agg AS (
+  SELECT
+    tabela,
+    COUNT(*) AS n_total,
+    COUNT(profit_loss) AS n_pl,
+    ROUND(100.0 * COUNT(profit_loss) / NULLIF(COUNT(*),0), 1) AS pl_cov_pct,
+    AVG(profit_loss) AS pl_mean,
+    STDDEV_SAMP(profit_loss) AS pl_sd,
+    COUNT(clv_pct) AS n_clv,
+    ROUND(100.0 * COUNT(clv_pct) / NULLIF(COUNT(*),0), 1) AS clv_cov_pct,
+    AVG(clv_pct) AS clv_mean,
+    STDDEV_SAMP(clv_pct) AS clv_sd,
+    AVG(
+      CASE
+        WHEN profit_loss IS NULL THEN NULL
+        WHEN profit_loss > 0 THEN 1.0
+        ELSE 0.0
+      END
+    ) AS win_rate
+  FROM data
+  GROUP BY 1
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n_pl >= 2 AND pl_sd IS NOT NULL THEN pl_sd / SQRT(n_pl::numeric) END AS pl_se,
+    CASE WHEN n_clv >= 2 AND clv_sd IS NOT NULL THEN clv_sd / SQRT(n_clv::numeric) END AS clv_se,
+    CASE
+      WHEN n_pl >= 2 AND win_rate IS NOT NULL
+      THEN SQRT(win_rate * (1 - win_rate) / n_pl::numeric)
+      ELSE NULL
+    END AS wr_se
+  FROM agg
+)
+SELECT
+  tabela,
+  n_total,
+  n_pl,
+  pl_cov_pct,
+  ROUND(pl_mean::numeric,4) AS pl_mean_u,
+  ROUND((pl_mean - 1.645 * pl_se)::numeric,4) AS pl_ci90_low,
+  ROUND((pl_mean + 1.645 * pl_se)::numeric,4) AS pl_ci90_high,
+  ROUND((pl_mean - 1.960 * pl_se)::numeric,4) AS pl_ci95_low,
+  ROUND((pl_mean + 1.960 * pl_se)::numeric,4) AS pl_ci95_high,
+  n_clv,
+  clv_cov_pct,
+  ROUND(clv_mean::numeric,4) AS clv_mean_pct,
+  ROUND((clv_mean - 1.960 * clv_se)::numeric,4) AS clv_ci95_low,
+  ROUND((clv_mean + 1.960 * clv_se)::numeric,4) AS clv_ci95_high,
+  ROUND((win_rate * 100)::numeric,2) AS win_rate_pct,
+  ROUND(((win_rate - 1.960 * wr_se) * 100)::numeric,2) AS win_rate_ci95_low,
+  ROUND(((win_rate + 1.960 * wr_se) * 100)::numeric,2) AS win_rate_ci95_high
+FROM calc
+ORDER BY tabela;
+"
+echo
+
+echo "9) NOTAS DE LEITURA"
 echo "- Back e Lay devem ser analisados separados."
 echo "- Lay tem cauda mais pesada: use p95/p99/ES95 de liability e bucket exposure."
-echo "- Para ROI/drawdown realizado, monitorar cobertura de profit_loss nas tabelas de hipótese."
+echo "- A seção 7 testa diferença média (diff_pct) vs 0 com IC e t_stat."
+echo "- A seção 8 usa apenas registros liquidados (profit_loss/clv não nulos)."
+echo "- Se pl_cov_pct for baixo, IC de ROI/drawdown realizado fica frágil (amostra efetiva pequena)."
 echo
 echo "====================================================================="
 echo "Fim da análise robusta."
