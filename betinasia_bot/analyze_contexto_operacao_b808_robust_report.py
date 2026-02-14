@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -288,6 +289,7 @@ async def fetch_h3b_audit_rows(
     db: Database,
     direction: str,
     versions: List[str],
+    lookback_days: Optional[int] = None,
 ) -> List[Tuple[Any, ...]]:
     """
     Traz a base principal:
@@ -360,10 +362,11 @@ async def fetch_h3b_audit_rows(
           AND a.reversal_direction = :direction
           AND m.kickoff_time < NOW()
           AND a.audit_version = ANY(:versions)
+          AND (:lookback_days IS NULL OR a.audited_at >= NOW() - (:lookback_days * INTERVAL '1 day'))
         """
     )
     async with db.async_session() as session:
-        res = await session.execute(q, {"direction": direction, "versions": versions})
+        res = await session.execute(q, {"direction": direction, "versions": versions, "lookback_days": lookback_days})
         return list(res.fetchall())
 
 
@@ -432,6 +435,12 @@ async def main() -> int:
         default=None,
         help="Override do DATABASE_URL (útil se o .env não estiver sendo carregado ou para apontar outro host)",
     )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=None,
+        help="Se definido, filtra auditorias por janela móvel (a.audited_at >= NOW() - N dias).",
+    )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
     args = parser.parse_args()
@@ -460,7 +469,19 @@ async def main() -> int:
         raise
 
     try:
-        rows = await fetch_h3b_audit_rows(db, direction=str(args.direction), versions=versions)
+        print(
+            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, lookback_days={args.lookback_days})...",
+            flush=True,
+        )
+        t0 = time.perf_counter()
+        rows = await fetch_h3b_audit_rows(
+            db,
+            direction=str(args.direction),
+            versions=versions,
+            lookback_days=args.lookback_days,
+        )
+        dt = time.perf_counter() - t0
+        print(f"[INFO] Linhas carregadas: {len(rows)} (tempo: {dt:.1f}s)", flush=True)
 
         # dataset em dicts (compatível com análise original)
         all_data: List[Dict[str, Any]] = []
