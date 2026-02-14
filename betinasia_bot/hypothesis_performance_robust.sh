@@ -182,15 +182,15 @@ x AS (
 SELECT
   audit_version,
   COUNT(*) AS n,
-  ROUND(AVG(difference_pct),2) AS diff_avg_pct,
+  ROUND(AVG(difference_pct)::numeric,2) AS diff_avg_pct,
   ROUND((PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY difference_pct))::numeric,2) AS diff_p50_pct,
   ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY difference_pct))::numeric,2) AS diff_p90_pct,
-  ROUND(AVG(betslip_odd),3) AS odd_avg,
-  ROUND(AVG(betslip_limit),2) AS limit_avg,
+  ROUND(AVG(betslip_odd)::numeric,3) AS odd_avg,
+  ROUND(AVG(betslip_limit)::numeric,2) AS limit_avg,
   ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY betslip_limit))::numeric,2) AS limit_p90,
-  ROUND(AVG(back_stake_est),2) AS stake_est_avg,
+  ROUND(AVG(back_stake_est)::numeric,2) AS stake_est_avg,
   ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY back_stake_est))::numeric,2) AS stake_est_p90,
-  ROUND(AVG(back_profit_if_win_est),2) AS profit_if_win_avg
+  ROUND(AVG(back_profit_if_win_est)::numeric,2) AS profit_if_win_avg
 FROM x
 GROUP BY 1
 ORDER BY 1 DESC;
@@ -247,18 +247,18 @@ x AS (
 SELECT
   audit_version,
   COUNT(*) AS n,
-  ROUND(AVG(difference_pct),2) AS diff_avg_pct,
+  ROUND(AVG(difference_pct)::numeric,2) AS diff_avg_pct,
   ROUND((PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY difference_pct))::numeric,2) AS diff_p50_pct,
   ROUND((PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY difference_pct))::numeric,2) AS diff_p10_pct,
-  ROUND(AVG(lay_odd),3) AS lay_odd_avg,
-  ROUND(AVG(lay_limit),2) AS lay_limit_avg,
-  ROUND(AVG(lay_stake_est),2) AS lay_stake_avg,
-  ROUND(AVG(lay_liability_est),2) AS liability_avg,
+  ROUND(AVG(lay_odd)::numeric,3) AS lay_odd_avg,
+  ROUND(AVG(lay_limit)::numeric,2) AS lay_limit_avg,
+  ROUND(AVG(lay_stake_est)::numeric,2) AS lay_stake_avg,
+  ROUND(AVG(lay_liability_est)::numeric,2) AS liability_avg,
   ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY lay_liability_est))::numeric,2) AS liability_p90,
   ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY lay_liability_est))::numeric,2) AS liability_p95,
   ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY lay_liability_est))::numeric,2) AS liability_p99,
-  ROUND(MAX(lay_liability_est),2) AS liability_max,
-  ROUND(AVG(CASE WHEN lay_stake_est > 0 THEN lay_liability_est / lay_stake_est END),2) AS liab_to_stake_avg
+  ROUND(MAX(lay_liability_est)::numeric,2) AS liability_max,
+  ROUND(AVG(CASE WHEN lay_stake_est > 0 THEN lay_liability_est / lay_stake_est END)::numeric,2) AS liab_to_stake_avg
 FROM x
 GROUP BY 1
 ORDER BY 1 DESC;
@@ -335,10 +335,10 @@ buckets AS (
 bucket_stats AS (
   SELECT
     audit_version,
-    ROUND(AVG(liability_bucket),2) AS bucket_liability_avg,
+    ROUND(AVG(liability_bucket)::numeric,2) AS bucket_liability_avg,
     ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY liability_bucket))::numeric,2) AS bucket_liability_p95,
     ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY liability_bucket))::numeric,2) AS bucket_liability_p99,
-    ROUND(MAX(liability_bucket),2) AS bucket_liability_max
+    ROUND(MAX(liability_bucket)::numeric,2) AS bucket_liability_max
   FROM buckets
   GROUP BY 1
 )
@@ -399,7 +399,7 @@ b AS (
     audit_version,
     to_timestamp(floor(extract(epoch from audited_at) / ${BUCKET_SEC}) * ${BUCKET_SEC}) AS bucket_utc,
     COUNT(*) AS n_lay,
-    ROUND(SUM(liability),2) AS liability_bucket
+    ROUND(SUM(liability)::numeric,2) AS liability_bucket
   FROM lay
   WHERE liability IS NOT NULL AND liability > 0
   GROUP BY 1,2
