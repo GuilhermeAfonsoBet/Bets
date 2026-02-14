@@ -1104,120 +1104,292 @@ async def main() -> int:
         lines.append("\n---\n")
 
         # ============================================================
-        # 8) Evolução temporal (T+0 -> último ponto)
+        # 8) Curva temporal (pico, reversão e melhor timing)
         # ============================================================
-        def _last_point(arr: Any) -> Tuple[Optional[float], Optional[float], int]:
-            """
-            Retorna (diff_last, t_last_s, n_pts) a partir de um array de pontos.
-            """
-            if not isinstance(arr, list) or not arr:
-                return None, None, 0
-            n_pts = len(arr)
-            diff_last = None
-            t_last = None
-            for e in reversed(arr):
-                if isinstance(e, dict):
-                    if diff_last is None:
-                        diff_last = _safe_float(e.get("diff_pct"))
-                    if t_last is None:
-                        t_last = _safe_float(e.get("t"))
-                if diff_last is not None and t_last is not None:
-                    break
-            return diff_last, t_last, n_pts
+        EPS_DIFF_STABLE = 0.20   # variação < 0.20pp conta como estável (ruído)
+        EPS_REV = 0.50           # reversão = queda/subida >= 0.50pp vs pico/vale
 
-        def _agg_temporal(rows_in: List[dict], mode: str) -> Dict[str, dict]:
+        def _outcome_mult(line: str, side: str, hs: Any, aws: Any) -> Optional[float]:
+            """Multiplicador do resultado para back (1, 0.5, 0, -0.5, -1)."""
+            if hs is None or aws is None:
+                return None
+            try:
+                goal_diff = int(hs) - int(aws)
+            except Exception:
+                return None
+            try:
+                ah_line = float(str(line).replace(",", "."))
+            except Exception:
+                return None
+            if (side or "").strip() == "home":
+                adjusted = goal_diff + ah_line
+            else:
+                adjusted = -goal_diff - ah_line
+            if adjusted > 0.25:
+                return 1.0
+            if adjusted == 0.25:
+                return 0.5
+            if adjusted == 0:
+                return 0.0
+            if adjusted == -0.25:
+                return -0.5
+            return -1.0
+
+        def _roi_back_pct(odd: float, mult: float) -> float:
+            if mult > 0:
+                return (odd - 1.0) * mult * 100.0
+            if mult < 0:
+                return mult * 100.0
+            return 0.0
+
+        def _roi_lay_pct_per_stake(lay_odd: float, mult_back: float) -> float:
+            # stake=1 (ganho máx = +1), perda = -(odd-1) quando o back vence
+            if mult_back > 0:
+                return -mult_back * max(0.0, lay_odd - 1.0) * 100.0
+            if mult_back < 0:
+                return (-mult_back) * 100.0
+            return 0.0
+
+        def _roi_lay_pct_per_liability(lay_odd: float, mult_back: float) -> Optional[float]:
+            liab = max(0.0, lay_odd - 1.0)
+            if liab <= 0:
+                return None
+            if mult_back > 0:
+                return -mult_back * 100.0
+            if mult_back < 0:
+                # lucro por stake = -mult_back (ex.: 1 ou 0.5), divide pela liability
+                return ((-mult_back) / liab) * 100.0
+            return 0.0
+
+        def _build_back_series(d: dict) -> List[dict]:
+            h = d.get("hypothesis_details") or {}
+            series = []
+            # T0 (auditoria)
+            t0_diff = _safe_float(d.get("diff_pct"))
+            t0_odd = _safe_float(d.get("bs_odd"))
+            if t0_diff is not None and t0_odd is not None:
+                series.append({"t": 0.0, "diff_pct": t0_diff, "odd": t0_odd})
+            arr = h.get("temporal")
+            if isinstance(arr, list):
+                for e in arr:
+                    if not isinstance(e, dict):
+                        continue
+                    t = _safe_float(e.get("t"))
+                    diff = _safe_float(e.get("diff_pct"))
+                    odd = _safe_float(e.get("bs_odd"))
+                    if t is None or diff is None or odd is None:
+                        continue
+                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+            series.sort(key=lambda x: x["t"])
+            return series
+
+        def _build_lay_series(d: dict) -> List[dict]:
+            h = d.get("hypothesis_details") or {}
+            series = []
+            ws_odd = _safe_float(d.get("ws_odd"))
+            lay0 = _safe_float(_get_path(h, ["lay", "odd"]))
+            if ws_odd and lay0:
+                series.append(
+                    {"t": 0.0, "diff_pct": ((lay0 - ws_odd) / ws_odd) * 100.0, "odd": lay0}
+                )
+            arr = h.get("lay_temporal")
+            if isinstance(arr, list):
+                for e in arr:
+                    if not isinstance(e, dict):
+                        continue
+                    t = _safe_float(e.get("t"))
+                    diff = _safe_float(e.get("diff_pct"))
+                    odd = _safe_float(e.get("lay_odd"))
+                    if t is None or diff is None or odd is None:
+                        continue
+                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+            series.sort(key=lambda x: x["t"])
+            return series
+
+        def _analyze_peak(series: List[dict], mode: str) -> dict:
             """
-            mode='back' usa difference_pct como t0 e h.temporal como série.
-            mode='lay'  usa lay odd do h.lay como t0 e h.lay_temporal como série.
+            mode='back': pico = max(diff_pct)
+            mode='lay' : vale = min(diff_pct) (mais negativo)
             """
+            if not series:
+                return {"n": 0}
+            diffs = [p["diff_pct"] for p in series]
+            if mode == "back":
+                idx_ext = int(np.argmax(diffs))
+            else:
+                idx_ext = int(np.argmin(diffs))
+            ext = series[idx_ext]
+            last = series[-1]
+            # monotonicidade (para "indefinidamente")
+            mono = True
+            for a, b in zip(diffs, diffs[1:]):
+                if mode == "back" and (b < a - EPS_DIFF_STABLE):
+                    mono = False
+                    break
+                if mode == "lay" and (b > a + EPS_DIFF_STABLE):
+                    mono = False
+                    break
+            # reversão: qualquer ponto após o extremo que "volta" >= EPS_REV
+            after = diffs[idx_ext + 1 :] if idx_ext + 1 < len(diffs) else []
+            had_rev = False
+            t_rev = None
+            if after:
+                if mode == "back":
+                    threshold = ext["diff_pct"] - EPS_REV
+                    for p in series[idx_ext + 1 :]:
+                        if p["diff_pct"] <= threshold:
+                            had_rev = True
+                            t_rev = p["t"]
+                            break
+                else:
+                    threshold = ext["diff_pct"] + EPS_REV
+                    for p in series[idx_ext + 1 :]:
+                        if p["diff_pct"] >= threshold:
+                            had_rev = True
+                            t_rev = p["t"]
+                            break
+            ext_at_end = abs(last["diff_pct"] - ext["diff_pct"]) <= EPS_DIFF_STABLE
+            return {
+                "n": len(series),
+                "t_ext": float(ext["t"]),
+                "diff_ext": float(ext["diff_pct"]),
+                "odd_ext": float(ext["odd"]),
+                "t_last": float(last["t"]),
+                "diff_last": float(last["diff_pct"]),
+                "odd_last": float(last["odd"]),
+                "monotonic": bool(mono),
+                "ext_at_end": bool(ext_at_end),
+                "had_reversal": bool(had_rev),
+                "t_reversal": float(t_rev) if t_rev is not None else None,
+            }
+
+        def _clv_pct_from_odd(odd: Optional[float], closing_odd: Any) -> Optional[float]:
+            odd = _safe_float(odd)
+            clo = _safe_float(closing_odd)
+            if odd is None or clo is None or clo <= 0:
+                return None
+            return (odd - clo) / clo * 100.0
+
+        def _summarize_timing(rows_in: List[dict], mode: str) -> Dict[str, Any]:
+            stats = []
+            for d in rows_in:
+                if mode == "back":
+                    s = _build_back_series(d)
+                else:
+                    s = _build_lay_series(d)
+                a = _analyze_peak(s, mode=mode)
+                if a.get("n", 0) == 0:
+                    continue
+                a["is_live"] = d.get("is_live")
+                a["match_id"] = d.get("match_id")
+                a["closing_odd"] = d.get("closing_odd")
+                a["line"] = d.get("line")
+                a["side"] = d.get("side")
+                a["hs"] = d.get("home_score")
+                a["as"] = d.get("away_score")
+                stats.append(a)
+            return {"rows": stats}
+
+        def _agg_by_regime(stats_rows: List[dict]) -> Dict[str, dict]:
             out: Dict[str, dict] = {}
             for regime, is_live_val in [("PRE_MATCH", False), ("IN_MATCH", True)]:
-                sub = [d for d in rows_in if d.get("is_live") is is_live_val]
-                t0s = []
-                lasts = []
-                deltas = []
-                npts = []
-                tlasts = []
-                for d in sub:
-                    h = d.get("hypothesis_details") or {}
-                    if mode == "back":
-                        arr = h.get("temporal")
-                        diff_t0 = _safe_float(d.get("diff_pct"))
-                    else:
-                        arr = h.get("lay_temporal")
-                        ws_odd = _safe_float(d.get("ws_odd"))
-                        lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
-                        diff_t0 = ((lay_odd - ws_odd) / ws_odd * 100.0) if (ws_odd and lay_odd) else None
-                    diff_last, t_last_s, n = _last_point(arr)
-                    if diff_t0 is None or diff_last is None:
-                        continue
-                    t0s.append(float(diff_t0))
-                    lasts.append(float(diff_last))
-                    deltas.append(float(diff_last - diff_t0))
-                    npts.append(n)
-                    if t_last_s is not None:
-                        tlasts.append(float(t_last_s))
-                if not deltas:
+                sub = [r for r in stats_rows if r.get("is_live") is is_live_val]
+                if not sub:
                     out[regime] = {"n": 0}
                     continue
-                m = float(np.mean(deltas))
-                sd = float(np.std(deltas, ddof=1)) if len(deltas) >= 2 else None
-                se = (sd / math.sqrt(len(deltas))) if (sd is not None and len(deltas) >= 2) else None
-                ci95 = (m - 1.96 * se, m + 1.96 * se) if se is not None else None
-
-                # retenção/perda/ganho de edge
-                if mode == "back":
-                    retain = sum(1 for a, b in zip(t0s, lasts) if a >= back_cut and b >= back_cut) / len(deltas)
-                    loss = sum(1 for a, b in zip(t0s, lasts) if a >= back_cut and b < back_cut) / len(deltas)
-                    gain = None
-                else:
-                    retain = sum(1 for a, b in zip(t0s, lasts) if a <= lay_cut and b <= lay_cut) / len(deltas)
-                    loss = sum(1 for a, b in zip(t0s, lasts) if a <= lay_cut and b > lay_cut) / len(deltas)
-                    gain = sum(1 for a, b in zip(t0s, lasts) if a > lay_cut and b <= lay_cut) / len(deltas)
-
+                t_ext = [r["t_ext"] for r in sub if r.get("t_ext") is not None]
+                t_rev = [r["t_reversal"] for r in sub if r.get("t_reversal") is not None]
                 out[regime] = {
-                    "n": len(deltas),
-                    "diff_t0_avg": float(np.mean(t0s)),
-                    "diff_tlast_avg": float(np.mean(lasts)),
-                    "delta_avg": m,
-                    "delta_ci95": ci95,
-                    "retain": retain,
-                    "loss": loss,
-                    "gain": gain,
-                    "avg_points": float(np.mean(npts)) if npts else None,
-                    "t_last_avg_s": float(np.mean(tlasts)) if tlasts else None,
+                    "n": len(sub),
+                    "t_ext_avg": float(np.mean(t_ext)) if t_ext else None,
+                    "t_ext_p50": float(np.median(t_ext)) if t_ext else None,
+                    "pct_monotonic": 100.0 * sum(1 for r in sub if r.get("monotonic")) / len(sub),
+                    "pct_ext_at_end": 100.0 * sum(1 for r in sub if r.get("ext_at_end")) / len(sub),
+                    "pct_reversal": 100.0 * sum(1 for r in sub if r.get("had_reversal")) / len(sub),
+                    "t_rev_avg": float(np.mean(t_rev)) if t_rev else None,
                 }
             return out
 
-        lines.append("## 8) Evolução temporal (T+0 -> último ponto)\n")
-        lines.append("Este bloco mede se o edge (diff_pct) **retém** ou **se perde** após alguns segundos/minutos (quando há `hypothesis_details.temporal`/`lay_temporal`).\n\n")
+        def _curve_table(rows_in: List[dict], mode: str) -> List[Tuple[str, int, float, float, Optional[float], Optional[float]]]:
+            """
+            Retorna linhas por tempo: (t_label, n, mean_diff, mean_odd, mean_clv, mean_roi)
+            """
+            times = [0, 3, 6, 10, 15, 20]
+            buckets: Dict[int, List[Tuple[float, float, Optional[float]]]] = {t: [] for t in times}
+            for d in rows_in:
+                series = _build_back_series(d) if mode == "back" else _build_lay_series(d)
+                if not series:
+                    continue
+                # outcome
+                mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                for p in series:
+                    # bin pelo target mais próximo
+                    t = float(p["t"])
+                    tgt = min(times, key=lambda x: abs(x - t))
+                    diff = float(p["diff_pct"])
+                    odd = float(p["odd"])
+                    clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                    roi = None
+                    if mult is not None:
+                        if mode == "back":
+                            roi = _roi_back_pct(odd, mult)
+                        else:
+                            roi = _roi_lay_pct_per_liability(odd, mult)
+                    buckets[tgt].append((diff, odd, clv, roi))
+            out = []
+            for t in times:
+                pts = buckets[t]
+                if not pts:
+                    continue
+                diffs = [x[0] for x in pts]
+                odds = [x[1] for x in pts]
+                clvs = [x[2] for x in pts if x[2] is not None]
+                rois = [x[3] for x in pts if x[3] is not None]
+                out.append((f"t+{t}s", len(pts), float(np.mean(diffs)), float(np.mean(odds)), float(np.mean(clvs)) if clvs else None, float(np.mean(rois)) if rois else None))
+            return out
 
-        back_temp = _agg_temporal(ok_bs, mode="back")
-        lay_temp = _agg_temporal(ok_bs, mode="lay")
+        lines.append("## 8) Curva temporal (pico, reversão e melhor timing)\n")
+        lines.append("Esta seção usa `hypothesis_details.temporal` (Back) e `hypothesis_details.lay_temporal` (Lay), coletados em pontos discretos (t≈0,3,6,10,15,20s).\n\n")
+        lines.append("O objetivo é responder: **tempo até o pico/vale**, **% que segue melhorando até t_max**, **% com reversão** e **impacto esperado (CLV/ROI) por timing**.\n\n")
 
-        lines.append("### 8.1 Back temporal\n")
-        lines.append("| Regime | N | diff_t0_avg % | diff_tlast_avg % | delta_avg % | IC95 delta | retenção edge % | perda edge % | pts médios | t_last médio (s) |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|\n")
+        # BACK
+        back_stats = _summarize_timing(ok_bs, mode="back")["rows"]
+        back_agg = _agg_by_regime(back_stats)
+        lines.append("### 8.1 Back (pico em diff_pct)\n")
+        lines.append("| Regime | N | t_pico médio (s) | t_pico p50 (s) | % monotônico | % pico no fim (\"sobe indef.\") | % com reversão | t_reversão médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for regime in ["PRE_MATCH", "IN_MATCH"]:
-            s = back_temp.get(regime, {"n": 0})
-            if s.get("n", 0) <= 0:
-                lines.append(f"| {regime} | 0 | — | — | — | — | — | — | — | — |\n")
+            s = back_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
                 continue
-            ci = s.get("delta_ci95")
             lines.append(
-                f"| {regime} | {s['n']} | {_fmt_pct(s['diff_t0_avg'],2)} | {_fmt_pct(s['diff_tlast_avg'],2)} | {_fmt_pct(s['delta_avg'],2)} | {_fmt_ci(ci,2)} | {s['retain']*100:.1f} | {s['loss']*100:.1f} | {_fmt_num(s.get('avg_points'),2)} | {_fmt_num(s.get('t_last_avg_s'),1)} |\n"
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_monotonic'),1)}% | {_fmt_num(s.get('pct_ext_at_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} |\n"
             )
-        lines.append("\n### 8.2 Lay temporal\n")
-        lines.append("| Regime | N | diff_t0_avg % | diff_tlast_avg % | delta_avg % | IC95 delta | retenção edge % | perda edge % | ganho edge % | pts médios | t_last médio (s) |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n")
+
+        lines.append("\n**Curva média (Back)**: média de `diff_pct`, `odd` e `CLV` por tempo. `ROI` (quando aparece) é o **ROI realizado** se a aposta fosse feita naquele ponto.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | odd média | CLV médio (vs closing) | ROI médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="back"):
+            lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
+
+        # LAY
+        lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
+        lay_agg = _agg_by_regime(lay_stats)
+        lines.append("\n### 8.2 Lay (vale em diff_pct)\n")
+        lines.append("| Regime | N | t_vale médio (s) | t_vale p50 (s) | % monotônico | % vale no fim (\"desce indef.\") | % com reversão | t_reversão médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for regime in ["PRE_MATCH", "IN_MATCH"]:
-            s = lay_temp.get(regime, {"n": 0})
-            if s.get("n", 0) <= 0:
-                lines.append(f"| {regime} | 0 | — | — | — | — | — | — | — | — | — |\n")
+            s = lay_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
                 continue
-            ci = s.get("delta_ci95")
-            gain = (s.get("gain") * 100.0) if s.get("gain") is not None else None
             lines.append(
-                f"| {regime} | {s['n']} | {_fmt_pct(s['diff_t0_avg'],2)} | {_fmt_pct(s['diff_tlast_avg'],2)} | {_fmt_pct(s['delta_avg'],2)} | {_fmt_ci(ci,2)} | {s['retain']*100:.1f} | {s['loss']*100:.1f} | {_fmt_num(gain,1)} | {_fmt_num(s.get('avg_points'),2)} | {_fmt_num(s.get('t_last_avg_s'),1)} |\n"
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_monotonic'),1)}% | {_fmt_num(s.get('pct_ext_at_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} |\n"
             )
+
+        lines.append("\n**Curva média (Lay)**: usa `odd=lay_odd`. O ROI mostrado aqui é **ROI por liability** (não por stake), porque Lay é governado por risco.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (vs closing) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="lay"):
+            lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
+
         lines.append("\n---\n")
 
         # ============================================================

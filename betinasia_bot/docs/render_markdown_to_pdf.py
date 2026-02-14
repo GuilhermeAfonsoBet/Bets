@@ -161,9 +161,22 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
                     flex_part = (col_widths[i] - min_col) / flex_total
                     col_widths[i] -= width_over * flex_part
 
+    # Header style: precisa ser branco, pois TableStyle(TEXTCOLOR) não sobrescreve
+    # a cor já definida dentro do ParagraphStyle.
+    header_style = ParagraphStyle(
+        "table_header",
+        parent=body_style,
+        fontName="Helvetica-Bold",
+        fontSize=9,
+        leading=11,
+        textColor=colors.white,
+        wordWrap="CJK",
+    )
+
     table_data = []
     for i, r in enumerate(padded_rows):
-        row_cells = [Paragraph(c if c else "&nbsp;", body_style) for c in r]
+        style = header_style if i == 0 else body_style
+        row_cells = [Paragraph(c if c else "&nbsp;", style) for c in r]
         table_data.append(row_cells)
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
