@@ -1646,7 +1646,8 @@ async def main() -> int:
         match_meta: Dict[int, Dict[str, Any]] = {}
         for d in all_data:
             mid = int(d.get("match_id"))
-            kickoff = d.get("kickoff_time")
+            # No dataset usamos a chave "kickoff" (datetime do match).
+            kickoff = d.get("kickoff") or d.get("kickoff_time")
             has_score = d.get("home_score") is not None and d.get("away_score") is not None
             if mid not in match_meta:
                 match_meta[mid] = {"kickoff": kickoff, "has_score": bool(has_score)}
