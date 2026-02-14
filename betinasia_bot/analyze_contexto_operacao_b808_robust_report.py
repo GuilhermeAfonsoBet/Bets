@@ -752,8 +752,9 @@ async def main() -> int:
         lines.append("## 6) Combinações de valor\n")
 
         # 6.1 buckets
+        bucket_clv_pm: Dict[str, MetricSummary] = {}
         lines.append("### 6.1 Buckets por diferença BS vs WS\n")
-        lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---|\n")
+        lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---:|---:|---|\n")
         for bucket in ["BS < WS (-10% a -2%)", "BS ~ WS (-2% a +2%)", "BS > WS (+2% a +10%)"]:
             subset = [d for d in with_bs if d.get("diff_bucket") == bucket]
             clv_pm = summarize_metric(
@@ -762,6 +763,7 @@ async def main() -> int:
                 clip_low=-50,
                 clip_high=50,
             )
+            bucket_clv_pm[bucket] = clv_pm
             roi_all = summarize_metric(
                 [d.get("roi_bs") for d in subset],
                 [d.get("match_id") for d in subset],
@@ -769,7 +771,7 @@ async def main() -> int:
                 clip_high=500,
             )
             lines.append(
-                f"| {bucket} | {len(subset)} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} |\n"
+                f"| {bucket} | {len(subset)} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {clv_pm.n_events} | {clv_pm.n_matches} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} |\n"
             )
         lines.append("\n---\n")
 
@@ -802,8 +804,9 @@ async def main() -> int:
         lines.append("\n---\n")
 
         # 6.3 lag
+        lag_clv_pm: Dict[str, MetricSummary] = {}
         lines.append("### 6.3 Combinação por faixa de lag\n")
-        lines.append("| Faixa de lag | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---|---:|\n")
+        lines.append("| Faixa de lag | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---:|---:|---|---:|\n")
         for lag in ["< 10s", "10-20s", "20-30s", "> 30s"]:
             subset = [d for d in with_bs if d.get("lag_bucket") == lag]
             clv_pm = summarize_metric(
@@ -812,6 +815,7 @@ async def main() -> int:
                 clip_low=-50,
                 clip_high=50,
             )
+            lag_clv_pm[lag] = clv_pm
             roi_all = summarize_metric(
                 [d.get("roi_bs") for d in subset],
                 [d.get("match_id") for d in subset],
@@ -825,9 +829,51 @@ async def main() -> int:
                 clip_high=50,
             )
             lines.append(
-                f"| {lag} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
+                f"| {lag} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {clv_pm.n_events} | {clv_pm.n_matches} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
             )
         lines.append("\n---\n")
+
+        # ============================================================
+        # Insere sumário executivo no topo (após header)
+        # ============================================================
+        summary_lines: List[str] = []
+        summary_lines.append("## 0) Sumário executivo (leitura rápida)\n")
+        summary_lines.append(f"- **Recorte**: direction=`{args.direction}`, lookback_days=`{args.lookback_days}`, versions=`{','.join(versions)}`.\n")
+        summary_lines.append(
+            f"- **Amostra**: {len(all_data)} auditorias (jogos únicos={unique_matches_all}, média={avg_obs_per_match:.1f} obs/jogo); betslip confiável={len(with_bs)}.\n"
+        )
+        if len(dom_all) == 0:
+            summary_lines.append("- **DOM**: sem dados no recorte atual (N=0), então não há comparação API vs DOM aqui.\n")
+        # CLV foco
+        summary_lines.append(
+            f"- **CLV pre-match (Betslip, API)**: média robusta por jogo {_fmt_pct(api_clv.mean_cluster)} (IC90 {_fmt_ci(api_clv.ci90_cluster)}), "
+            f"com N={api_clv.n_events} eventos (jogos={api_clv.n_matches}).\n"
+        )
+        # Buckets
+        b_neg = bucket_clv_pm.get("BS < WS (-10% a -2%)")
+        b_neu = bucket_clv_pm.get("BS ~ WS (-2% a +2%)")
+        b_pos = bucket_clv_pm.get("BS > WS (+2% a +10%)")
+        if b_neg and b_neu and b_pos:
+            summary_lines.append(
+                "- **Padrão por bucket (CLV PM)**: "
+                f"`BS < WS` {_fmt_pct(b_neg.mean_event)} ({_sig_label(b_neg.ci90_cluster)}), "
+                f"`BS ~ WS` {_fmt_pct(b_neu.mean_event)} ({_sig_label(b_neu.ci90_cluster)}), "
+                f"`BS > WS` {_fmt_pct(b_pos.mean_event)} ({_sig_label(b_pos.ci90_cluster)}).\n"
+            )
+        # ROI coverage
+        if api_roi.n_events == 0 and dom_roi.n_events == 0:
+            summary_lines.append(
+                "- **ROI**: sem cobertura no recorte (N=0). Isso normalmente acontece quando os placares ainda não foram sincronizados para esses jogos.\n"
+            )
+        summary_lines.append(
+            "- **Leitura recomendada**: use este relatório para validar **qualidade de execução/CLV**. Para concluir sobre **ROI**, rode após atualizar resultados "
+            "e/ou use uma janela com jogos já liquidados.\n"
+        )
+        summary_lines.append("\n---\n")
+
+        # Header atual tem 5 linhas: título, data, escopo, nota, '---'
+        # Inserimos o sumário logo depois disso.
+        lines[5:5] = summary_lines
 
         # 7) bloco econômico (mantém forma do relatório original)
         lines.append("## 7) Estimativa econômica (indicativa)\n")
