@@ -1,0 +1,98 @@
+======================================================================
+ANÁLISE H3B REALISTA: CLV COM ODD DO BETSLIP
+======================================================================
+
+Metodologia IDÊNTICA à análise v6, mas com a odd REAL do betslip:
+
+  CLV = (odd - closing_odd) / closing_odd × 100
+
+  WebSocket: odd = odd do WebSocket no momento da detecção
+  Betslip:   odd = odd real disponível no betslip (a que seria apostada)
+
+Nota: só inclui jogos que já tiveram kickoff (closing line disponível).
+
+======================================================================
+PARTE 1: CLV WebSocket (referência v6)
+======================================================================
+
+   WEBSOCKET - REVERSÃO UP:
+
+   N = 273
+   CLV adicional = 1.116%
+   Erro padrão   = 0.960%
+   IC 90%        = [-0.463%, 2.695%]
+   IC 95%        = [-0.765%, 2.998%]
+   ⚪ Não significativo
+
+   📊 N estimado p/ significância (IC 90%): ~547
+
+   WEBSOCKET - REVERSÃO DOWN:
+
+   N = 282
+   CLV adicional = -1.359%
+   Erro padrão   = 0.986%
+   IC 90%        = [-2.981%, 0.262%]
+   IC 95%        = [-3.291%, 0.573%]
+   ⚪ Não significativo
+
+
+======================================================================
+PARTE 2: CLV Betslip (realista)
+======================================================================
+
+   BETSLIP - REVERSÃO UP:
+
+   N = 386
+   CLV adicional = -17.579%
+   Erro padrão   = 1.272%
+   IC 90%        = [-19.672%, -15.486%]
+   IC 95%        = [-20.073%, -15.085%]
+   ❌ SIGNIFICATIVO NEGATIVO
+
+   Detalhes:
+     CLV médio WebSocket (mesmos eventos): 0.546%
+     Odd média betslip: 1.625
+     Odd média websocket: 1.980
+     Closing odd média: 1.973
+
+   BETSLIP - REVERSÃO DOWN: N=0
+   Sem dados. Jogos ainda não tiveram kickoff ou formato de linha sem match.
+
+======================================================================
+VISÃO GERAL DOS DADOS
+======================================================================
+
+  Total auditorias: 4828
+  Com betslip: 2640
+  Pre-match: 1660
+  In-match: 2290
+
+  Auditorias com match no banco: 2640
+  Destes, com kickoff passado: 2037
+
+  Linhas auditadas (com kickoff passado):
+    AH -1: 337 auditorias, 155 com closing line
+    AH 0: 309 auditorias, 124 com closing line
+    AH -2: 253 auditorias, 127 com closing line
+    AH 1: 209 auditorias, 85 com closing line
+    AH 3: 204 auditorias, 106 com closing line
+    AH -3: 200 auditorias, 107 com closing line
+    AH 2: 151 auditorias, 85 com closing line
+    AH -4: 100 auditorias, 4 com closing line
+    AH -5: 52 auditorias, 3 com closing line
+    AH 4: 49 auditorias, 2 com closing line
+    AH -6: 34 auditorias, 4 com closing line
+    AH -8: 26 auditorias, 0 com closing line
+    AH 5: 23 auditorias, 0 com closing line
+    AH -9: 23 auditorias, 0 com closing line
+    AH -7: 20 auditorias, 0 com closing line
+    AH -10: 15 auditorias, 0 com closing line
+    AH 8: 12 auditorias, 0 com closing line
+    AH 6: 7 auditorias, 0 com closing line
+    AH 7: 7 auditorias, 0 com closing line
+    AH 9: 4 auditorias, 0 com closing line
+    AH 10: 2 auditorias, 0 com closing line
+
+======================================================================
+FIM DA ANÁLISE
+======================================================================
