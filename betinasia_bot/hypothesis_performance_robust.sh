@@ -106,6 +106,49 @@ echo "combo_min_n_lay=${COMBO_MIN_N_LAY}"
 echo "====================================================================="
 echo
 
+echo "0) COBERTURA REAL POR VERSAO (duracao efetiva vs janela)"
+run_psql "
+WITH hist AS (
+  SELECT
+    audit_version,
+    MIN(audited_at) AS first_seen,
+    MAX(audited_at) AS last_seen,
+    COUNT(*) AS n_all
+  FROM betslip_audit_results
+  WHERE ${AUDIT_FILTER_SQL}
+  GROUP BY 1
+),
+win AS (
+  SELECT
+    audit_version,
+    MIN(audited_at) AS first_in_lookback,
+    MAX(audited_at) AS last_in_lookback,
+    COUNT(*) AS n_lookback
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+  GROUP BY 1
+)
+SELECT
+  h.audit_version,
+  h.first_seen,
+  h.last_seen,
+  ROUND((EXTRACT(EPOCH FROM (h.last_seen - h.first_seen)) / 86400.0)::numeric,2) AS active_days_total,
+  h.n_all,
+  COALESCE(w.n_lookback,0) AS n_lookback,
+  w.first_in_lookback,
+  w.last_in_lookback,
+  CASE
+    WHEN w.first_in_lookback IS NOT NULL
+    THEN ROUND((EXTRACT(EPOCH FROM (w.last_in_lookback - w.first_in_lookback)) / 86400.0)::numeric,2)
+    ELSE NULL
+  END AS covered_days_in_lookback
+FROM hist h
+LEFT JOIN win w USING (audit_version)
+ORDER BY h.last_seen DESC;
+"
+echo
+
 echo "1) PERFIL OPERACIONAL POR VERSAO"
 run_psql "
 WITH base AS (
@@ -213,6 +256,89 @@ SELECT
 FROM b
 GROUP BY 1
 ORDER BY 1 DESC;
+"
+echo
+
+echo "1.2) PERFORMANCE RECENTE POR JANELA (6h/24h/${LOOKBACK_DAYS}d)"
+run_psql "
+WITH windows AS (
+  SELECT '6h'::text AS window_label, now() - interval '6 hours' AS ts_start, 1 AS ord
+  UNION ALL
+  SELECT '24h'::text, now() - interval '24 hours', 2
+  UNION ALL
+  SELECT '${LOOKBACK_DAYS}d'::text, now() - interval '${LOOKBACK_DAYS} days', 3
+),
+raw AS (
+  SELECT
+    w.window_label,
+    w.ord,
+    r.audit_version,
+    r.status,
+    CASE
+      WHEN COALESCE(r.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (r.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric
+      ELSE NULL
+    END AS queue_wait_ms,
+    CASE
+      WHEN COALESCE(r.hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (r.hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
+      ELSE NULL
+    END AS total_bot_ms,
+    CASE
+      WHEN COALESCE(r.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (r.hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue')::numeric
+      ELSE NULL
+    END AS q_depth_enq
+  FROM windows w
+  JOIN betslip_audit_results r
+    ON r.audited_at >= w.ts_start
+  WHERE ${AUDIT_FILTER_SQL}
+),
+tot AS (
+  SELECT
+    window_label,
+    ord,
+    audit_version,
+    COUNT(*) AS n_total,
+    COUNT(*) FILTER (WHERE status='OK') AS n_ok
+  FROM raw
+  GROUP BY 1,2,3
+),
+ok_stats AS (
+  SELECT
+    window_label,
+    ord,
+    audit_version,
+    ROUND(AVG(queue_wait_ms),1) AS queue_wait_avg_ms,
+    ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY queue_wait_ms))::numeric,1) AS queue_wait_p95_ms,
+    ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY queue_wait_ms))::numeric,1) AS queue_wait_p99_ms,
+    ROUND(AVG(q_depth_enq),2) AS queue_depth_enq_avg,
+    ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q_depth_enq))::numeric,2) AS queue_depth_enq_p95,
+    ROUND(AVG(total_bot_ms),1) AS total_bot_avg_ms,
+    ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY total_bot_ms))::numeric,1) AS total_bot_p95_ms
+  FROM raw
+  WHERE status='OK'
+  GROUP BY 1,2,3
+)
+SELECT
+  t.window_label,
+  t.audit_version,
+  t.n_total,
+  t.n_ok,
+  ROUND((100.0 * t.n_ok / NULLIF(t.n_total,0))::numeric,1) AS ok_pct,
+  o.queue_wait_avg_ms,
+  o.queue_wait_p95_ms,
+  o.queue_wait_p99_ms,
+  o.queue_depth_enq_avg,
+  o.queue_depth_enq_p95,
+  o.total_bot_avg_ms,
+  o.total_bot_p95_ms
+FROM tot t
+LEFT JOIN ok_stats o
+  ON o.window_label=t.window_label
+ AND o.ord=t.ord
+ AND o.audit_version=t.audit_version
+ORDER BY t.audit_version DESC, t.ord ASC;
 "
 echo
 
@@ -892,6 +1018,106 @@ SELECT
   ROUND(((win_rate + 1.960 * wr_se) * 100)::numeric,2) AS win_rate_ci95_high
 FROM calc
 ORDER BY tabela;
+"
+echo
+
+echo "8.1) H3B - RETORNO POR LADO (BACK/LAY) E POR VERSAO"
+run_psql "
+WITH audits_ranked AS (
+  SELECT
+    id,
+    audit_version,
+    hypothesis_event_id,
+    difference_pct::numeric AS diff_pct,
+    audited_at,
+    ROW_NUMBER() OVER (
+      PARTITION BY hypothesis_event_id
+      ORDER BY audited_at DESC, id DESC
+    ) AS rn
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND hypothesis_type='H3B'
+    AND status='OK'
+    AND hypothesis_event_id IS NOT NULL
+),
+audits AS (
+  SELECT
+    audit_version,
+    hypothesis_event_id,
+    diff_pct
+  FROM audits_ranked
+  WHERE rn=1
+),
+joined AS (
+  SELECT
+    a.audit_version,
+    CASE
+      WHEN a.diff_pct >= ${BACK_DIFF_MIN} THEN 'BACK'
+      WHEN a.diff_pct <= ${LAY_DIFF_MAX} THEN 'LAY'
+      ELSE 'NEUTRO'
+    END AS side_group,
+    e.profit_loss::numeric AS roi_u,
+    e.clv_pct::numeric AS clv_pct
+  FROM audits a
+  JOIN h3b_temporal_reversal_events e
+    ON e.id = a.hypothesis_event_id
+),
+agg AS (
+  SELECT
+    audit_version,
+    side_group,
+    COUNT(*) AS n_total,
+    COUNT(roi_u) AS n_roi,
+    ROUND(100.0 * COUNT(roi_u) / NULLIF(COUNT(*),0),1) AS roi_cov_pct,
+    AVG(roi_u) AS roi_mean,
+    STDDEV_SAMP(roi_u) AS roi_sd,
+    COUNT(clv_pct) AS n_clv,
+    ROUND(100.0 * COUNT(clv_pct) / NULLIF(COUNT(*),0),1) AS clv_cov_pct,
+    AVG(clv_pct) AS clv_mean,
+    STDDEV_SAMP(clv_pct) AS clv_sd,
+    AVG(
+      CASE
+        WHEN roi_u IS NULL THEN NULL
+        WHEN roi_u > 0 THEN 1.0
+        ELSE 0.0
+      END
+    ) AS win_rate
+  FROM joined
+  WHERE side_group IN ('BACK','LAY')
+  GROUP BY 1,2
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n_roi >= 2 AND roi_sd IS NOT NULL THEN roi_sd / SQRT(n_roi::numeric) END AS roi_se,
+    CASE WHEN n_clv >= 2 AND clv_sd IS NOT NULL THEN clv_sd / SQRT(n_clv::numeric) END AS clv_se,
+    CASE
+      WHEN n_roi >= 2 AND win_rate IS NOT NULL
+      THEN SQRT(win_rate * (1 - win_rate) / n_roi::numeric)
+      ELSE NULL
+    END AS wr_se
+  FROM agg
+)
+SELECT
+  audit_version,
+  side_group,
+  n_total,
+  n_roi,
+  roi_cov_pct,
+  ROUND(roi_mean::numeric,4) AS roi_mean_u,
+  ROUND((roi_mean - 1.960 * roi_se)::numeric,4) AS roi_ci95_low,
+  ROUND((roi_mean + 1.960 * roi_se)::numeric,4) AS roi_ci95_high,
+  n_clv,
+  clv_cov_pct,
+  ROUND(clv_mean::numeric,4) AS clv_mean_pct,
+  ROUND((clv_mean - 1.960 * clv_se)::numeric,4) AS clv_ci95_low,
+  ROUND((clv_mean + 1.960 * clv_se)::numeric,4) AS clv_ci95_high,
+  ROUND((win_rate * 100)::numeric,2) AS win_rate_pct,
+  ROUND(((win_rate - 1.960 * wr_se) * 100)::numeric,2) AS win_rate_ci95_low,
+  ROUND(((win_rate + 1.960 * wr_se) * 100)::numeric,2) AS win_rate_ci95_high
+FROM calc
+ORDER BY audit_version DESC, side_group;
 "
 echo
 

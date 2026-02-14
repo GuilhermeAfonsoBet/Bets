@@ -99,6 +99,10 @@ def normalize_cell(text: str) -> str:
     return text
 
 
+def strip_html_like(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def is_table_line(line: str) -> bool:
     return line.strip().startswith("|") and line.strip().endswith("|")
 
@@ -130,8 +134,32 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
 
     n_cols = max(len(r) for r in clean_rows)
     padded_rows = [r + [""] * (n_cols - len(r)) for r in clean_rows]
-    col_width = available_width / n_cols
-    col_widths = [col_width] * n_cols
+
+    # Distribui largura por "peso" de conteúdo para melhorar legibilidade.
+    col_weights = []
+    for c in range(n_cols):
+        max_len = 6
+        for row in padded_rows:
+            cell = strip_html_like(row[c])
+            max_len = max(max_len, len(cell))
+        col_weights.append(float(max_len))
+
+    total_weight = sum(col_weights) if sum(col_weights) > 0 else float(n_cols)
+    raw_widths = [(w / total_weight) * available_width for w in col_weights]
+
+    # Largura mínima evita esmagar colunas pequenas.
+    min_col = min(75.0, max(48.0, available_width * 0.08))
+    col_widths = [max(min_col, w) for w in raw_widths]
+    width_over = sum(col_widths) - available_width
+    if width_over > 0:
+        # Ajuste proporcional sem quebrar mínimos.
+        flex_indices = [i for i, w in enumerate(col_widths) if w > min_col]
+        if flex_indices:
+            flex_total = sum(col_widths[i] - min_col for i in flex_indices)
+            if flex_total > 0:
+                for i in flex_indices:
+                    flex_part = (col_widths[i] - min_col) / flex_total
+                    col_widths[i] -= width_over * flex_part
 
     table_data = []
     for i, r in enumerate(padded_rows):
@@ -139,23 +167,31 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
         table_data.append(row_cells)
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+    body_font_size = 9 if n_cols <= 7 else (8 if n_cols <= 10 else 7.5)
     table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e5e7eb")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3b73")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("FONTSIZE", (0, 1), (-1, -1), 9),
-                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d1d5db")),
+                ("FONTSIZE", (0, 1), (-1, -1), body_font_size),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 5),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 5),
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
             ]
         )
     )
+
+    # Zebra striping no corpo da tabela.
+    for r_idx in range(1, len(table_data)):
+        bg = colors.HexColor("#f8fafc") if (r_idx % 2 == 1) else colors.white
+        table.setStyle(TableStyle([("BACKGROUND", (0, r_idx), (-1, r_idx), bg)]))
+
     return table
 
 
