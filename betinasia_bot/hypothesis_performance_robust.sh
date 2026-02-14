@@ -21,6 +21,7 @@ FALLBACK_STAKE_PCT="${FALLBACK_STAKE_PCT:-0.25}"
 LIABILITY_BUCKET_MIN=5
 MAX_BUCKETS=20
 COMBO_MIN_N=20
+COMBO_MIN_N_LAY=8
 
 DB_NAME="${DB_NAME:-betinasia_bot}"
 DB_USER="${DB_USER:-betbot}"
@@ -39,6 +40,7 @@ Opcoes:
   --liability-bucket-min N Bucket de agregação de exposição lay (default: 5)
   --max-buckets N         Top buckets mais expostos para imprimir (default: 20)
   --combo-min-n N         N mínimo para combos inferenciais (default: 20)
+  --combo-min-n-lay N     N mínimo para combos inferenciais de lay (default: 8)
   --db-name N             Banco (default: betinasia_bot)
   --db-user U             Usuário psql (default: betbot)
   --no-sudo-psql          Não usar sudo -u no psql
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --liability-bucket-min) LIABILITY_BUCKET_MIN="${2:-}"; shift 2 ;;
     --max-buckets) MAX_BUCKETS="${2:-}"; shift 2 ;;
     --combo-min-n) COMBO_MIN_N="${2:-}"; shift 2 ;;
+    --combo-min-n-lay) COMBO_MIN_N_LAY="${2:-}"; shift 2 ;;
     --db-name) DB_NAME="${2:-}"; shift 2 ;;
     --db-user) DB_USER="${2:-}"; shift 2 ;;
     --no-sudo-psql) USE_SUDO_PSQL=0; shift ;;
@@ -99,6 +102,7 @@ else
 fi
 echo "fallback_stake_pct=${FALLBACK_STAKE_PCT} | liability_bucket=${LIABILITY_BUCKET_MIN}m"
 echo "combo_min_n=${COMBO_MIN_N}"
+echo "combo_min_n_lay=${COMBO_MIN_N_LAY}"
 echo "====================================================================="
 echo
 
@@ -769,7 +773,7 @@ SELECT
   ROUND(liab_avg::numeric,2) AS liability_avg,
   ROUND(liab_p95::numeric,2) AS liability_p95
 FROM calc
-WHERE n >= ${COMBO_MIN_N}
+WHERE n >= ${COMBO_MIN_N_LAY}
 ORDER BY n DESC, mean_diff ASC
 LIMIT 80;
 "
@@ -782,6 +786,7 @@ echo "- A seção 7 testa diferença média (diff_pct) vs 0 com IC e t_stat."
 echo "- A seção 8 usa apenas registros liquidados (profit_loss/clv não nulos)."
 echo "- As seções 9 e 10 trazem inferência por combinação H3B (regime x faixa AH x bucket de diff)."
 echo "- Para evitar ruído, combos com N < ${COMBO_MIN_N} são omitidos."
+echo "- Para Lay em combinações, o corte de N é ${COMBO_MIN_N_LAY} (normalmente menor que Back)."
 echo "- Se pl_cov_pct for baixo, IC de ROI/drawdown realizado fica frágil (amostra efetiva pequena)."
 echo
 echo "====================================================================="
