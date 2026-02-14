@@ -8,6 +8,7 @@ O sistema coleta odds de futebol do BetinAsia 24/7, rodando como serviço no Lin
 - `betinasia-collector` — Coleta contínua de odds (a cada ~10 segundos)
 - `betinasia-results` — Atualiza resultados dos jogos (a cada 4 horas)
 - `betinasia-xvfb` — Display virtual para o Playwright
+- `betinasia-report-b808.timer` — (opcional) Gera relatório PDF e faz push no GitHub
 
 ---
 
@@ -102,6 +103,45 @@ cd /home/betbot/Bets
 git pull
 sudo bash betinasia_bot/deploy.sh --update
 ```
+
+---
+
+## Relatório PDF automático (b808) com push no GitHub (opcional)
+
+Objetivo: você abrir sempre o PDF direto do GitHub, sem ter que rodar manualmente.
+
+### 1) Preparar autenticação git não-interativa (1x)
+
+O `systemd` não pode ficar pedindo senha. Opções:
+
+- **Opção A (recomendada)**: GitHub CLI com device login (não precisa lembrar senha)
+
+```bash
+sudo apt update && sudo apt install -y gh
+gh auth login -h github.com -p https -w
+gh auth setup-git
+```
+
+- **Opção B**: SSH (deploy key). Requer adicionar a chave no GitHub.
+
+### 2) Instalar unit + timer
+
+```bash
+sudo cp /home/betbot/Bets/betinasia_bot/betinasia-report-b808.service /etc/systemd/system/betinasia-report-b808.service
+sudo cp /home/betbot/Bets/betinasia_bot/betinasia-report-b808.timer /etc/systemd/system/betinasia-report-b808.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-report-b808.timer
+```
+
+### 3) Ver status/logs
+
+```bash
+systemctl list-timers --all | grep betinasia-report-b808 || true
+sudo systemctl status betinasia-report-b808.timer --no-pager
+sudo journalctl -u betinasia-report-b808.service -n 200 --no-pager
+```
+
+O PDF será gerado em `betinasia_bot/docs/analise_contexto_operacao_b808_robusta.pdf` e o serviço tentará `commit + push`.
 
 ---
 

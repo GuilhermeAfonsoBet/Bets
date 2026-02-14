@@ -1,0 +1,31 @@
+[Unit]
+Description=BetinAsia Report b808 - Gera PDF e faz push no GitHub
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PYTHONUNBUFFERED=1"
+# Importante para git/gh encontrarem credenciais do usuário:
+Environment="HOME=/home/betbot"
+
+# Gera md+pdf e tenta commitar/pushar automaticamente (requer git auth não-interativa no VPS)
+ExecStart=/bin/bash -lc '\
+  cd /home/betbot/Bets/betinasia_bot && \
+  if [ -x ./venv/bin/python ]; then PY=./venv/bin/python; \
+  elif [ -x /home/betbot/Bets/venv/bin/python ]; then PY=/home/betbot/Bets/venv/bin/python; \
+  else PY=/usr/bin/python3; fi; \
+  $PY analyze_contexto_operacao_b808_robust_report.py \
+    --direction up \
+    --versions v4.0-api,v1.0,v1.0-recovered \
+    --lookback-days 2 \
+    --out docs/analise_contexto_operacao_b808_robusta.md \
+    --pdf docs/analise_contexto_operacao_b808_robusta.pdf \
+    --git-commit --git-push \
+    --git-message "Relatorio b808 (PDF) auto: lookback=2d" \
+'
+
