@@ -590,9 +590,13 @@ async def main() -> int:
                 "limit": r[11] or 0.0,
                 "status": r[12],
                 "is_live": r[13],
-                "lag_total": r[14] or 0,
-                "lag_click": r[15] or 0,
-                "lag_bs": r[16] or 0,
+                # timing/lag (em ms)
+                # - audit_total_duration_ms: duração total da auditoria (não é "lag" puro)
+                # - lag_detection_to_click_ms: tempo entre detecção e clique
+                # - lag_click_to_betslip_ms: tempo entre clique e extração do betslip
+                "audit_total_ms": r[14],
+                "lag_det_to_click_ms": r[15],
+                "lag_click_to_betslip_ms": r[16],
                 "direction": r[17],
                 "period": r[18],
                 "version": r[19],
@@ -605,6 +609,21 @@ async def main() -> int:
                 "match_status": r[26],
                 "closing_odd": r[27],
             }
+
+            # Lag fim-a-fim (proxy) e overhead:
+            # - fim-a-fim = detecção->click + click->betslip
+            # - overhead = duração_total - fim-a-fim (sugere fila/retries/esperas adicionais)
+            det_ms = _safe_float(d.get("lag_det_to_click_ms"))
+            bs_ms = _safe_float(d.get("lag_click_to_betslip_ms"))
+            total_ms = _safe_float(d.get("audit_total_ms"))
+            if det_ms is not None and det_ms > 0 and bs_ms is not None and bs_ms > 0:
+                d["lag_e2e_ms"] = float(det_ms + bs_ms)
+            else:
+                d["lag_e2e_ms"] = None
+            if total_ms is not None and total_ms > 0 and d.get("lag_e2e_ms") is not None:
+                d["lag_overhead_ms"] = float(total_ms - float(d["lag_e2e_ms"]))
+            else:
+                d["lag_overhead_ms"] = None
 
             # CLV (bruto)
             if d["closing_odd"] and d["closing_odd"] > 0:
@@ -633,7 +652,7 @@ async def main() -> int:
             d["model"] = classify_model(str(d.get("version", "")))
             d["diff_bucket"] = diff_bucket(_safe_float(d.get("diff_pct")))
             d["line_bucket"] = line_bucket(str(d.get("line", "")))
-            d["lag_bucket"] = lag_bucket(int(d.get("lag_total") or 0))
+            d["lag_bucket"] = lag_bucket(int(d.get("lag_e2e_ms") or 0))
 
             all_data.append(d)
 
@@ -743,8 +762,9 @@ async def main() -> int:
         dom_all = subset_model("DOM (15-30s)")
         api_bs = subset_bs_model("API (2-4s)")
         dom_bs = subset_bs_model("DOM (15-30s)")
-        api_lag = _mean([float(d["lag_total"]) for d in api_all if d.get("lag_total")])
-        dom_lag = _mean([float(d["lag_total"]) for d in dom_all if d.get("lag_total")])
+        # Latência fim-a-fim (proxy): detecção->click + click->betslip
+        api_lag = _mean([float(d["lag_e2e_ms"]) for d in api_all if d.get("lag_e2e_ms") is not None])
+        dom_lag = _mean([float(d["lag_e2e_ms"]) for d in dom_all if d.get("lag_e2e_ms") is not None])
         api_clv_pm_n = len([d for d in api_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
         dom_clv_pm_n = len([d for d in dom_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
         api_roi_n = len([d for d in api_bs if d.get("roi_bs") is not None])
@@ -754,6 +774,40 @@ async def main() -> int:
         lines.append(f"| Com CLV pre-match (betslip) | {api_clv_pm_n} | {dom_clv_pm_n} |\n")
         lines.append(f"| Com ROI (betslip) | {api_roi_n} | {dom_roi_n} |\n")
         lines.append(f"| Lag médio observado (fim-a-fim) | {_fmt_num(api_lag, 0)} ms | {_fmt_num(dom_lag, 0)} ms |\n")
+        lines.append("\n---\n")
+
+        # 2.0b) Decomposição de latência (foco: fila/overhead)
+        lines.append("### 2.0b Decomposição do tempo (detecção→clique→betslip vs. overhead)\n")
+        lines.append(
+            "Interpretação: `lag_e2e` é o **tempo fim-a-fim** (detecção→clique + clique→betslip). "
+            "`overhead` = `audit_total` − `lag_e2e` (proxy de fila/retries/esperas fora das 2 etapas instrumentadas).\n\n"
+        )
+
+        def _stage_stats(rows_in: List[Dict[str, Any]], key: str) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+            vals: List[float] = []
+            for d in rows_in:
+                v = _safe_float(d.get(key))
+                if v is None:
+                    continue
+                vals.append(float(v))
+            # remove zeros e negativos para tempos, exceto overhead (pode ser <0 por inconsistência de medição)
+            if key != "lag_overhead_ms":
+                vals = [v for v in vals if v > 0]
+            if not vals:
+                return None, None, None, 0
+            return float(np.mean(vals)), float(np.median(vals)), float(np.quantile(vals, 0.95)), len(vals)
+
+        lines.append("| Modelo | Métrica | mean (ms) | p50 (ms) | p95 (ms) | N |\n|---|---|---:|---:|---:|---:|\n")
+        for model_name, rows_in in [("API (2-4s)", api_all), ("DOM (15-30s)", dom_all)]:
+            for label, key in [
+                ("lag_det→click", "lag_det_to_click_ms"),
+                ("lag_click→betslip", "lag_click_to_betslip_ms"),
+                ("lag_e2e (soma)", "lag_e2e_ms"),
+                ("audit_total (duração)", "audit_total_ms"),
+                ("overhead (total - e2e)", "lag_overhead_ms"),
+            ]:
+                mu, p50, p95, n = _stage_stats(rows_in, key)
+                lines.append(f"| {model_name} | {label} | {_fmt_num(mu,0)} | {_fmt_num(p50,0)} | {_fmt_num(p95,0)} | {n} |\n")
         lines.append("\n---\n")
 
         # 2.1) Pre vs in
