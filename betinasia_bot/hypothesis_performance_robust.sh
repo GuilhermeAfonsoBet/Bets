@@ -124,7 +124,17 @@ WITH base AS (
       WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
       THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
       ELSE NULL
-    END AS pipe_ms
+    END AS pipe_ms,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue')::numeric
+      ELSE NULL
+    END AS q_depth_enq,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_after_dequeue','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_after_dequeue')::numeric
+      ELSE NULL
+    END AS q_depth_deq
   FROM betslip_audit_results
   WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
     AND ${AUDIT_FILTER_SQL}
@@ -141,13 +151,68 @@ SELECT
   ROUND(100.0 * COUNT(*) FILTER (WHERE (h -> 'lay') IS NOT NULL) / NULLIF(COUNT(*),0), 1) AS lay_t0_cov_pct,
   ROUND(100.0 * COUNT(*) FILTER (WHERE (h -> 'lay_temporal') IS NOT NULL) / NULLIF(COUNT(*),0), 1) AS lay_temporal_cov_pct,
   ROUND(100.0 * COUNT(*) FILTER (WHERE (h -> 'finance') IS NOT NULL) / NULLIF(COUNT(*),0), 1) AS finance_cov_pct,
-  ROUND(AVG(COALESCE(q_ms,0)),1) AS q_avg_ms,
-  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(q_ms,0)))::numeric,1) AS q_p95_ms,
-  ROUND(AVG(COALESCE(pipe_ms,0)),1) AS pipe_avg_ms,
-  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(pipe_ms,0)))::numeric,1) AS pipe_p95_ms
+  ROUND(AVG(COALESCE(q_ms,0)),1) AS queue_wait_avg_ms,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(q_ms,0)))::numeric,1) AS queue_wait_p95_ms,
+  ROUND(AVG(COALESCE(q_depth_enq,0)),2) AS queue_depth_enq_avg,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(q_depth_enq,0)))::numeric,2) AS queue_depth_enq_p95,
+  ROUND(AVG(COALESCE(q_depth_deq,0)),2) AS queue_depth_deq_avg,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(q_depth_deq,0)))::numeric,2) AS queue_depth_deq_p95,
+  ROUND(AVG(COALESCE(pipe_ms,0)),1) AS total_bot_avg_ms,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(pipe_ms,0)))::numeric,1) AS total_bot_p95_ms
 FROM base
 GROUP BY 1,2
 ORDER BY 1 DESC, 2;
+"
+echo
+
+echo "1.1) PERFORMANCE DO BOT (FILA + TEMPO TOTAL)"
+run_psql "
+WITH b AS (
+  SELECT
+    audit_version,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_wait_ms')::numeric
+      ELSE NULL
+    END AS queue_wait_ms,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_at_enqueue')::numeric
+      ELSE NULL
+    END AS q_depth_enq,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_after_dequeue','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'queue_depth_after_dequeue')::numeric
+      ELSE NULL
+    END AS q_depth_deq,
+    CASE
+      WHEN COALESCE(hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (hypothesis_details::jsonb -> 'telemetry' ->> 'pipeline_total_ms')::numeric
+      ELSE NULL
+    END AS total_bot_ms
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+)
+SELECT
+  audit_version,
+  COUNT(*) AS n_ok,
+  ROUND(AVG(queue_wait_ms),1) AS queue_wait_avg_ms,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY queue_wait_ms))::numeric,1) AS queue_wait_p95_ms,
+  ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY queue_wait_ms))::numeric,1) AS queue_wait_p99_ms,
+  ROUND(AVG(q_depth_enq),2) AS queue_depth_enq_avg,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q_depth_enq))::numeric,2) AS queue_depth_enq_p95,
+  ROUND(MAX(q_depth_enq)::numeric,2) AS queue_depth_enq_max,
+  ROUND(AVG(q_depth_deq),2) AS queue_depth_deq_avg,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY q_depth_deq))::numeric,2) AS queue_depth_deq_p95,
+  ROUND(MAX(q_depth_deq)::numeric,2) AS queue_depth_deq_max,
+  ROUND(AVG(total_bot_ms),1) AS total_bot_avg_ms,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY total_bot_ms))::numeric,1) AS total_bot_p95_ms,
+  ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY total_bot_ms))::numeric,1) AS total_bot_p99_ms
+FROM b
+GROUP BY 1
+ORDER BY 1 DESC;
 "
 echo
 
@@ -270,6 +335,54 @@ SELECT
 FROM x
 GROUP BY 1
 ORDER BY 1 DESC;
+"
+echo
+
+echo "3.1) MATRIZ BS vs WS POR BUCKET (inclui faixa neutra)"
+run_psql "
+WITH b AS (
+  SELECT
+    audit_version,
+    status,
+    difference_pct::numeric AS diff_pct,
+    CASE WHEN is_live IS TRUE THEN 'IN_MATCH' ELSE 'PRE_MATCH' END AS regime
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+    AND difference_pct IS NOT NULL
+),
+x AS (
+  SELECT
+    *,
+    CASE
+      WHEN diff_pct <= -10 THEN 'A <= -10%'
+      WHEN diff_pct <= -2 THEN 'B (-10,-2]%'
+      WHEN diff_pct < 2 THEN 'C (-2,+2)%'
+      ELSE 'D > +2%'
+    END AS diff_bucket
+  FROM b
+)
+SELECT
+  audit_version,
+  diff_bucket,
+  COUNT(*) AS n,
+  ROUND(100.0 * COUNT(*) / NULLIF(SUM(COUNT(*)) OVER (PARTITION BY audit_version),0), 1) AS bucket_share_pct,
+  COUNT(*) FILTER (WHERE regime='PRE_MATCH') AS n_pre_match,
+  COUNT(*) FILTER (WHERE regime='IN_MATCH') AS n_in_match,
+  ROUND(AVG(diff_pct)::numeric,2) AS diff_avg_pct,
+  ROUND((PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY diff_pct))::numeric,2) AS diff_p50_pct,
+  ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY diff_pct))::numeric,2) AS diff_p95_pct
+FROM x
+GROUP BY 1,2
+ORDER BY
+  audit_version DESC,
+  CASE diff_bucket
+    WHEN 'A <= -10%' THEN 1
+    WHEN 'B (-10,-2]%' THEN 2
+    WHEN 'C (-2,+2)%' THEN 3
+    ELSE 4
+  END;
 "
 echo
 
@@ -416,6 +529,209 @@ SELECT *
 FROM b
 ORDER BY liability_bucket DESC
 LIMIT ${MAX_BUCKETS};
+"
+echo
+
+echo "5.1) EVOLUCAO TEMPORAL BACK (T+0 -> ultimo ponto)"
+run_psql "
+WITH base AS (
+  SELECT
+    audit_version,
+    CASE WHEN is_live IS TRUE THEN 'IN_MATCH' ELSE 'PRE_MATCH' END AS regime,
+    difference_pct::numeric AS diff_t0,
+    hypothesis_details::jsonb AS h
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+    AND difference_pct IS NOT NULL
+),
+points AS (
+  SELECT
+    audit_version,
+    regime,
+    diff_t0,
+    jsonb_array_length(h -> 'temporal') AS n_pts,
+    (
+      SELECT (e ->> 'diff_pct')::numeric
+      FROM jsonb_array_elements(h -> 'temporal') WITH ORDINALITY arr(e, ord)
+      WHERE COALESCE(e ->> 'diff_pct','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      ORDER BY ord DESC
+      LIMIT 1
+    ) AS diff_t_last,
+    (
+      SELECT (e ->> 't')::numeric
+      FROM jsonb_array_elements(h -> 'temporal') WITH ORDINALITY arr(e, ord)
+      WHERE COALESCE(e ->> 't','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      ORDER BY ord DESC
+      LIMIT 1
+    ) AS t_last_s
+  FROM base
+  WHERE (h -> 'temporal') IS NOT NULL
+    AND jsonb_typeof(h -> 'temporal') = 'array'
+    AND jsonb_array_length(h -> 'temporal') > 0
+),
+calc AS (
+  SELECT
+    *,
+    (diff_t_last - diff_t0) AS delta
+  FROM points
+  WHERE diff_t_last IS NOT NULL
+),
+agg AS (
+  SELECT
+    audit_version,
+    regime,
+    COUNT(*) AS n,
+    AVG(diff_t0) AS diff_t0_avg,
+    AVG(diff_t_last) AS diff_tlast_avg,
+    AVG(delta) AS delta_avg,
+    STDDEV_SAMP(delta) AS delta_sd,
+    AVG(CASE WHEN diff_t0 >= ${BACK_DIFF_MIN} AND diff_t_last >= ${BACK_DIFF_MIN} THEN 1.0 ELSE 0.0 END) AS edge_retention,
+    AVG(CASE WHEN diff_t0 >= ${BACK_DIFF_MIN} AND diff_t_last <  ${BACK_DIFF_MIN} THEN 1.0 ELSE 0.0 END) AS edge_loss,
+    AVG(CASE WHEN delta <= -0.5 THEN 1.0 ELSE 0.0 END) AS decay_pct,
+    AVG(CASE WHEN ABS(delta) < 0.5 THEN 1.0 ELSE 0.0 END) AS stable_pct,
+    AVG(CASE WHEN delta >= 0.5 THEN 1.0 ELSE 0.0 END) AS improve_pct,
+    AVG(n_pts::numeric) AS avg_points,
+    AVG(t_last_s) AS avg_last_t_s
+  FROM calc
+  GROUP BY 1,2
+),
+final AS (
+  SELECT
+    *,
+    CASE WHEN n >= 2 AND delta_sd IS NOT NULL THEN delta_sd / SQRT(n::numeric) END AS delta_se
+  FROM agg
+)
+SELECT
+  audit_version,
+  regime,
+  n,
+  ROUND(diff_t0_avg::numeric,2) AS diff_t0_avg_pct,
+  ROUND(diff_tlast_avg::numeric,2) AS diff_tlast_avg_pct,
+  ROUND(delta_avg::numeric,2) AS delta_avg_pct,
+  ROUND((delta_avg - 1.960 * delta_se)::numeric,2) AS delta_ci95_low,
+  ROUND((delta_avg + 1.960 * delta_se)::numeric,2) AS delta_ci95_high,
+  ROUND((edge_retention * 100)::numeric,1) AS edge_retention_pct,
+  ROUND((edge_loss * 100)::numeric,1) AS edge_loss_pct,
+  ROUND((decay_pct * 100)::numeric,1) AS decay_pct,
+  ROUND((stable_pct * 100)::numeric,1) AS stable_pct,
+  ROUND((improve_pct * 100)::numeric,1) AS improve_pct,
+  ROUND(avg_points::numeric,2) AS temporal_points_avg,
+  ROUND(avg_last_t_s::numeric,1) AS last_point_t_avg_s
+FROM final
+ORDER BY audit_version DESC, regime;
+"
+echo
+
+echo "5.2) EVOLUCAO TEMPORAL LAY (T+0 -> ultimo ponto)"
+run_psql "
+WITH base AS (
+  SELECT
+    audit_version,
+    CASE WHEN is_live IS TRUE THEN 'IN_MATCH' ELSE 'PRE_MATCH' END AS regime,
+    websocket_odd::numeric AS ws_odd,
+    hypothesis_details::jsonb AS h
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+),
+t0 AS (
+  SELECT
+    audit_version,
+    regime,
+    ws_odd,
+    h,
+    CASE
+      WHEN COALESCE(h -> 'lay' ->> 'odd','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (h -> 'lay' ->> 'odd')::numeric
+      ELSE NULL
+    END AS lay_odd_t0
+  FROM base
+),
+points AS (
+  SELECT
+    audit_version,
+    regime,
+    CASE
+      WHEN ws_odd > 0 AND lay_odd_t0 IS NOT NULL
+      THEN ((lay_odd_t0 - ws_odd) / ws_odd) * 100
+      ELSE NULL
+    END AS diff_t0,
+    jsonb_array_length(h -> 'lay_temporal') AS n_pts,
+    (
+      SELECT (e ->> 'diff_pct')::numeric
+      FROM jsonb_array_elements(h -> 'lay_temporal') WITH ORDINALITY arr(e, ord)
+      WHERE COALESCE(e ->> 'diff_pct','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      ORDER BY ord DESC
+      LIMIT 1
+    ) AS diff_t_last,
+    (
+      SELECT (e ->> 't')::numeric
+      FROM jsonb_array_elements(h -> 'lay_temporal') WITH ORDINALITY arr(e, ord)
+      WHERE COALESCE(e ->> 't','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      ORDER BY ord DESC
+      LIMIT 1
+    ) AS t_last_s
+  FROM t0
+  WHERE (h -> 'lay_temporal') IS NOT NULL
+    AND jsonb_typeof(h -> 'lay_temporal') = 'array'
+    AND jsonb_array_length(h -> 'lay_temporal') > 0
+),
+calc AS (
+  SELECT
+    *,
+    (diff_t_last - diff_t0) AS delta
+  FROM points
+  WHERE diff_t0 IS NOT NULL
+    AND diff_t_last IS NOT NULL
+),
+agg AS (
+  SELECT
+    audit_version,
+    regime,
+    COUNT(*) AS n,
+    AVG(diff_t0) AS diff_t0_avg,
+    AVG(diff_t_last) AS diff_tlast_avg,
+    AVG(delta) AS delta_avg,
+    STDDEV_SAMP(delta) AS delta_sd,
+    AVG(CASE WHEN diff_t0 <= ${LAY_DIFF_MAX} AND diff_t_last <= ${LAY_DIFF_MAX} THEN 1.0 ELSE 0.0 END) AS edge_retention,
+    AVG(CASE WHEN diff_t0 <= ${LAY_DIFF_MAX} AND diff_t_last >  ${LAY_DIFF_MAX} THEN 1.0 ELSE 0.0 END) AS edge_loss,
+    AVG(CASE WHEN diff_t0 >  ${LAY_DIFF_MAX} AND diff_t_last <= ${LAY_DIFF_MAX} THEN 1.0 ELSE 0.0 END) AS edge_gain,
+    AVG(CASE WHEN delta >= 0.5 THEN 1.0 ELSE 0.0 END) AS decay_against_pct,
+    AVG(CASE WHEN ABS(delta) < 0.5 THEN 1.0 ELSE 0.0 END) AS stable_pct,
+    AVG(CASE WHEN delta <= -0.5 THEN 1.0 ELSE 0.0 END) AS improve_favor_pct,
+    AVG(n_pts::numeric) AS avg_points,
+    AVG(t_last_s) AS avg_last_t_s
+  FROM calc
+  GROUP BY 1,2
+),
+final AS (
+  SELECT
+    *,
+    CASE WHEN n >= 2 AND delta_sd IS NOT NULL THEN delta_sd / SQRT(n::numeric) END AS delta_se
+  FROM agg
+)
+SELECT
+  audit_version,
+  regime,
+  n,
+  ROUND(diff_t0_avg::numeric,2) AS diff_t0_avg_pct,
+  ROUND(diff_tlast_avg::numeric,2) AS diff_tlast_avg_pct,
+  ROUND(delta_avg::numeric,2) AS delta_avg_pct,
+  ROUND((delta_avg - 1.960 * delta_se)::numeric,2) AS delta_ci95_low,
+  ROUND((delta_avg + 1.960 * delta_se)::numeric,2) AS delta_ci95_high,
+  ROUND((edge_retention * 100)::numeric,1) AS edge_retention_pct,
+  ROUND((edge_loss * 100)::numeric,1) AS edge_loss_pct,
+  ROUND((edge_gain * 100)::numeric,1) AS edge_gain_pct,
+  ROUND((decay_against_pct * 100)::numeric,1) AS decay_against_pct,
+  ROUND((stable_pct * 100)::numeric,1) AS stable_pct,
+  ROUND((improve_favor_pct * 100)::numeric,1) AS improve_favor_pct,
+  ROUND(avg_points::numeric,2) AS temporal_points_avg,
+  ROUND(avg_last_t_s::numeric,1) AS last_point_t_avg_s
+FROM final
+ORDER BY audit_version DESC, regime;
 "
 echo
 
@@ -781,7 +1097,9 @@ echo
 
 echo "11) NOTAS DE LEITURA"
 echo "- Back e Lay devem ser analisados separados."
+echo "- A seção 3.1 traz explicitamente buckets BS vs WS: (-10,-2], (-2,+2) e >+2 (mais faixa <=-10 para cauda)."
 echo "- Lay tem cauda mais pesada: use p95/p99/ES95 de liability e bucket exposure."
+echo "- As seções 5.1 e 5.2 trazem evolução temporal (T+0 -> último ponto) e padrões de valor/não valor."
 echo "- A seção 7 testa diferença média (diff_pct) vs 0 com IC e t_stat."
 echo "- A seção 8 usa apenas registros liquidados (profit_loss/clv não nulos)."
 echo "- As seções 9 e 10 trazem inferência por combinação H3B (regime x faixa AH x bucket de diff)."
