@@ -83,7 +83,7 @@ class APIFootballClient:
             await self._client.aclose()
         logger.info("API-Football client fechado")
         
-    async def _request(self, endpoint: str, params: Dict[str, Any] = None) -> Dict:
+    async def _request(self, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """Faz requisicao GET para a API."""
         if not self._client:
             await self.start()
@@ -107,7 +107,9 @@ class APIFootballClient:
             # Log de uso da API
             if "errors" in data and data["errors"]:
                 logger.error(f"API Error: {data['errors']}")
-                return None
+                # Importante: retornamos o payload mesmo com errors para permitir diagnóstico
+                # (ex.: plano free sem acesso à data). Chamadores típicos lidam com response vazio.
+                return data
                 
             return data
             

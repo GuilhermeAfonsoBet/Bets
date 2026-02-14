@@ -29,7 +29,7 @@ from sqlalchemy import and_, select, text
 
 from storage.database import Database
 from storage.models import Match
-from .api_football import APIFootballClient
+from .api_football import APIFootballClient, MatchResult
 from .update_results import match_teams, normalize_team_name, similarity_ratio, get_mapped_name
 
 
@@ -146,6 +146,7 @@ async def main():
 
         # cache por data (UTC)
         api_cache: Dict[str, list] = {}
+        api_meta: Dict[str, dict] = {}
         reasons = Counter()
 
         def get_api(date_str: str):
@@ -153,18 +154,67 @@ async def main():
                 api_cache[date_str] = []
             return api_cache[date_str]
 
-        # busca resultados de datas no sample
+        def parse_results(payload: dict) -> List[MatchResult]:
+            if not payload:
+                return []
+            results: List[MatchResult] = []
+            for fixture in payload.get("response", []) or []:
+                try:
+                    fixture_data = fixture.get("fixture", {}) or {}
+                    teams = fixture.get("teams", {}) or {}
+                    goals = fixture.get("goals", {}) or {}
+                    score = fixture.get("score", {}) or {}
+                    league = fixture.get("league", {}) or {}
+
+                    status = (fixture_data.get("status", {}) or {}).get("short", "") or ""
+                    if status not in ["FT", "AET", "PEN"]:
+                        continue
+
+                    results.append(
+                        MatchResult(
+                            fixture_id=int(fixture_data.get("id")),
+                            home_team=str((teams.get("home", {}) or {}).get("name", "")),
+                            away_team=str((teams.get("away", {}) or {}).get("name", "")),
+                            home_score=int(goals.get("home", 0) or 0),
+                            away_score=int(goals.get("away", 0) or 0),
+                            status=str(status),
+                            kickoff_time=datetime.fromisoformat(str(fixture_data.get("date", "")).replace("Z", "+00:00")),
+                            league_name=str(league.get("name", "")),
+                            league_country=str(league.get("country", "")),
+                            home_score_ht=(score.get("halftime", {}) or {}).get("home"),
+                            away_score_ht=(score.get("halftime", {}) or {}).get("away"),
+                        )
+                    )
+                except Exception:
+                    continue
+            return results
+
+        def _classify_api_meta(payload: dict) -> str:
+            if not payload:
+                return "api_falhou_sem_payload"
+            errs = payload.get("errors") or {}
+            if not errs:
+                return ""
+            txt = str(errs)
+            if "Free plans do not have access to this date" in txt or "access to this date" in txt:
+                return "api_sem_acesso_data_plano_free"
+            return "api_com_erro"
+
+        # busca fixtures (1 request por data) e parseia FT
         dates = sorted({m.kickoff_time.strftime("%Y-%m-%d") for m in sample})
         for ds in dates:
-            res = await api.get_results_by_date(ds)
-            api_cache[ds] = res
+            payload = await api._request("/fixtures", {"date": ds})
+            api_meta[ds] = payload
+            api_cache[ds] = parse_results(payload or {})
         # também busca datas adjacentes para detectar mismatch de timezone/data
         for ds in dates:
             dt = datetime.strptime(ds, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             for adj in [(dt - timedelta(days=1)), (dt + timedelta(days=1))]:
                 s = adj.strftime("%Y-%m-%d")
                 if s not in api_cache:
-                    api_cache[s] = await api.get_results_by_date(s)
+                    payload = await api._request("/fixtures", {"date": s})
+                    api_meta[s] = payload
+                    api_cache[s] = parse_results(payload or {})
 
         matched = 0
         examples_not_found: List[Tuple[Match, str]] = []
@@ -172,7 +222,8 @@ async def main():
             ds = m.kickoff_time.strftime("%Y-%m-%d")
             api_results = api_cache.get(ds) or []
             if not api_results:
-                reasons["api_sem_resultado_na_data"] += 1
+                tag = _classify_api_meta(api_meta.get(ds) or {})
+                reasons[tag or "api_sem_resultado_na_data"] += 1
                 continue
 
             found = None
@@ -205,6 +256,16 @@ async def main():
             print("- principais motivos (aprox.):")
             for k, v in reasons.most_common(10):
                 print(f"  - {k}: {v}")
+        # datas com erro da API (ex.: plano free sem acesso)
+        bad_dates = []
+        for ds, payload in api_meta.items():
+            tag = _classify_api_meta(payload or {})
+            if tag:
+                bad_dates.append((ds, tag, payload.get("errors") if payload else None))
+        if bad_dates:
+            print("\n- datas com erro reportado pela API:")
+            for ds, tag, err in sorted(bad_dates)[:10]:
+                print(f"  - {ds}: {tag} | errors={err}")
         print()
 
         if examples_not_found:

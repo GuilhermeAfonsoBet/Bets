@@ -769,7 +769,7 @@ async def main() -> int:
             f"| ROI WebSocket | {len([d for d in all_data if d.get('is_live') is False and d.get('roi_ws') is not None])} | {len([d for d in all_data if d.get('is_live') is True and d.get('roi_ws') is not None])} | Referência de mercado |\n"
         )
         lines.append(
-            f"| CLV Betslip (informativo) | {len([d for d in with_bs if d.get('is_live') is False and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | {len([d for d in with_bs if d.get('is_live') is True and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | Decisão prioriza CLV pre-match |\n"
+            f"| CLV (apenas pre-match) | {len([d for d in with_bs if d.get('is_live') is False and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | — | CLV vs closing pré-jogo não é interpretável in-match |\n"
         )
         lines.append("\n---\n")
 
@@ -1325,14 +1325,33 @@ async def main() -> int:
                     continue
                 t_ext = [r["t_ext"] for r in sub if r.get("t_ext") is not None]
                 t_rev = [r["t_reversal"] for r in sub if r.get("t_reversal") is not None]
+                t_rev_delay = [
+                    float(r["t_reversal"]) - float(r["t_ext"])
+                    for r in sub
+                    if r.get("t_reversal") is not None and r.get("t_ext") is not None
+                ]
+                # Partição 100% (categorias exclusivas)
+                end_no_rev = sum(1 for r in sub if r.get("ext_at_end") and not r.get("had_reversal"))
+                end_with_rev = sum(1 for r in sub if r.get("ext_at_end") and r.get("had_reversal"))
+                not_end_with_rev = sum(1 for r in sub if (not r.get("ext_at_end")) and r.get("had_reversal"))
+                not_end_no_rev = sum(1 for r in sub if (not r.get("ext_at_end")) and not r.get("had_reversal"))
                 out[regime] = {
                     "n": len(sub),
                     "t_ext_avg": float(np.mean(t_ext)) if t_ext else None,
                     "t_ext_p50": float(np.median(t_ext)) if t_ext else None,
                     "pct_monotonic": 100.0 * sum(1 for r in sub if r.get("monotonic")) / len(sub),
-                    "pct_ext_at_end": 100.0 * sum(1 for r in sub if r.get("ext_at_end")) / len(sub),
+                    # "melhora até o fim" = monotônico + extremo no fim (proxy do "sobe/desce indef.")
+                    "pct_improve_to_end": 100.0 * sum(1 for r in sub if r.get("monotonic") and r.get("ext_at_end")) / len(sub),
                     "pct_reversal": 100.0 * sum(1 for r in sub if r.get("had_reversal")) / len(sub),
                     "t_rev_avg": float(np.mean(t_rev)) if t_rev else None,
+                    "t_rev_p50": float(np.median(t_rev)) if t_rev else None,
+                    "dt_rev_avg": float(np.mean(t_rev_delay)) if t_rev_delay else None,
+                    "dt_rev_p50": float(np.median(t_rev_delay)) if t_rev_delay else None,
+                    # partição 100% (exclusiva)
+                    "pct_end_no_rev": 100.0 * end_no_rev / len(sub),
+                    "pct_end_with_rev": 100.0 * end_with_rev / len(sub),
+                    "pct_not_end_with_rev": 100.0 * not_end_with_rev / len(sub),
+                    "pct_not_end_no_rev": 100.0 * not_end_no_rev / len(sub),
                 }
             return out
 
@@ -1354,10 +1373,14 @@ async def main() -> int:
                     tgt = min(times, key=lambda x: abs(x - t))
                     diff = float(p["diff_pct"])
                     odd = float(p["odd"])
-                    if mode == "back":
-                        clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                    # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+                    if d.get("is_live") is True:
+                        clv = None
                     else:
-                        clv = _clv_pct_lay_from_odd(odd, d.get("closing_odd"))
+                        if mode == "back":
+                            clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                        else:
+                            clv = _clv_pct_lay_from_odd(odd, d.get("closing_odd"))
                     roi = None
                     if mult is not None:
                         if mode == "back":
@@ -1379,24 +1402,42 @@ async def main() -> int:
 
         lines.append("## 8) Curva temporal (pico, reversão e melhor timing)\n")
         lines.append("Esta seção usa `hypothesis_details.temporal` (Back) e `hypothesis_details.lay_temporal` (Lay), coletados em pontos discretos (t≈0,3,6,10,15,20s).\n\n")
-        lines.append("O objetivo é responder: **tempo até o pico/vale**, **% que segue melhorando até t_max**, **% com reversão** e **impacto esperado (CLV/ROI) por timing**.\n\n")
+        lines.append(
+            "O objetivo é responder: **tempo até o pico/vale**, **% que segue melhorando até t_max**, **% com reversão** e **impacto esperado por timing**. "
+            "**CLV é reportado somente pre-match** (closing pré-jogo).\n\n"
+        )
 
         # BACK
         back_stats = _summarize_timing(ok_bs, mode="back")["rows"]
         back_agg = _agg_by_regime(back_stats)
         lines.append("### 8.1 Back (pico em diff_pct)\n")
-        lines.append("| Regime | N | t_pico médio (s) | t_pico p50 (s) | % monotônico | % pico no fim (\"sobe indef.\") | % com reversão | t_reversão médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        lines.append(
+            f"Definições: **pico** = `max(diff_pct)`. **reversão** = após o pico, `diff_pct` cair pelo menos {EPS_REV:.2f} p.p. "
+            f"(para Lay, subir {EPS_REV:.2f} p.p. após o vale). `t_reversão` é o 1º tempo que cruza esse limiar (logo, não é o pico).\n\n"
+        )
+        lines.append("| Regime | N | t_pico médio (s) | t_pico p50 (s) | % melhora até fim | % com reversão | t_reversão médio (s) | Δt (rev - pico) médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for regime in ["PRE_MATCH", "IN_MATCH"]:
             s = back_agg.get(regime, {"n": 0})
             if s.get("n", 0) == 0:
                 lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
                 continue
             lines.append(
-                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_monotonic'),1)}% | {_fmt_num(s.get('pct_ext_at_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} |\n"
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_improve_to_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} | {_fmt_num(s.get('dt_rev_avg'),1)} |\n"
             )
 
-        lines.append("\n**Curva média (Back)**: média de `diff_pct`, `odd` e `CLV` por tempo. `ROI` (quando aparece) é o **ROI realizado** se a aposta fosse feita naquele ponto.\n\n")
-        lines.append("| Tempo | N pts | diff_pct médio | odd média | CLV médio (vs closing) | ROI médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        lines.append("\n**Partição 100% (Back)**: categorias exclusivas (somam 100% por regime).\n\n")
+        lines.append("| Regime | % pico no fim, sem reversão | % pico no fim, com reversão (recuperou) | % pico antes, com reversão | % pico antes, sem reversão relevante |\n|---|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = back_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {_fmt_num(s.get('pct_end_no_rev'),1)}% | {_fmt_num(s.get('pct_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_no_rev'),1)}% |\n"
+            )
+
+        lines.append("\n**Curva média (Back)**: média de `diff_pct` e `odd` por tempo. `CLV` é reportado **somente pre-match** (closing pré-jogo). `ROI` (quando aparece) é o **ROI realizado** se a aposta fosse feita naquele ponto.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | odd média | CLV médio (pre-match) | ROI médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
         for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="back"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
 
@@ -1416,14 +1457,18 @@ async def main() -> int:
             roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
             roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
+            # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+            clv0 = _clv_pct_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
+            clve = _clv_pct_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
+            clvl = _clv_pct_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
             return {
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
                 "had_reversal": bool(a.get("had_reversal")),
                 "t_ext": a.get("t_ext"),
-                "clv_t0": _clv_pct_from_odd(p0["odd"], closing),
-                "clv_ext": _clv_pct_from_odd(a["odd_ext"], closing),
-                "clv_last": _clv_pct_from_odd(plast["odd"], closing),
+                "clv_t0": clv0,
+                "clv_ext": clve,
+                "clv_last": clvl,
                 "roi_t0": roi0,
                 "roi_ext": roipeak,
                 "roi_last": roilast,
@@ -1443,14 +1488,18 @@ async def main() -> int:
             roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
             roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
+            # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+            clv0 = _clv_pct_lay_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
+            clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
+            clvl = _clv_pct_lay_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
             return {
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
                 "had_reversal": bool(a.get("had_reversal")),
                 "t_ext": a.get("t_ext"),
-                "clv_t0": _clv_pct_lay_from_odd(p0["odd"], closing),
-                "clv_ext": _clv_pct_lay_from_odd(a["odd_ext"], closing),
-                "clv_last": _clv_pct_lay_from_odd(plast["odd"], closing),
+                "clv_t0": clv0,
+                "clv_ext": clve,
+                "clv_last": clvl,
                 "roi_t0": roi0,
                 "roi_ext": roival,
                 "roi_last": roilast,
@@ -1464,8 +1513,8 @@ async def main() -> int:
         # 8.1b) impacto: t0 vs pico vs último, com/sem reversão
         back_entries = [em for d in ok_bs for em in [_entry_metrics_back(d)] if em is not None]
         lines.append("\n### 8.1b Back — impacto por timing (t0 vs pico vs último) e reversão\n")
-        lines.append("Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**.\n\n")
-        lines.append("| Subcoorte | N | CLV t0 | CLV pico | CLV último | ROI t0 | ROI pico | ROI último |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        lines.append("Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. Observação: **CLV só é calculado pre-match**.\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 | CLV pico | CLV último | N ROI | ROI t0 | ROI pico | ROI último |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for label, filt in [
             ("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]),
             ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]]),
@@ -1476,31 +1525,46 @@ async def main() -> int:
             roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
             roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
             roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
-            lines.append(f"| {label} | {len(filt)} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n")
+            n_clv = sum(1 for r in filt if r.get("clv_t0") is not None or r.get("clv_ext") is not None or r.get("clv_last") is not None)
+            n_roi = sum(1 for r in filt if r.get("roi_t0") is not None or r.get("roi_ext") is not None or r.get("roi_last") is not None)
+            lines.append(
+                f"| {label} | {len(filt)} | {n_clv} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {n_roi} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n"
+            )
 
         # LAY
         lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
         lay_agg = _agg_by_regime(lay_stats)
         lines.append("\n### 8.2 Lay (vale em diff_pct)\n")
-        lines.append("| Regime | N | t_vale médio (s) | t_vale p50 (s) | % monotônico | % vale no fim (\"desce indef.\") | % com reversão | t_reversão médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        lines.append("| Regime | N | t_vale médio (s) | t_vale p50 (s) | % melhora até fim | % com reversão | t_reversão médio (s) | Δt (rev - vale) médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for regime in ["PRE_MATCH", "IN_MATCH"]:
             s = lay_agg.get(regime, {"n": 0})
             if s.get("n", 0) == 0:
                 lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
                 continue
             lines.append(
-                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_monotonic'),1)}% | {_fmt_num(s.get('pct_ext_at_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} |\n"
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_improve_to_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} | {_fmt_num(s.get('dt_rev_avg'),1)} |\n"
             )
 
-        lines.append("\n**Curva média (Lay)**: usa `odd=lay_odd`. O ROI mostrado aqui é **ROI por liability** (não por stake), porque Lay é governado por risco.\n\n")
-        lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (vs closing) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        lines.append("\n**Partição 100% (Lay)**: categorias exclusivas (somam 100% por regime).\n\n")
+        lines.append("| Regime | % vale no fim, sem reversão | % vale no fim, com reversão (recuperou) | % vale antes, com reversão | % vale antes, sem reversão relevante |\n|---|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = lay_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {_fmt_num(s.get('pct_end_no_rev'),1)}% | {_fmt_num(s.get('pct_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_no_rev'),1)}% |\n"
+            )
+
+        lines.append("\n**Curva média (Lay)**: usa `odd=lay_odd`. `CLV` é reportado **somente pre-match** (closing pré-jogo). O ROI mostrado aqui é **ROI por liability** (não por stake), porque Lay é governado por risco.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (pre-match) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
         for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="lay"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
 
         lay_entries = [em for d in ok_bs for em in [_entry_metrics_lay(d)] if em is not None]
         lines.append("\n### 8.2b Lay — impacto por timing (t0 vs vale vs último) e reversão\n")
-        lines.append("Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**.\n\n")
-        lines.append("| Subcoorte | N | CLV t0 | CLV vale | CLV último | ROI/liab t0 | ROI/liab vale | ROI/liab último |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        lines.append("Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. Observação: **CLV só é calculado pre-match**.\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 | CLV vale | CLV último | N ROI | ROI/liab t0 | ROI/liab vale | ROI/liab último |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for label, filt in [
             ("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]),
             ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]]),
@@ -1511,7 +1575,11 @@ async def main() -> int:
             roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
             roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
             roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
-            lines.append(f"| {label} | {len(filt)} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n")
+            n_clv = sum(1 for r in filt if r.get("clv_t0") is not None or r.get("clv_ext") is not None or r.get("clv_last") is not None)
+            n_roi = sum(1 for r in filt if r.get("roi_t0") is not None or r.get("roi_ext") is not None or r.get("roi_last") is not None)
+            lines.append(
+                f"| {label} | {len(filt)} | {n_clv} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {n_roi} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n"
+            )
 
         lines.append("\n---\n")
 
@@ -1566,7 +1634,49 @@ async def main() -> int:
         lines.append(f"| Jogos únicos no recorte | {unique_matches_all} |\n")
         lines.append(f"| Jogos com placar disponível (home_score/away_score não nulos) | {matches_with_scores} |\n")
         lines.append(f"| Jogos com status='finished' no banco | {matches_finished_flag} |\n")
-        lines.append("\nSe `placar disponível` estiver 0, isso geralmente indica que o job de resultados não rodou (ou está sem credenciais/chave da API).  \n")
+        # distribuição por data de kickoff (para explicar janela da API free)
+        match_meta: Dict[int, Dict[str, Any]] = {}
+        for d in all_data:
+            mid = int(d.get("match_id"))
+            kickoff = d.get("kickoff_time")
+            has_score = d.get("home_score") is not None and d.get("away_score") is not None
+            if mid not in match_meta:
+                match_meta[mid] = {"kickoff": kickoff, "has_score": bool(has_score)}
+            else:
+                if has_score:
+                    match_meta[mid]["has_score"] = True
+        kickoff_dates = [m.get("kickoff") for m in match_meta.values() if m.get("kickoff") is not None]
+        kickoff_min = min(kickoff_dates) if kickoff_dates else None
+        kickoff_max = max(kickoff_dates) if kickoff_dates else None
+        by_date: Dict[str, Dict[str, int]] = {}
+        for m in match_meta.values():
+            ko = m.get("kickoff")
+            if not ko:
+                continue
+            ds = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            by_date.setdefault(ds, {"matches": 0, "with_score": 0})
+            by_date[ds]["matches"] += 1
+            by_date[ds]["with_score"] += 1 if m.get("has_score") else 0
+
+        lines.append("\n### 10.1 Distribuição por data de kickoff (explica janela da API)\n")
+        def _fmt_ko(dt: Any) -> str:
+            try:
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                return str(dt)
+
+        lines.append(f"- Kickoff (UTC) no recorte: **{_fmt_ko(kickoff_min) if kickoff_min else '—'}** até **{_fmt_ko(kickoff_max) if kickoff_max else '—'}**.\n\n")
+        lines.append("| Kickoff date (UTC) | Jogos | Com placar | Cobertura |\n|---|---:|---:|---:|\n")
+        for ds in sorted(by_date.keys(), reverse=True)[:14]:
+            m = by_date[ds]
+            cov = 100.0 * m["with_score"] / m["matches"] if m["matches"] else 0.0
+            lines.append(f"| {ds} | {m['matches']} | {m['with_score']} | {_fmt_num(cov,1)}% |\n")
+
+        lines.append(
+            "\n**Leitura**: se seu recorte inclui muitos jogos com kickoff antigo, a API-Football **free** pode não retornar fixtures dessa data "
+            "(limitação por janela recente). Nesse cenário, mesmo com o job rodando, `placar disponível` ficará baixo para jogos fora da janela.\n\n"
+        )
+        lines.append("Se `placar disponível` estiver 0 (mesmo para datas recentes), isso geralmente indica que o job de resultados não rodou ou está sem chave válida.  \n")
         lines.append("Sugestão (rodar no servidor): `cd betinasia_bot && python3 -m results.auto_update_results --once` (ou configure o serviço para rodar em loop).\n")
         lines.append("\n---\n")
 
@@ -1575,7 +1685,7 @@ async def main() -> int:
         # ============================================================
         lines.append("## 11) Conclusões, riscos e pontos em aberto\n")
         lines.append("- **Execução (CLV)**: use as seções 3/6 para validar qualidade de execução (especialmente pre-match). Se CLV cluster ficar robustamente positivo, há evidência de boa entrada; se ficar negativo, há erosão estrutural.\n")
-        lines.append("- **Pre-match vs in-match**: valide que o comportamento de edge/diff e CLV difere entre regimes (seção 2.2). Não é seguro misturar regimes para decisão.\n")
+        lines.append("- **Pre-match vs in-match**: valide que o comportamento de edge/diff e ROI (quando houver placar) difere entre regimes (seção 2.2). Não é seguro misturar regimes para decisão.\n")
         lines.append("- **Lay**: não pode ser decidido por média. Governança tem que usar p95/p99/ES95 de liability (seção 7.2) e combos com risco (seção 9.2). Se p99/ES95 forem altos, a estratégia precisa limite de exposição por janela.\n")
         lines.append("- **Temporal (retenção de edge)**: se a cobertura `temporal/lay_temporal` for baixa, a inferência de retenção fica limitada (seção 8). Quando há cobertura, delta e retenção indicam se o edge “some” rápido.\n")
         lines.append("- **ROI/resultado realizado**: sem placares no banco, ROI fica 0/ausente e a conclusão financeira final não é possível (seção 10). Primeiro garanta o job de resultados.\n")
