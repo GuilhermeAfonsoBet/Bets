@@ -20,6 +20,7 @@ LAY_DIFF_MAX=-2.0
 FALLBACK_STAKE_PCT="${FALLBACK_STAKE_PCT:-0.25}"
 LIABILITY_BUCKET_MIN=5
 MAX_BUCKETS=20
+COMBO_MIN_N=20
 
 DB_NAME="${DB_NAME:-betinasia_bot}"
 DB_USER="${DB_USER:-betbot}"
@@ -37,6 +38,7 @@ Opcoes:
   --fallback-stake-pct X  Stake fallback (% do limite), default: 0.25
   --liability-bucket-min N Bucket de agregação de exposição lay (default: 5)
   --max-buckets N         Top buckets mais expostos para imprimir (default: 20)
+  --combo-min-n N         N mínimo para combos inferenciais (default: 20)
   --db-name N             Banco (default: betinasia_bot)
   --db-user U             Usuário psql (default: betbot)
   --no-sudo-psql          Não usar sudo -u no psql
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --fallback-stake-pct) FALLBACK_STAKE_PCT="${2:-}"; shift 2 ;;
     --liability-bucket-min) LIABILITY_BUCKET_MIN="${2:-}"; shift 2 ;;
     --max-buckets) MAX_BUCKETS="${2:-}"; shift 2 ;;
+    --combo-min-n) COMBO_MIN_N="${2:-}"; shift 2 ;;
     --db-name) DB_NAME="${2:-}"; shift 2 ;;
     --db-user) DB_USER="${2:-}"; shift 2 ;;
     --no-sudo-psql) USE_SUDO_PSQL=0; shift ;;
@@ -95,6 +98,7 @@ else
   echo "audit_version=TODAS"
 fi
 echo "fallback_stake_pct=${FALLBACK_STAKE_PCT} | liability_bucket=${LIABILITY_BUCKET_MIN}m"
+echo "combo_min_n=${COMBO_MIN_N}"
 echo "====================================================================="
 echo
 
@@ -571,11 +575,213 @@ ORDER BY tabela;
 "
 echo
 
-echo "9) NOTAS DE LEITURA"
+echo "9) COMBINACOES H3B - INFERENCIA BACK (regime x faixa AH x bucket diff)"
+run_psql "
+WITH base AS (
+  SELECT
+    audit_version,
+    CASE WHEN is_live IS TRUE THEN 'IN_MATCH' ELSE 'PRE_MATCH' END AS regime,
+    market_type,
+    line,
+    difference_pct::numeric AS diff_pct
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+    AND difference_pct >= ${BACK_DIFF_MIN}
+),
+feat AS (
+  SELECT
+    audit_version,
+    regime,
+    diff_pct,
+    CASE
+      WHEN market_type='AH' AND line ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN ABS(line::numeric)
+      ELSE NULL
+    END AS abs_line
+  FROM base
+),
+bucketed AS (
+  SELECT
+    audit_version,
+    regime,
+    CASE
+      WHEN abs_line IS NULL THEN 'AH_NA'
+      WHEN abs_line <= 1 THEN 'AH_0_1'
+      WHEN abs_line <= 2 THEN 'AH_1_2'
+      WHEN abs_line <= 4 THEN 'AH_2_4'
+      ELSE 'AH_4_PLUS'
+    END AS ah_band,
+    CASE
+      WHEN diff_pct < 5 THEN 'B1_[2,5)'
+      WHEN diff_pct < 10 THEN 'B2_[5,10)'
+      WHEN diff_pct < 20 THEN 'B3_[10,20)'
+      ELSE 'B4_[20,+)'
+    END AS diff_band,
+    diff_pct
+  FROM feat
+),
+agg AS (
+  SELECT
+    audit_version,
+    regime,
+    ah_band,
+    diff_band,
+    COUNT(*) AS n,
+    AVG(diff_pct) AS mean_diff,
+    STDDEV_SAMP(diff_pct) AS sd_diff
+  FROM bucketed
+  GROUP BY 1,2,3,4
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n >= 2 AND sd_diff IS NOT NULL THEN sd_diff / SQRT(n::numeric) END AS se_diff
+  FROM agg
+)
+SELECT
+  audit_version,
+  regime,
+  ah_band,
+  diff_band,
+  n,
+  ROUND(mean_diff::numeric,3) AS mean_diff_pct,
+  ROUND((mean_diff - 1.960 * se_diff)::numeric,3) AS ci95_low,
+  ROUND((mean_diff + 1.960 * se_diff)::numeric,3) AS ci95_high,
+  ROUND((mean_diff / NULLIF(se_diff,0))::numeric,2) AS t_stat_vs_0,
+  CASE
+    WHEN se_diff IS NULL THEN 'NA'
+    WHEN (mean_diff - 1.960 * se_diff) > 0 THEN 'YES'
+    ELSE 'NO'
+  END AS sig_95
+FROM calc
+WHERE n >= ${COMBO_MIN_N}
+ORDER BY n DESC, mean_diff DESC
+LIMIT 80;
+"
+echo
+
+echo "10) COMBINACOES H3B - INFERENCIA LAY (regime x faixa AH x bucket diff)"
+run_psql "
+WITH base AS (
+  SELECT
+    audit_version,
+    audited_at,
+    CASE WHEN is_live IS TRUE THEN 'IN_MATCH' ELSE 'PRE_MATCH' END AS regime,
+    market_type,
+    line,
+    difference_pct::numeric AS diff_pct,
+    hypothesis_details::jsonb AS h
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_DAYS} days'
+    AND ${AUDIT_FILTER_SQL}
+    AND status='OK'
+    AND difference_pct <= ${LAY_DIFF_MAX}
+),
+feat AS (
+  SELECT
+    audit_version,
+    audited_at,
+    regime,
+    diff_pct,
+    CASE
+      WHEN market_type='AH' AND line ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN ABS(line::numeric)
+      ELSE NULL
+    END AS abs_line,
+    CASE
+      WHEN COALESCE(h -> 'finance' -> 'lay' ->> 'liability_if_lose','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (h -> 'finance' -> 'lay' ->> 'liability_if_lose')::numeric
+      ELSE NULL
+    END AS liab_fin,
+    CASE
+      WHEN COALESCE(h -> 'finance' -> 'lay' ->> 'suggested_stake','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (h -> 'finance' -> 'lay' ->> 'suggested_stake')::numeric
+      WHEN COALESCE(h -> 'lay' ->> 'limit','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (h -> 'lay' ->> 'limit')::numeric * ${FALLBACK_STAKE_PCT}
+      ELSE NULL
+    END AS lay_stake_est,
+    CASE
+      WHEN COALESCE(h -> 'lay' ->> 'odd','') ~ '^[+-]?[0-9]+([.][0-9]+)?$'
+      THEN (h -> 'lay' ->> 'odd')::numeric
+      ELSE NULL
+    END AS lay_odd
+  FROM base
+),
+bucketed AS (
+  SELECT
+    audit_version,
+    regime,
+    CASE
+      WHEN abs_line IS NULL THEN 'AH_NA'
+      WHEN abs_line <= 1 THEN 'AH_0_1'
+      WHEN abs_line <= 2 THEN 'AH_1_2'
+      WHEN abs_line <= 4 THEN 'AH_2_4'
+      ELSE 'AH_4_PLUS'
+    END AS ah_band,
+    CASE
+      WHEN diff_pct <= -20 THEN 'L4_(-inf,-20]'
+      WHEN diff_pct <= -10 THEN 'L3_(-20,-10]'
+      WHEN diff_pct <= -5 THEN 'L2_(-10,-5]'
+      ELSE 'L1_(-5,-2]'
+    END AS diff_band,
+    diff_pct,
+    COALESCE(liab_fin, lay_stake_est * GREATEST(COALESCE(lay_odd,0)-1,0)) AS liability_est
+  FROM feat
+),
+agg AS (
+  SELECT
+    audit_version,
+    regime,
+    ah_band,
+    diff_band,
+    COUNT(*) AS n,
+    AVG(diff_pct) AS mean_diff,
+    STDDEV_SAMP(diff_pct) AS sd_diff,
+    AVG(liability_est) AS liab_avg,
+    (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY liability_est))::numeric AS liab_p95
+  FROM bucketed
+  WHERE liability_est IS NOT NULL AND liability_est > 0
+  GROUP BY 1,2,3,4
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n >= 2 AND sd_diff IS NOT NULL THEN sd_diff / SQRT(n::numeric) END AS se_diff
+  FROM agg
+)
+SELECT
+  audit_version,
+  regime,
+  ah_band,
+  diff_band,
+  n,
+  ROUND(mean_diff::numeric,3) AS mean_diff_pct,
+  ROUND((mean_diff - 1.960 * se_diff)::numeric,3) AS ci95_low,
+  ROUND((mean_diff + 1.960 * se_diff)::numeric,3) AS ci95_high,
+  ROUND((mean_diff / NULLIF(se_diff,0))::numeric,2) AS t_stat_vs_0,
+  CASE
+    WHEN se_diff IS NULL THEN 'NA'
+    WHEN (mean_diff + 1.960 * se_diff) < 0 THEN 'YES'
+    ELSE 'NO'
+  END AS sig_95,
+  ROUND(liab_avg::numeric,2) AS liability_avg,
+  ROUND(liab_p95::numeric,2) AS liability_p95
+FROM calc
+WHERE n >= ${COMBO_MIN_N}
+ORDER BY n DESC, mean_diff ASC
+LIMIT 80;
+"
+echo
+
+echo "11) NOTAS DE LEITURA"
 echo "- Back e Lay devem ser analisados separados."
 echo "- Lay tem cauda mais pesada: use p95/p99/ES95 de liability e bucket exposure."
 echo "- A seção 7 testa diferença média (diff_pct) vs 0 com IC e t_stat."
 echo "- A seção 8 usa apenas registros liquidados (profit_loss/clv não nulos)."
+echo "- As seções 9 e 10 trazem inferência por combinação H3B (regime x faixa AH x bucket de diff)."
+echo "- Para evitar ruído, combos com N < ${COMBO_MIN_N} são omitidos."
 echo "- Se pl_cov_pct for baixo, IC de ROI/drawdown realizado fica frágil (amostra efetiva pequena)."
 echo
 echo "====================================================================="
