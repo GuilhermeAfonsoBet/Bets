@@ -1121,6 +1121,85 @@ ORDER BY audit_version DESC, side_group;
 "
 echo
 
+echo "8.2) ROBUSTEZ CLV (RAW vs FILTRADO vs WINSORIZADO P1-P99)"
+run_psql "
+WITH data AS (
+  SELECT 'h1_pricing_events' AS tabela, clv_pct::numeric AS clv_pct
+  FROM h1_pricing_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h3_line_monotonicity_events', clv_pct::numeric
+  FROM h3_line_monotonicity_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h3b_temporal_reversal_events', clv_pct::numeric
+  FROM h3b_temporal_reversal_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+  UNION ALL
+  SELECT 'h6_correlation_lag_events', clv_pct::numeric
+  FROM h6_correlation_lag_events
+  WHERE detected_at >= now() - interval '${LOOKBACK_DAYS} days'
+),
+clv AS (
+  SELECT tabela, clv_pct
+  FROM data
+  WHERE clv_pct IS NOT NULL
+),
+lims AS (
+  SELECT
+    tabela,
+    (PERCENTILE_CONT(0.01) WITHIN GROUP (ORDER BY clv_pct))::numeric AS p01,
+    (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY clv_pct))::numeric AS p99
+  FROM clv
+  GROUP BY 1
+),
+tagged AS (
+  SELECT
+    c.tabela,
+    c.clv_pct,
+    CASE WHEN c.clv_pct BETWEEN -50 AND 50 THEN c.clv_pct ELSE NULL END AS clv_clean,
+    LEAST(GREATEST(c.clv_pct, l.p01), l.p99) AS clv_wins
+  FROM clv c
+  JOIN lims l USING (tabela)
+),
+agg AS (
+  SELECT
+    tabela,
+    COUNT(*) AS n_clv_raw,
+    COUNT(clv_clean) AS n_clv_clean,
+    ROUND(100.0 * (COUNT(*) - COUNT(clv_clean)) / NULLIF(COUNT(*),0),1) AS outlier_pct_clean,
+    AVG(clv_pct) AS mean_raw,
+    AVG(clv_clean) AS mean_clean,
+    STDDEV_SAMP(clv_clean) AS sd_clean,
+    AVG(clv_wins) AS mean_wins,
+    STDDEV_SAMP(clv_wins) AS sd_wins
+  FROM tagged
+  GROUP BY 1
+),
+calc AS (
+  SELECT
+    *,
+    CASE WHEN n_clv_clean >= 2 AND sd_clean IS NOT NULL THEN sd_clean / SQRT(n_clv_clean::numeric) END AS se_clean,
+    CASE WHEN n_clv_raw >= 2 AND sd_wins IS NOT NULL THEN sd_wins / SQRT(n_clv_raw::numeric) END AS se_wins
+  FROM agg
+)
+SELECT
+  tabela,
+  n_clv_raw,
+  n_clv_clean,
+  outlier_pct_clean,
+  ROUND(mean_raw::numeric,4) AS clv_mean_raw_pct,
+  ROUND(mean_clean::numeric,4) AS clv_mean_clean_pct,
+  ROUND((mean_clean - 1.960 * se_clean)::numeric,4) AS clv_clean_ci95_low,
+  ROUND((mean_clean + 1.960 * se_clean)::numeric,4) AS clv_clean_ci95_high,
+  ROUND(mean_wins::numeric,4) AS clv_mean_wins_p1_p99_pct,
+  ROUND((mean_wins - 1.960 * se_wins)::numeric,4) AS clv_wins_ci95_low,
+  ROUND((mean_wins + 1.960 * se_wins)::numeric,4) AS clv_wins_ci95_high
+FROM calc
+ORDER BY tabela;
+"
+echo
+
 echo "9) COMBINACOES H3B - INFERENCIA BACK (regime x faixa AH x bucket diff)"
 run_psql "
 WITH base AS (
