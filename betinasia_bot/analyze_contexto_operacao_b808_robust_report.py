@@ -1071,6 +1071,24 @@ async def main() -> int:
         lines.append(f"| Profit_if_win total (estimado) | {_fmt_num(sum(back_profit_if_win) if back_profit_if_win else None, 2)} |\n")
         lines.append(f"| Profit_if_win médio | {_fmt_num(_mean(back_profit_if_win), 2)} |\n")
 
+        # ROI realizado (quando houver placar)
+        back_realized = []
+        back_realized_stakes = []
+        for d in back_edge:
+            roi = _safe_float(d.get("roi_bs"))
+            if roi is None:
+                continue
+            bs, _, _, _ = finance_for_row(d)
+            back_realized.append(float(bs) * float(roi) / 100.0)
+            back_realized_stakes.append(float(bs))
+        if back_realized:
+            roi_weighted = (sum(back_realized) / sum(back_realized_stakes) * 100.0) if sum(back_realized_stakes) > 0 else None
+            lines.append(f"| N com ROI realizado | {len(back_realized)} |\n")
+            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(back_realized), 2)} |\n")
+            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_weighted, 2)}% |\n")
+        else:
+            lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
+
         lines.append("\n### 7.2 Lay (BS << WS) — risco de cauda\n")
         lines.append("| Métrica | Valor |\n|---|---:|\n")
         lines.append(f"| Corte (diff_pct) | <= {lay_cut:.1f}% |\n")
@@ -1082,6 +1100,7 @@ async def main() -> int:
         lines.append(f"| Liability p99 | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
         lines.append(f"| ES95 (liability) | {_fmt_num(_es_tail(lay_liability, 95), 2)} |\n")
         lines.append(f"| Liability max | {_fmt_num(max(lay_liability) if lay_liability else None, 2)} |\n")
+        lines.append(f"| Proxy de banca (>= p99 liability) | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
         lines.append("\n---\n")
 
         # ============================================================
@@ -1260,10 +1279,12 @@ async def main() -> int:
         # 11) Conclusões, riscos e pontos em aberto
         # ============================================================
         lines.append("## 11) Conclusões, riscos e pontos em aberto\n")
-        lines.append("- **Execução (CLV)**: use as seções 3/6 para validar qualidade de execução (especialmente pre-match).\n")
-        lines.append("- **Lay**: não pode ser decidido por média. Use p95/p99/ES95 de liability (seção 7.2) e combos com risco (seção 9.2).\n")
-        lines.append("- **Temporal**: se a cobertura `temporal/lay_temporal` for baixa, a inferência de retenção de edge fica limitada (seção 8).\n")
-        lines.append("- **ROI/resultado**: se placares não estão no banco, qualquer conclusão de lucro realizado fica em aberto (seção 10).\n")
+        lines.append("- **Execução (CLV)**: use as seções 3/6 para validar qualidade de execução (especialmente pre-match). Se CLV cluster ficar robustamente positivo, há evidência de boa entrada; se ficar negativo, há erosão estrutural.\n")
+        lines.append("- **Pre-match vs in-match**: valide que o comportamento de edge/diff e CLV difere entre regimes (seção 2.2). Não é seguro misturar regimes para decisão.\n")
+        lines.append("- **Lay**: não pode ser decidido por média. Governança tem que usar p95/p99/ES95 de liability (seção 7.2) e combos com risco (seção 9.2). Se p99/ES95 forem altos, a estratégia precisa limite de exposição por janela.\n")
+        lines.append("- **Temporal (retenção de edge)**: se a cobertura `temporal/lay_temporal` for baixa, a inferência de retenção fica limitada (seção 8). Quando há cobertura, delta e retenção indicam se o edge “some” rápido.\n")
+        lines.append("- **ROI/resultado realizado**: sem placares no banco, ROI fica 0/ausente e a conclusão financeira final não é possível (seção 10). Primeiro garanta o job de resultados.\n")
+        lines.append("- **Pontos em aberto típicos**: (i) trazer DOM para a mesma janela, (ii) garantir atualização de placares, (iii) aumentar cobertura temporal e finance no `hypothesis_details`, (iv) definir política de banca para Lay.\n")
         lines.append("\n---\n")
 
         # ============================================================
