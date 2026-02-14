@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gera relatório estatístico ROBUSTO (cluster por jogo) no estilo do:
+  docs/analise_h3b_resultados_v4_somente.md
+
+Foco: H3B (reversal_direction), comparando modelos por audit_version.
+
+Robustez adicionada:
+- métricas reportadas com N_eventos e N_jogos
+- IC via bootstrap por cluster (jogo/match_id), reduzindo viés por correlação intra-jogo
+
+Uso:
+  # (requer .env com DATABASE_URL; BETINASIA_USERNAME/PASSWORD podem ser dummy p/ Settings)
+  python analyze_contexto_operacao_b808_robust_report.py --out docs/analise_contexto_operacao_b808_robusta.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from sqlalchemy import text
+
+# Mantém padrão dos scripts existentes
+import sys
+
+sys.path.insert(0, ".")
+
+from storage.database import Database
+
+
+Z_90 = 1.645
+Z_95 = 1.960
+
+
+@dataclass(frozen=True)
+class MetricSummary:
+    n_events: int
+    n_matches: int
+    mean_event: Optional[float]
+    ci90_event: Optional[Tuple[float, float]]
+    mean_cluster: Optional[float]
+    ci90_cluster: Optional[Tuple[float, float]]
+    median_event: Optional[float]
+    p25_event: Optional[float]
+    p75_event: Optional[float]
+    hit_rate_event: Optional[float]  # % valores > 0 (exclui zeros)
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return None
+        return xf
+    except Exception:
+        return None
+
+
+def _mean(xs: Sequence[float]) -> Optional[float]:
+    if not xs:
+        return None
+    return float(sum(xs) / len(xs))
+
+
+def _std(xs: Sequence[float]) -> Optional[float]:
+    if len(xs) < 2:
+        return None
+    m = _mean(xs)
+    assert m is not None
+    var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+    return float(math.sqrt(var))
+
+
+def _normal_ci(mean: Optional[float], std: Optional[float], n: int, z: float) -> Optional[Tuple[float, float]]:
+    if mean is None or std is None or n < 2:
+        return None
+    se = std / math.sqrt(n)
+    return (float(mean - z * se), float(mean + z * se))
+
+
+def _percentiles(xs: Sequence[float], ps: Sequence[float]) -> List[Optional[float]]:
+    if not xs:
+        return [None for _ in ps]
+    arr = np.asarray(xs, dtype=float)
+    return [float(np.percentile(arr, p)) for p in ps]
+
+
+def cluster_bootstrap_ci(
+    values_by_match: Dict[int, List[float]],
+    n_boot: int = 4000,
+    alpha: float = 0.10,
+    seed: int = 1337,
+) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+    """
+    Bootstrap por cluster (match_id).
+    Estimador: média dos MEANS por match (cada jogo pesa 1).
+    """
+    match_ids = list(values_by_match.keys())
+    if not match_ids:
+        return None, None
+
+    # mean por match
+    per_match_means: Dict[int, float] = {}
+    for mid, vals in values_by_match.items():
+        if not vals:
+            continue
+        per_match_means[mid] = float(sum(vals) / len(vals))
+
+    match_ids = list(per_match_means.keys())
+    if len(match_ids) < 2:
+        m = per_match_means[match_ids[0]] if match_ids else None
+        return m, None
+
+    rng = random.Random(seed)
+    boot = []
+    for _ in range(int(n_boot)):
+        sample = [per_match_means[rng.choice(match_ids)] for _ in range(len(match_ids))]
+        boot.append(float(sum(sample) / len(sample)))
+
+    boot_arr = np.asarray(boot, dtype=float)
+    mean_hat = float(np.mean(boot_arr))
+    lo = float(np.quantile(boot_arr, alpha / 2))
+    hi = float(np.quantile(boot_arr, 1 - alpha / 2))
+    return mean_hat, (lo, hi)
+
+
+def summarize_metric(
+    values: Sequence[float],
+    match_ids: Sequence[int],
+    clip_low: Optional[float] = None,
+    clip_high: Optional[float] = None,
+) -> MetricSummary:
+    # filtro + sanity
+    v = []
+    mids = []
+    for x, mid in zip(values, match_ids):
+        xf = _safe_float(x)
+        if xf is None:
+            continue
+        if clip_low is not None and xf < clip_low:
+            continue
+        if clip_high is not None and xf > clip_high:
+            continue
+        v.append(float(xf))
+        mids.append(int(mid))
+
+    n_events = len(v)
+    n_matches = len(set(mids))
+
+    mean_event = _mean(v)
+    std_event = _std(v)
+    ci90_event = _normal_ci(mean_event, std_event, n_events, Z_90)
+
+    median_event, p25_event, p75_event = _percentiles(v, [50, 25, 75])
+
+    # hit rate (exclui zeros, como no log)
+    pos = sum(1 for x in v if x > 0)
+    neg = sum(1 for x in v if x < 0)
+    hit_rate_event = (pos / (pos + neg) * 100.0) if (pos + neg) > 0 else None
+
+    by_match: Dict[int, List[float]] = {}
+    for x, mid in zip(v, mids):
+        by_match.setdefault(mid, []).append(x)
+
+    mean_cluster, ci90_cluster = cluster_bootstrap_ci(by_match, n_boot=4000, alpha=0.10)
+
+    return MetricSummary(
+        n_events=n_events,
+        n_matches=n_matches,
+        mean_event=mean_event,
+        ci90_event=ci90_event,
+        mean_cluster=mean_cluster,
+        ci90_cluster=ci90_cluster,
+        median_event=median_event,
+        p25_event=p25_event,
+        p75_event=p75_event,
+        hit_rate_event=hit_rate_event,
+    )
+
+
+def _sig_label(ci: Optional[Tuple[float, float]]) -> str:
+    if not ci:
+        return "N/A"
+    if ci[0] > 0:
+        return "sig. positivo"
+    if ci[1] < 0:
+        return "sig. negativo"
+    return "NS"
+
+
+def _fmt_pct(x: Optional[float], digits: int = 3) -> str:
+    if x is None:
+        return "—"
+    return f"{x:+.{digits}f}%"
+
+
+def _fmt_num(x: Optional[float], digits: int = 1) -> str:
+    if x is None:
+        return "—"
+    return f"{x:.{digits}f}"
+
+
+def _fmt_ci(ci: Optional[Tuple[float, float]], digits: int = 3, suffix: str = "%") -> str:
+    if not ci:
+        return "—"
+    return f"[{ci[0]:+.{digits}f}{suffix}, {ci[1]:+.{digits}f}{suffix}]"
+
+
+def classify_model(audit_version: str) -> str:
+    v = (audit_version or "").strip()
+    if v == "v4.0-api":
+        return "API (2-4s)"
+    if v in ("v1.0", "v1.0-recovered"):
+        return "DOM (15-30s)"
+    return f"Outro ({v})" if v else "Outro"
+
+
+def diff_bucket(diff_pct: Optional[float]) -> Optional[str]:
+    if diff_pct is None:
+        return None
+    if diff_pct < -10:
+        return "BS < WS (-10% a -2%)"  # fora do confiável, mas mantemos label macro
+    if diff_pct < -2:
+        return "BS < WS (-10% a -2%)"
+    if diff_pct <= 2:
+        return "BS ~ WS (-2% a +2%)"
+    if diff_pct <= 10:
+        return "BS > WS (+2% a +10%)"
+    return "BS > WS (+2% a +10%)"
+
+
+def line_bucket(line_str: str) -> str:
+    try:
+        x = abs(float(str(line_str).replace(",", ".")))
+    except Exception:
+        return "Outro"
+    if x <= 1:
+        return "AH 0-1 (líquida)"
+    if x <= 2:
+        return "AH 1-2 (média)"
+    return "AH 2+ (extrema)"
+
+
+def lag_bucket(ms: Optional[int]) -> str:
+    if not ms or ms <= 0:
+        return "Desconhecido"
+    if ms < 10000:
+        return "< 10s"
+    if ms < 20000:
+        return "10-20s"
+    if ms < 30000:
+        return "20-30s"
+    return "> 30s"
+
+
+async def fetch_h3b_audit_rows(
+    db: Database,
+    direction: str,
+    versions: List[str],
+) -> List[Tuple[Any, ...]]:
+    """
+    Traz a base principal:
+    - betslip_audit_results (H3B, direction) + match (kickoff passado)
+    - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
+    """
+    q = text(
+        """
+        SELECT
+            a.id,
+            a.event_id,
+            a.home_team,
+            a.away_team,
+            a.league,
+            a.market_type,
+            a.line,
+            a.side,
+            a.websocket_odd,
+            a.betslip_odd,
+            a.difference_pct,
+            a.betslip_limit,
+            a.status,
+            a.is_live,
+            a.audit_total_duration_ms,
+            a.lag_detection_to_click_ms,
+            a.lag_click_to_betslip_ms,
+            a.reversal_direction,
+            a.market_period,
+            a.audit_version,
+            m.id AS match_id,
+            m.kickoff_time,
+            m.home_score,
+            m.away_score,
+            m.status AS match_status,
+            CASE
+                WHEN a.side = 'home' THEN (
+                    SELECT boh.best_home_odds
+                    FROM best_odds_history boh
+                    WHERE boh.match_id = m.id
+                      AND (boh.ah_line = a.line OR boh.ah_line = a.line || '.0'
+                           OR boh.ah_line = CASE
+                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line ELSE a.line END
+                           OR boh.ah_line = CASE
+                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line || '.0' ELSE a.line || '.0' END
+                      )
+                      AND boh.scraped_at < m.kickoff_time
+                      AND boh.best_home_odds > 0
+                    ORDER BY boh.scraped_at DESC
+                    LIMIT 1
+                )
+                ELSE (
+                    SELECT boh.best_away_odds
+                    FROM best_odds_history boh
+                    WHERE boh.match_id = m.id
+                      AND (boh.ah_line = a.line OR boh.ah_line = a.line || '.0'
+                           OR boh.ah_line = CASE
+                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line ELSE a.line END
+                           OR boh.ah_line = CASE
+                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line || '.0' ELSE a.line || '.0' END
+                      )
+                      AND boh.scraped_at < m.kickoff_time
+                      AND boh.best_away_odds > 0
+                    ORDER BY boh.scraped_at DESC
+                    LIMIT 1
+                )
+            END AS closing_odd
+        FROM betslip_audit_results a
+        JOIN matches m ON m.external_id = a.event_id
+        WHERE a.hypothesis_type = 'H3B'
+          AND a.reversal_direction = :direction
+          AND m.kickoff_time < NOW()
+          AND a.audit_version = ANY(:versions)
+        """
+    )
+    async with db.async_session() as session:
+        res = await session.execute(q, {"direction": direction, "versions": versions})
+        return list(res.fetchall())
+
+
+def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optional[float], hs: Any, aws: Any) -> Tuple[Optional[float], Optional[float]]:
+    """
+    ROI em % para stake=1 (compatível com analyze_h3b_comprehensive.py).
+    """
+    if hs is None or aws is None:
+        return None, None
+
+    try:
+        goal_diff = int(hs) - int(aws)
+    except Exception:
+        return None, None
+
+    try:
+        ah_line = float(str(line).replace(",", "."))
+    except Exception:
+        return None, None
+
+    if (side or "").strip() == "home":
+        adjusted = goal_diff + ah_line
+    else:
+        adjusted = -goal_diff - ah_line
+
+    # win/loss/push/half
+    if adjusted > 0.25:
+        mult = 1.0
+    elif adjusted == 0.25:
+        mult = 0.5
+    elif adjusted == 0:
+        mult = 0.0
+    elif adjusted == -0.25:
+        mult = -0.5
+    else:
+        mult = -1.0
+
+    roi_ws = None
+    roi_bs = None
+
+    if mult > 0:
+        if ws_odd and ws_odd > 0:
+            roi_ws = (ws_odd - 1.0) * mult * 100.0
+        if bs_odd and bs_odd > 0:
+            roi_bs = (bs_odd - 1.0) * mult * 100.0
+    elif mult < 0:
+        roi_ws = mult * 100.0
+        roi_bs = mult * 100.0
+    else:
+        roi_ws = 0.0
+        roi_bs = 0.0
+
+    return roi_ws, roi_bs
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
+    parser.add_argument(
+        "--versions",
+        default="v4.0-api,v1.0,v1.0-recovered",
+        help="Lista de audit_version separada por vírgula (default: v4.0-api,v1.0,v1.0-recovered)",
+    )
+    parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
+    parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
+    args = parser.parse_args()
+
+    # seed global para reprodutibilidade do bootstrap
+    random.seed(int(args.seed))
+    np.random.seed(int(args.seed))
+
+    versions = [v.strip() for v in str(args.versions).split(",") if v.strip()]
+    out_path = Path(args.out)
+
+    db = Database()
+    await db.connect()
+
+    try:
+        rows = await fetch_h3b_audit_rows(db, direction=str(args.direction), versions=versions)
+
+        # dataset em dicts (compatível com análise original)
+        all_data: List[Dict[str, Any]] = []
+        for r in rows:
+            d: Dict[str, Any] = {
+                "id": r[0],
+                "event_id": r[1],
+                "home_team": r[2],
+                "away_team": r[3],
+                "league": r[4] or "",
+                "market_type": r[5],
+                "line": r[6],
+                "side": r[7],
+                "ws_odd": r[8],
+                "bs_odd": r[9],
+                "diff_pct": r[10],
+                "limit": r[11] or 0.0,
+                "status": r[12],
+                "is_live": r[13],
+                "lag_total": r[14] or 0,
+                "lag_click": r[15] or 0,
+                "lag_bs": r[16] or 0,
+                "direction": r[17],
+                "period": r[18],
+                "version": r[19],
+                "match_id": int(r[20]),
+                "kickoff": r[21],
+                "home_score": r[22],
+                "away_score": r[23],
+                "match_status": r[24],
+                "closing_odd": r[25],
+            }
+
+            # CLV (bruto)
+            if d["closing_odd"] and d["closing_odd"] > 0:
+                d["clv_ws"] = (d["ws_odd"] - d["closing_odd"]) / d["closing_odd"] * 100.0 if d["ws_odd"] else None
+                if d["bs_odd"] and d["bs_odd"] > 0:
+                    d["clv_bs"] = (d["bs_odd"] - d["closing_odd"]) / d["closing_odd"] * 100.0
+                else:
+                    d["clv_bs"] = None
+            else:
+                d["clv_ws"] = None
+                d["clv_bs"] = None
+
+            # ROI
+            roi_ws, roi_bs = compute_roi_pct(
+                line=str(d["line"]),
+                side=str(d["side"]),
+                ws_odd=_safe_float(d["ws_odd"]),
+                bs_odd=_safe_float(d["bs_odd"]),
+                hs=d["home_score"],
+                aws=d["away_score"],
+            )
+            d["roi_ws"] = roi_ws
+            d["roi_bs"] = roi_bs
+
+            # Buckets auxiliares
+            d["model"] = classify_model(str(d.get("version", "")))
+            d["diff_bucket"] = diff_bucket(_safe_float(d.get("diff_pct")))
+            d["line_bucket"] = line_bucket(str(d.get("line", "")))
+            d["lag_bucket"] = lag_bucket(int(d.get("lag_total") or 0))
+
+            all_data.append(d)
+
+        # Filtro qualidade betslip (igual ao script: -10 a +10)
+        with_bs_raw = [d for d in all_data if d.get("bs_odd") and d["bs_odd"] > 0]
+        with_bs = [d for d in with_bs_raw if d.get("diff_pct") is not None and -10 <= float(d["diff_pct"]) <= 10]
+
+        unique_matches_all = len(set(d["match_id"] for d in all_data))
+        unique_matches_bs = len(set(d["match_id"] for d in with_bs))
+        avg_obs_per_match = (len(all_data) / unique_matches_all) if unique_matches_all else 0.0
+
+        # CLV adicional (baseline por jogo: média das outras observações WS do jogo)
+        by_match: Dict[int, List[Dict[str, Any]]] = {}
+        for d in all_data:
+            if d.get("clv_ws") is not None:
+                by_match.setdefault(d["match_id"], []).append(d)
+        for mid, entries in by_match.items():
+            if len(entries) < 2:
+                for e in entries:
+                    e["clv_baseline"] = None
+                    e["clv_ws_adicional"] = e.get("clv_ws")
+                    e["clv_bs_adicional"] = e.get("clv_bs")
+                continue
+            for e in entries:
+                others = [x["clv_ws"] for x in entries if x["id"] != e["id"] and x.get("clv_ws") is not None]
+                if others:
+                    e["clv_baseline"] = float(sum(others) / len(others))
+                    e["clv_ws_adicional"] = float(e["clv_ws"] - e["clv_baseline"])
+                    e["clv_bs_adicional"] = float(e["clv_bs"] - e["clv_baseline"]) if e.get("clv_bs") is not None else None
+                else:
+                    e["clv_baseline"] = None
+                    e["clv_ws_adicional"] = e.get("clv_ws")
+                    e["clv_bs_adicional"] = e.get("clv_bs")
+
+        # Helpers para métricas por modelo
+        def subset_model(model_name: str) -> List[Dict[str, Any]]:
+            return [d for d in all_data if d.get("model") == model_name]
+
+        def subset_bs_model(model_name: str) -> List[Dict[str, Any]]:
+            return [d for d in with_bs if d.get("model") == model_name]
+
+        models = ["API (2-4s)", "DOM (15-30s)"]
+
+        # --- relatório markdown ---
+        now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        lines: List[str] = []
+        lines.append("# Análise Estatística Robusta — Contexto Operação (b808)\n")
+        lines.append(f"**Data da execução:** {now_utc}  \n")
+        lines.append("**Escopo:** H3B (auditoria), com comparação por `audit_version` e inferência robusta por jogo (cluster bootstrap).  \n")
+        lines.append("**Nota:** a robustez aqui significa que intervalos de confiança consideram correlação intra-jogo (múltiplas auditorias por partida).\n")
+        lines.append("---\n")
+
+        # 1) Contexto
+        lines.append("## 1) Contexto do corte (b808)\n")
+        lines.append("| Indicador | Valor |\n|---|---:|\n")
+        lines.append(f"| Auditorias H3B `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n")
+        lines.append(f"| Betslip bruto | {len(with_bs_raw)} |\n")
+        lines.append(f"| Betslip confiável (diff -10% a +10%) | {len(with_bs)} |\n")
+        lines.append(f"| Descartados no filtro de qualidade | {len(with_bs_raw) - len(with_bs)} |\n")
+        lines.append(f"| Jogos únicos (geral) | {unique_matches_all} |\n")
+        lines.append(f"| Média de observações por jogo | {avg_obs_per_match:.1f} |\n")
+        lines.append(f"| Jogos únicos com betslip confiável | {unique_matches_bs} |\n")
+        lines.append("\n---\n")
+
+        # 2) Base comparativa
+        lines.append("## 2) Base comparativa: API vs DOM\n")
+        lines.append("| Métrica | API (v4.0-api) | DOM (v1.0) |\n|---|---:|---:|\n")
+        for m in models:
+            pass
+        # total obs
+        api_all = subset_model("API (2-4s)")
+        dom_all = subset_model("DOM (15-30s)")
+        api_bs = subset_bs_model("API (2-4s)")
+        dom_bs = subset_bs_model("DOM (15-30s)")
+        api_lag = _mean([float(d["lag_total"]) for d in api_all if d.get("lag_total")])
+        dom_lag = _mean([float(d["lag_total"]) for d in dom_all if d.get("lag_total")])
+        api_clv_pm_n = len([d for d in api_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
+        dom_clv_pm_n = len([d for d in dom_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
+        api_roi_n = len([d for d in api_bs if d.get("roi_bs") is not None])
+        dom_roi_n = len([d for d in dom_bs if d.get("roi_bs") is not None])
+        lines.append(f"| Total de observações | {len(api_all)} | {len(dom_all)} |\n")
+        lines.append(f"| Com betslip confiável | {len(api_bs)} | {len(dom_bs)} |\n")
+        lines.append(f"| Com CLV pre-match (betslip) | {api_clv_pm_n} | {dom_clv_pm_n} |\n")
+        lines.append(f"| Com ROI (betslip) | {api_roi_n} | {dom_roi_n} |\n")
+        lines.append(f"| Lag médio observado (fim-a-fim) | {_fmt_num(api_lag, 0)} ms | {_fmt_num(dom_lag, 0)} ms |\n")
+        lines.append("\n---\n")
+
+        # 2.1) Pre vs in
+        lines.append("### 2.1 Cobertura temporal (pre-match vs in-match)\n")
+        pm = [d for d in all_data if d.get("is_live") is False]
+        im = [d for d in all_data if d.get("is_live") is True]
+        lines.append("| Métrica | Pre-match | In-match | Observação |\n|---|---:|---:|---|\n")
+        lines.append(f"| Observações totais com classificação temporal | {len(pm)} | {len(im)} | Contagem bruta do corte |\n")
+        lines.append(
+            f"| ROI Betslip | {len([d for d in with_bs if d.get('is_live') is False and d.get('roi_bs') is not None])} | {len([d for d in with_bs if d.get('is_live') is True and d.get('roi_bs') is not None])} | Amostra com resultado do jogo |\n"
+        )
+        lines.append(
+            f"| ROI WebSocket | {len([d for d in all_data if d.get('is_live') is False and d.get('roi_ws') is not None])} | {len([d for d in all_data if d.get('is_live') is True and d.get('roi_ws') is not None])} | Referência de mercado |\n"
+        )
+        lines.append(
+            f"| CLV Betslip (informativo) | {len([d for d in with_bs if d.get('is_live') is False and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | {len([d for d in with_bs if d.get('is_live') is True and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | Decisão prioriza CLV pre-match |\n"
+        )
+        lines.append("\n---\n")
+
+        # 3) CLV pre-match (robusto)
+        lines.append("## 3) CLV pre-match (núcleo)\n")
+        lines.append("### 3.1 CLV com odd do Betslip (execução real)\n")
+        lines.append(
+            "| Métrica | API | DOM |\n|---|---:|---:|\n"
+        )
+
+        def model_metric(model_name: str, key: str, prematch_only: bool = True) -> MetricSummary:
+            subset = subset_bs_model(model_name)  # apenas betslip confiável
+            if prematch_only:
+                subset = [d for d in subset if d.get("is_live") is False]
+            vals = [d.get(key) for d in subset]
+            mids = [d.get("match_id") for d in subset]
+            return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+
+        api_clv = model_metric("API (2-4s)", "clv_bs", prematch_only=True)
+        dom_clv = model_metric("DOM (15-30s)", "clv_bs", prematch_only=True)
+        api_clv_ad = model_metric("API (2-4s)", "clv_bs_adicional", prematch_only=True)
+        dom_clv_ad = model_metric("DOM (15-30s)", "clv_bs_adicional", prematch_only=True)
+
+        lines.append(
+            f"| CLV Bruto BS Pre-Match | {_fmt_pct(api_clv.mean_event)} ({_sig_label(api_clv.ci90_cluster)}, N={api_clv.n_events}, jogos={api_clv.n_matches}) | {_fmt_pct(dom_clv.mean_event)} ({_sig_label(dom_clv.ci90_cluster)}, N={dom_clv.n_events}, jogos={dom_clv.n_matches}) |\n"
+        )
+        lines.append(
+            f"| CLV Adicional BS Pre-Match | {_fmt_pct(api_clv_ad.mean_event)} ({_sig_label(api_clv_ad.ci90_cluster)}, N={api_clv_ad.n_events}, jogos={api_clv_ad.n_matches}) | {_fmt_pct(dom_clv_ad.mean_event)} ({_sig_label(dom_clv_ad.ci90_cluster)}, N={dom_clv_ad.n_events}, jogos={dom_clv_ad.n_matches}) |\n"
+        )
+        lines.append(
+            f"| Taxa de CLV > 0 (bruto) | {_fmt_num(api_clv.hit_rate_event, 1)}% | {_fmt_num(dom_clv.hit_rate_event, 1)}% |\n"
+        )
+        lines.append(
+            f"| Taxa de CLV > 0 (adicional) | {_fmt_num(api_clv_ad.hit_rate_event, 1)}% | {_fmt_num(dom_clv_ad.hit_rate_event, 1)}% |\n"
+        )
+        lines.append("\nNotas de robustez (IC 90% por jogo):  \n")
+        lines.append(f"- API CLV bruto (cluster): média {_fmt_pct(api_clv.mean_cluster)}; IC90 {_fmt_ci(api_clv.ci90_cluster)}  \n")
+        lines.append(f"- DOM CLV bruto (cluster): média {_fmt_pct(dom_clv.mean_cluster)}; IC90 {_fmt_ci(dom_clv.ci90_cluster)}  \n")
+        lines.append("\n---\n")
+
+        # 4) ROI por modelo
+        lines.append("## 4) ROI por modelo\n")
+        lines.append("| Métrica | API | DOM |\n|---|---:|---:|\n")
+
+        api_roi = model_metric("API (2-4s)", "roi_bs", prematch_only=False)
+        dom_roi = model_metric("DOM (15-30s)", "roi_bs", prematch_only=False)
+        api_roi_ws = summarize_metric(
+            [d.get("roi_ws") for d in api_all],
+            [d.get("match_id") for d in api_all],
+            clip_low=-100,
+            clip_high=500,  # ROI pode ser alto; limitamos só para evitar infinito
+        )
+        dom_roi_ws = summarize_metric(
+            [d.get("roi_ws") for d in dom_all],
+            [d.get("match_id") for d in dom_all],
+            clip_low=-100,
+            clip_high=500,
+        )
+
+        lines.append(
+            f"| ROI Betslip | {_fmt_pct(api_roi.mean_event)} ({_sig_label(api_roi.ci90_cluster)}, N={api_roi.n_events}) | {_fmt_pct(dom_roi.mean_event)} ({_sig_label(dom_roi.ci90_cluster)}, N={dom_roi.n_events}) |\n"
+        )
+        lines.append(
+            f"| ROI WebSocket | {_fmt_pct(api_roi_ws.mean_event)} ({_sig_label(api_roi_ws.ci90_cluster)}, N={api_roi_ws.n_events}) | {_fmt_pct(dom_roi_ws.mean_event)} ({_sig_label(dom_roi_ws.ci90_cluster)}, N={dom_roi_ws.n_events}) |\n"
+        )
+        lines.append(
+            f"| Win rate ROI Betslip | {_fmt_num(api_roi.hit_rate_event, 1)}% | {_fmt_num(dom_roi.hit_rate_event, 1)}% |\n"
+        )
+        lines.append(
+            f"| Win rate ROI WS | {_fmt_num(api_roi_ws.hit_rate_event, 1)}% | {_fmt_num(dom_roi_ws.hit_rate_event, 1)}% |\n"
+        )
+        lines.append("\n---\n")
+
+        # 5) Diferença de preço BS vs WS
+        lines.append("## 5) Diferença de preço BS vs WS\n")
+        lines.append("| Métrica | API | DOM |\n|---|---:|---:|\n")
+
+        def model_diff(model_name: str) -> MetricSummary:
+            subset = subset_bs_model(model_name)
+            vals = [d.get("diff_pct") for d in subset]
+            mids = [d.get("match_id") for d in subset]
+            return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+
+        api_diff = model_diff("API (2-4s)")
+        dom_diff = model_diff("DOM (15-30s)")
+        api_bs_gt_ws = len([d for d in api_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 0])
+        dom_bs_gt_ws = len([d for d in dom_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 0])
+        api_bs_gt_ws_2 = len([d for d in api_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 2])
+        dom_bs_gt_ws_2 = len([d for d in dom_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 2])
+
+        lines.append(
+            f"| Diff BS vs WS (média) | {_fmt_pct(api_diff.mean_event)} ({_sig_label(api_diff.ci90_cluster)}, N={api_diff.n_events}) | {_fmt_pct(dom_diff.mean_event)} ({_sig_label(dom_diff.ci90_cluster)}, N={dom_diff.n_events}) |\n"
+        )
+        lines.append(f"| BS > WS | {_fmt_num(api_bs_gt_ws / len(api_bs) * 100 if api_bs else None, 1)}% ({api_bs_gt_ws}/{len(api_bs)}) | {_fmt_num(dom_bs_gt_ws / len(dom_bs) * 100 if dom_bs else None, 1)}% ({dom_bs_gt_ws}/{len(dom_bs)}) |\n")
+        lines.append(f"| BS > WS +2% | {_fmt_num(api_bs_gt_ws_2 / len(api_bs) * 100 if api_bs else None, 1)}% ({api_bs_gt_ws_2}/{len(api_bs)}) | {_fmt_num(dom_bs_gt_ws_2 / len(dom_bs) * 100 if dom_bs else None, 1)}% ({dom_bs_gt_ws_2}/{len(dom_bs)}) |\n")
+        lines.append("\n---\n")
+
+        # 6) Combinações (buckets / linha / lag)
+        lines.append("## 6) Combinações de valor\n")
+
+        # 6.1 buckets
+        lines.append("### 6.1 Buckets por diferença BS vs WS\n")
+        lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---|\n")
+        for bucket in ["BS < WS (-10% a -2%)", "BS ~ WS (-2% a +2%)", "BS > WS (+2% a +10%)"]:
+            subset = [d for d in with_bs if d.get("diff_bucket") == bucket]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            lines.append(
+                f"| {bucket} | {len(subset)} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 6.2 linha AH
+        lines.append("### 6.2 Combinação por faixa de linha AH\n")
+        lines.append("| Faixa AH | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---|---:|\n")
+        for lb in ["AH 0-1 (líquida)", "AH 1-2 (média)", "AH 2+ (extrema)"]:
+            subset = [d for d in with_bs if d.get("line_bucket") == lb]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            diff_all = summarize_metric(
+                [d.get("diff_pct") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-50,
+                clip_high=50,
+            )
+            lines.append(
+                f"| {lb} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 6.3 lag
+        lines.append("### 6.3 Combinação por faixa de lag\n")
+        lines.append("| Faixa de lag | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---|---:|\n")
+        for lag in ["< 10s", "10-20s", "20-30s", "> 30s"]:
+            subset = [d for d in with_bs if d.get("lag_bucket") == lag]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            diff_all = summarize_metric(
+                [d.get("diff_pct") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-50,
+                clip_high=50,
+            )
+            lines.append(
+                f"| {lag} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 7) bloco econômico (mantém forma do relatório original)
+        lines.append("## 7) Estimativa econômica (indicativa)\n")
+        lines.append("Base: bucket **BS > WS (+2% a +10%)** (betslip confiável).  \n")
+        subset_good = [d for d in with_bs if d.get("diff_bucket") == "BS > WS (+2% a +10%)"]
+        roi_good = summarize_metric(
+            [d.get("roi_bs") for d in subset_good],
+            [d.get("match_id") for d in subset_good],
+            clip_low=-100,
+            clip_high=500,
+        )
+        lines.append(f"- ROI médio (evento): {_fmt_pct(roi_good.mean_event)}; IC90 cluster {_fmt_ci(roi_good.ci90_cluster)}; N={roi_good.n_events}; jogos={roi_good.n_matches}\n")
+        lines.append("\n---\n")
+
+        lines.append("## 8) Como reproduzir\n")
+        lines.append("1. Configure `betinasia_bot/.env` com `DATABASE_URL`.  \n")
+        lines.append("2. Execute (de dentro de `betinasia_bot/`):\n\n")
+        lines.append("```bash\n")
+        lines.append("python analyze_contexto_operacao_b808_robust_report.py \\\n")
+        lines.append("  --direction up \\\n")
+        lines.append("  --versions v4.0-api,v1.0,v1.0-recovered \\\n")
+        lines.append("  --out docs/analise_contexto_operacao_b808_robusta.md\n")
+        lines.append("```\n")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("".join(lines), encoding="utf-8")
+
+        print(f"Relatório gerado em: {out_path}")
+        return 0
+
+    finally:
+        await db.close()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    raise SystemExit(asyncio.run(main()))
+
