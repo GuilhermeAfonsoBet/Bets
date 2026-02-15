@@ -341,6 +341,21 @@ def lag_bucket(ms: Optional[int]) -> str:
     return "> 30s"
 
 
+def exec_time_bucket(ms: Optional[float]) -> str:
+    """Buckets operacionais por tempo total (ms)."""
+    if ms is None or ms <= 0:
+        return "Desconhecido"
+    if ms < 5000:
+        return "< 5s"
+    if ms < 10000:
+        return "5-10s"
+    if ms < 20000:
+        return "10-20s"
+    if ms < 40000:
+        return "20-40s"
+    return "> 40s"
+
+
 async def fetch_h3b_audit_rows(
     db: Database,
     direction: str,
@@ -352,82 +367,55 @@ async def fetch_h3b_audit_rows(
     - betslip_audit_results (H3B, direction) + match (kickoff passado)
     - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
     """
+    # OBS importante de performance:
+    # A versão antiga calculava `closing_odd` via subquery correlacionada em `best_odds_history`
+    # para CADA auditoria. Isso explode o tempo para janelas maiores (ex.: 14 dias).
+    #
+    # Aqui buscamos a base "audit + match" primeiro (rápido) e calculamos `closing_odd` em batch depois.
     q = (
         text(
-        """
-        SELECT
-            a.id,
-            a.event_id,
-            a.home_team,
-            a.away_team,
-            a.league,
-            a.market_type,
-            a.line,
-            a.side,
-            a.websocket_odd,
-            a.betslip_odd,
-            a.difference_pct,
-            a.betslip_limit,
-            a.status,
-            a.is_live,
-            a.audit_total_duration_ms,
-            a.lag_detection_to_click_ms,
-            a.lag_click_to_betslip_ms,
-            a.reversal_direction,
-            a.market_period,
-            a.audit_version,
-            a.audited_at,
-            a.hypothesis_details,
-            m.id AS match_id,
-            m.kickoff_time,
-            m.home_score,
-            m.away_score,
-            m.status AS match_status,
-            CASE
-                WHEN a.side = 'home' THEN (
-                    SELECT boh.best_home_odds
-                    FROM best_odds_history boh
-                    WHERE boh.match_id = m.id
-                      AND (boh.ah_line = a.line OR boh.ah_line = a.line || '.0'
-                           OR boh.ah_line = CASE
-                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line ELSE a.line END
-                           OR boh.ah_line = CASE
-                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line || '.0' ELSE a.line || '.0' END
-                      )
-                      AND boh.scraped_at < m.kickoff_time
-                      AND boh.best_home_odds > 0
-                    ORDER BY boh.scraped_at DESC
-                    LIMIT 1
-                )
-                ELSE (
-                    SELECT boh.best_away_odds
-                    FROM best_odds_history boh
-                    WHERE boh.match_id = m.id
-                      AND (boh.ah_line = a.line OR boh.ah_line = a.line || '.0'
-                           OR boh.ah_line = CASE
-                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line ELSE a.line END
-                           OR boh.ah_line = CASE
-                                WHEN a.line NOT LIKE '+%' AND a.line NOT LIKE '-%' THEN '+' || a.line || '.0' ELSE a.line || '.0' END
-                      )
-                      AND boh.scraped_at < m.kickoff_time
-                      AND boh.best_away_odds > 0
-                    ORDER BY boh.scraped_at DESC
-                    LIMIT 1
-                )
-            END AS closing_odd
-        FROM betslip_audit_results a
-        JOIN matches m ON m.external_id = a.event_id
-        WHERE a.hypothesis_type = 'H3B'
-          AND a.reversal_direction = :direction
-          AND m.kickoff_time < NOW()
-          AND a.audit_version = ANY(:versions)
-          AND (
-            :lookback_days IS NULL
-            OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
-          )
-        """
+            """
+            SELECT
+                a.id,
+                a.event_id,
+                a.home_team,
+                a.away_team,
+                a.league,
+                a.market_type,
+                a.line,
+                a.side,
+                a.websocket_odd,
+                a.betslip_odd,
+                a.difference_pct,
+                a.betslip_limit,
+                a.status,
+                a.is_live,
+                a.audit_total_duration_ms,
+                a.lag_detection_to_click_ms,
+                a.lag_click_to_betslip_ms,
+                a.hypothesis_detected_at,
+                a.audited_at,
+                a.reversal_direction,
+                a.market_period,
+                a.audit_version,
+                a.hypothesis_details,
+                m.id AS match_id,
+                m.kickoff_time,
+                m.home_score,
+                m.away_score,
+                m.status AS match_status
+            FROM betslip_audit_results a
+            JOIN matches m ON m.external_id = a.event_id
+            WHERE a.hypothesis_type = 'H3B'
+              AND a.reversal_direction = :direction
+              AND m.kickoff_time < NOW()
+              AND a.audit_version = ANY(:versions)
+              AND (
+                :lookback_days IS NULL
+                OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
+              )
+            """
         )
-        # Evita AmbiguousParameterError no asyncpg (tipa explicitamente).
         .bindparams(bindparam("lookback_days", type_=Integer))
     )
     async with db.async_session() as session:
@@ -573,6 +561,7 @@ async def main() -> int:
         print(f"[INFO] Linhas carregadas: {len(rows)} (tempo: {dt:.1f}s)", flush=True)
 
         # dataset em dicts (compatível com análise original)
+        # OBS: `closing_odd` é calculado em batch após carregar as auditorias.
         all_data: List[Dict[str, Any]] = []
         for r in rows:
             d: Dict[str, Any] = {
@@ -591,23 +580,21 @@ async def main() -> int:
                 "status": r[12],
                 "is_live": r[13],
                 # timing/lag (em ms)
-                # - audit_total_duration_ms: duração total da auditoria (não é "lag" puro)
-                # - lag_detection_to_click_ms: tempo entre detecção e clique
-                # - lag_click_to_betslip_ms: tempo entre clique e extração do betslip
                 "audit_total_ms": r[14],
                 "lag_det_to_click_ms": r[15],
                 "lag_click_to_betslip_ms": r[16],
-                "direction": r[17],
-                "period": r[18],
-                "version": r[19],
-                "audited_at": r[20],
-                "hypothesis_details": _as_dict(r[21]),
-                "match_id": int(r[22]),
-                "kickoff": r[23],
-                "home_score": r[24],
-                "away_score": r[25],
-                "match_status": r[26],
-                "closing_odd": r[27],
+                "hypothesis_detected_at": r[17],
+                "audited_at": r[18],
+                "direction": r[19],
+                "period": r[20],
+                "version": r[21],
+                "hypothesis_details": _as_dict(r[22]),
+                "match_id": int(r[23]),
+                "kickoff": r[24],
+                "home_score": r[25],
+                "away_score": r[26],
+                "match_status": r[27],
+                "closing_odd": None,
             }
 
             # Lag fim-a-fim (proxy) e overhead:
@@ -625,16 +612,18 @@ async def main() -> int:
             else:
                 d["lag_overhead_ms"] = None
 
-            # CLV (bruto)
-            if d["closing_odd"] and d["closing_odd"] > 0:
-                d["clv_ws"] = (d["ws_odd"] - d["closing_odd"]) / d["closing_odd"] * 100.0 if d["ws_odd"] else None
-                if d["bs_odd"] and d["bs_odd"] > 0:
-                    d["clv_bs"] = (d["bs_odd"] - d["closing_odd"]) / d["closing_odd"] * 100.0
-                else:
-                    d["clv_bs"] = None
-            else:
-                d["clv_ws"] = None
-                d["clv_bs"] = None
+            # Lag "total" em parede (se timestamps existem): audited_at - detected_at
+            d["lag_wall_ms"] = None
+            try:
+                det_at = d.get("hypothesis_detected_at")
+                aud_at = d.get("audited_at")
+                if det_at and aud_at:
+                    d["lag_wall_ms"] = float((aud_at - det_at).total_seconds() * 1000.0)
+            except Exception:
+                d["lag_wall_ms"] = None
+
+            # Lag total operacional: preferimos wall_ms; fallback = audit_total_ms
+            d["lag_total_ms"] = _safe_float(d.get("lag_wall_ms")) or _safe_float(d.get("audit_total_ms")) or None
 
             # ROI
             roi_ws, roi_bs = compute_roi_pct(
@@ -652,9 +641,113 @@ async def main() -> int:
             d["model"] = classify_model(str(d.get("version", "")))
             d["diff_bucket"] = diff_bucket(_safe_float(d.get("diff_pct")))
             d["line_bucket"] = line_bucket(str(d.get("line", "")))
-            d["lag_bucket"] = lag_bucket(int(d.get("lag_e2e_ms") or 0))
+            d["lag_bucket"] = lag_bucket(int(d.get("lag_total_ms") or 0))
+            d["exec_bucket"] = exec_time_bucket(_safe_float(d.get("lag_total_ms")))
 
             all_data.append(d)
+
+        # ------------------------------------------------------------
+        # Closing odds em batch (melhora muito performance em janelas longas)
+        # ------------------------------------------------------------
+        from sqlalchemy.dialects.postgresql import ARRAY
+
+        def _line_variants(line: Any) -> List[str]:
+            s = str(line).strip().replace(",", ".")
+            out = {s}
+            try:
+                f = float(s)
+            except Exception:
+                return list(out)
+            # formatações comuns
+            out.add(f"{f:.1f}")
+            if f > 0:
+                out.add(f"+{f:.1f}")
+                if float(int(f)) == f:
+                    out.add(f"+{int(f)}")
+                    out.add(str(int(f)))
+            else:
+                if float(int(f)) == f:
+                    out.add(str(int(f)))
+            # remove/insere + e .0
+            if s.startswith("+"):
+                out.add(s[1:])
+            if "." not in s:
+                out.add(s + ".0")
+                if not s.startswith(("+", "-")):
+                    out.add("+" + s)
+                    out.add("+" + s + ".0")
+            return list(out)
+
+        async def _fetch_closing_by_match_line(db_in: Database, match_ids: List[int]) -> Dict[Tuple[int, str], Tuple[Optional[float], Optional[float]]]:
+            if not match_ids:
+                return {}
+            q_clo = (
+                text(
+                    """
+                    SELECT match_id, ah_line, best_home_odds, best_away_odds
+                    FROM (
+                      SELECT
+                        boh.match_id,
+                        boh.ah_line,
+                        boh.best_home_odds,
+                        boh.best_away_odds,
+                        row_number() OVER (PARTITION BY boh.match_id, boh.ah_line ORDER BY boh.scraped_at DESC) AS rn
+                      FROM best_odds_history boh
+                      JOIN matches m ON m.id = boh.match_id
+                      WHERE boh.match_id = ANY(:match_ids)
+                        AND boh.scraped_at < m.kickoff_time
+                        AND (boh.best_home_odds > 0 OR boh.best_away_odds > 0)
+                    ) t
+                    WHERE rn = 1
+                    """
+                )
+                .bindparams(bindparam("match_ids", type_=ARRAY(Integer)))
+            )
+            async with db_in.async_session() as session:
+                res = await session.execute(q_clo, {"match_ids": match_ids})
+                rows2 = list(res.fetchall())
+            out: Dict[Tuple[int, str], Tuple[Optional[float], Optional[float]]] = {}
+            for mid, ah_line, bho, bao in rows2:
+                out[(int(mid), str(ah_line))] = (_safe_float(bho), _safe_float(bao))
+            return out
+
+        # busca closing odds apenas para matches do recorte
+        match_ids_all = sorted({int(d["match_id"]) for d in all_data})
+        closing_map = await _fetch_closing_by_match_line(db, match_ids_all)
+
+        # aplica closing_odd e calcula CLV (somente AH)
+        for d in all_data:
+            closing = None
+            try:
+                if str(d.get("market_type")) != "AH":
+                    closing = None
+                else:
+                    mid = int(d["match_id"])
+                    side = str(d.get("side") or "")
+                    for lv in _line_variants(d.get("line")):
+                        key = (mid, str(lv))
+                        if key not in closing_map:
+                            continue
+                        bho, bao = closing_map[key]
+                        if side == "home" and bho and bho > 0:
+                            closing = float(bho)
+                            break
+                        if side != "home" and bao and bao > 0:
+                            closing = float(bao)
+                            break
+            except Exception:
+                closing = None
+            d["closing_odd"] = closing
+
+            # CLV (bruto) depende do closing_odd
+            if closing and closing > 0:
+                ws = _safe_float(d.get("ws_odd"))
+                bs = _safe_float(d.get("bs_odd"))
+                d["clv_ws"] = (ws - closing) / closing * 100.0 if ws else None
+                d["clv_bs"] = (bs - closing) / closing * 100.0 if bs and bs > 0 else None
+            else:
+                d["clv_ws"] = None
+                d["clv_bs"] = None
 
         # Filtro qualidade betslip (igual ao script: -10 a +10)
         with_bs_raw = [d for d in all_data if d.get("bs_odd") and d["bs_odd"] > 0]
@@ -762,9 +855,12 @@ async def main() -> int:
         dom_all = subset_model("DOM (15-30s)")
         api_bs = subset_bs_model("API (2-4s)")
         dom_bs = subset_bs_model("DOM (15-30s)")
-        # Latência fim-a-fim (proxy): detecção->click + click->betslip
-        api_lag = _mean([float(d["lag_e2e_ms"]) for d in api_all if d.get("lag_e2e_ms") is not None])
-        dom_lag = _mean([float(d["lag_e2e_ms"]) for d in dom_all if d.get("lag_e2e_ms") is not None])
+        # Tempo total observado (preferindo wall_ms quando disponível)
+        api_lag_total = _mean([float(d["lag_total_ms"]) for d in api_all if d.get("lag_total_ms") is not None])
+        dom_lag_total = _mean([float(d["lag_total_ms"]) for d in dom_all if d.get("lag_total_ms") is not None])
+        # Decomposição instrumentada (não inclui tudo, mas ajuda a identificar gargalo)
+        api_lag_e2e = _mean([float(d["lag_e2e_ms"]) for d in api_all if d.get("lag_e2e_ms") is not None])
+        dom_lag_e2e = _mean([float(d["lag_e2e_ms"]) for d in dom_all if d.get("lag_e2e_ms") is not None])
         api_clv_pm_n = len([d for d in api_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
         dom_clv_pm_n = len([d for d in dom_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
         api_roi_n = len([d for d in api_bs if d.get("roi_bs") is not None])
@@ -773,7 +869,8 @@ async def main() -> int:
         lines.append(f"| Com betslip confiável | {len(api_bs)} | {len(dom_bs)} |\n")
         lines.append(f"| Com CLV pre-match (betslip) | {api_clv_pm_n} | {dom_clv_pm_n} |\n")
         lines.append(f"| Com ROI (betslip) | {api_roi_n} | {dom_roi_n} |\n")
-        lines.append(f"| Lag médio observado (fim-a-fim) | {_fmt_num(api_lag, 0)} ms | {_fmt_num(dom_lag, 0)} ms |\n")
+        lines.append(f"| Tempo total observado (detecção→betslip, wall/total) | {_fmt_num(api_lag_total, 0)} ms | {_fmt_num(dom_lag_total, 0)} ms |\n")
+        lines.append(f"| Tempo instrumentado (detecção→clique→betslip) | {_fmt_num(api_lag_e2e, 0)} ms | {_fmt_num(dom_lag_e2e, 0)} ms |\n")
         lines.append("\n---\n")
 
         # 2.0b) Decomposição de latência (foco: fila/overhead)
@@ -839,6 +936,47 @@ async def main() -> int:
             diff_mean = _mean([float(d["diff_pct"]) for d in sub_ok]) if sub_ok else None
             lines.append(
                 f"| {label} | {len(sub_all)} | {len(sub_bs)} | {len(sub_ok)} | {len(sub_back)} | {len(sub_lay)} | {_fmt_pct(diff_mean)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 2.3) Regimes operacionais por bucket de tempo total (lag_total_ms)
+        lines.append("### 2.3 Regimes operacionais por tempo total (bucket)\n")
+        lines.append(
+            "Objetivo: separar a amostra em **regimes de execução** (tempo total) e medir performance em cada regime. "
+            "Use isso para detectar **fila/saturação**: regimes lentos tendem a ter edge menor e pior ROI.\n\n"
+        )
+        lines.append("| Bucket (tempo total) | N OK | Jogos | lag_total mean (ms) | lag_total p95 (ms) | overhead p95 (ms) | Back edge | Lay edge | CLV PM (mean; IC90) | ROI (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
+            sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
+            if not sub:
+                lines.append(f"| {b} | 0 | 0 | — | — | — | 0 | 0 | — | — |\n")
+                continue
+            lags = [float(x) for x in [(_safe_float(d.get("lag_total_ms"))) for d in sub] if x is not None and x > 0]
+            over = [float(x) for x in [(_safe_float(d.get("lag_overhead_ms"))) for d in sub] if x is not None]
+            lag_mean = float(np.mean(lags)) if lags else None
+            lag_p95 = float(np.quantile(lags, 0.95)) if lags else None
+            ov_p95 = float(np.quantile(over, 0.95)) if over else None
+
+            n_matches = len({int(d["match_id"]) for d in sub})
+            n_back = sum(1 for d in sub if int(d["id"]) in back_edge_ids)
+            n_lay = sum(1 for d in sub if int(d["id"]) in lay_edge_ids)
+
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in sub if d.get("is_live") is False],
+                [d.get("match_id") for d in sub if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in sub],
+                [d.get("match_id") for d in sub],
+                clip_low=-100,
+                clip_high=500,
+            )
+            clv_txt = f"{_fmt_pct(clv_pm.mean_cluster,2)} {_fmt_ci(clv_pm.ci90_cluster,2)}" if clv_pm.n_events else "—"
+            roi_txt = f"{_fmt_pct(roi_all.mean_cluster,2)} {_fmt_ci(roi_all.ci90_cluster,2)}" if roi_all.n_events else "—"
+            lines.append(
+                f"| {b} | {len(sub)} | {n_matches} | {_fmt_num(lag_mean,0)} | {_fmt_num(lag_p95,0)} | {_fmt_num(ov_p95,0)} | {n_back} | {n_lay} | {clv_txt} | {roi_txt} |\n"
             )
         lines.append("\n---\n")
 
@@ -918,6 +1056,9 @@ async def main() -> int:
         lines.append(
             f"| Win rate ROI WS | {_fmt_num(api_roi_ws.hit_rate_event, 1)}% | {_fmt_num(dom_roi_ws.hit_rate_event, 1)}% |\n"
         )
+        lines.append("\nNotas de robustez (IC 90% por jogo):  \n")
+        lines.append(f"- API ROI betslip (cluster): média {_fmt_pct(api_roi.mean_cluster)}; IC90 {_fmt_ci(api_roi.ci90_cluster)}  \n")
+        lines.append(f"- API ROI WS (cluster): média {_fmt_pct(api_roi_ws.mean_cluster)}; IC90 {_fmt_ci(api_roi_ws.ci90_cluster)}  \n")
         lines.append("\n---\n")
 
         # 5) Diferença de preço BS vs WS
@@ -1151,6 +1292,8 @@ async def main() -> int:
         # ROI realizado (quando houver placar)
         back_realized = []
         back_realized_stakes = []
+        back_realized_roi = []
+        back_realized_mids = []
         for d in back_edge:
             roi = _safe_float(d.get("roi_bs"))
             if roi is None:
@@ -1158,13 +1301,38 @@ async def main() -> int:
             bs, _, _, _ = finance_for_row(d)
             back_realized.append(float(bs) * float(roi) / 100.0)
             back_realized_stakes.append(float(bs))
+            back_realized_roi.append(float(roi))
+            back_realized_mids.append(int(d.get("match_id")))
         if back_realized:
             roi_weighted = (sum(back_realized) / sum(back_realized_stakes) * 100.0) if sum(back_realized_stakes) > 0 else None
             lines.append(f"| N com ROI realizado | {len(back_realized)} |\n")
             lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(back_realized), 2)} |\n")
             lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_weighted, 2)}% |\n")
+
+            roi_sum = summarize_metric(back_realized_roi, back_realized_mids, clip_low=-100, clip_high=500)
+            lines.append(f"| ROI realizado (robusto por jogo, mean; IC90) | {_fmt_pct(roi_sum.mean_cluster,2)} {_fmt_ci(roi_sum.ci90_cluster,2)} |\n")
+
+            # IC90 também para ROI ponderado por stake (agrega por jogo e bootstrap)
+            by_match_w: Dict[int, Tuple[float, float]] = {}
+            for d in back_edge:
+                roi = _safe_float(d.get("roi_bs"))
+                if roi is None:
+                    continue
+                mid = int(d.get("match_id"))
+                bs, _, _, _ = finance_for_row(d)
+                pnl = float(bs) * float(roi) / 100.0
+                s, w = by_match_w.get(mid, (0.0, 0.0))
+                by_match_w[mid] = (s + pnl, w + float(bs))
+            per_match_roi = {mid: (pnl / w * 100.0) for mid, (pnl, w) in by_match_w.items() if w > 0}
+            mean_w, ci_w = cluster_bootstrap_ci({mid: [val] for mid, val in per_match_roi.items()}, n_boot=4000, alpha=0.10)
+            lines.append(f"| ROI ponderado por stake (robusto por jogo, mean; IC90) | {_fmt_pct(mean_w,2)} {_fmt_ci(ci_w,2)} |\n")
         else:
             lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
+        lines.append(
+            "\nObservação: a Seção 4 reporta ROI médio no **recorte completo** (betslip confiável). "
+            "Aqui (7.1) é apenas a coorte **Back edge** (diff>=corte) e o ROI também é mostrado ponderado por stake; "
+            "por isso sinais podem divergir.\n"
+        )
 
         lines.append("\n### 7.2 Lay (BS << WS) — risco de cauda\n")
         lines.append("| Métrica | Valor |\n|---|---:|\n")
@@ -1178,6 +1346,110 @@ async def main() -> int:
         lines.append(f"| ES95 (liability) | {_fmt_num(_es_tail(lay_liability, 95), 2)} |\n")
         lines.append(f"| Liability max | {_fmt_num(max(lay_liability) if lay_liability else None, 2)} |\n")
         lines.append(f"| Proxy de banca (>= p99 liability) | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
+
+        # ROI/P&L realizado no Lay (quando houver placar)
+        def _mult_back_from_row(d: dict) -> Optional[float]:
+            hs = d.get("home_score")
+            aws = d.get("away_score")
+            if hs is None or aws is None:
+                return None
+            try:
+                goal_diff = int(hs) - int(aws)
+            except Exception:
+                return None
+            try:
+                ah_line = float(str(d.get("line", "")).replace(",", "."))
+            except Exception:
+                return None
+            side = (str(d.get("side") or "")).strip()
+            if side == "home":
+                adjusted = goal_diff + ah_line
+            else:
+                adjusted = -goal_diff - ah_line
+            if adjusted > 0.25:
+                return 1.0
+            if adjusted == 0.25:
+                return 0.5
+            if adjusted == 0:
+                return 0.0
+            if adjusted == -0.25:
+                return -0.5
+            return -1.0
+
+        lay_realized_pnl = []
+        lay_realized_liab = []
+        lay_realized_stake = []
+        lay_realized_roi_liab = []
+        lay_realized_roi_stake = []
+        lay_realized_mids = []
+        for d in lay_edge:
+            mult = _mult_back_from_row(d)
+            if mult is None:
+                continue
+            h = d.get("hypothesis_details") or {}
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+            if lay_odd is None or lay_odd <= 0:
+                lay_odd = _safe_float(d.get("bs_odd"))
+            if lay_odd is None or lay_odd <= 1.0:
+                continue
+            _, _, ls, ll = finance_for_row(d)
+            ls = float(ls)
+            ll = float(ll)
+            if ls <= 0 or ll <= 0:
+                continue
+            # ROI por stake e por liability
+            roi_stake = (-mult) * 100.0 if mult < 0 else (-mult) * (lay_odd - 1.0) * 100.0 if mult > 0 else 0.0
+            roi_stake = float(roi_stake)
+            roi_liab = (-mult) / (lay_odd - 1.0) * 100.0 if mult < 0 else (-mult) * 100.0 if mult > 0 else 0.0
+            roi_liab = float(roi_liab)
+            pnl = ls * roi_stake / 100.0  # equivale a ll * roi_liab/100
+
+            lay_realized_pnl.append(pnl)
+            lay_realized_liab.append(ll)
+            lay_realized_stake.append(ls)
+            lay_realized_roi_liab.append(roi_liab)
+            lay_realized_roi_stake.append(roi_stake)
+            lay_realized_mids.append(int(d.get("match_id")))
+
+        if lay_realized_pnl:
+            roi_liab_weighted = (sum(lay_realized_pnl) / sum(lay_realized_liab) * 100.0) if sum(lay_realized_liab) > 0 else None
+            roi_stake_weighted = (sum(lay_realized_pnl) / sum(lay_realized_stake) * 100.0) if sum(lay_realized_stake) > 0 else None
+            lines.append(f"| N com ROI realizado | {len(lay_realized_pnl)} |\n")
+            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(lay_realized_pnl), 2)} |\n")
+            lines.append(f"| ROI realizado (ponderado por liability) | {_fmt_num(roi_liab_weighted, 2)}% |\n")
+            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_stake_weighted, 2)}% |\n")
+
+            # robusto por jogo (não ponderado)
+            roi_liab_sum = summarize_metric(lay_realized_roi_liab, lay_realized_mids, clip_low=-200, clip_high=5000)
+            lines.append(f"| ROI/liability (robusto por jogo, mean; IC90) | {_fmt_pct(roi_liab_sum.mean_cluster,2)} {_fmt_ci(roi_liab_sum.ci90_cluster,2)} |\n")
+
+            # robusto por jogo (ponderado por liability)
+            by_match_l: Dict[int, Tuple[float, float]] = {}
+            for d in lay_edge:
+                mult = _mult_back_from_row(d)
+                if mult is None:
+                    continue
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+                if lay_odd is None or lay_odd <= 0:
+                    lay_odd = _safe_float(d.get("bs_odd"))
+                if lay_odd is None or lay_odd <= 1.0:
+                    continue
+                _, _, ls, ll = finance_for_row(d)
+                ls = float(ls)
+                ll = float(ll)
+                if ls <= 0 or ll <= 0:
+                    continue
+                roi_stake = (-mult) * 100.0 if mult < 0 else (-mult) * (lay_odd - 1.0) * 100.0 if mult > 0 else 0.0
+                pnl = ls * float(roi_stake) / 100.0
+                mid = int(d.get("match_id"))
+                s, w = by_match_l.get(mid, (0.0, 0.0))
+                by_match_l[mid] = (s + pnl, w + ll)
+            per_match_roi_l = {mid: (pnl / w * 100.0) for mid, (pnl, w) in by_match_l.items() if w > 0}
+            mean_lw, ci_lw = cluster_bootstrap_ci({mid: [val] for mid, val in per_match_roi_l.items()}, n_boot=4000, alpha=0.10)
+            lines.append(f"| ROI/liability ponderado (robusto por jogo, mean; IC90) | {_fmt_pct(mean_lw,2)} {_fmt_ci(ci_lw,2)} |\n")
+        else:
+            lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
         lines.append("\n---\n")
 
         # ============================================================
@@ -1527,6 +1799,8 @@ async def main() -> int:
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
                 "had_reversal": bool(a.get("had_reversal")),
+                "ext_at_end": bool(a.get("ext_at_end")),
+                "monotonic": bool(a.get("monotonic")),
                 "t_ext": a.get("t_ext"),
                 "clv_t0": clv0,
                 "clv_ext": clve,
@@ -1558,6 +1832,8 @@ async def main() -> int:
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
                 "had_reversal": bool(a.get("had_reversal")),
+                "ext_at_end": bool(a.get("ext_at_end")),
+                "monotonic": bool(a.get("monotonic")),
                 "t_ext": a.get("t_ext"),
                 "clv_t0": clv0,
                 "clv_ext": clve,
@@ -1567,31 +1843,46 @@ async def main() -> int:
                 "roi_last": roilast,
             }
 
-        def _summarize_entry(rows: List[dict], key: str) -> MetricSummary:
+        def _summarize_entry(rows: List[dict], key: str, *, clip_low: Optional[float] = None, clip_high: Optional[float] = None) -> MetricSummary:
             vals = [r.get(key) for r in rows]
             mids = [r.get("match_id") for r in rows]
-            return summarize_metric(vals, mids, clip_low=-50, clip_high=50) if "clv" in key else summarize_metric(vals, mids)
+            return summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
 
         # 8.1b) impacto: t0 vs pico vs último, com/sem reversão
         back_entries = [em for d in ok_bs for em in [_entry_metrics_back(d)] if em is not None]
         lines.append("\n### 8.1b Back — impacto por timing (t0 vs pico vs último) e reversão\n")
-        lines.append("Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. Observação: **CLV só é calculado pre-match**.\n\n")
-        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 | CLV pico | CLV último | N ROI | ROI t0 | ROI pico | ROI último |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-        for label, filt in [
-            ("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]),
-            ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]]),
-        ]:
-            clv0 = _mean([r["clv_t0"] for r in filt if r.get("clv_t0") is not None])
-            clve = _mean([r["clv_ext"] for r in filt if r.get("clv_ext") is not None])
-            clvl = _mean([r["clv_last"] for r in filt if r.get("clv_last") is not None])
-            roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
-            roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
-            roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
-            n_clv = sum(1 for r in filt if r.get("clv_t0") is not None or r.get("clv_ext") is not None or r.get("clv_last") is not None)
-            n_roi = sum(1 for r in filt if r.get("roi_t0") is not None or r.get("roi_ext") is not None or r.get("roi_last") is not None)
+        lines.append(
+            "Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
+            "Aqui reportamos **média robusta por jogo + IC90**. Observação: **CLV só é calculado pre-match**.\n\n"
+        )
+
+        # CLV (pre-match) com IC
+        lines.append("**CLV (somente pre-match) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 (mean; IC90) | CLV pico (mean; IC90) | CLV último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]])]:
+            pm = [r for r in filt if r.get("is_live") is False]
+            s0 = _summarize_entry(pm, "clv_t0", clip_low=-50, clip_high=50)
+            se = _summarize_entry(pm, "clv_ext", clip_low=-50, clip_high=50)
+            sl = _summarize_entry(pm, "clv_last", clip_low=-50, clip_high=50)
             lines.append(
-                f"| {label} | {len(filt)} | {n_clv} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {n_roi} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n"
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
             )
+
+        # ROI (back) com IC
+        lines.append("\n**ROI (stake=1) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N ROI | ROI t0 (mean; IC90) | ROI pico (mean; IC90) | ROI último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]])]:
+            s0 = _summarize_entry(filt, "roi_t0", clip_low=-100, clip_high=500)
+            se = _summarize_entry(filt, "roi_ext", clip_low=-100, clip_high=500)
+            sl = _summarize_entry(filt, "roi_last", clip_low=-100, clip_high=500)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        lines.append(
+            "\nNota interpretativa: a subcoorte **COM_REVERSAO** pode ter CLV maior no **pico** porque, por definição, ela inclui casos em que o edge atingiu um extremo mais alto antes de reverter. "
+            "Para entender a hipótese 'sem reversão deveria ser maior', compare também a categoria '**pico no fim, sem reversão**' na partição 100% (tabela 8.1).\n"
+        )
 
         # LAY
         lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
@@ -1625,22 +1916,30 @@ async def main() -> int:
 
         lay_entries = [em for d in ok_bs for em in [_entry_metrics_lay(d)] if em is not None]
         lines.append("\n### 8.2b Lay — impacto por timing (t0 vs vale vs último) e reversão\n")
-        lines.append("Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. Observação: **CLV só é calculado pre-match**.\n\n")
-        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 | CLV vale | CLV último | N ROI | ROI/liab t0 | ROI/liab vale | ROI/liab último |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-        for label, filt in [
-            ("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]),
-            ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]]),
-        ]:
-            clv0 = _mean([r["clv_t0"] for r in filt if r.get("clv_t0") is not None])
-            clve = _mean([r["clv_ext"] for r in filt if r.get("clv_ext") is not None])
-            clvl = _mean([r["clv_last"] for r in filt if r.get("clv_last") is not None])
-            roi0 = _mean([r["roi_t0"] for r in filt if r.get("roi_t0") is not None])
-            roie = _mean([r["roi_ext"] for r in filt if r.get("roi_ext") is not None])
-            roil = _mean([r["roi_last"] for r in filt if r.get("roi_last") is not None])
-            n_clv = sum(1 for r in filt if r.get("clv_t0") is not None or r.get("clv_ext") is not None or r.get("clv_last") is not None)
-            n_roi = sum(1 for r in filt if r.get("roi_t0") is not None or r.get("roi_ext") is not None or r.get("roi_last") is not None)
+        lines.append(
+            "Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
+            "Aqui reportamos **média robusta por jogo + IC90**. Observação: **CLV só é calculado pre-match**.\n\n"
+        )
+
+        lines.append("**CLV (somente pre-match) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 (mean; IC90) | CLV vale (mean; IC90) | CLV último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]])]:
+            pm = [r for r in filt if r.get("is_live") is False]
+            s0 = _summarize_entry(pm, "clv_t0", clip_low=-50, clip_high=50)
+            se = _summarize_entry(pm, "clv_ext", clip_low=-50, clip_high=50)
+            sl = _summarize_entry(pm, "clv_last", clip_low=-50, clip_high=50)
             lines.append(
-                f"| {label} | {len(filt)} | {n_clv} | {_fmt_pct(clv0,2)} | {_fmt_pct(clve,2)} | {_fmt_pct(clvl,2)} | {n_roi} | {_fmt_num(roi0,2)} | {_fmt_num(roie,2)} | {_fmt_num(roil,2)} |\n"
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        lines.append("\n**ROI/liability — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N ROI | ROI/liab t0 (mean; IC90) | ROI/liab vale (mean; IC90) | ROI/liab último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]])]:
+            s0 = _summarize_entry(filt, "roi_t0", clip_low=-200, clip_high=5000)
+            se = _summarize_entry(filt, "roi_ext", clip_low=-200, clip_high=5000)
+            sl = _summarize_entry(filt, "roi_last", clip_low=-200, clip_high=5000)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
             )
 
         lines.append("\n---\n")
