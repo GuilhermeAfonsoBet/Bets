@@ -36,6 +36,9 @@ SELECT
 
 O monitor executa a cada ~2 minutos e envia alerta no Telegram quando houver WARN/FAIL.
 
+> Nota: o `ops.health_monitor` usa **exit codes** (0=PASS, 1=WARN, 2=FAIL).  
+> Nos units `betinasia-ops-monitor.service` e `betinasia-ops-autopilot.service` nós já incluímos `SuccessExitStatus=1 2` para o systemd **não** marcar o unit como "failed" em WARN/FAIL (o que é esperado e não significa que o timer quebrou).
+
 ### Instalar systemd unit + timer
 ```bash
 sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-monitor.service /etc/systemd/system/
