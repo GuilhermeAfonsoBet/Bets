@@ -285,7 +285,10 @@ def _load_state(path: Path) -> Dict[str, Any]:
 def _save_state(path: Path, state: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Escrita atômica (reduz risco de state corrompido em timers concorrentes)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
     except Exception:
         pass
 
@@ -374,6 +377,12 @@ def main() -> int:
     ap.add_argument("--collector-telemetry", default=os.getenv("COLLECTOR_TELEMETRY_FILE", "logs/collector_telemetry.jsonl"))
     ap.add_argument("--audit-telemetry", default=os.getenv("AUDIT_TELEMETRY_FILE", "logs/audit_api_telemetry.jsonl"))
     ap.add_argument("--telegram", action="store_true", help="Envia alerta no Telegram em WARN/FAIL")
+    ap.add_argument(
+        "--telegram-recovery",
+        action="store_true",
+        default=(os.getenv("OPS_TELEGRAM_SEND_RECOVERY", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Envia mensagem no Telegram quando sair de WARN/FAIL e voltar para PASS (default=on).",
+    )
     ap.add_argument("--restart-on-fail", action="store_true", help="Reinicia serviços quando FAIL (requer sudo sem prompt)")
     ap.add_argument(
         "--autopilot",
@@ -398,12 +407,19 @@ def main() -> int:
         )
     )
 
+    # Estado (para detectar RECOVERY e evitar spam)
+    state_path = Path(str(args.state_file))
+    state = _load_state(state_path)
+    prev_code = _safe_int(state.get("last_overall_code"), 0)
+    prev_non_ok = _safe_int(state.get("last_non_ok_code"), 0)
+    prev_non_ok_utc = str(state.get("last_non_ok_utc") or "")
+    prev_non_ok_lines = list(state.get("last_non_ok_lines") or [])
+    recovered = (prev_code > 0 and int(code) == 0)
+
     # AUTO-PILOT (seguro): restarts com rate limit/cooldown, após FAILs consecutivos
     now = _utcnow()
     autopilot_actions: List[str] = []
     if args.autopilot:
-        state_path = Path(str(args.state_file))
-        state = _load_state(state_path)
         state["last_run_utc"] = now.isoformat()
 
         # marca falhas por serviço
@@ -436,6 +452,17 @@ def main() -> int:
 
         _save_state(state_path, state)
 
+    # Atualiza estado de "último status"
+    state["last_overall_utc"] = str(meta.get("now_utc") or now.isoformat())
+    state["last_overall_code"] = int(code)
+    if int(code) > 0:
+        state["last_non_ok_utc"] = str(meta.get("now_utc") or now.isoformat())
+        state["last_non_ok_code"] = int(code)
+        state["last_non_ok_lines"] = [f"[{r.level}] {r.message}" for r in results if r.level in ("WARN", "FAIL")]
+    elif recovered:
+        state["last_recovery_utc"] = str(meta.get("now_utc") or now.isoformat())
+    _save_state(state_path, state)
+
     # imprime output legível
     print("=" * 70)
     print(f"OPS HEALTH MONITOR | {meta.get('now_utc')}")
@@ -450,20 +477,35 @@ def main() -> int:
     print("-" * 70)
     print(f"Exit code: {code}")
 
-    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions)):
+    should_send_recovery = bool(args.telegram_recovery) and recovered
+    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
         if token and chat_id:
-            level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
-            lines = [f"OPS HEALTH ({level}) @ {meta.get('now_utc')}"]
-            for r in results:
-                if r.level in ("WARN", "FAIL"):
-                    lines.append(f"- [{r.level}] {r.message}")
-            if args.autopilot and autopilot_actions:
-                lines.append("- Auto-pilot:")
-                for a in autopilot_actions:
-                    lines.append(f"  - {a}")
-            _telegram_send(token, chat_id, "\n".join(lines))
+            if should_send_recovery:
+                lines = [f"OPS HEALTH (RECOVERY/OK) @ {meta.get('now_utc')}"]
+                # Inclui o último problema conhecido (para contexto)
+                if prev_non_ok > 0:
+                    prev_level = "FAIL" if prev_non_ok >= 2 else "WARN"
+                    lines.append(f"Anterior: {prev_level} @ {prev_non_ok_utc}")
+                    for ln in prev_non_ok_lines[:20]:
+                        lines.append(f"- {ln}")
+                if args.autopilot and autopilot_actions:
+                    lines.append("- Auto-pilot:")
+                    for a in autopilot_actions:
+                        lines.append(f"  - {a}")
+                _telegram_send(token, chat_id, "\n".join(lines))
+            else:
+                level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
+                lines = [f"OPS HEALTH ({level}) @ {meta.get('now_utc')}"]
+                for r in results:
+                    if r.level in ("WARN", "FAIL"):
+                        lines.append(f"- [{r.level}] {r.message}")
+                if args.autopilot and autopilot_actions:
+                    lines.append("- Auto-pilot:")
+                    for a in autopilot_actions:
+                        lines.append(f"  - {a}")
+                _telegram_send(token, chat_id, "\n".join(lines))
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")
 
