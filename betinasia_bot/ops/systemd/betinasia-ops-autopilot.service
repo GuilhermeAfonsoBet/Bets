@@ -7,5 +7,5 @@
  Type=oneshot
  WorkingDirectory=/home/betbot/Bets/betinasia_bot
  EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
- ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram --autopilot; else exec /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram --autopilot; fi'
+ ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram --autopilot; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram --autopilot; fi'
  

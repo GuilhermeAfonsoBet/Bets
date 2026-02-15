@@ -47,7 +47,7 @@ systemctl list-timers --all | rg betinasia-ops-monitor
 
 ### Rodar manualmente
 ```bash
-python3 -m ops.health_monitor --since-minutes 30 --telegram
+PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --telegram
 ```
 
 Variáveis úteis (no `.env`):
@@ -62,7 +62,7 @@ Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu b
 3) No VPS, com `TELEGRAM_BOT_TOKEN` no `.env`, rode:
 
 ```bash
-python3 -m ops.telegram_setup
+PYTHONPATH=betinasia_bot python3 -m ops.telegram_setup
 ```
 
 Ele vai imprimir o `chat_id`. Coloque no `.env` como `TELEGRAM_CHAT_ID=...`.
