@@ -60,6 +60,10 @@ class ContinuousCollector:
     SAVE_TIMEOUT_SECONDS = int(os.getenv("SAVE_TIMEOUT_SECONDS", "90"))
     ZERO_ODDS_RECOVERY_THRESHOLD = int(os.getenv("COLLECT_ZERO_ODDS_RECOVERY_THRESHOLD", "3"))
     STARTUP_RETRY_SECONDS = int(os.getenv("COLLECT_STARTUP_RETRY_SECONDS", "30"))
+    # Evita "hang silencioso" ao reiniciar browser/sessão
+    BROWSER_START_TIMEOUT_SECONDS = int(os.getenv("COLLECT_BROWSER_START_TIMEOUT_SECONDS", "180"))
+    # Telemetria de fase (melhor diagnóstico e evita gaps sem escrita)
+    PHASE_TELEMETRY = os.getenv("COLLECT_PHASE_TELEMETRY", "1").strip() not in ("0", "false", "False", "no", "NO")
     
     def __init__(self):
         self.collector: Optional[FastCollector] = None
@@ -111,16 +115,37 @@ class ContinuousCollector:
         
     async def _start_browser(self):
         """Inicia ou reinicia o browser."""
+        t0 = time.time()
+        if self.PHASE_TELEMETRY:
+            self._append_jsonl(
+                self.telemetry_file,
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "cycle": self.total_collections + 1,
+                    "status": "BROWSER_START",
+                },
+            )
         if self.collector:
             try:
-                await self.collector.close()
+                await asyncio.wait_for(self.collector.close(), timeout=30)
             except:
                 pass
                 
         self.collector = FastCollector()
-        await self.collector.start()
+        await asyncio.wait_for(self.collector.start(), timeout=self.BROWSER_START_TIMEOUT_SECONDS)
         self._last_browser_start = datetime.now(timezone.utc)
-        logger.info("Browser iniciado")
+        dt_ms = int((time.time() - t0) * 1000)
+        logger.info(f"Browser iniciado (dt={dt_ms}ms)")
+        if self.PHASE_TELEMETRY:
+            self._append_jsonl(
+                self.telemetry_file,
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "cycle": self.total_collections + 1,
+                    "status": "BROWSER_OK",
+                    "browser_start_ms": dt_ms,
+                },
+            )
         
     def _signal_handler(self, signum, frame):
         """Handler para sinais de shutdown."""
@@ -190,6 +215,15 @@ class ContinuousCollector:
         while self.running:
             try:
                 cycle_start = datetime.now(timezone.utc)
+                if self.PHASE_TELEMETRY:
+                    self._append_jsonl(
+                        self.telemetry_file,
+                        {
+                            "ts_utc": cycle_start.isoformat(),
+                            "cycle": self.total_collections + 1,
+                            "status": "CYCLE_START",
+                        },
+                    )
                 
                 # Verifica se precisa reiniciar browser
                 if self._should_refresh_browser():
@@ -266,6 +300,17 @@ class ContinuousCollector:
                 
                 if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                     logger.warning(f"Muitos erros consecutivos, pausando por {self.ERROR_PAUSE_SECONDS}s...")
+                    if self.PHASE_TELEMETRY:
+                        self._append_jsonl(
+                            self.telemetry_file,
+                            {
+                                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                                "cycle": self.total_collections + 1,
+                                "status": "PAUSE_LONG",
+                                "pause_sec": int(self.ERROR_PAUSE_SECONDS),
+                                "reason": "MAX_CONSECUTIVE_ERRORS",
+                            },
+                        )
                     await asyncio.sleep(self.ERROR_PAUSE_SECONDS)
                     
                     # Tenta reiniciar browser
@@ -328,6 +373,15 @@ class ContinuousCollector:
         cycle_start = datetime.now(timezone.utc)
         cycle_t0 = time.time()
         logger.info(f"Iniciando ciclo de coleta #{self.total_collections + 1}...")
+        if self.PHASE_TELEMETRY:
+            self._append_jsonl(
+                self.telemetry_file,
+                {
+                    "ts_utc": cycle_start.isoformat(),
+                    "cycle": self.total_collections + 1,
+                    "status": "COLLECT_START",
+                },
+            )
         
         # Coleta dados
         collect_t0 = time.time()
@@ -353,9 +407,31 @@ class ContinuousCollector:
             self._append_jsonl(self.telemetry_file, timeout_payload)
             raise RuntimeError(f"COLLECT_TIMEOUT_{self.COLLECT_TIMEOUT_SECONDS}s")
         collect_ms = int((time.time() - collect_t0) * 1000)
+        if self.PHASE_TELEMETRY:
+            self._append_jsonl(
+                self.telemetry_file,
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "cycle": self.total_collections + 1,
+                    "status": "COLLECT_OK",
+                    "collect_ms": collect_ms,
+                    "events_discovered": int(getattr(result, "total_events", 0) or 0),
+                    "events_with_odds": int(getattr(result, "total_with_odds", 0) or 0),
+                    "matches_payload": int(len(getattr(result, "matches", []) or [])),
+                },
+            )
         
         # Salva no banco
         save_t0 = time.time()
+        if self.PHASE_TELEMETRY:
+            self._append_jsonl(
+                self.telemetry_file,
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "cycle": self.total_collections + 1,
+                    "status": "SAVE_START",
+                },
+            )
         try:
             save_metrics = await asyncio.wait_for(
                 self._save_to_database(result),
