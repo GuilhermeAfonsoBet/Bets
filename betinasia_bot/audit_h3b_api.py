@@ -51,12 +51,16 @@ class H3bApiAudit:
         save_to_db: bool = True,
         executor_workers: int = 4,
         temporal_workers: int = 2,
+        max_queue_depth: int = 50,
+        max_queue_wait_ms: int = 5000,
     ):
         self.num_audits = num_audits
         self.direction = direction
         self.save_to_db = save_to_db
         self.executor_workers = max(1, int(executor_workers))
         self.temporal_workers = max(0, int(temporal_workers))
+        self.max_queue_depth = max(0, int(max_queue_depth))
+        self.max_queue_wait_ms = max(0, int(max_queue_wait_ms))
 
         self.scraper: Optional[BetinAsiaScraper] = None
         self.api_client: Optional[ApiBetslipClient] = None
@@ -84,6 +88,8 @@ class H3bApiAudit:
         self._queue_ref: Optional[asyncio.Queue] = None
         self.max_temporal_queue_depth_observed = 0
         self._temporal_queue_ref: Optional[asyncio.Queue] = None
+        self.dropped_full_queue: int = 0
+        self.dropped_stale_queue_wait: int = 0
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -290,7 +296,7 @@ class H3bApiAudit:
         if not ok:
             return
 
-        audit_queue = asyncio.Queue()
+        audit_queue = asyncio.Queue(maxsize=self.max_queue_depth) if self.max_queue_depth > 0 else asyncio.Queue()
         self._queue_ref = audit_queue
         temporal_queue = asyncio.Queue()
         self._temporal_queue_ref = temporal_queue
@@ -302,7 +308,10 @@ class H3bApiAudit:
         for twid in range(1, self.temporal_workers + 1):
             tasks.append(asyncio.create_task(self._temporal_loop(temporal_queue, worker_id=twid)))
         tasks.append(asyncio.create_task(self._maintenance_loop()))
-        logger.info(f"Executores T+0 ativos: {self.executor_workers} | Temporal workers: {self.temporal_workers}")
+        logger.info(
+            f"Executores T+0 ativos: {self.executor_workers} | Temporal workers: {self.temporal_workers} | "
+            f"max_queue_depth={self.max_queue_depth or 'inf'} | max_queue_wait_ms={self.max_queue_wait_ms or 'inf'}"
+        )
 
         try:
             while self.running:
@@ -451,23 +460,30 @@ class H3bApiAudit:
                 is_live = kickoff <= datetime.now(timezone.utc) if kickoff else None
 
                 queue_depth_at_enqueue = queue.qsize()
-                queue.put_nowait({
-                    'event_id': event_id,
-                    'audit_key': audit_key,
-                    'home_team': info.get('home', '?'),
-                    'away_team': info.get('away', '?'),
-                    'league': info.get('league', ''),
-                    'kickoff': kickoff,
-                    'is_live': is_live,
-                    'market_type': market_type,
-                    'market_period': period,
-                    'line': str(h3b.ah_line),
-                    'side': h3b.side,
-                    'websocket_odd': h3b.odd_at_reversal,
-                    'direction': h3b.direction_after,
-                    'detected_at': time.time(),
-                    'queue_depth_at_enqueue': queue_depth_at_enqueue,
-                })
+                if self.max_queue_depth > 0 and queue_depth_at_enqueue >= self.max_queue_depth:
+                    self.dropped_full_queue += 1
+                    continue
+                try:
+                    queue.put_nowait({
+                        'event_id': event_id,
+                        'audit_key': audit_key,
+                        'home_team': info.get('home', '?'),
+                        'away_team': info.get('away', '?'),
+                        'league': info.get('league', ''),
+                        'kickoff': kickoff,
+                        'is_live': is_live,
+                        'market_type': market_type,
+                        'market_period': period,
+                        'line': str(h3b.ah_line),
+                        'side': h3b.side,
+                        'websocket_odd': h3b.odd_at_reversal,
+                        'direction': h3b.direction_after,
+                        'detected_at': time.time(),
+                        'queue_depth_at_enqueue': queue_depth_at_enqueue,
+                    })
+                except asyncio.QueueFull:
+                    self.dropped_full_queue += 1
+                    continue
                 self.max_queue_depth_observed = max(self.max_queue_depth_observed, queue.qsize())
                 audited.add(audit_key)
 
@@ -541,12 +557,22 @@ class H3bApiAudit:
                     f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_part} w={worker_id} | "
                     f"{len(self.results)}")
             else:
-                self.total_errors += 1
-                logger.warning(
-                    f"[FAIL][{live}] {result['home_team']} vs {result['away_team']} | "
-                    f"{result['market_type']} {result['line']} {result['side']} | "
-                    f"ws={result['ws_odd']:.3f} | err={result.get('error','')} | "
-                    f"lag={result['total_ms']}ms | {len(self.results)}")
+                status = result.get("status", "FAIL")
+                if status == "STALE_QUEUE_WAIT":
+                    q_ms = telemetry.get('queue_wait_ms', 0)
+                    logger.info(
+                        f"[STALE][{live}] {result['home_team']} vs {result['away_team']} | "
+                        f"{result['market_type']} {result['line']} {result['side']} | "
+                        f"ws={result['ws_odd']:.3f} | q={q_ms}ms | "
+                        f"lag={result['total_ms']}ms | {len(self.results)}"
+                    )
+                else:
+                    self.total_errors += 1
+                    logger.warning(
+                        f"[FAIL][{live}] {result['home_team']} vs {result['away_team']} | "
+                        f"{result['market_type']} {result['line']} {result['side']} | "
+                        f"ws={result['ws_odd']:.3f} | err={result.get('error','')} | "
+                        f"lag={result['total_ms']}ms | {len(self.results)}")
 
             if len(self.results) % STATS_INTERVAL == 0:
                 self._log_stats()
@@ -733,6 +759,53 @@ class H3bApiAudit:
                 'num_bk': len(lay_bookmakers),
             }
 
+        telemetry = {
+            'queue_wait_ms': queue_wait_ms,
+            'queue_depth_at_enqueue': queue_depth_at_enqueue,
+            'queue_depth_after_dequeue': queue_depth_after_dequeue,
+        }
+
+        base = {
+            'event_id': h3b['event_id'],
+            'home_team': h3b['home_team'],
+            'away_team': h3b['away_team'],
+            'league': h3b.get('league', ''),
+            'kickoff': h3b.get('kickoff'),
+            'market_type': h3b['market_type'],
+            'market_period': h3b.get('market_period', 'full_time'),
+            'line': h3b['line'],
+            'side': h3b['side'],
+            'ws_odd': h3b['websocket_odd'],
+            'is_live': h3b.get('is_live'),
+            'direction': h3b.get('direction', 'up'),
+            'detected_at': detected_at,
+            'post_ms': 0,
+            'pmm_ms': 0,
+        }
+
+        # Drop explícito: evento ficou velho demais na fila.
+        # Objetivo: preservar baixa latência e evitar gastar API em oportunidades já inválidas.
+        if self.max_queue_wait_ms > 0 and queue_wait_ms > self.max_queue_wait_ms:
+            self.dropped_stale_queue_wait += 1
+            end_to_end_ms = int((time.time() - detected_at) * 1000)
+            telemetry.update({
+                'stale_dropped': True,
+                'stale_reason': 'queue_wait_ms_exceeded',
+                'parallel_fetch_ms': 0,
+                'temporal_total_ms': 0,
+                'execution_ms': int((time.time() - execution_start) * 1000),
+                'end_to_end_ms': end_to_end_ms,
+            })
+            base.update({
+                'success': False,
+                'status': 'STALE_QUEUE_WAIT',
+                'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
+                'error': f"STALE_QUEUE_WAIT: queue_wait_ms={queue_wait_ms} > {self.max_queue_wait_ms}",
+                'total_ms': end_to_end_ms,
+                'telemetry': telemetry,
+            })
+            return base
+
         # Constrói bet_types
         t_build = time.time()
         back_bet_type = ApiBetslipClient.build_bet_type(
@@ -776,10 +849,7 @@ class H3bApiAudit:
         lay_total_ms = lay_result.total_time_ms if lay_result else 0
         lay_pmm_ms = max(0, lay_total_ms - lay_post_ms)
 
-        telemetry = {
-            'queue_wait_ms': queue_wait_ms,
-            'queue_depth_at_enqueue': queue_depth_at_enqueue,
-            'queue_depth_after_dequeue': queue_depth_after_dequeue,
+        telemetry.update({
             'build_bet_type_ms': build_bet_type_ms,
             'parallel_fetch_ms': parallel_fetch_ms,
             'back_post_ms': back_post_ms,
@@ -792,25 +862,9 @@ class H3bApiAudit:
             'lay_success': bool(lay_result and lay_result.success),
             'back_error': back_result.error if (back_result and not back_result.success and back_result.error) else '',
             'lay_error': lay_result.error if (lay_result and not lay_result.success and lay_result.error) else '',
-        }
-
-        base = {
-            'event_id': h3b['event_id'],
-            'home_team': h3b['home_team'],
-            'away_team': h3b['away_team'],
-            'league': h3b.get('league', ''),
-            'kickoff': h3b.get('kickoff'),
-            'market_type': h3b['market_type'],
-            'market_period': h3b.get('market_period', 'full_time'),
-            'line': h3b['line'],
-            'side': h3b['side'],
-            'ws_odd': h3b['websocket_odd'],
-            'is_live': h3b.get('is_live'),
-            'direction': h3b.get('direction', 'up'),
-            'detected_at': detected_at,
-            'post_ms': back_post_ms,
-            'pmm_ms': back_pmm_ms,
-        }
+        })
+        base['post_ms'] = back_post_ms
+        base['pmm_ms'] = back_pmm_ms
 
         if not back_result or not back_result.success:
             lay_snapshot = _extract_lay_snapshot(lay_result)
@@ -836,6 +890,7 @@ class H3bApiAudit:
             )
             base.update({
                 'success': False,
+                'status': 'API_FAILED',
                 'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
                 'error': back_err,
                 'total_ms': end_to_end_ms,
@@ -848,6 +903,7 @@ class H3bApiAudit:
 
         base.update({
             'success': True,
+            'status': 'OK',
             'bs_odd': back_result.best_odd,
             'bs_bookie': back_result.best_bookie,
             'bs_limit': back_result.best_limit,
@@ -943,6 +999,10 @@ class H3bApiAudit:
             if telemetry:
                 hypothesis_details['telemetry'] = telemetry
 
+            status = r.get("status")
+            if not status:
+                status = "OK" if r.get("success") else "API_FAILED"
+
             record = BetslipAuditResult(
                 hypothesis_type="H3B",
                 event_id=r['event_id'],
@@ -962,7 +1022,7 @@ class H3bApiAudit:
                 difference_pct=r.get('diff_pct') if r.get('success') else None,
                 difference_absolute=(r['bs_odd'] - r['ws_odd']) if r.get('success') else None,
                 betslip_limit=r.get('bs_limit', 0),
-                status="OK" if r.get('success') else "API_FAILED",
+                status=status,
                 is_valid_opportunity=r.get('success', False),
                 is_live=r.get('is_live'),
                 reversal_direction=r.get('direction', 'up'),
@@ -999,6 +1059,7 @@ class H3bApiAudit:
                 f"last {ws_age:.0f}s | "
                 f"Fila T+0: now={queue_now} max={self.max_queue_depth_observed} | "
                 f"Fila temporal: now={temporal_queue_now} max={self.max_temporal_queue_depth_observed} | "
+                f"drops: fullq={self.dropped_full_queue} staleq={self.dropped_stale_queue_wait} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
                 f"H3B: {self.h3b_detected} | Erros: {self.total_errors}")
 
@@ -1097,6 +1158,18 @@ async def main():
         default=int(os.getenv("AUDIT_TEMPORAL_WORKERS", "2")),
         help="Quantidade de workers paralelos para monitoramento temporal assíncrono",
     )
+    parser.add_argument(
+        "--max-queue-depth",
+        type=int,
+        default=int(os.getenv("AUDIT_MAX_QUEUE_DEPTH", "50")),
+        help="Tamanho máximo da fila T+0 (0=infinito). Acima disso, eventos são descartados.",
+    )
+    parser.add_argument(
+        "--max-queue-wait-ms",
+        type=int,
+        default=int(os.getenv("AUDIT_MAX_QUEUE_WAIT_MS", "5000")),
+        help="Se queue_wait_ms exceder este valor, descarta o evento sem chamar a API (0=desliga).",
+    )
     args = parser.parse_args()
 
     logger.remove()
@@ -1112,6 +1185,8 @@ async def main():
         save_to_db=not args.no_db,
         executor_workers=args.executor_workers,
         temporal_workers=args.temporal_workers,
+        max_queue_depth=args.max_queue_depth,
+        max_queue_wait_ms=args.max_queue_wait_ms,
     )
     await audit.run()
 
