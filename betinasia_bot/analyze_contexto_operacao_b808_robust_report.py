@@ -25,7 +25,7 @@ import random
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1669,7 +1669,9 @@ async def main() -> int:
             "Premissas:\n"
             "- **Mês = 30 dias fixo**.\n"
             "- Turnover = soma de stakes (Back e Lay). Para Lay, também reportamos exposição por **liability**.\n"
-            "- **Banca conservadora** = p99(exposição unitária). **Banca agressiva** = ES95(exposição unitária).\n"
+            "- **Banca por risco (unitária)** = p99/ES95(exposição por aposta).\n"
+            "- **Banca por liquidez (turnover)** = p95/p99 de capital **simultaneamente travado** (stake/liability em aberto até a liquidação), "
+            "capturando distribuição desigual de entradas ao longo do tempo.\n"
             "- Projeção de lucro usa duas visões: (i) **lucro/dia observado** e (ii) **ROI observado × turnover projetado**.\n\n"
         )
 
@@ -1742,6 +1744,86 @@ async def main() -> int:
         if back_bank_aggressive is not None or lay_bank_aggressive is not None:
             total_bank_aggressive = float(back_bank_aggressive or 0.0) + float(lay_bank_aggressive or 0.0)
 
+        # ------------------------------------------------------------
+        # Banca por liquidez (capital travado ao longo do tempo)
+        # ------------------------------------------------------------
+        LIQUIDITY_SETTLE_BUFFER_HOURS = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+        LIQUIDITY_GRID_MINUTES = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+        LIQUIDITY_BANK_BUFFER_PCT = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))  # margem extra
+
+        def _exposure_jobs(rows_in: List[dict], mode: str) -> List[Tuple[datetime, datetime, float]]:
+            """
+            mode='back': exposure=stake
+            mode='lay' : exposure=liability
+            """
+            jobs: List[Tuple[datetime, datetime, float]] = []
+            for d in rows_in:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                if isinstance(ko, datetime):
+                    t1 = ko + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+                else:
+                    t1 = t0 + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+                if not isinstance(t1, datetime) or t1 <= t0:
+                    t1 = t0 + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+
+                bs, _, _, ll = finance_for_row(d)
+                exp = float(bs) if mode == "back" else float(ll)
+                if exp <= 0:
+                    continue
+                jobs.append((t0, t1, exp))
+            return jobs
+
+        def _liquidity_pctl(jobs: List[Tuple[datetime, datetime, float]]) -> Dict[str, Optional[float]]:
+            if not jobs:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+            t_min = min(t0 for t0, _, _ in jobs)
+            t_max = max(t1 for _, t1, _ in jobs)
+            if t_max <= t_min:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+
+            step = max(1, int(LIQUIDITY_GRID_MINUTES))
+            # grid alinhado por minutos (para estabilidade)
+            t = t_min
+            vals: List[float] = []
+            while t <= t_max:
+                s = 0.0
+                for a, b, exp in jobs:
+                    if a <= t < b:
+                        s += float(exp)
+                vals.append(float(s))
+                t = t + timedelta(minutes=step)
+            if not vals:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+            return {
+                "mean": float(np.mean(vals)),
+                "p50": float(np.quantile(vals, 0.50)),
+                "p95": float(np.quantile(vals, 0.95)),
+                "p99": float(np.quantile(vals, 0.99)),
+                "max": float(max(vals)),
+                "n_grid": int(len(vals)),
+            }
+
+        back_jobs = _exposure_jobs([d for d in back_edge], mode="back")
+        lay_jobs = _exposure_jobs([d for d in lay_edge], mode="lay")
+        total_jobs = back_jobs + lay_jobs
+
+        back_liq = _liquidity_pctl(back_jobs)
+        lay_liq = _liquidity_pctl(lay_jobs)
+        total_liq = _liquidity_pctl(total_jobs)
+
+        def _with_buffer(x: Optional[float]) -> Optional[float]:
+            if x is None:
+                return None
+            return float(x) * (1.0 + max(0.0, LIQUIDITY_BANK_BUFFER_PCT) / 100.0)
+
+        total_bank_liq_p99 = _with_buffer(total_liq.get("p99"))
+        total_bank_eff_conservative = None
+        if total_bank_conservative is not None or total_bank_liq_p99 is not None:
+            total_bank_eff_conservative = max(float(total_bank_conservative or 0.0), float(total_bank_liq_p99 or 0.0))
+
         def _roi_on_bank(profit_30d: Optional[float], bank: Optional[float]) -> Optional[float]:
             if profit_30d is None or bank is None or bank <= 0:
                 return None
@@ -1759,7 +1841,7 @@ async def main() -> int:
         )
         lines.append("\n")
 
-        lines.append("**Risco/Banca (exposição unitária)**\n\n")
+        lines.append("**Banca por risco (exposição unitária)**\n\n")
         lines.append("| Bloco | Banca conservadora (p99) | Banca agressiva (ES95) | ROI/banca 30d (direto) | ROI/banca 30d (ROI×turnover) |\n|---|---:|---:|---:|---:|\n")
         lines.append(
             f"| Back (stake) | {_fmt_num(back_bank_conservative, 2)} | {_fmt_num(back_bank_aggressive, 2)} | "
@@ -1777,6 +1859,31 @@ async def main() -> int:
             f"{_fmt_num(_roi_on_bank(total_profit_30d_roi, total_bank_conservative), 2)}% |\n"
         )
         lines.append("\n")
+
+        lines.append("**Banca por liquidez (capital simultaneamente travado)**\n\n")
+        lines.append(
+            f"Definição operacional: cada aposta trava capital de `audited_at` até `kickoff + {LIQUIDITY_SETTLE_BUFFER_HOURS:.2f}h` "
+            f"(grid={LIQUIDITY_GRID_MINUTES}min). A banca recomendada aplica buffer de +{LIQUIDITY_BANK_BUFFER_PCT:.0f}%.\n\n"
+        )
+        lines.append("| Bloco | Liquidez mean | Liquidez p95 | Liquidez p99 | Liquidez max | Banca liq p99 (+buffer) |\n|---|---:|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back (stake) | {_fmt_num(back_liq.get('mean'), 2)} | {_fmt_num(back_liq.get('p95'), 2)} | {_fmt_num(back_liq.get('p99'), 2)} | {_fmt_num(back_liq.get('max'), 2)} | {_fmt_num(_with_buffer(back_liq.get('p99')), 2)} |\n"
+        )
+        lines.append(
+            f"| Lay (liability) | {_fmt_num(lay_liq.get('mean'), 2)} | {_fmt_num(lay_liq.get('p95'), 2)} | {_fmt_num(lay_liq.get('p99'), 2)} | {_fmt_num(lay_liq.get('max'), 2)} | {_fmt_num(_with_buffer(lay_liq.get('p99')), 2)} |\n"
+        )
+        lines.append(
+            f"| Total (Back+Lay) | {_fmt_num(total_liq.get('mean'), 2)} | {_fmt_num(total_liq.get('p95'), 2)} | {_fmt_num(total_liq.get('p99'), 2)} | {_fmt_num(total_liq.get('max'), 2)} | {_fmt_num(total_bank_liq_p99, 2)} |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Banca recomendada (conservadora)**\n\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Banca por risco (p99 unitário, soma) | {_fmt_num(total_bank_conservative, 2)} |\n")
+        lines.append(f"| Banca por liquidez (p99 simultâneo + buffer) | {_fmt_num(total_bank_liq_p99, 2)} |\n")
+        lines.append(f"| Banca efetiva (max das duas) | {_fmt_num(total_bank_eff_conservative, 2)} |\n")
+        lines.append(f"| ROI/banca 30d (direto, banca efetiva) | {_fmt_num(_roi_on_bank(total_profit_30d_direct, total_bank_eff_conservative), 2)}% |\n")
+        lines.append(f"| ROI/banca 30d (ROI×turnover, banca efetiva) | {_fmt_num(_roi_on_bank(total_profit_30d_roi, total_bank_eff_conservative), 2)}% |\n")
 
         lines.append("**Diagnóstico de cobertura (placar/ROI)**\n\n")
         lines.append("| Bloco | Turnover total | Turnover com ROI | Cobertura turnover |\n|---|---:|---:|---:|\n")
@@ -2674,6 +2781,65 @@ async def main() -> int:
 
         FX = float(args.fx_usdbrl or 5.20)
 
+        def _liq_bank_from_sized(rows_b_all: List[dict], rows_l_all: List[dict], scheme: str) -> Optional[float]:
+            """Banca por liquidez: p99 do capital simultaneamente travado (com buffer)."""
+            # Reusa premissas de liquidez do 7.3 (defaults/env)
+            settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+            grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+            buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
+
+            jobs: List[Tuple[datetime, datetime, float]] = []
+
+            for d in rows_b_all:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                if t1 <= t0:
+                    t1 = t0 + timedelta(hours=settle_h)
+                st = _sizing_back(d, scheme)
+                if st is None or float(st) <= 0:
+                    continue
+                jobs.append((t0, t1, float(st)))
+
+            for d in rows_l_all:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                if t1 <= t0:
+                    t1 = t0 + timedelta(hours=settle_h)
+                sized = _sizing_lay_liab(d, scheme)
+                if not sized:
+                    continue
+                liab, _ = sized
+                if liab is None or float(liab) <= 0:
+                    continue
+                jobs.append((t0, t1, float(liab)))
+
+            if not jobs:
+                return None
+            t_min = min(a for a, _, _ in jobs)
+            t_max = max(b for _, b, _ in jobs)
+            if t_max <= t_min:
+                return None
+            step = max(1, int(grid_min))
+            vals: List[float] = []
+            t = t_min
+            while t <= t_max:
+                s = 0.0
+                for a, b, exp in jobs:
+                    if a <= t < b:
+                        s += float(exp)
+                vals.append(float(s))
+                t = t + timedelta(minutes=step)
+            if not vals:
+                return None
+            p99 = float(np.quantile(vals, 0.99))
+            return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
+
         def _summ_strategy(name: str, rows_b: List[dict], rows_l: List[dict], scheme: str):
             eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme)
             el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme)
@@ -2695,13 +2861,29 @@ async def main() -> int:
             stake_avg_lay = (float(el["turnover_stake"]) / lay_n) if lay_n > 0 else None
             liab_avg_lay = (float(el["exposure_liab"]) / lay_n) if lay_n > 0 else None
 
-            bank_back_p99 = eb.get("p99_stake")
-            bank_lay_p99 = el.get("p99_liab")
-            bank_total_p99 = None
+            # Banca por risco (unitária) deve vir do sizing (não só do subconjunto com ROI).
+            risk_back = []
+            for d in rows_b:
+                st = _sizing_back(d, scheme)
+                if st is not None and float(st) > 0:
+                    risk_back.append(float(st))
+            risk_lay = []
+            for d in rows_l:
+                sized = _sizing_lay_liab(d, scheme)
+                if sized and sized[0] is not None and float(sized[0]) > 0:
+                    risk_lay.append(float(sized[0]))
+            bank_back_p99 = _pctl(risk_back, 99) if risk_back else None
+            bank_lay_p99 = _pctl(risk_lay, 99) if risk_lay else None
+            bank_risk_total = None
             if bank_back_p99 is not None or bank_lay_p99 is not None:
-                bank_total_p99 = float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)
+                bank_risk_total = float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)
 
-            roi_bank_30d = (float(profit_30d) / float(bank_total_p99) * 100.0) if (profit_30d is not None and bank_total_p99 and bank_total_p99 > 0) else None
+            bank_liq_total = _liq_bank_from_sized(rows_b, rows_l, scheme)
+            bank_eff = None
+            if bank_risk_total is not None or bank_liq_total is not None:
+                bank_eff = max(float(bank_risk_total or 0.0), float(bank_liq_total or 0.0))
+
+            roi_bank_30d = (float(profit_30d) / float(bank_eff) * 100.0) if (profit_30d is not None and bank_eff and bank_eff > 0) else None
 
             return {
                 "name": name,
@@ -2722,7 +2904,9 @@ async def main() -> int:
                 # 30d
                 "turn_30d": turn_30d,
                 "profit_30d": profit_30d,
-                "bank_total_p99": bank_total_p99,
+                "bank_risk_p99": bank_risk_total,
+                "bank_liq_p99": bank_liq_total,
+                "bank_eff": bank_eff,
                 "roi_bank_30d": roi_bank_30d,
                 # risco
                 "back_bank_p99": bank_back_p99,
@@ -2731,16 +2915,16 @@ async def main() -> int:
                 # BRL
                 "turn_30d_brl": (float(turn_30d) * FX) if turn_30d is not None else None,
                 "profit_30d_brl": (float(profit_30d) * FX) if profit_30d is not None else None,
-                "bank_total_p99_brl": (float(bank_total_p99) * FX) if bank_total_p99 is not None else None,
+                "bank_eff_brl": (float(bank_eff) * FX) if bank_eff is not None else None,
             }
 
         lines.append(
             "| Estratégia | Scheme | N Back (janela) | N Lay (janela) | N Back 30d (proj.) | N Lay 30d (proj.) | "
             "Stake médio Back | Stake médio Lay | Liability média Lay | "
             "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | "
-            "Banca p99 (Back) | Banca p99 (Lay) | Banca p99 (Total) | ROI/banca 30d | "
-            "Turnover 30d (R$) | Lucro 30d (R$) | Banca p99 Total (R$) | DD 30d p95 |\n"
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+            "Banca p99 (Back) | Banca p99 (Lay) | Banca risco p99 (soma) | Banca liquidez p99 (+buf) | Banca recomendada (max) | ROI/banca 30d | "
+            "Turnover 30d (R$) | Lucro 30d (R$) | Banca rec. (R$) | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         )
         for sc in ["FLAT", "KELLY_0.25"]:
             s1 = _summ_strategy("BackFast (<5s, PM) + LayReversal (t_ext<=3s)", strat_back, strat_lay, sc)
@@ -2748,8 +2932,8 @@ async def main() -> int:
                 f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
                 f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
                 f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | "
-                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_total_p99'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
-                f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_total_p99_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
+                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_risk_p99'],2)} | {_fmt_num(s1['bank_liq_p99'],2)} | {_fmt_num(s1['bank_eff'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
+                f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_eff_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
             )
         lines.append(
             "\nNotas:\n"
@@ -2757,7 +2941,7 @@ async def main() -> int:
             "- `BackFast` implementa sua hipótese **Back só quando execução <5s** e pre‑match.\n"
             "- `LayReversal` usa o diagnóstico da seção 8.2b: **subcoorte com reversão** e vale cedo (t_ext<=3s) como proxy de “logo após a reversão”.\n"
             "- `Stake médio` e `Liability média` são **proxies** na unidade monetária do seu limit/finance; valores em **R$** usam fx `--fx-usdbrl`.\n"
-            "- `ROI/banca 30d` usa banca = soma de p99(exposição) Back+Lay (proxy conservador).\n"
+            "- `Banca recomendada` = max( banca por risco p99 (unitária, soma) ; banca por liquidez p99 (+buffer) ).\n"
         )
 
         # ============================================================
