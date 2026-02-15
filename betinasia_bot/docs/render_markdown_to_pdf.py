@@ -141,7 +141,7 @@ def normalize_inline(text: str) -> str:
 
     # `código inline` -> fonte monoespaçada
     # (não suporta múltiplas linhas)
-    text = re.sub(r"`([^`]+)`", r"<font face=\"Courier\">\1</font>", text)
+    text = re.sub(r"`([^`]+)`", r'<font face="Courier">\1</font>', text)
     return text
 
 
