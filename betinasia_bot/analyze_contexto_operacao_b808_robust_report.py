@@ -494,6 +494,12 @@ async def main() -> int:
         default=None,
         help="Se definido, filtra auditorias por janela móvel (a.audited_at >= NOW() - N dias).",
     )
+    parser.add_argument(
+        "--exec-bucket",
+        default=None,
+        help="Opcional. Filtra o relatório para um (ou mais) regimes operacionais por tempo total. "
+        "Ex.: \"< 5s\" ou \"< 5s,5-10s\".",
+    )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
     parser.add_argument(
         "--pdf",
@@ -815,6 +821,11 @@ async def main() -> int:
                     e["clv_ws_adicional"] = e.get("clv_ws")
                     e["clv_bs_adicional"] = e.get("clv_bs")
 
+        # Filtro opcional por regime de execução (tempo total)
+        if args.exec_bucket:
+            wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
+            all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
+
         # Helpers para métricas por modelo
         def subset_model(model_name: str) -> List[Dict[str, Any]]:
             return [d for d in all_data if d.get("model") == model_name]
@@ -827,7 +838,10 @@ async def main() -> int:
         # --- relatório markdown ---
         now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
         lines: List[str] = []
-        lines.append("# Análise Estatística Robusta — Contexto Operação (b808)\n")
+        title = "Análise Estatística Robusta — Contexto Operação (b808)"
+        if args.exec_bucket:
+            title += f" — Regime(s): {args.exec_bucket}"
+        lines.append(f"# {title}\n")
         lines.append(f"**Data da execução:** {now_utc}  \n")
         lines.append("**Escopo:** H3B (auditoria), com comparação por `audit_version` e inferência robusta por jogo (cluster bootstrap).  \n")
         lines.append("**Nota:** a robustez aqui significa que intervalos de confiança consideram correlação intra-jogo (múltiplas auditorias por partida).\n")
@@ -939,46 +953,47 @@ async def main() -> int:
             )
         lines.append("\n---\n")
 
-        # 2.3) Regimes operacionais por bucket de tempo total (lag_total_ms)
-        lines.append("### 2.3 Regimes operacionais por tempo total (bucket)\n")
-        lines.append(
-            "Objetivo: separar a amostra em **regimes de execução** (tempo total) e medir performance em cada regime. "
-            "Use isso para detectar **fila/saturação**: regimes lentos tendem a ter edge menor e pior ROI.\n\n"
-        )
-        lines.append("| Bucket (tempo total) | N OK | Jogos | lag_total mean (ms) | lag_total p95 (ms) | overhead p95 (ms) | Back edge | Lay edge | CLV PM (mean; IC90) | ROI (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-        for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
-            sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
-            if not sub:
-                lines.append(f"| {b} | 0 | 0 | — | — | — | 0 | 0 | — | — |\n")
-                continue
-            lags = [float(x) for x in [(_safe_float(d.get("lag_total_ms"))) for d in sub] if x is not None and x > 0]
-            over = [float(x) for x in [(_safe_float(d.get("lag_overhead_ms"))) for d in sub] if x is not None]
-            lag_mean = float(np.mean(lags)) if lags else None
-            lag_p95 = float(np.quantile(lags, 0.95)) if lags else None
-            ov_p95 = float(np.quantile(over, 0.95)) if over else None
-
-            n_matches = len({int(d["match_id"]) for d in sub})
-            n_back = sum(1 for d in sub if int(d["id"]) in back_edge_ids)
-            n_lay = sum(1 for d in sub if int(d["id"]) in lay_edge_ids)
-
-            clv_pm = summarize_metric(
-                [d.get("clv_bs") for d in sub if d.get("is_live") is False],
-                [d.get("match_id") for d in sub if d.get("is_live") is False],
-                clip_low=-50,
-                clip_high=50,
-            )
-            roi_all = summarize_metric(
-                [d.get("roi_bs") for d in sub],
-                [d.get("match_id") for d in sub],
-                clip_low=-100,
-                clip_high=500,
-            )
-            clv_txt = f"{_fmt_pct(clv_pm.mean_cluster,2)} {_fmt_ci(clv_pm.ci90_cluster,2)}" if clv_pm.n_events else "—"
-            roi_txt = f"{_fmt_pct(roi_all.mean_cluster,2)} {_fmt_ci(roi_all.ci90_cluster,2)}" if roi_all.n_events else "—"
+        if not args.exec_bucket:
+            # 2.3) Regimes operacionais por bucket de tempo total (lag_total_ms)
+            lines.append("### 2.3 Regimes operacionais por tempo total (bucket)\n")
             lines.append(
-                f"| {b} | {len(sub)} | {n_matches} | {_fmt_num(lag_mean,0)} | {_fmt_num(lag_p95,0)} | {_fmt_num(ov_p95,0)} | {n_back} | {n_lay} | {clv_txt} | {roi_txt} |\n"
+                "Objetivo: separar a amostra em **regimes de execução** (tempo total) e medir performance em cada regime. "
+                "Use isso para detectar **fila/saturação**: regimes lentos tendem a ter edge menor e pior ROI.\n\n"
             )
-        lines.append("\n---\n")
+            lines.append("| Bucket (tempo total) | N OK | Jogos | lag_total mean (ms) | lag_total p95 (ms) | overhead p95 (ms) | Back edge | Lay edge | CLV PM (mean; IC90) | ROI (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
+                sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
+                if not sub:
+                    lines.append(f"| {b} | 0 | 0 | — | — | — | 0 | 0 | — | — |\n")
+                    continue
+                lags = [float(x) for x in [(_safe_float(d.get("lag_total_ms"))) for d in sub] if x is not None and x > 0]
+                over = [float(x) for x in [(_safe_float(d.get("lag_overhead_ms"))) for d in sub] if x is not None]
+                lag_mean = float(np.mean(lags)) if lags else None
+                lag_p95 = float(np.quantile(lags, 0.95)) if lags else None
+                ov_p95 = float(np.quantile(over, 0.95)) if over else None
+
+                n_matches = len({int(d["match_id"]) for d in sub})
+                n_back = sum(1 for d in sub if int(d["id"]) in back_edge_ids)
+                n_lay = sum(1 for d in sub if int(d["id"]) in lay_edge_ids)
+
+                clv_pm = summarize_metric(
+                    [d.get("clv_bs") for d in sub if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                roi_all = summarize_metric(
+                    [d.get("roi_bs") for d in sub],
+                    [d.get("match_id") for d in sub],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                clv_txt = f"{_fmt_pct(clv_pm.mean_cluster,2)} {_fmt_ci(clv_pm.ci90_cluster,2)}" if clv_pm.n_events else "—"
+                roi_txt = f"{_fmt_pct(roi_all.mean_cluster,2)} {_fmt_ci(roi_all.ci90_cluster,2)}" if roi_all.n_events else "—"
+                lines.append(
+                    f"| {b} | {len(sub)} | {n_matches} | {_fmt_num(lag_mean,0)} | {_fmt_num(lag_p95,0)} | {_fmt_num(ov_p95,0)} | {n_back} | {n_lay} | {clv_txt} | {roi_txt} |\n"
+                )
+            lines.append("\n---\n")
 
         # 3) CLV pre-match (robusto)
         lines.append("## 3) CLV pre-match (núcleo)\n")
@@ -1802,6 +1817,10 @@ async def main() -> int:
                 "ext_at_end": bool(a.get("ext_at_end")),
                 "monotonic": bool(a.get("monotonic")),
                 "t_ext": a.get("t_ext"),
+                "odd_t0": float(p0["odd"]),
+                "odd_ext": float(a["odd_ext"]),
+                "odd_last": float(plast["odd"]),
+                "closing_odd": _safe_float(closing),
                 "clv_t0": clv0,
                 "clv_ext": clve,
                 "clv_last": clvl,
@@ -1883,6 +1902,18 @@ async def main() -> int:
             "\nNota interpretativa: a subcoorte **COM_REVERSAO** pode ter CLV maior no **pico** porque, por definição, ela inclui casos em que o edge atingiu um extremo mais alto antes de reverter. "
             "Para entender a hipótese 'sem reversão deveria ser maior', compare também a categoria '**pico no fim, sem reversão**' na partição 100% (tabela 8.1).\n"
         )
+        lines.append("\n**Decomposição (pre-match): entry_odd vs closing_odd (IC90)**\n\n")
+        lines.append("| Subcoorte | N CLV (PM) | entry_odd t0 (mean; IC90) | entry_odd pico (mean; IC90) | closing_odd (mean; IC90) |\n|---|---:|---:|---:|---:|\n")
+        for label, filt in [
+            ("SEM_REVERSAO", [r for r in back_entries if (not r.get("had_reversal")) and r.get("is_live") is False]),
+            ("COM_REVERSAO", [r for r in back_entries if r.get("had_reversal") and r.get("is_live") is False]),
+        ]:
+            s_t0 = summarize_metric([r.get("odd_t0") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            s_ext = summarize_metric([r.get("odd_ext") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            s_clo = summarize_metric([r.get("closing_odd") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            lines.append(
+                f"| {label} | {s_clo.n_events} | {_fmt_num(s_t0.mean_cluster,3)} {_fmt_ci(s_t0.ci90_cluster,3,suffix='')} | {_fmt_num(s_ext.mean_cluster,3)} {_fmt_ci(s_ext.ci90_cluster,3,suffix='')} | {_fmt_num(s_clo.mean_cluster,3)} {_fmt_ci(s_clo.ci90_cluster,3,suffix='')} |\n"
+            )
 
         # LAY
         lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
