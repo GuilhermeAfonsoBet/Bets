@@ -512,6 +512,12 @@ async def main() -> int:
     parser.add_argument("--stake-pct-of-limit", type=float, default=0.25, help="Stake fallback (%% do limite), default 0.25")
     parser.add_argument("--stake-cap", type=float, default=0.0, help="Cap opcional para stake fallback (0=sem cap)")
     parser.add_argument(
+        "--fx-usdbrl",
+        type=float,
+        default=5.20,
+        help="Taxa de conversão para reportar valores em R$ (default: 5.20).",
+    )
+    parser.add_argument(
         "--git-commit",
         action="store_true",
         help="Se definido, adiciona o .md/.pdf gerados ao git e cria um commit local (não faz push).",
@@ -2627,35 +2633,92 @@ async def main() -> int:
             if ok:
                 strat_lay.append(d)
 
+        FX = float(args.fx_usdbrl or 5.20)
+
         def _summ_strategy(name: str, rows_b: List[dict], rows_l: List[dict], scheme: str):
             eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme)
             el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme)
-            # projeção 30d direta (escala por dias observados)
+
+            back_n = int(eb["n"] or 0)
+            lay_n = int(el["n"] or 0)
+            back_n_30d = int(round((back_n / window_days) * horizon_days)) if window_days > 0 else None
+            lay_n_30d = int(round((lay_n / window_days) * horizon_days)) if window_days > 0 else None
+
+            turn_win = float(eb["turnover"] + el["turnover_stake"])
+            prof_win = float(eb["profit"] + el["profit"])
+            roi_turn_win = (prof_win / turn_win * 100.0) if turn_win > 0 else None
+
+            turn_30d = _proj_30(turn_win)
+            profit_30d = _proj_30(prof_win)
+
+            # stake/liability médios na janela (proxy)
+            stake_avg_back = (float(eb["turnover"]) / back_n) if back_n > 0 else None
+            stake_avg_lay = (float(el["turnover_stake"]) / lay_n) if lay_n > 0 else None
+            liab_avg_lay = (float(el["exposure_liab"]) / lay_n) if lay_n > 0 else None
+
+            bank_back_p99 = eb.get("p99_stake")
+            bank_lay_p99 = el.get("p99_liab")
+            bank_total_p99 = None
+            if bank_back_p99 is not None or bank_lay_p99 is not None:
+                bank_total_p99 = float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)
+
+            roi_bank_30d = (float(profit_30d) / float(bank_total_p99) * 100.0) if (profit_30d is not None and bank_total_p99 and bank_total_p99 > 0) else None
+
             return {
                 "name": name,
                 "scheme": scheme,
-                "back_n": eb["n"],
-                "lay_n": el["n"],
-                "turn_30d": _proj_30(eb["turnover"] + el["turnover_stake"]),
-                "profit_30d": _proj_30(eb["profit"] + el["profit"]),
-                "roi_turn": ((eb["profit"] + el["profit"]) / max(1e-9, (eb["turnover"] + el["turnover_stake"])) * 100.0) if (eb["turnover"] + el["turnover_stake"]) > 0 else None,
-                "back_bank_p99": eb["p99_stake"],
-                "lay_bank_p99": el["p99_liab"],
+                # N: sempre na janela; também reportamos projeção simples 30d
+                "back_n": back_n,
+                "lay_n": lay_n,
+                "back_n_30d": back_n_30d,
+                "lay_n_30d": lay_n_30d,
+                # stake sizing médio (janela)
+                "stake_avg_back": stake_avg_back,
+                "stake_avg_lay": stake_avg_lay,
+                "liab_avg_lay": liab_avg_lay,
+                # janela
+                "turn_win": turn_win,
+                "prof_win": prof_win,
+                "roi_turn_win": roi_turn_win,
+                # 30d
+                "turn_30d": turn_30d,
+                "profit_30d": profit_30d,
+                "bank_total_p99": bank_total_p99,
+                "roi_bank_30d": roi_bank_30d,
+                # risco
+                "back_bank_p99": bank_back_p99,
+                "lay_bank_p99": bank_lay_p99,
                 "dd_p95": max([x for x in [eb["dd_p95"], el["dd_p95"]] if x is not None], default=None),
+                # BRL
+                "turn_30d_brl": (float(turn_30d) * FX) if turn_30d is not None else None,
+                "profit_30d_brl": (float(profit_30d) * FX) if profit_30d is not None else None,
+                "bank_total_p99_brl": (float(bank_total_p99) * FX) if bank_total_p99 is not None else None,
             }
 
-        lines.append("| Estratégia | Scheme | N Back | N Lay | Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | p99 stake (Back) | p99 liability (Lay) | DD 30d p95 |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        lines.append(
+            "| Estratégia | Scheme | N Back (janela) | N Lay (janela) | N Back 30d (proj.) | N Lay 30d (proj.) | "
+            "Stake médio Back | Stake médio Lay | Liability média Lay | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | "
+            "Banca p99 (Back) | Banca p99 (Lay) | Banca p99 (Total) | ROI/banca 30d | "
+            "Turnover 30d (R$) | Lucro 30d (R$) | Banca p99 Total (R$) | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        )
         for sc in ["FLAT", "KELLY_0.25"]:
             s1 = _summ_strategy("BackFast (<5s, PM) + LayReversal (t_ext<=3s)", strat_back, strat_lay, sc)
             lines.append(
-                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn'],2)}% | "
-                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
+                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
+                f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
+                f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | "
+                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_total_p99'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
+                f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_total_p99_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
             )
         lines.append(
             "\nNotas:\n"
+            "- **N Back/Lay** na tabela é **na janela observada**. As colunas `N 30d (proj.)` são uma **escala linear** por dias observados.\n"
             "- `BackFast` implementa sua hipótese **Back só quando execução <5s** e pre‑match.\n"
             "- `LayReversal` usa o diagnóstico da seção 8.2b: **subcoorte com reversão** e vale cedo (t_ext<=3s) como proxy de “logo após a reversão”.\n"
-            "- As projeções 30d aqui são **escala linear** pelo número de dias observados; para uma projeção mais robusta, rode com lookback maior.\n"
+            "- `Stake médio` e `Liability média` são **proxies** na unidade monetária do seu limit/finance; valores em **R$** usam fx `--fx-usdbrl`.\n"
+            "- `ROI/banca 30d` usa banca = soma de p99(exposição) Back+Lay (proxy conservador).\n"
         )
 
         # ============================================================
@@ -2717,13 +2780,85 @@ async def main() -> int:
         # ============================================================
         # 11) Conclusões, riscos e pontos em aberto
         # ============================================================
-        lines.append("## 11) Conclusões, riscos e pontos em aberto\n")
-        lines.append("- **Execução (CLV)**: use as seções 3/6 para validar qualidade de execução (especialmente pre-match). Se CLV cluster ficar robustamente positivo, há evidência de boa entrada; se ficar negativo, há erosão estrutural.\n")
-        lines.append("- **Pre-match vs in-match**: valide que o comportamento de edge/diff e ROI (quando houver placar) difere entre regimes (seção 2.2). Não é seguro misturar regimes para decisão.\n")
-        lines.append("- **Lay**: não pode ser decidido por média. Governança tem que usar p95/p99/ES95 de liability (seção 7.2) e combos com risco (seção 9.2). Se p99/ES95 forem altos, a estratégia precisa limite de exposição por janela.\n")
-        lines.append("- **Temporal (retenção de edge)**: se a cobertura `temporal/lay_temporal` for baixa, a inferência de retenção fica limitada (seção 8). Quando há cobertura, delta e retenção indicam se o edge “some” rápido.\n")
-        lines.append("- **ROI/resultado realizado**: sem placares no banco, ROI fica 0/ausente e a conclusão financeira final não é possível (seção 10). Primeiro garanta o job de resultados.\n")
-        lines.append("- **Pontos em aberto típicos**: (i) trazer DOM para a mesma janela, (ii) garantir atualização de placares, (iii) aumentar cobertura temporal e finance no `hypothesis_details`, (iv) definir política de banca para Lay.\n")
+        lines.append("## 11) Conclusões (visão de investidor), riscos e próximos passos\n")
+        lines.append(
+            "Esta seção é escrita como se um investidor externo estivesse avaliando a tese: **há edge replicável? o sistema executa? "
+            "o risco é governável? a mensuração é confiável?**\n\n"
+        )
+
+        lines.append("### 11.1 O que já está forte (e por quê)\n")
+        lines.append(
+            "- **Evidência de execução (CLV pre‑match)**: CLV robusto por jogo positivo é um dos melhores sinais de edge/execução em janela curta. "
+            "Diferente de ROI, CLV não depende de amostra grande de jogos liquidados; ele mede **qualidade de entrada**.\n"
+        )
+        lines.append(
+            "- **Controle de latência por regime**: o relatório já separa regimes de execução por tempo total (2.3/2.3b). "
+            "Isso permite uma regra objetiva de operação (ex.: só operar `exec_bucket < 5s`).\n"
+        )
+        lines.append(
+            "- **Separação Back vs Lay**: Back e Lay têm perfis de risco diferentes. Lay deve ser governado por **liability** (p95/p99/ES), "
+            "e isso já aparece como métrica de banca e risco.\n\n"
+        )
+
+        lines.append("### 11.2 O que ainda está frágil (e impede captação hoje)\n")
+        lines.append(
+            "- **ROI ainda não é prova**: mesmo quando ROI aparece, a incerteza por jogo pode ser grande e a cobertura de placar pode ser incompleta. "
+            "Para captação, um investidor vai pedir **histórico maior**, **pipeline de resultados estável** e **métrica de drawdown** bem definida.\n"
+        )
+        lines.append(
+            "- **Risco de viés por falhas de coleta**: quando o collector fica “active” mas não coleta odds, você perde janelas do mercado de forma não aleatória. "
+            "Isso impacta a extrapolação para execução.\n"
+        )
+        lines.append(
+            "- **Stake sizing ainda é proxy**: parte do sizing usa limit/finance como aproximação. Para captação, é necessário um sizing governado por risco "
+            "e consistente com edge (ex.: Kelly fracionado + caps), com auditoria clara.\n\n"
+        )
+
+        lines.append("### 11.3 Avaliação das 2 estratégias candidatas (como um investidor leria)\n")
+        lines.append(
+            "Você propôs duas teses operacionais coerentes com o mecanismo observado:\n"
+            "1) **BackFast**: operar Back edge apenas quando a execução foi rápida (`< 5s`) e pre‑match.\n"
+            "2) **LayReversal**: operar Lay edge apenas quando há reversão e entrar próximo do vale (t_ext curto).\n\n"
+        )
+        lines.append(
+            "O relatório quantifica isso na **Seção 9.4** com (i) N na janela, (ii) projeção 30d, "
+            "(iii) stake/liability médio, (iv) banca p99 e ROI/banca mensal, e (v) drawdown p95.\n\n"
+        )
+        lines.append(
+            "**Como um investidor decide**: ele vai priorizar uma estratégia com\n"
+            "- sinal de edge (CLV) consistente,\n"
+            "- execução estável (latência controlada),\n"
+            "- sizing governado por risco (caps + banca p99/ES),\n"
+            "- e um perfil de drawdown aceitável no horizonte de caixa.\n\n"
+        )
+
+        lines.append("### 11.4 Stake sizing: recomendação inicial para produção (sem overfitting)\n")
+        lines.append(
+            "- Use **baseline FLAT** como controle (para detectar se o sizing está degradando performance).\n"
+            "- Para Back, use **Kelly fracionado** (ex.: `KELLY_0.25`) apenas quando houver `closing_odd` (pre‑match), com **cap** por aposta (ex.: 2% da banca p99).\n"
+            "- Para Lay, faça sizing por **liability**, com cap mais conservador (ex.: 1% da banca p99) e monitoramento de cauda (p95/p99/ES95).\n\n"
+        )
+        lines.append(
+            "A Seção 9.3 compara `FLAT` vs `PROXY` vs `KELLY` (fracionado) no subconjunto com placar, "
+            "e reporta risco (p99/ES) e drawdown 30d via bootstrap.\n\n"
+        )
+
+        lines.append("### 11.5 Status para captação (checkpoint objetivo)\n")
+        lines.append(
+            "Se você estivesse captando hoje, um investidor institucional provavelmente pediria:\n"
+            "- **(A)** 30–90 dias de execução estável com SLO de coleta (collector), auditoria e resultados.\n"
+            "- **(B)** KPIs: CLV pre‑match por jogo estável; latência por bucket; taxa de falhas; cobertura de placar.\n"
+            "- **(C)** Política de risco: banca por p99/ES, caps por aposta, limites por janela e mecanismos de stop.\n"
+            "- **(D)** Demonstração de P&L com sizing definido (não só proxy) e drawdown observado/estimado.\n\n"
+        )
+        lines.append(
+            "Minha leitura: **a tese de edge/execução parece promissora pelo CLV**, mas o projeto ainda está em fase de "
+            "**consolidação operacional/medição** para uma captação “grande”. Um caminho pragmático é:\n"
+            "- validar BackFast com sizing conservador e risco baixo,\n"
+            "- validar LayReversal com governança de liability,\n"
+            "- e só então ampliar banca.\n"
+        )
+
         lines.append("\n---\n")
 
         # ============================================================
