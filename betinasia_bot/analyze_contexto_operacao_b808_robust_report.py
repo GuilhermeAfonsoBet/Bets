@@ -614,10 +614,6 @@ async def main() -> int:
                 d["lag_e2e_ms"] = float(det_ms + bs_ms)
             else:
                 d["lag_e2e_ms"] = None
-            if total_ms is not None and total_ms > 0 and d.get("lag_e2e_ms") is not None:
-                d["lag_overhead_ms"] = float(total_ms - float(d["lag_e2e_ms"]))
-            else:
-                d["lag_overhead_ms"] = None
 
             # Lag "total" em parede (se timestamps existem): audited_at - detected_at
             d["lag_wall_ms"] = None
@@ -631,6 +627,16 @@ async def main() -> int:
 
             # Lag total operacional: preferimos wall_ms; fallback = audit_total_ms
             d["lag_total_ms"] = _safe_float(d.get("lag_wall_ms")) or _safe_float(d.get("audit_total_ms")) or None
+
+            # Overhead operacional: total_observado - e2e_instrumentado
+            # (usa lag_total_ms, não audit_total_ms; audit_total pode ter janela diferente em alguns regimes/versões)
+            if d.get("lag_total_ms") is not None and d.get("lag_e2e_ms") is not None:
+                d["lag_overhead_ms"] = float(d["lag_total_ms"]) - float(d["lag_e2e_ms"])
+            elif total_ms is not None and total_ms > 0 and d.get("lag_e2e_ms") is not None:
+                # fallback
+                d["lag_overhead_ms"] = float(total_ms - float(d["lag_e2e_ms"]))
+            else:
+                d["lag_overhead_ms"] = None
 
             # ROI
             roi_ws, roi_bs = compute_roi_pct(
@@ -893,7 +899,7 @@ async def main() -> int:
         lines.append("### 2.0b Decomposição do tempo (detecção→clique→betslip vs. overhead)\n")
         lines.append(
             "Interpretação: `lag_e2e` é o **tempo fim-a-fim** (detecção→clique + clique→betslip). "
-            "`overhead` = `audit_total` − `lag_e2e` (proxy de fila/retries/esperas fora das 2 etapas instrumentadas).\n\n"
+            "`overhead` = `lag_total` − `lag_e2e` (proxy de fila/retries/esperas fora das 2 etapas instrumentadas).\n\n"
         )
 
         def _stage_stats(rows_in: List[Dict[str, Any]], key: str) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
