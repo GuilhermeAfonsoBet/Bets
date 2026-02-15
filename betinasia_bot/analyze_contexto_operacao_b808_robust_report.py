@@ -755,6 +755,12 @@ async def main() -> int:
                 d["clv_ws"] = None
                 d["clv_bs"] = None
 
+        # Filtro opcional por regime de execução (tempo total) — aplicado ANTES de qualquer métrica,
+        # para não misturar regimes em CLV adicional, buckets, finanças, etc.
+        if args.exec_bucket:
+            wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
+            all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
+
         # Filtro qualidade betslip (igual ao script: -10 a +10)
         with_bs_raw = [d for d in all_data if d.get("bs_odd") and d["bs_odd"] > 0]
         with_bs = [d for d in with_bs_raw if d.get("diff_pct") is not None and -10 <= float(d["diff_pct"]) <= 10]
@@ -820,11 +826,6 @@ async def main() -> int:
                     e["clv_baseline"] = None
                     e["clv_ws_adicional"] = e.get("clv_ws")
                     e["clv_bs_adicional"] = e.get("clv_bs")
-
-        # Filtro opcional por regime de execução (tempo total)
-        if args.exec_bucket:
-            wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
-            all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
 
         # Helpers para métricas por modelo
         def subset_model(model_name: str) -> List[Dict[str, Any]]:
