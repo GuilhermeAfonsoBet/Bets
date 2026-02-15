@@ -907,6 +907,23 @@ async def main() -> int:
         lines.append(f"| Tempo instrumentado (detecção→clique→betslip) | {_fmt_num(api_lag_e2e, 0)} ms | {_fmt_num(dom_lag_e2e, 0)} ms |\n")
         lines.append("\n---\n")
 
+        # 2.0a) Glossário (métricas-chave)
+        lines.append("### 2.0a Glossário de métricas (definições operacionais)\n")
+        lines.append(
+            "Este glossário existe para eliminar ambiguidades entre **tempo total**, **tempos instrumentados** e **overhead**.\n\n"
+        )
+        lines.append("- **`hypothesis_detected_at`**: timestamp (UTC) de detecção do evento que gerou a auditoria.\n")
+        lines.append("- **`audited_at`**: timestamp (UTC) em que a auditoria foi concluída/persistida.\n")
+        lines.append("- **`lag_total_ms` (tempo total observado / wall)**: proxy de tempo “de parede” do pipeline do evento até o betslip; quando disponível usa wall time (ex.: `audited_at - detected_at`).\n")
+        lines.append("- **`lag_det_to_click_ms` (detecção→clique)**: tempo até o robô executar o clique/ação de betslip.\n")
+        lines.append("- **`lag_click_to_betslip_ms` (clique→betslip)**: tempo até carregar/obter o payload do betslip após o clique.\n")
+        lines.append("- **`lag_e2e_ms` (tempo instrumentado)**: `lag_det_to_click_ms + lag_click_to_betslip_ms`.\n")
+        lines.append("- **`audit_total_ms` (duração da auditoria)**: duração instrumentada do ciclo de auditoria (pode diferir de `lag_total_ms` se houver esperas fora do escopo instrumentado).\n")
+        lines.append("- **`lag_overhead_ms` (overhead)**: `lag_total_ms - lag_e2e_ms`; agrega espera fora das duas etapas instrumentadas (ex.: fila, retries, pausas, latência externa).\n")
+        lines.append("- **`diff_pct` (BS vs WS)**: diferença percentual entre preço do betslip (BS) e referência (WS) no momento; buckets `BS>WS` e `BS<WS` são usados como proxies de coortes Back/Lay.\n")
+        lines.append("- **Betslip confiável**: filtro de qualidade `diff_pct ∈ [-10%, +10%]` para reduzir casos de mismatch/parse incorreto.\n")
+        lines.append("\n---\n")
+
         # 2.0b) Decomposição de latência (foco: fila/overhead)
         lines.append("### 2.0b Decomposição do tempo (detecção→clique→betslip vs. overhead)\n")
         lines.append(
@@ -1040,6 +1057,56 @@ async def main() -> int:
                 )
             lines.append("\n---\n")
 
+            # 2.3b) Mesmo bucket, mas separando coortes Back/Lay (diff buckets)
+            lines.append("### 2.3b Regimes por tempo total — separando Back vs Lay (por `diff_pct`)\n")
+            lines.append(
+                "Nesta tabela, **Back** = `diff_pct >= +2%` (bucket `BS > WS`) e **Lay** = `diff_pct <= -2%` (bucket `BS < WS`). "
+                "CLV é reportado apenas em pre‑match.\n\n"
+            )
+            lines.append("| Bucket | N OK | Back edge | Lay edge | CLV PM Back (mean; IC90) | CLV PM Lay (mean; IC90) | ROI Back (mean; IC90) | ROI Lay (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+            for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
+                sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
+                if not sub:
+                    lines.append(f"| {b} | 0 | 0 | 0 | — | — | — | — |\n")
+                    continue
+
+                sub_back = [d for d in sub if int(d["id"]) in back_edge_ids]
+                sub_lay = [d for d in sub if int(d["id"]) in lay_edge_ids]
+
+                clv_back = summarize_metric(
+                    [d.get("clv_bs") for d in sub_back if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub_back if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                clv_lay = summarize_metric(
+                    [d.get("clv_bs") for d in sub_lay if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub_lay if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                roi_back = summarize_metric(
+                    [d.get("roi_bs") for d in sub_back],
+                    [d.get("match_id") for d in sub_back],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                roi_lay = summarize_metric(
+                    [d.get("roi_bs") for d in sub_lay],
+                    [d.get("match_id") for d in sub_lay],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+
+                clv_back_txt = f"{_fmt_pct(clv_back.mean_cluster,2)} {_fmt_ci(clv_back.ci90_cluster,2)}" if clv_back.n_events else "—"
+                clv_lay_txt = f"{_fmt_pct(clv_lay.mean_cluster,2)} {_fmt_ci(clv_lay.ci90_cluster,2)}" if clv_lay.n_events else "—"
+                roi_back_txt = f"{_fmt_pct(roi_back.mean_cluster,2)} {_fmt_ci(roi_back.ci90_cluster,2)}" if roi_back.n_events else "—"
+                roi_lay_txt = f"{_fmt_pct(roi_lay.mean_cluster,2)} {_fmt_ci(roi_lay.ci90_cluster,2)}" if roi_lay.n_events else "—"
+                lines.append(
+                    f"| {b} | {len(sub)} | {len(sub_back)} | {len(sub_lay)} | {clv_back_txt} | {clv_lay_txt} | {roi_back_txt} | {roi_lay_txt} |\n"
+                )
+            lines.append("\n---\n")
+
         # 3) CLV pre-match (robusto)
         lines.append("## 3) CLV pre-match (núcleo)\n")
         lines.append("### 3.1 CLV com odd do Betslip (execução real)\n")
@@ -1151,6 +1218,12 @@ async def main() -> int:
         # 6.1 buckets
         bucket_clv_pm: Dict[str, MetricSummary] = {}
         lines.append("### 6.1 Buckets por diferença BS vs WS\n")
+        lines.append(
+            "Nota de leitura:\n"
+            "- `BS > WS (+2% a +10%)` é a região típica de **Back edge** (preço no betslip acima da referência).\n"
+            "- `BS < WS (-10% a -2%)` é a região típica de **Lay edge** (preço no betslip abaixo da referência).\n"
+            "- O ROI abaixo é calculado **dentro do bucket** (não mistura buckets), mas ainda é sensível à cobertura de placar.\n\n"
+        )
         lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---:|---:|---|\n")
         for bucket in ["BS < WS (-10% a -2%)", "BS ~ WS (-2% a +2%)", "BS > WS (+2% a +10%)"]:
             subset = [d for d in with_bs if d.get("diff_bucket") == bucket]
