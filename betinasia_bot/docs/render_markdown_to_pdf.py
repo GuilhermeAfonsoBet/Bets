@@ -198,8 +198,14 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
     raw_widths = [(w / total_weight) * available_width for w in col_weights]
 
     # Largura mínima evita esmagar colunas pequenas.
-    min_col = min(75.0, max(48.0, available_width * 0.08))
-    col_widths = [max(min_col, w) for w in raw_widths]
+    # Porém, quando n_cols é grande, `n_cols * min_col` pode estourar a página e quebrar o layout.
+    # Ajustamos min_col dinamicamente para sempre caber.
+    base_min = min(75.0, max(48.0, available_width * 0.08))
+    # Se a tabela é "larga", reduz min_col para caber.
+    if n_cols * base_min > available_width:
+        base_min = max(14.0, (available_width / float(n_cols)) * 0.98)
+    min_col = float(base_min)
+    col_widths = [max(min_col, float(w)) for w in raw_widths]
     width_over = sum(col_widths) - available_width
     if width_over > 0:
         # Ajuste proporcional sem quebrar mínimos.
@@ -230,21 +236,24 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
         table_data.append(row_cells)
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
-    body_font_size = 9 if n_cols <= 7 else (8 if n_cols <= 10 else 7.5)
+    body_font_size = 9 if n_cols <= 7 else (8 if n_cols <= 10 else (7.5 if n_cols <= 14 else 6.8))
+    header_font_size = 9 if n_cols <= 10 else (8 if n_cols <= 14 else 6.8)
+    pad_lr = 5 if n_cols <= 10 else (3 if n_cols <= 14 else 1.5)
+    pad_tb = 4 if n_cols <= 10 else (3 if n_cols <= 14 else 2)
     table.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3b73")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("FONTSIZE", (0, 0), (-1, 0), header_font_size),
                 ("FONTSIZE", (0, 1), (-1, -1), body_font_size),
                 ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), pad_lr),
+                ("RIGHTPADDING", (0, 0), (-1, -1), pad_lr),
+                ("TOPPADDING", (0, 0), (-1, -1), pad_tb),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), pad_tb),
                 ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
             ]
         )
