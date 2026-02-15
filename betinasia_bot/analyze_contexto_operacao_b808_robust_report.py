@@ -921,6 +921,31 @@ async def main() -> int:
             ]:
                 mu, p50, p95, n = _stage_stats(rows_in, key)
                 lines.append(f"| {model_name} | {label} | {_fmt_num(mu,0)} | {_fmt_num(p50,0)} | {_fmt_num(p95,0)} | {n} |\n")
+
+        # Diagnóstico de cauda (% acima de thresholds) e consistência do overhead
+        def _pct_gt(rows_in: List[Dict[str, Any]], key: str, thr_ms: float) -> Optional[float]:
+            vals = [_safe_float(d.get(key)) for d in rows_in]
+            vals = [float(v) for v in vals if v is not None]
+            if not vals:
+                return None
+            return 100.0 * sum(1 for v in vals if v > thr_ms) / len(vals)
+
+        def _pct_lt(rows_in: List[Dict[str, Any]], key: str, thr_ms: float) -> Optional[float]:
+            vals = [_safe_float(d.get(key)) for d in rows_in]
+            vals = [float(v) for v in vals if v is not None]
+            if not vals:
+                return None
+            return 100.0 * sum(1 for v in vals if v < thr_ms) / len(vals)
+
+        lines.append("\n**Diagnóstico de cauda (percentual acima do limiar)**\n\n")
+        lines.append("| Modelo | % det→click > 5s | % det→click > 20s | % total > 10s | % total > 40s | % overhead < 0 |\n|---|---:|---:|---:|---:|---:|\n")
+        for model_name, rows_in in [("API (2-4s)", api_all), ("DOM (15-30s)", dom_all)]:
+            p1 = _pct_gt(rows_in, "lag_det_to_click_ms", 5000)
+            p2 = _pct_gt(rows_in, "lag_det_to_click_ms", 20000)
+            p3 = _pct_gt(rows_in, "lag_total_ms", 10000)
+            p4 = _pct_gt(rows_in, "lag_total_ms", 40000)
+            p5 = _pct_lt(rows_in, "lag_overhead_ms", 0)
+            lines.append(f"| {model_name} | {_fmt_num(p1,1)}% | {_fmt_num(p2,1)}% | {_fmt_num(p3,1)}% | {_fmt_num(p4,1)}% | {_fmt_num(p5,1)}% |\n")
         lines.append("\n---\n")
 
         # 2.1) Pre vs in
