@@ -2302,6 +2302,363 @@ async def main() -> int:
         lines.append("\n---\n")
 
         # ============================================================
+        # 9.3) Stake sizing (teoria + calibração empírica)
+        # ============================================================
+        lines.append("### 9.3 Stake sizing — teoria mínima + calibração empírica\n")
+        lines.append(
+            "Objetivo: explicar por que **ROI por aposta** pode divergir de **ROI ponderado por stake/liability**, "
+            "e propor uma política de staking que seja (i) coerente com edge/CLV e (ii) controlada por risco (p99/ES).\n\n"
+        )
+
+        lines.append("**Teoria (resumo prático)**\n\n")
+        lines.append("- **Flat stake**: cada aposta pesa igual. Boa baseline para checar se o sizing atual está piorando resultado.\n")
+        lines.append("- **Proporcional ao limite**: útil operacionalmente (capacidade), mas **não é** sizing por edge.\n")
+        lines.append("- **Kelly fracionado**: sizing por edge. Para Back, \\(f^* \\propto \\frac{EV}{odds-1}\\). Para Lay, o sizing natural é por **liability**.\n")
+        lines.append("- **Governança de risco**: impor **cap por aposta** (ex.: 1–2% da banca) e olhar p95/p99/ES95 de exposição.\n\n")
+
+        # --- calibração: stake vs ROI/CLV ---
+        def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+            if len(xs) < 3 or len(ys) < 3:
+                return None
+            try:
+                x = np.array(xs, dtype=float)
+                y = np.array(ys, dtype=float)
+                if float(np.std(x)) <= 1e-12 or float(np.std(y)) <= 1e-12:
+                    return None
+                return float(np.corrcoef(x, y)[0, 1])
+            except Exception:
+                return None
+
+        back_pairs = []
+        lay_pairs = []
+        for d in ok_bs:
+            roi = _safe_float(d.get("roi_bs"))
+            if roi is None:
+                continue
+            bs, _, _, ll = finance_for_row(d)
+            clv = _safe_float(d.get("clv_bs"))
+            if int(d["id"]) in back_edge_ids:
+                back_pairs.append((float(bs), float(roi), float(clv) if clv is not None else None))
+            if int(d["id"]) in lay_edge_ids:
+                lay_pairs.append((float(ll), float(roi), float(clv) if clv is not None else None))
+
+        def _corr_block(pairs: List[Tuple[float, float, Optional[float]]], label: str):
+            xs_roi = [p[0] for p in pairs]
+            ys_roi = [p[1] for p in pairs]
+            xs_clv = [p[0] for p in pairs if p[2] is not None]
+            ys_clv = [p[2] for p in pairs if p[2] is not None]
+            c_roi = _pearson(xs_roi, ys_roi)
+            c_clv = _pearson(xs_clv, ys_clv)
+            lines.append(f"- **{label}**: corr(exposição, ROI)={_fmt_num(c_roi,3)}; corr(exposição, CLV)={_fmt_num(c_clv,3)} (onde CLV existe).\n")
+
+        lines.append("**Diagnóstico: exposição vs performance (correlação de Pearson; indicativo, não causal)**\n\n")
+        _corr_block(back_pairs, "Back (stake)")
+        _corr_block(lay_pairs, "Lay (liability)")
+        lines.append("\n")
+
+        # --- sizing rules / backtest ---
+        def _kelly_back_frac(entry_odd: Any, closing_odd: Any) -> Optional[float]:
+            o = _safe_float(entry_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            b = o - 1.0
+            ev = (o * p) - 1.0  # esperado por stake=1
+            f = ev / b
+            return float(f)
+
+        def _kelly_lay_liab_frac(entry_lay_odd: Any, closing_odd: Any) -> Optional[float]:
+            """
+            Fração ótima de banca em termos de **liability** para Lay:
+            f* = 1 - p*o, com p≈1/closing_odd e o=entry_lay_odd.
+            """
+            o = _safe_float(entry_lay_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            f = 1.0 - (p * o)
+            return float(f)
+
+        def _pnl_back(roi_pct: Optional[float], stake: float) -> Optional[float]:
+            if roi_pct is None:
+                return None
+            return float(stake) * float(roi_pct) / 100.0
+
+        def _pnl_lay_from_liab(liab: float, lay_odd: float, mult_back: Optional[float]) -> Optional[float]:
+            if mult_back is None:
+                return None
+            roi_liab = _roi_lay_pct_per_liability(float(lay_odd), float(mult_back))
+            if roi_liab is None:
+                return None
+            return float(liab) * float(roi_liab) / 100.0
+
+        def _max_drawdown(series: List[float]) -> float:
+            eq = 0.0
+            peak = 0.0
+            max_dd = 0.0
+            for x in series:
+                eq += float(x)
+                peak = max(peak, eq)
+                max_dd = min(max_dd, eq - peak)
+            return float(-max_dd)
+
+        def _bootstrap_dd(daily_pnls: List[float], horizon_days: int = 30, n_boot: int = 2000) -> Tuple[Optional[float], Optional[float]]:
+            if not daily_pnls:
+                return (None, None)
+            dd = []
+            for _ in range(int(n_boot)):
+                samp = [float(random.choice(daily_pnls)) for _ in range(int(horizon_days))]
+                dd.append(_max_drawdown(samp))
+            return (float(np.mean(dd)), float(np.quantile(dd, 0.95)))
+
+        # Window days para projeções (mesma lógica do 7.3, mas com fallback seguro)
+        window_days = None
+        try:
+            window_days = float(args.lookback_days) if args.lookback_days else None
+        except Exception:
+            window_days = None
+        if audited_span_days is not None:
+            window_days = max(float(audited_span_days), float(window_days or 0.0))
+        window_days = float(window_days or 1.0)
+        horizon_days = 30.0
+
+        def _proj_30(x: Optional[float]) -> Optional[float]:
+            if x is None:
+                return None
+            return float(x) * (horizon_days / window_days)
+
+        # Bancas de referência (proxy): p99 exposição observada no sizing proxy atual
+        back_bank_ref = float(_pctl(back_stakes, 99) or 0.0)
+        lay_bank_ref = float(_pctl(lay_liability, 99) or 0.0)
+        # caps fracionários (guardrail)
+        BACK_CAP_FRAC = 0.02
+        LAY_CAP_FRAC = 0.01
+
+        def _sizing_back(d: dict, scheme: str) -> Optional[float]:
+            """
+            Retorna stake (em unidade monetária proxy).
+            """
+            if scheme == "FLAT":
+                return 1.0
+            if scheme == "PROXY":
+                bs, _, _, _ = finance_for_row(d)
+                return float(bs)
+            if scheme.startswith("KELLY"):
+                # KELLY_xx: xx = fração (0.10, 0.25, 0.50)
+                frac = float(scheme.split("_")[1])
+                f = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f is None:
+                    return None
+                f = max(0.0, f) * frac
+                cap = BACK_CAP_FRAC * max(1e-9, back_bank_ref)
+                return min(f * back_bank_ref, cap)
+            return None
+
+        def _sizing_lay_liab(d: dict, scheme: str) -> Optional[Tuple[float, float]]:
+            """
+            Retorna (liability, lay_odd) em unidade monetária proxy.
+            Para Lay, o sizing governado por liability.
+            """
+            h = d.get("hypothesis_details") or {}
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+            if lay_odd is None:
+                lay_odd = _safe_float(d.get("bs_odd"))
+            if lay_odd is None or lay_odd <= 1.0:
+                return None
+            if scheme == "FLAT":
+                return (1.0, float(lay_odd))
+            if scheme == "PROXY":
+                _, _, _, ll = finance_for_row(d)
+                return (float(ll), float(lay_odd))
+            if scheme.startswith("KELLY"):
+                frac = float(scheme.split("_")[1])
+                f = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f is None:
+                    return None
+                f = max(0.0, f) * frac
+                cap = LAY_CAP_FRAC * max(1e-9, lay_bank_ref)
+                return (min(f * lay_bank_ref, cap), float(lay_odd))
+            return None
+
+        schemes = ["FLAT", "PROXY", "KELLY_0.10", "KELLY_0.25"]
+
+        def _eval_back(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+            pnls = []
+            stakes = []
+            mids = []
+            by_day = {}
+            for d in rows_in:
+                roi = _safe_float(d.get("roi_bs"))
+                if roi is None:
+                    continue
+                st = _sizing_back(d, scheme)
+                if st is None or st <= 0:
+                    continue
+                pnl = _pnl_back(roi, st)
+                if pnl is None:
+                    continue
+                pnls.append(float(pnl))
+                stakes.append(float(st))
+                mids.append(int(d.get("match_id")))
+                ko = d.get("kickoff") or d.get("audited_at")
+                if ko:
+                    day = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    by_day[day] = by_day.get(day, 0.0) + float(pnl)
+            turnover = float(sum(stakes)) if stakes else 0.0
+            profit = float(sum(pnls)) if pnls else 0.0
+            roi_turn = (profit / turnover * 100.0) if turnover > 0 else None
+            dd_mean, dd_p95 = _bootstrap_dd(list(by_day.values()), horizon_days=30, n_boot=1200)
+            return {
+                "n": len(pnls),
+                "turnover": turnover,
+                "profit": profit,
+                "roi_turn": roi_turn,
+                "p99_stake": _pctl(stakes, 99),
+                "es95_stake": _es_tail(stakes, 95),
+                "dd_mean": dd_mean,
+                "dd_p95": dd_p95,
+            }
+
+        def _eval_lay(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+            pnls = []
+            liabs = []
+            stakes = []
+            by_day = {}
+            for d in rows_in:
+                mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if mult is None:
+                    continue
+                sized = _sizing_lay_liab(d, scheme)
+                if not sized:
+                    continue
+                liab, lay_odd = sized
+                if liab is None or liab <= 0:
+                    continue
+                pnl = _pnl_lay_from_liab(float(liab), float(lay_odd), mult)
+                if pnl is None:
+                    continue
+                pnls.append(float(pnl))
+                liabs.append(float(liab))
+                st = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                stakes.append(st)
+                ko = d.get("kickoff") or d.get("audited_at")
+                if ko:
+                    day = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    by_day[day] = by_day.get(day, 0.0) + float(pnl)
+            turnover = float(sum(stakes)) if stakes else 0.0
+            profit = float(sum(pnls)) if pnls else 0.0
+            roi_turn = (profit / turnover * 100.0) if turnover > 0 else None
+            roi_liab = (profit / float(sum(liabs)) * 100.0) if sum(liabs) > 0 else None
+            dd_mean, dd_p95 = _bootstrap_dd(list(by_day.values()), horizon_days=30, n_boot=1200)
+            return {
+                "n": len(pnls),
+                "turnover_stake": turnover,
+                "exposure_liab": float(sum(liabs)) if liabs else 0.0,
+                "profit": profit,
+                "roi_turn": roi_turn,
+                "roi_liab": roi_liab,
+                "p99_liab": _pctl(liabs, 99),
+                "es95_liab": _es_tail(liabs, 95),
+                "dd_mean": dd_mean,
+                "dd_p95": dd_p95,
+            }
+
+        # Baselines: coortes (com placar)
+        back_finished = [d for d in back_edge if d.get("roi_bs") is not None]
+        lay_finished = [d for d in lay_edge if d.get("home_score") is not None and d.get("away_score") is not None]
+
+        lines.append("**Backtest de sizing (apenas eventos com placar; valores em unidade monetária *proxy*)**\n\n")
+        lines.append("| Lado | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover | p99 exposição | ES95 exposição | DD 30d (média) | DD 30d (p95) |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for sc in schemes:
+            eb = _eval_back(back_finished, sc)
+            el = _eval_lay(lay_finished, sc)
+            lines.append(
+                f"| Back | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | "
+                f"{_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['es95_stake'],2)} | {_fmt_num(eb['dd_mean'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
+            )
+            lines.append(
+                f"| Lay | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | "
+                f"{_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['es95_liab'],2)} | {_fmt_num(el['dd_mean'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nLeitura:\n"
+            "- Se `PROXY` piora ROI/turnover vs `FLAT`, isso indica que a política de stake atual está concentrando exposição em pontos com pior performance.\n"
+            "- `KELLY_0.25` tende a ser um bom compromisso quando o edge é estimado por CLV, mas requer **caps** e só é aplicável quando há `closing_odd` (pre‑match).\n"
+            "- DD é estimado por bootstrap i.i.d de dias (aproximação). Para uma curva mais fiel, use bootstrap por dia com blocos maiores.\n\n"
+        )
+
+        # ============================================================
+        # 9.4) Estratégias candidatas (com sizing recomendado)
+        # ============================================================
+        lines.append("### 9.4 Estratégias candidatas (filtros + sizing recomendado)\n")
+        lines.append(
+            "Aqui consolidamos duas hipóteses operacionais do usuário e reportamos resultados esperados no recorte "
+            "(e projeção simples para 30 dias). **Recomendação de sizing**: comece com `KELLY_0.25` + caps, "
+            "e compare contra `FLAT` como baseline.\n\n"
+        )
+
+        # Estratégia 1: Back only when exec < 5s
+        strat_back = [
+            d for d in back_edge
+            if str(d.get("exec_bucket")) == "< 5s" and d.get("is_live") is False
+        ]
+
+        # Estratégia 2: Lay only when há reversão e entrar logo após (aprox: vale até 3s)
+        lay_entry_by_id = {}
+        try:
+            for em in lay_entries:
+                # lay_entries tem match_id, mas não id. Guardamos por (match_id, line, side, event_id?) se existir.
+                # fallback por match_id apenas (suficiente para estatística agregada por jogo).
+                lay_entry_by_id.setdefault(int(em.get("match_id")), []).append(em)
+        except Exception:
+            lay_entry_by_id = {}
+
+        strat_lay = []
+        for d in lay_edge:
+            mids = lay_entry_by_id.get(int(d.get("match_id")), [])
+            # usa qualquer entry com reversão e vale cedo
+            ok = False
+            for em in mids:
+                if bool(em.get("had_reversal")) and (_safe_float(em.get("t_ext")) is not None) and float(em.get("t_ext")) <= 3.0:
+                    ok = True
+                    break
+            if ok:
+                strat_lay.append(d)
+
+        def _summ_strategy(name: str, rows_b: List[dict], rows_l: List[dict], scheme: str):
+            eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme)
+            el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme)
+            # projeção 30d direta (escala por dias observados)
+            return {
+                "name": name,
+                "scheme": scheme,
+                "back_n": eb["n"],
+                "lay_n": el["n"],
+                "turn_30d": _proj_30(eb["turnover"] + el["turnover_stake"]),
+                "profit_30d": _proj_30(eb["profit"] + el["profit"]),
+                "roi_turn": ((eb["profit"] + el["profit"]) / max(1e-9, (eb["turnover"] + el["turnover_stake"])) * 100.0) if (eb["turnover"] + el["turnover_stake"]) > 0 else None,
+                "back_bank_p99": eb["p99_stake"],
+                "lay_bank_p99": el["p99_liab"],
+                "dd_p95": max([x for x in [eb["dd_p95"], el["dd_p95"]] if x is not None], default=None),
+            }
+
+        lines.append("| Estratégia | Scheme | N Back | N Lay | Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | p99 stake (Back) | p99 liability (Lay) | DD 30d p95 |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for sc in ["FLAT", "KELLY_0.25"]:
+            s1 = _summ_strategy("BackFast (<5s, PM) + LayReversal (t_ext<=3s)", strat_back, strat_lay, sc)
+            lines.append(
+                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn'],2)}% | "
+                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nNotas:\n"
+            "- `BackFast` implementa sua hipótese **Back só quando execução <5s** e pre‑match.\n"
+            "- `LayReversal` usa o diagnóstico da seção 8.2b: **subcoorte com reversão** e vale cedo (t_ext<=3s) como proxy de “logo após a reversão”.\n"
+            "- As projeções 30d aqui são **escala linear** pelo número de dias observados; para uma projeção mais robusta, rode com lookback maior.\n"
+        )
+
+        # ============================================================
         # 10) Diagnóstico de ROI / atualização de resultados
         # ============================================================
         lines.append("## 10) Diagnóstico: por que o ROI pode estar zerado\n")
