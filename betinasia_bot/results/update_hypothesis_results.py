@@ -422,6 +422,13 @@ async def process_h6_events(
                 "Rode a migration: python -m migrations.add_verification_columns. "
                 "Pulando atualização de H6 por enquanto."
             )
+            # IMPORTANTE: o erro acima aborta a transação atual no Postgres.
+            # Se não fizermos rollback, todo o resto do loop falha com
+            # InFailedSQLTransactionError.
+            try:
+                await session.rollback()
+            except Exception:
+                pass
             return 0
         raise
     

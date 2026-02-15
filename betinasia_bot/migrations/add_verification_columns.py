@@ -40,7 +40,7 @@ async def run_migration():
     
     table = "h6_correlation_lag_events"
     
-    async with db._engine.begin() as conn:
+    async with db.engine.begin() as conn:
         print(f"\n📋 Tabela: {table}")
         print("-" * 40)
         
@@ -92,7 +92,7 @@ async def run_migration():
     print("ESTATÍSTICAS")
     print("=" * 70)
     
-    async with db.session() as session:
+    async with db.async_session() as session:
         result = await session.execute(text(f"SELECT COUNT(*) FROM {table}"))
         total = result.scalar()
         
