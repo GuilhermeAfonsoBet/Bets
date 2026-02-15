@@ -38,8 +38,8 @@ O monitor executa a cada ~2 minutos e envia alerta no Telegram quando houver WAR
 
 ### Instalar systemd unit + timer
 ```bash
-sudo cp -v ops/systemd/betinasia-ops-monitor.service /etc/systemd/system/
-sudo cp -v ops/systemd/betinasia-ops-monitor.timer   /etc/systemd/system/
+sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-monitor.service /etc/systemd/system/
+sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-monitor.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-monitor.timer
 systemctl list-timers --all | grep -i betinasia-ops-monitor || true
@@ -78,8 +78,8 @@ O auto-pilot roda a cada ~2 minutos e:
 
 ### Instalar
 ```bash
-sudo cp -v ops/systemd/betinasia-ops-autopilot.service /etc/systemd/system/
-sudo cp -v ops/systemd/betinasia-ops-autopilot.timer   /etc/systemd/system/
+sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-autopilot.service /etc/systemd/system/
+sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-autopilot.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-autopilot.timer
 systemctl list-timers --all | grep -i betinasia-ops-autopilot || true
