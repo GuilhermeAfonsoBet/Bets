@@ -42,7 +42,7 @@ sudo cp -v ops/systemd/betinasia-ops-monitor.service /etc/systemd/system/
 sudo cp -v ops/systemd/betinasia-ops-monitor.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-monitor.timer
-systemctl list-timers --all | rg betinasia-ops-monitor
+systemctl list-timers --all | grep -i betinasia-ops-monitor || true
 ```
 
 ### Rodar manualmente
@@ -82,7 +82,7 @@ sudo cp -v ops/systemd/betinasia-ops-autopilot.service /etc/systemd/system/
 sudo cp -v ops/systemd/betinasia-ops-autopilot.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-autopilot.timer
-systemctl list-timers --all | rg betinasia-ops-autopilot
+systemctl list-timers --all | grep -i betinasia-ops-autopilot || true
 ```
 
 ### Configurar parâmetros (no `.env`)

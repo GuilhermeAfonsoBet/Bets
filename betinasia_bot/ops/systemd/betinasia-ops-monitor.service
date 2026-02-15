@@ -1,11 +1,11 @@
- [Unit]
- Description=BetinAsia Ops Monitor (health + alert)
- After=network-online.target
- Wants=network-online.target
- 
- [Service]
- Type=oneshot
- WorkingDirectory=/home/betbot/Bets/betinasia_bot
- EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
- ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram; fi'
- 
+[Unit]
+Description=BetinAsia Ops Monitor (health + alert)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram; fi'
+
