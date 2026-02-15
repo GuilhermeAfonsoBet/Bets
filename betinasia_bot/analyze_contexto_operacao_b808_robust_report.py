@@ -776,6 +776,18 @@ async def main() -> int:
         unique_matches_bs = len(set(d["match_id"] for d in with_bs))
         avg_obs_per_match = (len(all_data) / unique_matches_all) if unique_matches_all else 0.0
 
+        # Janela efetiva do recorte (audited_at) — ajuda a validar lookback e explicar N "parecido"
+        audited_ts = [d.get("audited_at") for d in all_data if isinstance(d.get("audited_at"), datetime)]
+        audited_min = min(audited_ts) if audited_ts else None
+        audited_max = max(audited_ts) if audited_ts else None
+        audited_unique_days = len({t.date() for t in audited_ts}) if audited_ts else 0
+        audited_span_days = None
+        if audited_min and audited_max:
+            try:
+                audited_span_days = max(0.0, float((audited_max - audited_min).total_seconds()) / 86400.0)
+            except Exception:
+                audited_span_days = None
+
         # Cobertura de resultados (diagnóstico de ROI)
         matches_with_scores = len(
             {d["match_id"] for d in all_data if d.get("home_score") is not None and d.get("away_score") is not None}
@@ -1227,6 +1239,17 @@ async def main() -> int:
         summary_lines.append(
             f"- **Amostra**: {len(all_data)} auditorias (jogos únicos={unique_matches_all}, média={avg_obs_per_match:.1f} obs/jogo); betslip confiável={len(with_bs)}.\n"
         )
+        if audited_min and audited_max:
+            span_label = f"{audited_span_days:.1f}d" if audited_span_days is not None else "—"
+            summary_lines.append(
+                f"- **Janela efetiva (audited_at)**: {audited_min.strftime('%d/%m %H:%M')} → {audited_max.strftime('%d/%m %H:%M')} UTC "
+                f"(span≈{span_label}; dias com dados={audited_unique_days}).\n"
+            )
+            if args.lookback_days and audited_span_days is not None and audited_span_days < (0.70 * float(args.lookback_days)):
+                summary_lines.append(
+                    f"- **Alerta**: lookback_days={args.lookback_days}, mas a janela efetiva observada foi menor (span≈{span_label}). "
+                    "Isso costuma indicar falta de auditorias antigas para essas `audit_version` (ou recorte por regime/qualidade).\n"
+                )
         summary_lines.append(
             f"- **Coortes (status=OK, betslip confiável)**: Back (diff>={back_cut:.1f}%): **{len(back_edge)}**; Lay (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
         )
@@ -1277,6 +1300,13 @@ async def main() -> int:
 
         stake_pct = max(0.0, float(args.stake_pct_of_limit))
         stake_cap = max(0.0, float(args.stake_cap))
+
+        lines.append("**Política de stake (proxy)**\n\n")
+        lines.append("| Parâmetro | Valor |\n|---|---:|\n")
+        lines.append(f"| stake_pct_of_limit | {stake_pct:.2f} |\n")
+        lines.append(f"| stake_cap | {stake_cap:.2f} |\n")
+        lines.append(f"| Cobertura finance (OK, betslip conf.) | {n_finance}/{len(ok_bs)} |\n")
+        lines.append("\n")
 
         def stake_from_limit(limit_value: float) -> float:
             s = max(0.0, limit_value) * stake_pct
@@ -1332,6 +1362,10 @@ async def main() -> int:
         lines.append("| Métrica | Valor |\n|---|---:|\n")
         lines.append(f"| Corte (diff_pct) | >= {back_cut:.1f}% |\n")
         lines.append(f"| N eventos | {len(back_edge)} |\n")
+        back_finance_cov = sum(
+            1 for d in back_edge if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
+        lines.append(f"| Cobertura finance (na coorte) | {back_finance_cov}/{len(back_edge)} |\n")
         lines.append(f"| Stake total (estimado) | {_fmt_num(sum(back_stakes) if back_stakes else None, 2)} |\n")
         lines.append(f"| Stake médio | {_fmt_num(_mean(back_stakes), 2)} |\n")
         lines.append(f"| Profit_if_win total (estimado) | {_fmt_num(sum(back_profit_if_win) if back_profit_if_win else None, 2)} |\n")
@@ -1377,6 +1411,12 @@ async def main() -> int:
         else:
             lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
         lines.append(
+            "\n**Como ler as 3 linhas de ROI (Back)**\n\n"
+            "- **ROI realizado (ponderado por stake)**: \u03a3P&L / \u03a3stake (pode ser dominado por stakes grandes).\n"
+            "- **ROI realizado (robusto por jogo)**: média por jogo (cada jogo pesa parecido; reduz dominância de outliers).\n"
+            "- **ROI ponderado por stake (robusto por jogo)**: calcula ROI ponderado dentro do jogo e depois faz média/IC por jogo.\n"
+        )
+        lines.append(
             "\nObservação: a Seção 4 reporta ROI médio no **recorte completo** (betslip confiável). "
             "Aqui (7.1) é apenas a coorte **Back edge** (diff>=corte) e o ROI também é mostrado ponderado por stake; "
             "por isso sinais podem divergir.\n"
@@ -1386,6 +1426,10 @@ async def main() -> int:
         lines.append("| Métrica | Valor |\n|---|---:|\n")
         lines.append(f"| Corte (diff_pct) | <= {lay_cut:.1f}% |\n")
         lines.append(f"| N eventos | {len(lay_edge)} |\n")
+        lay_finance_cov = sum(
+            1 for d in lay_edge if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
+        lines.append(f"| Cobertura finance (na coorte) | {lay_finance_cov}/{len(lay_edge)} |\n")
         lines.append(f"| Stake total (estimado) | {_fmt_num(sum(lay_stakes) if lay_stakes else None, 2)} |\n")
         lines.append(f"| Liability total (estimada) | {_fmt_num(sum(lay_liability) if lay_liability else None, 2)} |\n")
         lines.append(f"| Liability média | {_fmt_num(_mean(lay_liability), 2)} |\n")
@@ -1498,6 +1542,140 @@ async def main() -> int:
             lines.append(f"| ROI/liability ponderado (robusto por jogo, mean; IC90) | {_fmt_pct(mean_lw,2)} {_fmt_ci(ci_lw,2)} |\n")
         else:
             lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
+
+        # ============================================================
+        # 7.3) Projeção mensal (30 dias fixo)
+        # ============================================================
+        lines.append("\n### 7.3 Projeção mensal (30 dias fixo) — turnover, lucro e banca\n")
+        lines.append(
+            "Premissas:\n"
+            "- **Mês = 30 dias fixo**.\n"
+            "- Turnover = soma de stakes (Back e Lay). Para Lay, também reportamos exposição por **liability**.\n"
+            "- **Banca conservadora** = p99(exposição unitária). **Banca agressiva** = ES95(exposição unitária).\n"
+            "- Projeção de lucro usa duas visões: (i) **lucro/dia observado** e (ii) **ROI observado × turnover projetado**.\n\n"
+        )
+
+        def _days_for_rate() -> float:
+            if args.lookback_days and int(args.lookback_days) > 0:
+                return float(args.lookback_days)
+            if audited_span_days is not None and audited_span_days > 0:
+                return float(audited_span_days)
+            return 1.0
+
+        window_days = _days_for_rate()
+        horizon_days = 30.0
+
+        def _proj_turnover(total_turnover: float) -> float:
+            return (float(total_turnover) / max(1e-9, window_days)) * horizon_days
+
+        def _roi_pct(pnl: float, turnover: float) -> Optional[float]:
+            if turnover <= 0:
+                return None
+            return (float(pnl) / float(turnover)) * 100.0
+
+        def _proj_profit_from_roi(turnover_30d: float, roi_pct: Optional[float]) -> Optional[float]:
+            if roi_pct is None:
+                return None
+            return float(turnover_30d) * float(roi_pct) / 100.0
+
+        # Back (realizado)
+        back_turnover_total = float(sum(back_stakes) if back_stakes else 0.0)
+        back_turnover_realized = float(sum(back_realized_stakes) if back_realized_stakes else 0.0)
+        back_pnl_realized = float(sum(back_realized) if back_realized else 0.0)
+        back_roi_realized = _roi_pct(back_pnl_realized, back_turnover_realized) if back_realized else None
+
+        # Lay (realizado)
+        lay_turnover_total = float(sum(lay_stakes) if lay_stakes else 0.0)
+        lay_liab_total = float(sum(lay_liability) if lay_liability else 0.0)
+        lay_turnover_realized = float(sum(lay_realized_stake) if lay_realized_stake else 0.0)
+        lay_liab_realized = float(sum(lay_realized_liab) if lay_realized_liab else 0.0)
+        lay_pnl_realized = float(sum(lay_realized_pnl) if lay_realized_pnl else 0.0)
+        lay_roi_realized_stake = _roi_pct(lay_pnl_realized, lay_turnover_realized) if lay_realized_pnl else None
+        lay_roi_realized_liab = _roi_pct(lay_pnl_realized, lay_liab_realized) if lay_realized_pnl else None
+
+        # Bancas (exposição unitária)
+        back_bank_conservative = _pctl(back_stakes, 99) if back_stakes else None
+        back_bank_aggressive = _es_tail(back_stakes, 95) if back_stakes else None
+        lay_bank_conservative = _pctl(lay_liability, 99) if lay_liability else None
+        lay_bank_aggressive = _es_tail(lay_liability, 95) if lay_liability else None
+
+        # Projeções 30d
+        back_turnover_30d = _proj_turnover(back_turnover_total)
+        lay_turnover_30d = _proj_turnover(lay_turnover_total)
+        lay_liab_30d = _proj_turnover(lay_liab_total)
+
+        back_profit_30d_direct = (back_pnl_realized / max(1e-9, window_days)) * horizon_days if back_realized else None
+        lay_profit_30d_direct = (lay_pnl_realized / max(1e-9, window_days)) * horizon_days if lay_realized_pnl else None
+        back_profit_30d_roi = _proj_profit_from_roi(back_turnover_30d, back_roi_realized) if back_realized else None
+        lay_profit_30d_roi = _proj_profit_from_roi(lay_turnover_30d, lay_roi_realized_stake) if lay_realized_pnl else None
+
+        total_turnover_30d = back_turnover_30d + lay_turnover_30d
+        total_profit_30d_direct = None
+        if back_profit_30d_direct is not None or lay_profit_30d_direct is not None:
+            total_profit_30d_direct = float(back_profit_30d_direct or 0.0) + float(lay_profit_30d_direct or 0.0)
+        total_profit_30d_roi = None
+        if back_profit_30d_roi is not None or lay_profit_30d_roi is not None:
+            total_profit_30d_roi = float(back_profit_30d_roi or 0.0) + float(lay_profit_30d_roi or 0.0)
+
+        total_bank_conservative = None
+        if back_bank_conservative is not None or lay_bank_conservative is not None:
+            total_bank_conservative = float(back_bank_conservative or 0.0) + float(lay_bank_conservative or 0.0)
+        total_bank_aggressive = None
+        if back_bank_aggressive is not None or lay_bank_aggressive is not None:
+            total_bank_aggressive = float(back_bank_aggressive or 0.0) + float(lay_bank_aggressive or 0.0)
+
+        def _roi_on_bank(profit_30d: Optional[float], bank: Optional[float]) -> Optional[float]:
+            if profit_30d is None or bank is None or bank <= 0:
+                return None
+            return (float(profit_30d) / float(bank)) * 100.0
+
+        lines.append("| Bloco | Janela(d) | Turnover 30d | Lucro 30d (direto) | Lucro 30d (ROI×turnover) |\n|---|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back | {window_days:.1f} | {_fmt_num(back_turnover_30d, 2)} | {_fmt_num(back_profit_30d_direct, 2)} | {_fmt_num(back_profit_30d_roi, 2)} |\n"
+        )
+        lines.append(
+            f"| Lay (stake) | {window_days:.1f} | {_fmt_num(lay_turnover_30d, 2)} | {_fmt_num(lay_profit_30d_direct, 2)} | {_fmt_num(lay_profit_30d_roi, 2)} |\n"
+        )
+        lines.append(
+            f"| Total (Back+Lay) | {window_days:.1f} | {_fmt_num(total_turnover_30d, 2)} | {_fmt_num(total_profit_30d_direct, 2)} | {_fmt_num(total_profit_30d_roi, 2)} |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Risco/Banca (exposição unitária)**\n\n")
+        lines.append("| Bloco | Banca conservadora (p99) | Banca agressiva (ES95) | ROI/banca 30d (direto) | ROI/banca 30d (ROI×turnover) |\n|---|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back (stake) | {_fmt_num(back_bank_conservative, 2)} | {_fmt_num(back_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(back_profit_30d_direct, back_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(back_profit_30d_roi, back_bank_conservative), 2)}% |\n"
+        )
+        lines.append(
+            f"| Lay (liability) | {_fmt_num(lay_bank_conservative, 2)} | {_fmt_num(lay_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(lay_profit_30d_direct, lay_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(lay_profit_30d_roi, lay_bank_conservative), 2)}% |\n"
+        )
+        lines.append(
+            f"| Total (soma) | {_fmt_num(total_bank_conservative, 2)} | {_fmt_num(total_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(total_profit_30d_direct, total_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(total_profit_30d_roi, total_bank_conservative), 2)}% |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Diagnóstico de cobertura (placar/ROI)**\n\n")
+        lines.append("| Bloco | Turnover total | Turnover com ROI | Cobertura turnover |\n|---|---:|---:|---:|\n")
+        lines.append(
+            f"| Back | {_fmt_num(back_turnover_total, 2)} | {_fmt_num(back_turnover_realized, 2)} | "
+            f"{_fmt_num((back_turnover_realized / back_turnover_total * 100.0) if back_turnover_total > 0 else None, 2)}% |\n"
+        )
+        lines.append(
+            f"| Lay | {_fmt_num(lay_turnover_total, 2)} | {_fmt_num(lay_turnover_realized, 2)} | "
+            f"{_fmt_num((lay_turnover_realized / lay_turnover_total * 100.0) if lay_turnover_total > 0 else None, 2)}% |\n"
+        )
+        lines.append("\n")
+        lines.append(
+            f"Notas (Lay): exposição 30d por liability (não é turnover) = {_fmt_num(lay_liab_30d, 2)}; "
+            f"ROI realizado por liability (ponderado) = {_fmt_num(lay_roi_realized_liab, 2)}%.\n"
+        )
+
         lines.append("\n---\n")
 
         # ============================================================
