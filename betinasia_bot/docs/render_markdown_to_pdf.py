@@ -16,6 +16,7 @@ import argparse
 import re
 from pathlib import Path
 from typing import List
+from xml.sax.saxutils import escape as _xml_escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -24,6 +25,7 @@ from reportlab.lib.units import cm
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
+    Preformatted,
     Spacer,
     Table,
     TableStyle,
@@ -74,6 +76,22 @@ def build_styles():
             textColor=colors.HexColor("#111827"),
             wordWrap="CJK",
         ),
+        "quote": ParagraphStyle(
+            "quote",
+            parent=styles["BodyText"],
+            fontName="Helvetica-Oblique",
+            fontSize=9.5,
+            leading=13,
+            leftIndent=10,
+            spaceBefore=3,
+            spaceAfter=3,
+            textColor=colors.HexColor("#111827"),
+            backColor=colors.HexColor("#f8fafc"),
+            borderColor=colors.HexColor("#cbd5e1"),
+            borderWidth=0.7,
+            borderPadding=6,
+            wordWrap="CJK",
+        ),
         "bullet": ParagraphStyle(
             "bullet",
             parent=styles["BodyText"],
@@ -87,16 +105,48 @@ def build_styles():
             textColor=colors.HexColor("#111827"),
             wordWrap="CJK",
         ),
+        "code": ParagraphStyle(
+            "code",
+            parent=styles["BodyText"],
+            fontName="Courier",
+            fontSize=8.8,
+            leading=11.2,
+            leftIndent=8,
+            rightIndent=8,
+            spaceBefore=4,
+            spaceAfter=6,
+            backColor=colors.HexColor("#0b1020"),
+            textColor=colors.HexColor("#e5e7eb"),
+            borderPadding=6,
+        ),
     }
 
 
-def normalize_cell(text: str) -> str:
-    text = text.strip()
+def normalize_inline(text: str) -> str:
+    """
+    Converte markdown *simples* para markup do ReportLab Paragraph.
+    - Escapa XML
+    - **bold**
+    - `inline code`
+    """
+    text = (text or "").strip()
     if text == "---" or text == "":
         return ""
-    # Converte **negrito** para <b>negrito</b> de forma segura.
+
+    # Escape primeiro para evitar quebrar markup do ReportLab.
+    text = _xml_escape(text)
+
+    # **negrito**
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    # `código inline` -> fonte monoespaçada
+    # (não suporta múltiplas linhas)
+    text = re.sub(r"`([^`]+)`", r"<font face=\"Courier\">\1</font>", text)
     return text
+
+
+def normalize_cell(text: str) -> str:
+    return normalize_inline(text)
 
 
 def strip_html_like(text: str) -> str:
@@ -217,18 +267,51 @@ def render_markdown(md_text: str, output_pdf: Path):
         rightMargin=1.8 * cm,
         topMargin=1.6 * cm,
         bottomMargin=1.6 * cm,
-        title="Análise H3B Back e Lay",
+        title="Relatório Analítico (BetinAsia)",
         author="BetinAsia Operação",
     )
+
+    def _footer(canvas, doc_):
+        canvas.saveState()
+        w, h = doc_.pagesize
+        canvas.setStrokeColor(colors.HexColor("#cbd5e1"))
+        canvas.setLineWidth(0.6)
+        canvas.line(doc_.leftMargin, doc_.bottomMargin - 6, w - doc_.rightMargin, doc_.bottomMargin - 6)
+        canvas.setFont("Helvetica", 8.5)
+        canvas.setFillColor(colors.HexColor("#334155"))
+        canvas.drawString(doc_.leftMargin, doc_.bottomMargin - 18, "BetinAsia • Relatório estatístico/operacional")
+        canvas.drawRightString(w - doc_.rightMargin, doc_.bottomMargin - 18, f"Página {canvas.getPageNumber()}")
+        canvas.restoreState()
 
     flow = []
     lines = md_text.splitlines()
     available_width = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
 
     i = 0
+    in_code = False
+    code_buf: List[str] = []
     while i < len(lines):
         raw = lines[i]
         line = raw.strip()
+
+        # Code fences (``` ... ```)
+        if line.startswith("```"):
+            if not in_code:
+                in_code = True
+                code_buf = []
+            else:
+                in_code = False
+                code_text = "\n".join(code_buf).rstrip()
+                if code_text:
+                    flow.append(Preformatted(code_text, styles["code"]))
+                    flow.append(Spacer(1, 6))
+            i += 1
+            continue
+
+        if in_code:
+            code_buf.append(raw.rstrip("\n"))
+            i += 1
+            continue
 
         if not line:
             flow.append(Spacer(1, 6))
@@ -249,15 +332,20 @@ def render_markdown(md_text: str, output_pdf: Path):
             continue
 
         if line.startswith("# "):
-            flow.append(Paragraph(line[2:].strip(), styles["h1"]))
+            flow.append(Paragraph(normalize_inline(line[2:].strip()), styles["h1"]))
             i += 1
             continue
         if line.startswith("## "):
-            flow.append(Paragraph(line[3:].strip(), styles["h2"]))
+            flow.append(Paragraph(normalize_inline(line[3:].strip()), styles["h2"]))
             i += 1
             continue
         if line.startswith("### "):
-            flow.append(Paragraph(line[4:].strip(), styles["h3"]))
+            flow.append(Paragraph(normalize_inline(line[4:].strip()), styles["h3"]))
+            i += 1
+            continue
+
+        if line.startswith("> "):
+            flow.append(Paragraph(normalize_inline(line[2:].strip()), styles["quote"]))
             i += 1
             continue
 
@@ -269,7 +357,7 @@ def render_markdown(md_text: str, output_pdf: Path):
         flow.append(Paragraph(normalize_cell(line), styles["body"]))
         i += 1
 
-    doc.build(flow)
+    doc.build(flow, onFirstPage=_footer, onLaterPages=_footer)
 
 
 def main():
