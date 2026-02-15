@@ -118,8 +118,17 @@ def _systemctl_show(service: str) -> Dict[str, str]:
 
 def _systemctl_restart(service: str) -> bool:
     try:
+        # Se estivermos rodando como root (comum em systemd units sem User=),
+        # não dependemos de sudo. Se não-root, usamos sudo *não-interativo* (-n)
+        # para evitar ficar pendurado esperando senha.
+        try:
+            is_root = (os.geteuid() == 0)  # type: ignore[attr-defined]
+        except Exception:
+            is_root = False
+
+        cmd = ["systemctl", "restart", service] if is_root else ["sudo", "-n", "systemctl", "restart", service]
         p = subprocess.run(
-            ["sudo", "systemctl", "restart", service],
+            cmd,
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
