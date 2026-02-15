@@ -41,8 +41,13 @@ O monitor executa a cada ~2 minutos e envia alerta no Telegram quando houver WAR
 
 ### Instalar systemd unit + timer
 ```bash
-sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-monitor.service /etc/systemd/system/
-sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-monitor.timer   /etc/systemd/system/
+# Alguns ambientes têm layout com pasta duplicada (ex.: betinasia_bot/betinasia_bot/...).
+# Para não errar o path, localize os arquivos via git:
+MON_SVC="$(git ls-files | grep -m1 'betinasia-ops-monitor.service')"
+MON_TMR="$(git ls-files | grep -m1 'betinasia-ops-monitor.timer')"
+echo "monitor: $MON_SVC | $MON_TMR"
+sudo cp -v "$MON_SVC" /etc/systemd/system/
+sudo cp -v "$MON_TMR" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-monitor.timer
 systemctl list-timers --all | grep -i betinasia-ops-monitor || true
@@ -81,8 +86,11 @@ O auto-pilot roda a cada ~2 minutos e:
 
 ### Instalar
 ```bash
-sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-autopilot.service /etc/systemd/system/
-sudo cp -v betinasia_bot/ops/systemd/betinasia-ops-autopilot.timer   /etc/systemd/system/
+AUTO_SVC="$(git ls-files | grep -m1 'betinasia-ops-autopilot.service')"
+AUTO_TMR="$(git ls-files | grep -m1 'betinasia-ops-autopilot.timer')"
+echo "autopilot: $AUTO_SVC | $AUTO_TMR"
+sudo cp -v "$AUTO_SVC" /etc/systemd/system/
+sudo cp -v "$AUTO_TMR" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-ops-autopilot.timer
 systemctl list-timers --all | grep -i betinasia-ops-autopilot || true
