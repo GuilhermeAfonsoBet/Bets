@@ -57,6 +57,7 @@ class ContinuousCollector:
     STATS_LOG_INTERVAL = 100  # log de estatísticas a cada N ciclos
     MEMORY_CLEANUP_INTERVAL = 500  # limpeza de memória a cada N ciclos
     COLLECT_TIMEOUT_SECONDS = int(os.getenv("COLLECT_TIMEOUT_SECONDS", "120"))
+    SAVE_TIMEOUT_SECONDS = int(os.getenv("SAVE_TIMEOUT_SECONDS", "90"))
     ZERO_ODDS_RECOVERY_THRESHOLD = int(os.getenv("COLLECT_ZERO_ODDS_RECOVERY_THRESHOLD", "3"))
     STARTUP_RETRY_SECONDS = int(os.getenv("COLLECT_STARTUP_RETRY_SECONDS", "30"))
     
@@ -104,6 +105,7 @@ class ContinuousCollector:
         logger.info(f"Ciclo de coleta: {self.CYCLE_TIME}s (tempo entre início de cada ciclo)")
         logger.info(
             f"Timeout coleta: {self.COLLECT_TIMEOUT_SECONDS}s | "
+            f"Timeout save: {self.SAVE_TIMEOUT_SECONDS}s | "
             f"Auto-recovery zero-odds: {self.ZERO_ODDS_RECOVERY_THRESHOLD} ciclos"
         )
         
@@ -244,11 +246,23 @@ class ContinuousCollector:
                     logger.warning("Timeout de coleta detectado, reiniciando browser imediatamente...")
                     try:
                         await self._start_browser()
+                        await self._restart_db()
                         self.consecutive_errors = 0
                         await asyncio.sleep(3)
                         continue
                     except Exception as e2:
                         logger.error(f"Falha ao reiniciar browser após timeout: {e2}")
+
+                if "SAVE_TIMEOUT" in str(e):
+                    logger.warning("Timeout no SAVE detectado, reiniciando DB e browser imediatamente...")
+                    try:
+                        await self._restart_db()
+                        await self._start_browser()
+                        self.consecutive_errors = 0
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception as e2:
+                        logger.error(f"Falha ao reiniciar após SAVE_TIMEOUT: {e2}")
                 
                 if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                     logger.warning(f"Muitos erros consecutivos, pausando por {self.ERROR_PAUSE_SECONDS}s...")
@@ -257,6 +271,7 @@ class ContinuousCollector:
                     # Tenta reiniciar browser
                     try:
                         await self._start_browser()
+                        await self._restart_db()
                         self.consecutive_errors = 0
                     except Exception as e2:
                         logger.error(f"Falha ao reiniciar browser: {e2}")
@@ -341,7 +356,31 @@ class ContinuousCollector:
         
         # Salva no banco
         save_t0 = time.time()
-        save_metrics = await self._save_to_database(result)
+        try:
+            save_metrics = await asyncio.wait_for(
+                self._save_to_database(result),
+                timeout=self.SAVE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            save_ms = int((time.time() - save_t0) * 1000)
+            timeout_payload = {
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "cycle": self.total_collections + 1,
+                "status": "SAVE_TIMEOUT",
+                "collect_ms": collect_ms,
+                "save_ms": save_ms,
+                "timeout_sec": self.SAVE_TIMEOUT_SECONDS,
+                "events_discovered": int(getattr(result, "total_events", 0) or 0),
+                "events_with_odds": int(getattr(result, "total_with_odds", 0) or 0),
+                "matches_payload": int(len(getattr(result, "matches", []) or [])),
+                "matches_saved": 0,
+                "prematch_saved": 0,
+                "live_saved": 0,
+                "hypothesis_events_saved": 0,
+                "save_errors": 1,
+            }
+            self._append_jsonl(self.telemetry_file, timeout_payload)
+            raise RuntimeError(f"SAVE_TIMEOUT_{self.SAVE_TIMEOUT_SECONDS}s")
         save_ms = int((time.time() - save_t0) * 1000)
         saved_count = save_metrics["saved_count"]
         
@@ -396,6 +435,17 @@ class ContinuousCollector:
             "events_with_odds": result.total_with_odds,
             "save_errors": save_metrics["save_errors"],
         }
+
+    async def _restart_db(self):
+        """Reinicia conexão com banco (útil após timeouts/hangs)."""
+        try:
+            if self.db:
+                await self.db.close()
+        except Exception:
+            pass
+        self.db = Database()
+        await self.db.connect()
+        logger.info("Banco de dados reiniciado")
     async def _save_to_database(self, result: CollectionResult) -> Dict[str, int]:
         """
         Salva resultado da coleta no banco de dados.
