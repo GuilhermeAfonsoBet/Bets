@@ -2939,19 +2939,35 @@ async def main() -> int:
             # Tenta versionar os artefatos gerados para facilitar download via GitHub.
             try:
                 # Descobre root do repo
-                repo_root = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+                repo_root_str = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+                repo_root = Path(repo_root_str).resolve()
                 msg = (
                     args.git_message
                     or f"Adiciona relatório b808 ({args.direction}, {','.join(versions)}, lookback={args.lookback_days})"
                 )
-                paths = [str(out_path)]
+
+                def _as_git_path(p: Path) -> str:
+                    """
+                    Converte um Path (possivelmente relativo ao CWD atual) em path válido para `git add`
+                    rodando em `repo_root`. Isso evita erro de pathspec quando o script é executado a partir
+                    de um subdiretório e `--out/--pdf` foram passados como paths relativos.
+                    """
+                    abs_p = p.expanduser().resolve()
+                    try:
+                        return str(abs_p.relative_to(repo_root))
+                    except Exception:
+                        # fallback: path absoluto (git aceita se estiver dentro do worktree)
+                        return str(abs_p)
+
+                paths: List[str] = [_as_git_path(out_path)]
                 if pdf_path and pdf_path.exists():
-                    paths.append(str(pdf_path))
-                subprocess.run(["git", "add", "--"] + paths, check=True, cwd=repo_root)
-                subprocess.run(["git", "commit", "-m", msg], check=True, cwd=repo_root)
+                    paths.append(_as_git_path(pdf_path))
+
+                subprocess.run(["git", "add", "--"] + paths, check=True, cwd=str(repo_root))
+                subprocess.run(["git", "commit", "-m", msg], check=True, cwd=str(repo_root))
                 print(f"[INFO] Artefatos commitados no git: {', '.join(paths)}")
                 if args.git_push:
-                    subprocess.run(["git", "push"], check=True, cwd=repo_root)
+                    subprocess.run(["git", "push"], check=True, cwd=str(repo_root))
                     print("[INFO] Push concluído.")
             except subprocess.CalledProcessError as e:
                 print(f"[WARN] Falha ao commitar/pushar artefatos: {e}")
