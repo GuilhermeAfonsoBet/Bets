@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
 from sqlalchemy import select, and_, update, func
+from sqlalchemy.exc import ProgrammingError
 
 from storage.database import Database
 from storage.models import Match, BestOddsHistory
@@ -399,15 +400,30 @@ async def process_h6_events(
     min_pre_snapshots: int = 1,
 ) -> int:
     """Processa eventos H6 para um jogo."""
-    result = await session.execute(
-        select(H6CorrelationLagEvent).where(
-            and_(
-                H6CorrelationLagEvent.match_id == match.id,
-                H6CorrelationLagEvent.clv.is_(None)
+    try:
+        result = await session.execute(
+            select(H6CorrelationLagEvent).where(
+                and_(
+                    H6CorrelationLagEvent.match_id == match.id,
+                    H6CorrelationLagEvent.clv.is_(None)
+                )
             )
         )
-    )
-    events = result.scalars().all()
+        events = result.scalars().all()
+    except ProgrammingError as e:
+        # Compatibilidade com bancos ainda não migrados.
+        # Se as colunas de verificação (verification_status, etc) não existirem
+        # no banco, qualquer SELECT do modelo falha. Nesse caso, pulamos H6 e
+        # orientamos a rodar a migration.
+        msg = str(e).lower()
+        if "verification_status" in msg and "does not exist" in msg:
+            logger.error(
+                "Tabela H6 está sem colunas de verificação no banco. "
+                "Rode a migration: python -m migrations.add_verification_columns. "
+                "Pulando atualização de H6 por enquanto."
+            )
+            return 0
+        raise
     
     updated = 0
     for event in events:
@@ -510,6 +526,7 @@ async def update_hypothesis_results(
             total_h3 = 0
             total_h3b = 0
             total_h6 = 0
+            skip_h6 = os.getenv("SKIP_H6_UPDATE", "").strip().lower() in ("1", "true", "yes", "y")
             
             for match in matches:
                 h1 = await process_h1_events(
@@ -533,13 +550,16 @@ async def update_hypothesis_results(
                     max_closing_lag_minutes=max_closing_lag_minutes,
                     min_pre_snapshots=min_pre_snapshots,
                 )
-                h6 = await process_h6_events(
-                    session,
-                    match,
-                    dry_run,
-                    max_closing_lag_minutes=max_closing_lag_minutes,
-                    min_pre_snapshots=min_pre_snapshots,
-                )
+                if skip_h6:
+                    h6 = 0
+                else:
+                    h6 = await process_h6_events(
+                        session,
+                        match,
+                        dry_run,
+                        max_closing_lag_minutes=max_closing_lag_minutes,
+                        min_pre_snapshots=min_pre_snapshots,
+                    )
                 
                 if h1 + h3 + h3b + h6 > 0:
                     print(f"  {match.home_team} vs {match.away_team}: H1={h1}, H3={h3}, H3b={h3b}, H6={h6}")
@@ -574,6 +594,11 @@ def main():
     parser.add_argument("--match-id", type=int, help="ID específico de jogo")
     parser.add_argument("--dry-run", action="store_true", help="Apenas mostra o que seria feito")
     parser.add_argument(
+        "--skip-h6",
+        action="store_true",
+        help="Ignora atualização de H6 (útil se faltar migration de colunas no banco).",
+    )
+    parser.add_argument(
         "--max-closing-lag-minutes",
         type=int,
         default=int(os.getenv("MAX_CLOSING_LAG_MINUTES", "60")),
@@ -588,6 +613,9 @@ def main():
     
     args = parser.parse_args()
     
+    if args.skip_h6:
+        os.environ["SKIP_H6_UPDATE"] = "1"
+
     asyncio.run(update_hypothesis_results(
         match_id=args.match_id,
         dry_run=args.dry_run,
