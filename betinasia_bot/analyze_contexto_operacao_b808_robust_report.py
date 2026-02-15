@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter
 
 import numpy as np
 from sqlalchemy import Integer, bindparam, text
@@ -774,6 +775,20 @@ async def main() -> int:
             wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
             all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
 
+        # Diagnóstico de cobertura do closing e distribuição de mercado (após filtros de recorte)
+        mt_counts = Counter(str(d.get("market_type") or "NA") for d in all_data)
+        ah_rows = [d for d in all_data if str(d.get("market_type")) == "AH"]
+        ah_unique_matches = len({int(d["match_id"]) for d in ah_rows}) if ah_rows else 0
+        ah_rows_with_closing = [
+            d for d in ah_rows if d.get("closing_odd") is not None and float(d["closing_odd"]) > 0
+        ]
+        ah_unique_matches_with_closing = (
+            len({int(d["match_id"]) for d in ah_rows_with_closing}) if ah_rows_with_closing else 0
+        )
+        ah_closing_coverage_pct = (
+            100.0 * ah_unique_matches_with_closing / ah_unique_matches if ah_unique_matches else None
+        )
+
         # Filtro qualidade betslip (igual ao script: -10 a +10)
         with_bs_raw = [d for d in all_data if d.get("bs_odd") and d["bs_odd"] > 0]
         with_bs = [d for d in with_bs_raw if d.get("diff_pct") is not None and -10 <= float(d["diff_pct"]) <= 10]
@@ -883,6 +898,14 @@ async def main() -> int:
         lines.append(f"| Jogos únicos (geral) | {unique_matches_all} |\n")
         lines.append(f"| Média de observações por jogo | {avg_obs_per_match:.1f} |\n")
         lines.append(f"| Jogos únicos com betslip confiável | {unique_matches_bs} |\n")
+        lines.append(
+            "| Distribuição por market_type | "
+            + ", ".join([f"{k}={mt_counts.get(k,0)}" for k in ["AH", "OU", "1X2", "NA"] if mt_counts.get(k, 0)])
+            + " |\n"
+        )
+        lines.append(f"| Jogos únicos (AH) no recorte | {ah_unique_matches} |\n")
+        lines.append(f"| Jogos únicos (AH) com closing_odd disponível | {ah_unique_matches_with_closing} |\n")
+        lines.append(f"| Cobertura closing_odd (AH) | {_fmt_num(ah_closing_coverage_pct,1)}% |\n")
         lines.append("\n---\n")
 
         # 2) Base comparativa
@@ -1344,6 +1367,16 @@ async def main() -> int:
         summary_lines.append(
             f"- **Cobertura de placar (ROI)**: jogos com placar={matches_with_scores}/{unique_matches_all} (status finished={matches_finished_flag}).\n"
         )
+        if ah_unique_matches:
+            summary_lines.append(
+                f"- **Cobertura de closing_odd (AH)**: jogos com closing={ah_unique_matches_with_closing}/{ah_unique_matches} "
+                f"({_fmt_num(ah_closing_coverage_pct,1)}%). CLV pre‑match depende disso.\n"
+            )
+            if ah_closing_coverage_pct is not None and ah_closing_coverage_pct < 80.0:
+                summary_lines.append(
+                    "- **Alerta**: cobertura de closing_odd está baixa. Isso tende a reduzir N de CLV e pode enviesar a leitura "
+                    "(os jogos “sem odds” ficam fora do CLV). Priorize estabilizar o collector e/ou condicionar análises a jogos com closing.\n"
+                )
         if len(dom_all) == 0:
             summary_lines.append("- **DOM**: sem dados no recorte atual (N=0), então não há comparação API vs DOM aqui.\n")
         # CLV foco
