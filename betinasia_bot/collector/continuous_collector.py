@@ -132,7 +132,22 @@ class ContinuousCollector:
                 pass
                 
         self.collector = FastCollector()
-        await asyncio.wait_for(self.collector.start(), timeout=self.BROWSER_START_TIMEOUT_SECONDS)
+        try:
+            await asyncio.wait_for(self.collector.start(), timeout=self.BROWSER_START_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            dt_ms = int((time.time() - t0) * 1000)
+            if self.PHASE_TELEMETRY:
+                self._append_jsonl(
+                    self.telemetry_file,
+                    {
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                        "cycle": self.total_collections + 1,
+                        "status": "BROWSER_TIMEOUT",
+                        "browser_start_ms": dt_ms,
+                        "timeout_sec": int(self.BROWSER_START_TIMEOUT_SECONDS),
+                    },
+                )
+            raise RuntimeError(f"BROWSER_START_TIMEOUT_{self.BROWSER_START_TIMEOUT_SECONDS}s")
         self._last_browser_start = datetime.now(timezone.utc)
         dt_ms = int((time.time() - t0) * 1000)
         logger.info(f"Browser iniciado (dt={dt_ms}ms)")
@@ -297,6 +312,17 @@ class ContinuousCollector:
                         continue
                     except Exception as e2:
                         logger.error(f"Falha ao reiniciar após SAVE_TIMEOUT: {e2}")
+
+                if "BROWSER_START_TIMEOUT" in str(e):
+                    logger.warning("Timeout ao iniciar browser detectado, reiniciando DB e browser imediatamente...")
+                    try:
+                        await self._restart_db()
+                        await self._start_browser()
+                        self.consecutive_errors = 0
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception as e2:
+                        logger.error(f"Falha ao reiniciar após BROWSER_START_TIMEOUT: {e2}")
                 
                 if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                     logger.warning(f"Muitos erros consecutivos, pausando por {self.ERROR_PAUSE_SECONDS}s...")
