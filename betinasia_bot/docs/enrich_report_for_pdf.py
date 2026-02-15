@@ -67,9 +67,21 @@ def build_preface(md: str, *, report_name: str) -> str:
     diff_mean = _grab(md, r"^\|\s*Diff BS vs WS \(média\)\s*\|\s*([^|]+)\|", default="N/A")
 
     # Performance (p50/p95) do bloco 2.0b
-    lag_p50 = _grab(md, r"^\|\s*API.*\|\s*lag_e2e.*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*\d+\s*\|", default="N/A")
-    lag_p95 = _grab(md, r"^\|\s*API.*\|\s*lag_e2e.*\|\s*\d+\s*\|\s*\d+\s*\|\s*(\d+)\s*\|", default="N/A")
-    overhead_p50 = _grab(md, r"^\|\s*API.*\|\s*overhead.*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*\d+\s*\|", default="N/A")
+    # Esperado (colunas): mean | p50 | p95 | N
+    def _grab_row(metric_label: str) -> Tuple[str, str, str, str]:
+        m = _rx(
+            md,
+            rf"^\|\s*API\s*\(2-4s\)\s*\|\s*{re.escape(metric_label)}\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|\s*([0-9.]+)\s*\|\s*$",
+        )
+        if not m:
+            return ("N/A", "N/A", "N/A", "N/A")
+        return (m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip())
+
+    det_mean, det_p50, det_p95, _det_n = _grab_row("lag_det→click")
+    bs_mean, bs_p50, bs_p95, _bs_n = _grab_row("lag_click→betslip")
+    e2e_mean, e2e_p50, e2e_p95, e2e_n = _grab_row("lag_e2e (soma)")
+    tot_mean, tot_p50, tot_p95, tot_n = _grab_row("audit_total (duração)")
+    ov_mean, ov_p50, ov_p95, ov_n = _grab_row("overhead (total - e2e)")
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -102,12 +114,22 @@ Interpretação: em média, quando a auditoria aponta edge e a execução ocorre
 - **DOM ausente (N=0)**: não há comparação API vs DOM neste recorte; qualquer conclusão “API melhor que DOM” aqui seria especulação.
 
 ### 0.3 Diagnóstico operacional (execução)
-Do ponto de vista de execução (detecção→betslip):
-- **lag_e2e**: p50≈{lag_p50}ms, p95≈{lag_p95}ms
-- **overhead**: p50≈{overhead_p50}ms (proxy de fila/retries fora das etapas instrumentadas)
+Do ponto de vista de execução (detecção→betslip), em linguagem direta:
+- **detecção→clique**: p50≈{det_p50}ms, p95≈{det_p95}ms
+- **clique→betslip**: p50≈{bs_p50}ms, p95≈{bs_p95}ms
+- **tempo instrumentado (detecção→clique→betslip)**: p50≈{e2e_p50}ms, p95≈{e2e_p95}ms (N={e2e_n})
+- **tempo total observado (detecção→betslip, “wall/total”)**: p50≈{tot_p50}ms, p95≈{tot_p95}ms (N={tot_n})
+- **overhead (total − instrumentado)**: p50≈{ov_p50}ms, p95≈{ov_p95}ms (N={ov_n})  
+  *Interpretação operacional*: overhead agrega espera fora das duas etapas instrumentadas (ex.: fila, retries, pausas e latências externas).
 
 Tradução: o pipeline API está “rápido o suficiente” na mediana, mas ainda existe cauda (p95) e regimes lentos. A lição operacional é simples:
 **o edge é perecível**; portanto, regimes lentos devem ser tratados como *degradação de qualidade* e não como “só mais devagar”.
+
+### 0.3b Glossário rápido (para não gerar ambiguidade)
+- **Tempo total observado**: tempo “de parede” do pipeline completo de auditoria (o que o operador sente), incluindo tudo que não está explicitamente instrumentado.
+- **Tempo instrumentado**: soma das etapas instrumentadas **detecção→clique** + **clique→betslip**.
+- **overhead**: diferença entre total observado e instrumentado; é um proxy para **fila/esperas/retries**.
+- **p50 / p95**: percentis. p95 deve ser ≥ p50; se aparecer invertido, é sinal de erro de parsing/relato.
 
 ### 0.4 Sinal de consistência: BS vs WS
 O relatório base mede também a diferença média entre o preço no betslip (BS) e o preço via WS (WS):

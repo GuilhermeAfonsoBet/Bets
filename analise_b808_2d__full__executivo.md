@@ -1,5 +1,5 @@
 # Análise Estatística Robusta — Contexto Operação (b808) — Versão Executiva (com interpretação)
-**Gerado em:** 2026-02-15 15:30 UTC  
+**Gerado em:** 2026-02-15 16:13 UTC  
 **Fonte:** relatório estatístico base (apêndice), extraído do repositório e enriquecido com interpretação.
 
 ---
@@ -27,12 +27,22 @@ Interpretação: em média, quando a auditoria aponta edge e a execução ocorre
 - **DOM ausente (N=0)**: não há comparação API vs DOM neste recorte; qualquer conclusão “API melhor que DOM” aqui seria especulação.
 
 ### 0.3 Diagnóstico operacional (execução)
-Do ponto de vista de execução (detecção→betslip):
-- **lag_e2e**: p50≈7695ms, p95≈1832ms
-- **overhead**: p50≈2547ms (proxy de fila/retries fora das etapas instrumentadas)
+Do ponto de vista de execução (detecção→betslip), em linguagem direta:
+- **detecção→clique**: p50≈840ms, p95≈2946ms
+- **clique→betslip**: p50≈2282ms, p95≈4573ms
+- **tempo instrumentado (detecção→clique→betslip)**: p50≈3582ms, p95≈7695ms (N=1832)
+- **tempo total observado (detecção→betslip, “wall/total”)**: p50≈4739ms, p95≈8223ms (N=1837)
+- **overhead (total − instrumentado)**: p50≈76ms, p95≈2547ms (N=1832)  
+  *Interpretação operacional*: overhead agrega espera fora das duas etapas instrumentadas (ex.: fila, retries, pausas e latências externas).
 
 Tradução: o pipeline API está “rápido o suficiente” na mediana, mas ainda existe cauda (p95) e regimes lentos. A lição operacional é simples:
 **o edge é perecível**; portanto, regimes lentos devem ser tratados como *degradação de qualidade* e não como “só mais devagar”.
+
+### 0.3b Glossário rápido (para não gerar ambiguidade)
+- **Tempo total observado**: tempo “de parede” do pipeline completo de auditoria (o que o operador sente), incluindo tudo que não está explicitamente instrumentado.
+- **Tempo instrumentado**: soma das etapas instrumentadas **detecção→clique** + **clique→betslip**.
+- **overhead**: diferença entre total observado e instrumentado; é um proxy para **fila/esperas/retries**.
+- **p50 / p95**: percentis. p95 deve ser ≥ p50; se aparecer invertido, é sinal de erro de parsing/relato.
 
 ### 0.4 Sinal de consistência: BS vs WS
 O relatório base mede também a diferença média entre o preço no betslip (BS) e o preço via WS (WS):
