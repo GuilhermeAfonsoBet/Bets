@@ -17,10 +17,11 @@ Uso:
 
 import asyncio
 import argparse
+import os
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
-from sqlalchemy import select, and_, update
+from sqlalchemy import select, and_, update, func
 
 from storage.database import Database
 from storage.models import Match, BestOddsHistory
@@ -94,7 +95,10 @@ async def get_closing_odd(
     match: Match,
     market_type: str,
     line: str,
-    side: str
+    side: str,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
 ) -> Optional[float]:
     """
     Busca a closing line (última odd ANTES do kickoff).
@@ -113,6 +117,20 @@ async def get_closing_odd(
         ah_line_search = "1X2"
     else:
         ah_line_search = line
+
+    # Quality gate 1: exige pelo menos N snapshots pré-kickoff por linha/mercado.
+    if min_pre_snapshots and int(min_pre_snapshots) > 1:
+        pre_cnt = await session.execute(
+            select(func.count(BestOddsHistory.id)).where(
+                and_(
+                    BestOddsHistory.match_id == match.id,
+                    BestOddsHistory.ah_line == ah_line_search,
+                    BestOddsHistory.scraped_at < match.kickoff_time,
+                )
+            )
+        )
+        if (pre_cnt.scalar() or 0) < int(min_pre_snapshots):
+            return None
     
     # Busca última odd ANTES do kickoff (closing line)
     result = await session.execute(
@@ -131,6 +149,19 @@ async def get_closing_odd(
     closing = result.scalar_one_or_none()
     
     if closing:
+        # Quality gate 2: closing não pode estar "stale" (muito distante do kickoff).
+        try:
+            lag_min = (match.kickoff_time - closing.scraped_at).total_seconds() / 60.0
+        except Exception:
+            lag_min = None
+        if (
+            lag_min is not None
+            and max_closing_lag_minutes is not None
+            and float(max_closing_lag_minutes) > 0
+            and lag_min > float(max_closing_lag_minutes)
+        ):
+            return None
+
         if side in ("home", "over", "side_a"):
             return closing.best_home_odds
         else:
@@ -139,7 +170,14 @@ async def get_closing_odd(
     return None
 
 
-async def process_h1_events(session, match: Match, dry_run: bool = False) -> int:
+async def process_h1_events(
+    session,
+    match: Match,
+    dry_run: bool = False,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
+) -> int:
     """Processa eventos H1 para um jogo."""
     result = await session.execute(
         select(H1PricingEvent).where(
@@ -159,7 +197,13 @@ async def process_h1_events(session, match: Match, dry_run: bool = False) -> int
         # Busca closing line
         side_for_closing = "home" if event.recommended_side == "side_a" else "away"
         closing = await get_closing_odd(
-            session, match, event.market_type, event.ah_line, side_for_closing
+            session,
+            match,
+            event.market_type,
+            event.ah_line,
+            side_for_closing,
+            max_closing_lag_minutes=max_closing_lag_minutes,
+            min_pre_snapshots=min_pre_snapshots,
         )
         
         if not closing:
@@ -203,7 +247,14 @@ async def process_h1_events(session, match: Match, dry_run: bool = False) -> int
     return updated
 
 
-async def process_h3_events(session, match: Match, dry_run: bool = False) -> int:
+async def process_h3_events(
+    session,
+    match: Match,
+    dry_run: bool = False,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
+) -> int:
     """Processa eventos H3 para um jogo."""
     result = await session.execute(
         select(H3LineMonotonicityEvent).where(
@@ -222,7 +273,13 @@ async def process_h3_events(session, match: Match, dry_run: bool = False) -> int
         
         # Busca closing line
         closing = await get_closing_odd(
-            session, match, "AH", event.recommended_line, event.side
+            session,
+            match,
+            "AH",
+            event.recommended_line,
+            event.side,
+            max_closing_lag_minutes=max_closing_lag_minutes,
+            min_pre_snapshots=min_pre_snapshots,
         )
         
         if not closing:
@@ -258,7 +315,14 @@ async def process_h3_events(session, match: Match, dry_run: bool = False) -> int
     return updated
 
 
-async def process_h3b_events(session, match: Match, dry_run: bool = False) -> int:
+async def process_h3b_events(
+    session,
+    match: Match,
+    dry_run: bool = False,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
+) -> int:
     """Processa eventos H3b para um jogo."""
     result = await session.execute(
         select(H3bTemporalReversalEvent).where(
@@ -277,7 +341,13 @@ async def process_h3b_events(session, match: Match, dry_run: bool = False) -> in
         
         # Busca closing line
         closing = await get_closing_odd(
-            session, match, event.market_type, event.ah_line, event.side
+            session,
+            match,
+            event.market_type,
+            event.ah_line,
+            event.side,
+            max_closing_lag_minutes=max_closing_lag_minutes,
+            min_pre_snapshots=min_pre_snapshots,
         )
         
         if not closing:
@@ -320,7 +390,14 @@ async def process_h3b_events(session, match: Match, dry_run: bool = False) -> in
     return updated
 
 
-async def process_h6_events(session, match: Match, dry_run: bool = False) -> int:
+async def process_h6_events(
+    session,
+    match: Match,
+    dry_run: bool = False,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
+) -> int:
     """Processa eventos H6 para um jogo."""
     result = await session.execute(
         select(H6CorrelationLagEvent).where(
@@ -341,7 +418,9 @@ async def process_h6_events(session, match: Match, dry_run: bool = False) -> int
         closing = await get_closing_odd(
             session, match, event.bet_market_type or event.lagged_market_type,
             event.bet_line or event.lagged_line,
-            event.bet_side or event.lagged_side
+            event.bet_side or event.lagged_side,
+            max_closing_lag_minutes=max_closing_lag_minutes,
+            min_pre_snapshots=min_pre_snapshots,
         )
         
         if not closing:
@@ -390,7 +469,10 @@ async def process_h6_events(session, match: Match, dry_run: bool = False) -> int
 
 async def update_hypothesis_results(
     match_id: int = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    *,
+    max_closing_lag_minutes: int = 60,
+    min_pre_snapshots: int = 1,
 ):
     """
     Atualiza eventos de hipóteses com CLV e resultado.
@@ -430,10 +512,34 @@ async def update_hypothesis_results(
             total_h6 = 0
             
             for match in matches:
-                h1 = await process_h1_events(session, match, dry_run)
-                h3 = await process_h3_events(session, match, dry_run)
-                h3b = await process_h3b_events(session, match, dry_run)
-                h6 = await process_h6_events(session, match, dry_run)
+                h1 = await process_h1_events(
+                    session,
+                    match,
+                    dry_run,
+                    max_closing_lag_minutes=max_closing_lag_minutes,
+                    min_pre_snapshots=min_pre_snapshots,
+                )
+                h3 = await process_h3_events(
+                    session,
+                    match,
+                    dry_run,
+                    max_closing_lag_minutes=max_closing_lag_minutes,
+                    min_pre_snapshots=min_pre_snapshots,
+                )
+                h3b = await process_h3b_events(
+                    session,
+                    match,
+                    dry_run,
+                    max_closing_lag_minutes=max_closing_lag_minutes,
+                    min_pre_snapshots=min_pre_snapshots,
+                )
+                h6 = await process_h6_events(
+                    session,
+                    match,
+                    dry_run,
+                    max_closing_lag_minutes=max_closing_lag_minutes,
+                    min_pre_snapshots=min_pre_snapshots,
+                )
                 
                 if h1 + h3 + h3b + h6 > 0:
                     print(f"  {match.home_team} vs {match.away_team}: H1={h1}, H3={h3}, H3b={h3b}, H6={h6}")
@@ -467,12 +573,26 @@ def main():
     parser = argparse.ArgumentParser(description="Atualiza eventos de hipóteses com CLV e resultado")
     parser.add_argument("--match-id", type=int, help="ID específico de jogo")
     parser.add_argument("--dry-run", action="store_true", help="Apenas mostra o que seria feito")
+    parser.add_argument(
+        "--max-closing-lag-minutes",
+        type=int,
+        default=int(os.getenv("MAX_CLOSING_LAG_MINUTES", "60")),
+        help="Quality gate: rejeita closing se a última odd pré-kickoff estiver mais distante que este limiar (min).",
+    )
+    parser.add_argument(
+        "--min-pre-snapshots",
+        type=int,
+        default=int(os.getenv("MIN_PRE_SNAPSHOTS", "1")),
+        help="Quality gate: exige pelo menos N snapshots pré-kickoff na linha/mercado para aceitar closing.",
+    )
     
     args = parser.parse_args()
     
     asyncio.run(update_hypothesis_results(
         match_id=args.match_id,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        max_closing_lag_minutes=args.max_closing_lag_minutes,
+        min_pre_snapshots=args.min_pre_snapshots,
     ))
 
 
