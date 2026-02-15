@@ -926,7 +926,11 @@ async def main() -> int:
         lines.append("- **`lag_e2e_ms` (tempo instrumentado)**: `lag_det_to_click_ms + lag_click_to_betslip_ms`.\n")
         lines.append("- **`audit_total_ms` (duração da auditoria)**: duração instrumentada do ciclo de auditoria (pode diferir de `lag_total_ms` se houver esperas fora do escopo instrumentado).\n")
         lines.append("- **`lag_overhead_ms` (overhead)**: `lag_total_ms - lag_e2e_ms`; agrega espera fora das duas etapas instrumentadas (ex.: fila, retries, pausas, latência externa).\n")
-        lines.append("- **`diff_pct` (BS vs WS)**: diferença percentual entre preço do betslip (BS) e referência (WS) no momento; buckets `BS>WS` e `BS<WS` são usados como proxies de coortes Back/Lay.\n")
+        lines.append(
+            "- **`diff_pct` (BS vs WS)**: diferença percentual entre a odd do **betslip no momento da execução** (BS) e a odd do **WebSocket no momento da detecção** (WS): "
+            "`(BS - WS) / WS * 100`. Importante: **BS e WS são medidos em instantes diferentes**, então este número mede principalmente "
+            "**drift durante a execução + slippage/atualização** (e não “mispricing contemporâneo”).\n"
+        )
         lines.append("- **Betslip confiável**: filtro de qualidade `diff_pct ∈ [-10%, +10%]` para reduzir casos de mismatch/parse incorreto.\n")
         lines.append("\n---\n")
 
@@ -1063,13 +1067,15 @@ async def main() -> int:
                 )
             lines.append("\n---\n")
 
-            # 2.3b) Mesmo bucket, mas separando coortes Back/Lay (diff buckets)
-            lines.append("### 2.3b Regimes por tempo total — separando Back vs Lay (por `diff_pct`)\n")
+            # 2.3b) Mesmo bucket, mas separando coortes por delta BS vs WS (diff buckets)
+            lines.append("### 2.3b Regimes por tempo total — separando coortes por `diff_pct` (BS vs WS)\n")
             lines.append(
-                "Nesta tabela, **Back** = `diff_pct >= +2%` (bucket `BS > WS`) e **Lay** = `diff_pct <= -2%` (bucket `BS < WS`). "
+                "Nesta tabela, separamos duas coortes operacionais por **delta de execução**: "
+                "`BS > WS` (diff_pct >= +2%) e `BS < WS` (diff_pct <= -2%). "
+                "Isso **não** é (por si só) “Back vs Lay”; é um recorte por **melhora/piora do preço** entre detecção (WS) e execução (BS). "
                 "CLV é reportado apenas em pre‑match.\n\n"
             )
-            lines.append("| Bucket | N OK | Back edge | Lay edge | CLV PM Back (mean; IC90) | CLV PM Lay (mean; IC90) | ROI Back (mean; IC90) | ROI Lay (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+            lines.append("| Bucket | N OK | N (BS>WS +2%) | N (BS<WS -2%) | CLV PM (BS>WS) | CLV PM (BS<WS) | ROI (BS>WS) | ROI (BS<WS) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
             for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
                 sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
                 if not sub:
@@ -1226,8 +1232,8 @@ async def main() -> int:
         lines.append("### 6.1 Buckets por diferença BS vs WS\n")
         lines.append(
             "Nota de leitura:\n"
-            "- `BS > WS (+2% a +10%)` é a região típica de **Back edge** (preço no betslip acima da referência).\n"
-            "- `BS < WS (-10% a -2%)` é a região típica de **Lay edge** (preço no betslip abaixo da referência).\n"
+            "- `BS > WS (+2% a +10%)`: preço no betslip ficou **melhor** do que o WS observado na detecção (delta positivo entre instantes).\n"
+            "- `BS < WS (-10% a -2%)`: preço no betslip ficou **pior** do que o WS observado na detecção (delta negativo entre instantes).\n"
             "- O ROI abaixo é calculado **dentro do bucket** (não mistura buckets), mas ainda é sensível à cobertura de placar.\n\n"
         )
         lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---:|---:|---|\n")
@@ -1330,7 +1336,7 @@ async def main() -> int:
                     "Isso costuma indicar falta de auditorias antigas para essas `audit_version` (ou recorte por regime/qualidade).\n"
                 )
         summary_lines.append(
-            f"- **Coortes (status=OK, betslip confiável)**: Back (diff>={back_cut:.1f}%): **{len(back_edge)}**; Lay (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
+            f"- **Coortes (status=OK, betslip confiável)**: `BS>WS` (diff>={back_cut:.1f}%): **{len(back_edge)}**; `BS<WS` (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
         )
         summary_lines.append(
             f"- **Coberturas em `hypothesis_details` (OK)**: temporal(back)={n_temporal}/{len(ok_bs)}; lay_temporal={n_lay_temporal}/{len(ok_bs)}; finance={n_finance}/{len(ok_bs)}.\n"
