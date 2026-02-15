@@ -35,6 +35,14 @@ class BetinAsiaScraper:
     LOGIN_URL = f"{BASE_URL}/login"
     SPORTSBOOK_URL = f"{BASE_URL}/sportsbook"
     FOOTBALL_URL = f"{BASE_URL}/sportsbook/football"
+
+    # Navegação (Playwright)
+    # Observação: `goto()` por padrão espera `load`, o que costuma estourar timeout
+    # em páginas pesadas/proxy. Para estabilidade operacional, preferimos
+    # `domcontentloaded` + waits explícitos.
+    DEFAULT_TIMEOUT_MS = int(os.getenv("BETINASIA_DEFAULT_TIMEOUT_MS", "60000"))
+    DEFAULT_NAV_TIMEOUT_MS = int(os.getenv("BETINASIA_NAV_TIMEOUT_MS", "90000"))
+    DEFAULT_GOTO_WAIT_UNTIL = os.getenv("BETINASIA_GOTO_WAIT_UNTIL", "domcontentloaded")
     
     # Mapeamento de ligas para códigos de URL
     # Formato: /sportsbook/football/{codigo_pagina}
@@ -187,7 +195,9 @@ class BetinAsiaScraper:
         self._context = await self._browser.new_context(**context_options)
         
         self._page = await self._context.new_page()
-        self._page.set_default_timeout(30000)
+        # Timeouts mais tolerantes (proxy / sportsbook costuma ser pesado)
+        self._page.set_default_timeout(self.DEFAULT_TIMEOUT_MS)
+        self._page.set_default_navigation_timeout(self.DEFAULT_NAV_TIMEOUT_MS)
         
         logger.info("Browser iniciado com sucesso")
         
@@ -203,8 +213,12 @@ class BetinAsiaScraper:
         """Verifica se a sessão atual ainda é válida."""
         try:
             # Navega para uma página que requer login
-            await self._page.goto(self.SPORTSBOOK_URL, timeout=15000)
-            await self._page.wait_for_load_state("networkidle")
+            await self._page.goto(
+                self.SPORTSBOOK_URL,
+                timeout=self.DEFAULT_NAV_TIMEOUT_MS,
+                wait_until=self.DEFAULT_GOTO_WAIT_UNTIL,
+            )
+            await self._page.wait_for_timeout(1000)
             
             # Se redirecionou para login, sessão expirou
             current_url = self._page.url
@@ -272,12 +286,15 @@ class BetinAsiaScraper:
         
         try:
             # Navega para página de login
-            await self._page.goto(self.LOGIN_URL)
-            await self._page.wait_for_load_state("networkidle")
+            await self._page.goto(
+                self.LOGIN_URL,
+                timeout=self.DEFAULT_NAV_TIMEOUT_MS,
+                wait_until=self.DEFAULT_GOTO_WAIT_UNTIL,
+            )
             
             # Aguarda os campos de login aparecerem
             # O site usa inputs dentro de um form
-            await self._page.wait_for_selector("input", timeout=15000)
+            await self._page.wait_for_selector("input", timeout=self.DEFAULT_TIMEOUT_MS)
             
             # Preenche APENAS o primeiro input de texto (username)
             # O site tem múltiplos inputs, precisamos ser específicos
@@ -344,8 +361,11 @@ class BetinAsiaScraper:
     async def navigate_to_football(self) -> bool:
         """Navega para a seção de futebol."""
         try:
-            await self._page.goto(self.FOOTBALL_URL)
-            await self._page.wait_for_load_state("networkidle")
+            await self._page.goto(
+                self.FOOTBALL_URL,
+                timeout=self.DEFAULT_NAV_TIMEOUT_MS,
+                wait_until=self.DEFAULT_GOTO_WAIT_UNTIL,
+            )
             await self._page.wait_for_timeout(2000)
             return True
         except Exception as e:

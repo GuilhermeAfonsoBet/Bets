@@ -122,7 +122,25 @@ class FastCollector:
         
     def _on_websocket(self, ws):
         """Callback quando WebSocket conecta."""
-        ws.on('framereceived', lambda data: self._ws_messages.append(str(data)))
+        # Playwright pode entregar `WebSocketFrame`, dict ou string; queremos sempre
+        # o payload textual (JSON) para o parser.
+        def _on_frame(frame):
+            try:
+                payload = None
+                # WebSocketFrame (Playwright) costuma ter `.payload`
+                if hasattr(frame, "payload"):
+                    payload = frame.payload
+                elif isinstance(frame, dict) and "payload" in frame:
+                    payload = frame.get("payload")
+                else:
+                    payload = frame
+                if payload is None:
+                    return
+                self._ws_messages.append(str(payload))
+            except Exception:
+                return
+
+        ws.on('framereceived', _on_frame)
         
     async def collect_all(self) -> CollectionResult:
         """
@@ -140,8 +158,11 @@ class FastCollector:
         self._ws_messages.clear()
         
         # Navega para página principal de futebol
-        await self.scraper._page.goto(self.FOOTBALL_URL)
-        await self.scraper._page.wait_for_load_state("networkidle")
+        await self.scraper._page.goto(
+            self.FOOTBALL_URL,
+            timeout=self.scraper.DEFAULT_NAV_TIMEOUT_MS,
+            wait_until=self.scraper.DEFAULT_GOTO_WAIT_UNTIL,
+        )
         await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
 
         # Sessão expirada pode redirecionar para /login sem levantar exceção.
@@ -150,12 +171,20 @@ class FastCollector:
             relog_ok = await self.scraper.login(force=True)
             if not relog_ok:
                 raise RuntimeError("Sessão inválida no collect_all (relogin falhou)")
-            await self.scraper._page.goto(self.FOOTBALL_URL)
-            await self.scraper._page.wait_for_load_state("networkidle")
+            await self.scraper._page.goto(
+                self.FOOTBALL_URL,
+                timeout=self.scraper.DEFAULT_NAV_TIMEOUT_MS,
+                wait_until=self.scraper.DEFAULT_GOTO_WAIT_UNTIL,
+            )
             await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
         
         # Parseia todas as mensagens
         all_events, events_with_odds = self._parse_all_messages()
+
+        # Em algumas condições (proxy / WS lento), os offers chegam após a primeira janela.
+        if len(all_events) > 0 and len(events_with_odds) == 0:
+            await self.scraper._page.wait_for_timeout(6000)
+            all_events, events_with_odds = self._parse_all_messages()
         
         # Filtra apenas eventos com odds
         matches = [m for m in all_events.values() if m.ah_lines]
@@ -198,8 +227,11 @@ class FastCollector:
         
         # Navega para página da liga
         league_url = f"{self.FOOTBALL_URL}/{league_code}"
-        await self.scraper._page.goto(league_url)
-        await self.scraper._page.wait_for_load_state("networkidle")
+        await self.scraper._page.goto(
+            league_url,
+            timeout=self.scraper.DEFAULT_NAV_TIMEOUT_MS,
+            wait_until=self.scraper.DEFAULT_GOTO_WAIT_UNTIL,
+        )
         await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
 
         if "login" in (self.scraper._page.url or "").lower():
@@ -207,8 +239,11 @@ class FastCollector:
             relog_ok = await self.scraper.login(force=True)
             if not relog_ok:
                 raise RuntimeError("Sessão inválida no collect_league (relogin falhou)")
-            await self.scraper._page.goto(league_url)
-            await self.scraper._page.wait_for_load_state("networkidle")
+            await self.scraper._page.goto(
+                league_url,
+                timeout=self.scraper.DEFAULT_NAV_TIMEOUT_MS,
+                wait_until=self.scraper.DEFAULT_GOTO_WAIT_UNTIL,
+            )
             await self.scraper._page.wait_for_timeout(self.WAIT_TIME_MS)
         
         # Parseia mensagens
@@ -250,6 +285,24 @@ class FastCollector:
                     msg_type = item[0]
                     msg_meta = item[1]
                     msg_data = item[2] if len(item) > 2 else {}
+
+                    def _extract_sport_event_id(meta) -> tuple[Optional[str], Optional[str]]:
+                        if not isinstance(meta, list) or not meta:
+                            return None, None
+                        # Padrões observados (variáveis entre releases):
+                        # - ['fb', '<event_id>', ...]
+                        # - ['offers', 'fb', '<event_id>', ...]
+                        # - [<sport>, <event_id>]
+                        try:
+                            if len(meta) >= 2 and meta[0] == 'fb':
+                                return 'fb', meta[1]
+                            if len(meta) >= 3 and meta[1] == 'fb':
+                                return 'fb', meta[2]
+                            if len(meta) >= 2 and meta[0] in ('fb', 'tn', 'bk', 'bb'):
+                                return meta[0], meta[1]
+                        except Exception:
+                            return None, None
+                        return None, None
                     
                     # Processa eventos (info dos jogos)
                     if msg_type == 'event' and isinstance(msg_meta, list) and len(msg_meta) >= 2:
@@ -263,16 +316,14 @@ class FastCollector:
                             self._parse_event_info(msg_data, events[event_id])
                     
                     # Processa offers (odds)
-                    if msg_type in ['offers_hcap', 'offers_event']:
-                        if isinstance(msg_meta, list) and len(msg_meta) >= 3:
-                            sport_type = msg_meta[1]
-                            event_id = msg_meta[2]
-                            
-                            # Apenas futebol principal
-                            if sport_type == 'fb':
-                                if event_id not in events:
-                                    events[event_id] = MatchOdds(event_id=event_id, sport="fb")
-                                self._parse_offers(msg_data, events[event_id])
+                    if isinstance(msg_type, str) and msg_type.startswith('offers'):
+                        sport_type, event_id = _extract_sport_event_id(msg_meta)
+                        if sport_type == 'fb' and event_id:
+                            if event_id not in events:
+                                events[event_id] = MatchOdds(event_id=event_id, sport="fb")
+                            self._parse_offers(msg_data, events[event_id])
+                            # Só marca "com odds" se algum mercado foi preenchido
+                            if events[event_id].ah_lines or events[event_id].over_under or events[event_id].match_odds:
                                 events_with_odds.add(event_id)
                             
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):

@@ -58,6 +58,7 @@ class ContinuousCollector:
     MEMORY_CLEANUP_INTERVAL = 500  # limpeza de memória a cada N ciclos
     COLLECT_TIMEOUT_SECONDS = int(os.getenv("COLLECT_TIMEOUT_SECONDS", "120"))
     ZERO_ODDS_RECOVERY_THRESHOLD = int(os.getenv("COLLECT_ZERO_ODDS_RECOVERY_THRESHOLD", "3"))
+    STARTUP_RETRY_SECONDS = int(os.getenv("COLLECT_STARTUP_RETRY_SECONDS", "30"))
     
     def __init__(self):
         self.collector: Optional[FastCollector] = None
@@ -170,7 +171,19 @@ class ContinuousCollector:
         
     async def run(self):
         """Loop principal de coleta."""
-        await self.start()
+        # Startup resiliente: se login/navegação falhar (proxy lento, etc),
+        # não derruba o processo e evita thrash do systemd + chromes órfãos.
+        while True:
+            try:
+                await self.start()
+                break
+            except Exception as e:
+                logger.error(f"Falha no start do collector (retry em {self.STARTUP_RETRY_SECONDS}s): {e}")
+                try:
+                    await self.stop()
+                except Exception:
+                    pass
+                await asyncio.sleep(self.STARTUP_RETRY_SECONDS)
         
         while self.running:
             try:
