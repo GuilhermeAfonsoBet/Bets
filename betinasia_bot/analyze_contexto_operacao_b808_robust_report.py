@@ -1142,6 +1142,61 @@ async def main() -> int:
                 )
             lines.append("\n---\n")
 
+            # 2.3c) Estabilidade temporal (time-dependent) — por dia
+            lines.append("### 2.3c Estabilidade temporal (por dia, `audited_at`)\n")
+            lines.append(
+                "Objetivo: checar se o regime de edge/execução é **time‑dependent**. "
+                "Se houver dias com comportamento distinto (ex.: collector intermitente, horários/ligas), isso aparecerá aqui.\n\n"
+            )
+            # Foco na amostra executável (OK + betslip confiável). Por padrão mostramos API; se DOM existir, aparece em outra linha.
+            lines.append(
+                "| Dia (UTC) | Modelo | N OK | Jogos | % BS>WS +2% | % BS<WS -2% | lag_total p50 (ms) | CLV PM (BS>WS) | CLV PM (BS<WS) |\n"
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+            )
+
+            def _day_key(dt: Any) -> Optional[str]:
+                if not isinstance(dt, datetime):
+                    return None
+                try:
+                    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                except Exception:
+                    return None
+
+            day_keys = sorted({k for k in (_day_key(d.get("audited_at")) for d in ok_bs) if k})
+            for ds in day_keys[-14:]:  # último ~14 dias no máximo
+                for model_name in ["API (2-4s)", "DOM (15-30s)"]:
+                    sub = [d for d in ok_bs if str(d.get("model")) == model_name and _day_key(d.get("audited_at")) == ds]
+                    if not sub:
+                        continue
+                    sub_back = [d for d in sub if int(d["id"]) in back_edge_ids]
+                    sub_lay = [d for d in sub if int(d["id"]) in lay_edge_ids]
+                    share_back = (100.0 * len(sub_back) / len(sub)) if sub else None
+                    share_lay = (100.0 * len(sub_lay) / len(sub)) if sub else None
+                    n_matches = len({int(d["match_id"]) for d in sub})
+                    lags = [float(v) for v in (_safe_float(d.get("lag_total_ms")) for d in sub) if v is not None and float(v) > 0]
+                    lag_p50 = float(np.median(lags)) if lags else None
+
+                    clv_back = summarize_metric(
+                        [d.get("clv_bs") for d in sub_back if d.get("is_live") is False],
+                        [d.get("match_id") for d in sub_back if d.get("is_live") is False],
+                        clip_low=-50,
+                        clip_high=50,
+                    )
+                    clv_lay = summarize_metric(
+                        [d.get("clv_bs") for d in sub_lay if d.get("is_live") is False],
+                        [d.get("match_id") for d in sub_lay if d.get("is_live") is False],
+                        clip_low=-50,
+                        clip_high=50,
+                    )
+                    clv_back_txt = f"{_fmt_pct(clv_back.mean_cluster,2)}" if clv_back.n_events else "—"
+                    clv_lay_txt = f"{_fmt_pct(clv_lay.mean_cluster,2)}" if clv_lay.n_events else "—"
+
+                    lines.append(
+                        f"| {ds} | {model_name} | {len(sub)} | {n_matches} | {_fmt_num(share_back,1)}% | {_fmt_num(share_lay,1)}% | "
+                        f"{_fmt_num(lag_p50,0)} | {clv_back_txt} | {clv_lay_txt} |\n"
+                    )
+            lines.append("\n---\n")
+
         # 3) CLV pre-match (robusto)
         lines.append("## 3) CLV pre-match (núcleo)\n")
         lines.append("### 3.1 CLV com odd do Betslip (execução real)\n")
