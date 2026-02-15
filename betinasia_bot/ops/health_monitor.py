@@ -43,6 +43,12 @@ class CheckResult:
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
 
 def _read_last_jsonl(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not path.exists():
@@ -258,6 +264,97 @@ async def run_checks(
         },
     }
 
+def _load_state(path: Path) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return {"v": 1, "services": {}}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"v": 1, "services": {}}
+
+
+def _save_state(path: Path, state: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _rate_limited(
+    state: Dict[str, Any],
+    service: str,
+    *,
+    now: datetime,
+    max_restarts_per_hour: int,
+    cooldown_sec: int,
+) -> Tuple[bool, str]:
+    """
+    Retorna (allowed, reason). Usa state['services'][svc]['restarts'] como lista de ISO timestamps.
+    """
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    restarts: List[str] = list(svc.get("restarts") or [])
+    # filtra janela 1h
+    cutoff = now - timedelta(hours=1)
+    kept: List[str] = []
+    last_dt: Optional[datetime] = None
+    for ts in restarts:
+        dt = _parse_iso_ts(ts)
+        if not dt:
+            continue
+        if dt >= cutoff:
+            kept.append(dt.isoformat())
+        if (last_dt is None) or (dt > last_dt):
+            last_dt = dt
+    svc["restarts"] = kept
+
+    if last_dt is not None:
+        age = int((now - last_dt).total_seconds())
+        if age < int(cooldown_sec):
+            return False, f"cooldown ({age}s < {cooldown_sec}s)"
+    if len(kept) >= int(max_restarts_per_hour):
+        return False, f"rate_limit ({len(kept)}/{max_restarts_per_hour} restarts na última hora)"
+    return True, "ok"
+
+
+def _mark_failure(state: Dict[str, Any], service: str) -> int:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    n = _safe_int(svc.get("consecutive_fail"), 0) + 1
+    svc["consecutive_fail"] = n
+    return n
+
+
+def _reset_failure(state: Dict[str, Any], service: str) -> None:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    svc["consecutive_fail"] = 0
+
+
+def _append_restart(state: Dict[str, Any], service: str, now: datetime) -> None:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    restarts: List[str] = list(svc.get("restarts") or [])
+    restarts.append(now.isoformat())
+    svc["restarts"] = restarts[-50:]
+
+
+def _should_restart_from_results(results: List[CheckResult], service: str) -> bool:
+    """
+    Heurística conservadora:
+    - se houver FAIL específico do serviço ou do seu subsistema (telemetria/DB)
+    """
+    key = str(service).strip()
+    for r in results:
+        if r.level != "FAIL":
+            continue
+        msg = r.message.lower()
+        if key.lower() in msg:
+            return True
+        # mapeamentos simples
+        if "collector" in key.lower() and ("collector" in msg or "best_odds_history" in msg):
+            return True
+        if "audit" in key.lower() and ("audit" in msg or "betslip_audit_results" in msg):
+            return True
+    return False
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -269,6 +366,15 @@ def main() -> int:
     ap.add_argument("--audit-telemetry", default=os.getenv("AUDIT_TELEMETRY_FILE", "logs/audit_api_telemetry.jsonl"))
     ap.add_argument("--telegram", action="store_true", help="Envia alerta no Telegram em WARN/FAIL")
     ap.add_argument("--restart-on-fail", action="store_true", help="Reinicia serviços quando FAIL (requer sudo sem prompt)")
+    ap.add_argument(
+        "--autopilot",
+        action="store_true",
+        help="Modo auto-pilot seguro: só reinicia após N FAILs consecutivos, com cooldown e rate limit.",
+    )
+    ap.add_argument("--state-file", default=os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))
+    ap.add_argument("--consecutive-fails-to-restart", type=int, default=int(os.getenv("OPS_FAILS_TO_RESTART", "2")))
+    ap.add_argument("--cooldown-sec", type=int, default=int(os.getenv("OPS_RESTART_COOLDOWN_SEC", "1800")))
+    ap.add_argument("--max-restarts-per-hour", type=int, default=int(os.getenv("OPS_MAX_RESTARTS_PER_HOUR", "2")))
     args = ap.parse_args()
 
     results, code, meta = asyncio.run(
@@ -279,9 +385,47 @@ def main() -> int:
             audit_service=str(args.audit_service),
             collector_telemetry=Path(str(args.collector_telemetry)),
             audit_telemetry=Path(str(args.audit_telemetry)),
-            restart_on_fail=bool(args.restart_on_fail),
+            restart_on_fail=bool(args.restart_on_fail) and (not bool(args.autopilot)),
         )
     )
+
+    # AUTO-PILOT (seguro): restarts com rate limit/cooldown, após FAILs consecutivos
+    now = _utcnow()
+    autopilot_actions: List[str] = []
+    if args.autopilot:
+        state_path = Path(str(args.state_file))
+        state = _load_state(state_path)
+        state["last_run_utc"] = now.isoformat()
+
+        # marca falhas por serviço
+        for svc in [str(args.collector_service), str(args.audit_service)]:
+            if code >= 2 and _should_restart_from_results(results, svc):
+                nfail = _mark_failure(state, svc)
+                autopilot_actions.append(f"{svc}: consecutive_fail={nfail}")
+            else:
+                _reset_failure(state, svc)
+
+        # decide restarts
+        for svc in [str(args.collector_service), str(args.audit_service)]:
+            svc_state = state.get("services", {}).get(svc, {})
+            nfail = _safe_int(svc_state.get("consecutive_fail"), 0)
+            if nfail < int(args.consecutive_fails_to_restart):
+                continue
+            allowed, reason = _rate_limited(
+                state,
+                svc,
+                now=now,
+                max_restarts_per_hour=int(args.max_restarts_per_hour),
+                cooldown_sec=int(args.cooldown_sec),
+            )
+            if not allowed:
+                autopilot_actions.append(f"{svc}: restart bloqueado ({reason})")
+                continue
+            ok = _systemctl_restart(svc)
+            _append_restart(state, svc, now)
+            autopilot_actions.append(f"{svc}: restart acionado={ok}")
+
+        _save_state(state_path, state)
 
     # imprime output legível
     print("=" * 70)
@@ -289,17 +433,27 @@ def main() -> int:
     print("=" * 70)
     for r in results:
         print(f"[{r.level}] {r.message}")
+    if args.autopilot and autopilot_actions:
+        print("-" * 70)
+        print("Auto-pilot:")
+        for a in autopilot_actions:
+            print(f"- {a}")
     print("-" * 70)
     print(f"Exit code: {code}")
 
-    if args.telegram and code > 0:
+    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions)):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
         if token and chat_id:
-            lines = [f"OPS HEALTH ({'FAIL' if code>=2 else 'WARN'}) @ {meta.get('now_utc')}"]
+            level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
+            lines = [f"OPS HEALTH ({level}) @ {meta.get('now_utc')}"]
             for r in results:
                 if r.level in ("WARN", "FAIL"):
                     lines.append(f"- [{r.level}] {r.message}")
+            if args.autopilot and autopilot_actions:
+                lines.append("- Auto-pilot:")
+                for a in autopilot_actions:
+                    lines.append(f"  - {a}")
             _telegram_send(token, chat_id, "\n".join(lines))
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")

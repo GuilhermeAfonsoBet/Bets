@@ -54,6 +54,56 @@ Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
 
+### Telegram (como “cadastrar” corretamente)
+Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.
+
+1) Crie um bot no Telegram via `@BotFather` e pegue o token.  
+2) No seu celular (o número `+55...`), abra o bot e mande `/start`.  
+3) No VPS, com `TELEGRAM_BOT_TOKEN` no `.env`, rode:
+
+```bash
+python3 -m ops.telegram_setup
+```
+
+Ele vai imprimir o `chat_id`. Coloque no `.env` como `TELEGRAM_CHAT_ID=...`.
+
+---
+
+## 2b) Auto-pilot seguro (timer com restart controlado)
+
+O auto-pilot roda a cada ~2 minutos e:
+- envia alerta Telegram em WARN/FAIL
+- **só reinicia** serviços quando houver **FAIL por 2 execuções seguidas** (default)
+- aplica **cooldown** e **rate limit** para evitar flapping
+
+### Instalar
+```bash
+sudo cp -v ops/systemd/betinasia-ops-autopilot.service /etc/systemd/system/
+sudo cp -v ops/systemd/betinasia-ops-autopilot.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-ops-autopilot.timer
+systemctl list-timers --all | rg betinasia-ops-autopilot
+```
+
+### Configurar parâmetros (no `.env`)
+- `OPS_FAILS_TO_RESTART=2`
+- `OPS_RESTART_COOLDOWN_SEC=1800`  (30min)
+- `OPS_MAX_RESTARTS_PER_HOUR=2`
+- `OPS_AUTOPILOT_STATE_FILE=logs/ops_autopilot_state.json`
+
+### Importante: sudo sem prompt (para o timer conseguir reiniciar)
+O restart usa `sudo systemctl restart ...`. Configure uma regra NOPASSWD (exemplo):
+
+```bash
+sudo visudo
+```
+
+Adicione (ajuste o path do systemctl se necessário, às vezes é `/usr/bin/systemctl`):
+```
+betbot ALL=(root) NOPASSWD: /bin/systemctl restart betinasia-collector, /bin/systemctl restart betinasia-audit-api
+betbot ALL=(root) NOPASSWD: /usr/bin/systemctl restart betinasia-collector, /usr/bin/systemctl restart betinasia-audit-api
+```
+
 ---
 
 ## 3) Procedimento “restart limpo” (quando travar)

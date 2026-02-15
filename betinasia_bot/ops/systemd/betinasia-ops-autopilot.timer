@@ -1,0 +1,12 @@
+ [Unit]
+ Description=BetinAsia Ops Auto-Pilot (timer)
+ 
+ [Timer]
+ OnBootSec=2min
+ OnUnitActiveSec=2min
+ AccuracySec=30s
+ Unit=betinasia-ops-autopilot.service
+ 
+ [Install]
+ WantedBy=timers.target
+ 
