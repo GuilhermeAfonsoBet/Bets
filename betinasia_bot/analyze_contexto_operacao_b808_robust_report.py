@@ -2523,6 +2523,50 @@ async def main() -> int:
         lines.append("- **Kelly fracionado**: sizing por edge. Para Back, \\(f^* \\propto \\frac{EV}{odds-1}\\). Para Lay, o sizing natural é por **liability**.\n")
         lines.append("- **Governança de risco**: impor **cap por aposta** (ex.: 1–2% da banca) e olhar p95/p99/ES95 de exposição.\n\n")
 
+        lines.append("**Como o Kelly está sendo calculado aqui (detalhado, com premissas)**\n\n")
+        lines.append(
+            "Como ainda não temos um modelo explícito de probabilidade \\(p\\) por aposta, usamos um proxy padrão: "
+            "**o closing pré‑jogo como melhor estimativa de preço justo**. A partir disso inferimos \\(p\\) e aplicamos Kelly como aproximação.\n\n"
+        )
+        lines.append("Premissas e entradas:\n\n")
+        lines.append("- **Entrada (Back)**: `entry_odd = bs_odd` (odd do betslip no momento de execução).\n")
+        lines.append("- **Entrada (Lay)**: `entry_lay_odd = hypothesis_details.lay.odd` (fallback: `bs_odd`).\n")
+        lines.append("- **Preço justo (pre‑match)**: `closing_odd` (closing line). Inferimos \\(p \\approx 1/closing\\_odd\\).\n")
+        lines.append("- **Aplicabilidade**: para `is_live=True` (in‑match), **não usamos** `closing_odd` como benchmark de CLV/Kelly.\n\n")
+        lines.append("Fórmulas (Back):\n\n")
+        lines.append("- Odds decimais \\(O\\); retorno líquido \\(b = O-1\\).\n")
+        lines.append("- \\(p \\approx 1/closing\\_odd\\).\n")
+        lines.append("- Valor esperado por unidade de stake: \\(EV = O\\cdot p - 1\\).\n")
+        lines.append("- Kelly cheio (fração de banca em **stake**): \\(f^* = \\frac{EV}{b} = \\frac{O\\cdot p - 1}{O-1}\\).\n")
+        lines.append("- No relatório: \\(f = \\max(0,f^*)\\cdot \\text{frac}\\) com `frac` em {0.10, 0.25, 0.50, 1.00}.\n\n")
+        lines.append("Fórmulas (Lay):\n\n")
+        lines.append("- Para Lay, o “capital em risco” natural é a **liability** \\(L\\) (perda máxima), não o stake.\n")
+        lines.append("- Usamos \\(p \\approx 1/closing\\_odd\\) e \\(o = entry\\_lay\\_odd\\).\n")
+        lines.append("- Kelly em termos de **liability** (proxy): \\(f^*_{liab} = 1 - p\\cdot o\\).\n")
+        lines.append("- No relatório: \\(f_{liab} = \\max(0,f^*_{liab})\\cdot \\text{frac}\\).\n")
+        lines.append("- Conversão para stake (apenas para turnover): \\(stake = L/(o-1)\\).\n\n")
+        lines.append("Derivação rápida (por que \\(f^*_{liab}=1-p\\cdot o\\)):\n\n")
+        lines.append(
+            "- Defina \\(W\\) como banca e escolha alocar \\(L=f\\cdot W\\) como **liability**.\n"
+            "- Se o evento acontece (prob. \\(p\\)), você perde \\(L\\): \\(W' = W-L = W(1-f)\\).\n"
+            "- Se o evento não acontece (prob. \\(1-p\\)), você ganha o **stake** do Lay, que é \\(S=L/(o-1)\\): "
+            "\\(W' = W+S = W\\left(1+\\frac{f}{o-1}\\right)\\).\n"
+            "- Kelly maximiza \\(p\\log(1-f) + (1-p)\\log\\left(1+\\frac{f}{o-1}\\right)\\). "
+            "Derivando e igualando a zero, obtém-se \\(f^* = 1 - p\\cdot o\\).\n\n"
+        )
+        lines.append("Parâmetros de escala (proxy de banca) e caps:\n\n")
+        lines.append("- `back_bank_ref = p99(stake)` e `lay_bank_ref = p99(liability)` observados no sizing **PROXY** da janela.\n")
+        lines.append("- `stake_back = min(f * back_bank_ref, cap_back)` e `liab_lay = min(f_liab * lay_bank_ref, cap_lay)`.\n")
+        lines.append("- Caps atuais (guardrail): `cap_back = 2% * back_bank_ref`, `cap_lay = 1% * lay_bank_ref`.\n")
+        lines.append(
+            "- **Implicação importante**: se o cap estiver frequentemente ativo, aumentar `frac` (ex.: >0,25×Kelly) "
+            "**não aumenta** tamanho real — a curva satura.\n\n"
+        )
+        lines.append(
+            "Limitações: comissão/vigorish não modelados; correlação entre apostas ignorada; closing como preço justo é aproximação; "
+            "e o `bank_ref` é uma escala interna (proxy) baseada em limits observados.\n\n"
+        )
+
         # --- calibração: stake vs ROI/CLV ---
         def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
             if len(xs) < 3 or len(ys) < 3:
@@ -2689,7 +2733,7 @@ async def main() -> int:
                 return (min(f * lay_bank_ref, cap), float(lay_odd))
             return None
 
-        schemes = ["FLAT", "PROXY", "KELLY_0.10", "KELLY_0.25"]
+        schemes = ["FLAT", "PROXY", "KELLY_0.10", "KELLY_0.25", "KELLY_0.50", "KELLY_1.00"]
 
         def _eval_back(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
             pnls = []
@@ -2793,6 +2837,7 @@ async def main() -> int:
             "\nLeitura:\n"
             "- Se `PROXY` piora ROI/turnover vs `FLAT`, isso indica que a política de stake atual está concentrando exposição em pontos com pior performance.\n"
             "- `KELLY_0.25` tende a ser um bom compromisso quando o edge é estimado por CLV, mas requer **caps** e só é aplicável quando há `closing_odd` (pre‑match).\n"
+            "- Em Lay, é comum observar ROI alto por **liability**, mas sizing menor em **stake**: isso é uma decisão deliberada de governança de risco (liability tem cauda pior).\n"
             "- DD é estimado por bootstrap i.i.d de dias (aproximação). Para uma curva mais fiel, use bootstrap por dia com blocos maiores.\n\n"
         )
 
@@ -2824,6 +2869,9 @@ async def main() -> int:
 
         strat_lay = []
         for d in lay_edge:
+            # Mantemos pre-match aqui para consistência com closing/Kelly e com a lógica de lay_entries (pré-jogo).
+            if d.get("is_live") is True:
+                continue
             mids = lay_entry_by_id.get(int(d.get("match_id")), [])
             # usa qualquer entry com reversão e vale cedo
             ok = False
@@ -2997,6 +3045,108 @@ async def main() -> int:
             "- `LayReversal` usa o diagnóstico da seção 8.2b: **subcoorte com reversão** e vale cedo (t_ext<=3s) como proxy de “logo após a reversão”.\n"
             "- `Stake médio` e `Liability média` são **proxies** na unidade monetária do seu limit/finance; valores em **R$** usam fx `--fx-usdbrl`.\n"
             "- `Banca recomendada` = max( banca por risco p99 (unitária, soma) ; banca por liquidez p99 (+buffer) ).\n"
+            "- **Por que Lay pode ter stake médio menor mesmo com ROI maior**: (i) Lay é governado por **liability** (risco) e usamos cap mais conservador; "
+            "(ii) stake em Lay é derivado de `liability/(odd-1)` e depende do nível médio de odds; (iii) Kelly depende do **edge vs closing** (gap entry→closing), "
+            "não do ROI observado isoladamente.\n"
+            "- **Por que não incluímos Back in‑match aqui**: Kelly/CLV usam `closing_odd` pré‑jogo; in‑match requer benchmark diferente (ex.: referência por minuto/VWAP) e "
+            "governança operacional específica. A seção 2.2 já compara PRE_MATCH vs IN_MATCH.\n"
+        )
+
+        # ------------------------------------------------------------
+        # 9.4b) Curva de capacidade (fração de Kelly) — tamanho potencial
+        # ------------------------------------------------------------
+        lines.append("\n### 9.4b Curva de capacidade — frações de Kelly e tamanho potencial\n")
+        lines.append(
+            "Esta tabela é um exercício para estimar **capacidade** (turnover/lucro/risco) ao variar a fração de Kelly. "
+            "Ela deixa explícito quando o sizing satura por **cap por aposta**.\n\n"
+        )
+
+        def _cap_rate_back(rows_b_all: List[dict], scheme: str) -> Optional[float]:
+            if not str(scheme).startswith("KELLY"):
+                return None
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return None
+            cap = BACK_CAP_FRAC * max(1e-9, float(back_bank_ref))
+            hits = 0
+            n = 0
+            for d in rows_b_all:
+                f0 = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(back_bank_ref)
+                if raw > cap + 1e-12:
+                    hits += 1
+                n += 1
+            return (100.0 * hits / n) if n > 0 else None
+
+        def _cap_rate_lay(rows_l_all: List[dict], scheme: str) -> Optional[float]:
+            if not str(scheme).startswith("KELLY"):
+                return None
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return None
+            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+            hits = 0
+            n = 0
+            for d in rows_l_all:
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d.get("bs_odd"))
+                if lay_odd is None:
+                    continue
+                f0 = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(lay_bank_ref)
+                if raw > cap + 1e-12:
+                    hits += 1
+                n += 1
+            return (100.0 * hits / n) if n > 0 else None
+
+        lines.append(
+            "| Strategy | Scheme | cap_hit Back (%) | cap_hit Lay (%) | Stake médio Back | Stake médio Lay | Liability média Lay | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | Banca rec. (max) | ROI/banca 30d | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        )
+        for sc in ["KELLY_0.10", "KELLY_0.25", "KELLY_0.50", "KELLY_1.00"]:
+            s = _summ_strategy("BackFast+LayReversal", strat_back, strat_lay, sc)
+            crb = _cap_rate_back(strat_back, sc)
+            crl = _cap_rate_lay(strat_lay, sc)
+            lines.append(
+                f"| {s['name']} | {sc} | {_fmt_num(crb,1)}% | {_fmt_num(crl,1)}% | "
+                f"{_fmt_num(s['stake_avg_back'],2)} | {_fmt_num(s['stake_avg_lay'],2)} | {_fmt_num(s['liab_avg_lay'],2)} | "
+                f"{_fmt_num(s['turn_30d'],2)} | {_fmt_num(s['profit_30d'],2)} | {_fmt_num(s['bank_eff'],2)} | "
+                f"{_fmt_num(s['roi_bank_30d'],2)}% | {_fmt_num(s['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nLeitura rápida:\n"
+            "- Se `cap_hit` estiver alto, a alavancagem adicional (ex.: 0,50× ou 1,00×) não vira turnover — o cap está “travando” o tamanho.\n"
+            "- Se `cap_hit` estiver baixo, a curva deve escalar quase linearmente com `frac` (até bater em limites reais/operacionais).\n"
+            "- Lay normalmente satura antes por ter cap mais conservador (liability) e por ter risco de cauda mais assimétrico.\n\n"
+        )
+
+        # ------------------------------------------------------------
+        # 9.4c) Diagnóstico in-match (Back): por que não entra na estratégia
+        # ------------------------------------------------------------
+        lines.append("### 9.4c Diagnóstico: Back in‑match (por que não está na estratégia candidata)\n")
+        lines.append(
+            "Aqui reportamos Back in‑match **apenas como diagnóstico**. "
+            "Não incluímos in‑match na estratégia candidata porque (i) `closing_odd` pré‑jogo não é benchmark in‑match e "
+            "(ii) o sizing Kelly acima depende desse benchmark.\n\n"
+        )
+        strat_back_im = [d for d in back_edge if str(d.get("exec_bucket")) == "< 5s" and d.get("is_live") is True]
+        eb_flat_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "FLAT")
+        eb_proxy_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "PROXY")
+        lines.append("| Regime | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover |\n|---|---|---:|---:|---:|---:|\n")
+        lines.append(f"| IN_MATCH BackFast (<5s) | FLAT | {eb_flat_im['n']} | {_fmt_num(eb_flat_im['turnover'],2)} | {_fmt_num(eb_flat_im['profit'],2)} | {_fmt_num(eb_flat_im['roi_turn'],2)}% |\n")
+        lines.append(f"| IN_MATCH BackFast (<5s) | PROXY | {eb_proxy_im['n']} | {_fmt_num(eb_proxy_im['turnover'],2)} | {_fmt_num(eb_proxy_im['profit'],2)} | {_fmt_num(eb_proxy_im['roi_turn'],2)}% |\n")
+        lines.append(
+            "\nPróximo passo (se quiser operar in‑match): definir um benchmark de preço justo in‑match (ex.: referência por minuto, VWAP, ou odds externas) "
+            "e calibrar sizing/risco específico do live.\n\n"
         )
 
         # ============================================================
