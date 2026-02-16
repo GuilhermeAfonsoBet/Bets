@@ -117,6 +117,26 @@ betbot ALL=(root) NOPASSWD: /usr/bin/systemctl restart betinasia-collector, /usr
 
 ---
 
+## 2c) Status on-demand via Telegram (/status)
+
+Além dos alertas automáticos, você pode **perguntar o status completo** pelo Telegram:
+
+- mande `/status` para o bot
+- ele responde com:
+  - systemd (collector + audit)
+  - frescor de telemetria/DB
+  - resumo da telemetria do collector (inclui `save_errors`, timeouts e ciclos com 0 odds úteis)
+
+### Instalar o serviço do bot de status
+```bash
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-ops-telegram-bot.service')" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-ops-telegram-bot.service
+sudo systemctl status --no-pager -n 80 betinasia-ops-telegram-bot.service
+```
+
+---
+
 ## 3) Procedimento “restart limpo” (quando travar)
 
 Collector:
