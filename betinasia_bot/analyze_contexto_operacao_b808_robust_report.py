@@ -570,6 +570,19 @@ async def main() -> int:
         default=float(os.getenv("MAX_STAKE_CAP", "0.0")),
         help="Cap absoluto adicional para stake máximo por evento (0=sem cap).",
     )
+    parser.add_argument(
+        "--walkforward",
+        action="store_true",
+        help="Habilita estudo OOS rolling-forward (walk-forward) por dia, com seleção de estratégias por IC90/p90.",
+    )
+    parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "3")), help="Dias de treino por passo (default 3).")
+    parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
+    parser.add_argument(
+        "--wf-min-matches",
+        type=int,
+        default=int(os.getenv("WF_MIN_MATCHES", "30")),
+        help="Mínimo de jogos por combinação para ser elegível (default 30).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -2338,8 +2351,10 @@ async def main() -> int:
             clve = _clv_pct_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
             clvl = _clv_pct_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
             return {
+                "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
+                "audited_at": d.get("audited_at"),
                 "had_reversal": bool(a.get("had_reversal")),
                 "ext_at_end": bool(a.get("ext_at_end")),
                 "monotonic": bool(a.get("monotonic")),
@@ -2375,8 +2390,10 @@ async def main() -> int:
             clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
             clvl = _clv_pct_lay_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
             return {
+                "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
                 "is_live": d.get("is_live"),
+                "audited_at": d.get("audited_at"),
                 "had_reversal": bool(a.get("had_reversal")),
                 "ext_at_end": bool(a.get("ext_at_end")),
                 "monotonic": bool(a.get("monotonic")),
@@ -2501,6 +2518,72 @@ async def main() -> int:
             )
 
         lines.append("\n---\n")
+
+        # ============================================================
+        # 8.3) Resumo das 8 combinações (Side × Pre/In × Reversal)
+        # ============================================================
+        lines.append("### 8.3 Resumo de estratégias — 8 combinações (Side × Pre/In × Reversal)\n")
+        lines.append(
+            "Esta tabela resume as **8 combinações** possíveis: `Back/Lay × Pre/In × Reversal(Sim/Não)`.\n\n"
+            "- **CLV** aqui é medido em `t0` e **somente pre‑match** (closing pré‑jogo).\n"
+            "- **ROI** aqui é em `t0` (se houver placar). Para Lay, o ROI é **por liability**.\n"
+            "- **IC90** é bootstrap por jogo (cluster em `match_id`).\n\n"
+        )
+
+        by_audit_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+
+        def _combo_rows(entries: List[dict], *, is_live: bool, had_rev: bool) -> List[dict]:
+            return [r for r in entries if r.get("is_live") is is_live and bool(r.get("had_reversal")) is bool(had_rev)]
+
+        def _summ_ci(rows: List[dict], key: str, clip_low: float, clip_high: float) -> Tuple[Optional[float], Optional[Tuple[float, float]], int, int]:
+            vals = [r.get(key) for r in rows]
+            mids = [r.get("match_id") for r in rows]
+            s = summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
+            return s.mean_cluster, s.ci90_cluster, s.n_events, s.n_matches
+
+        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI t0 (mean; IC90) | Valor (IC90 lb>0) |\n")
+        lines.append("|---|---|---|---:|---:|---:|---:|---|\n")
+        for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
+                    filt = _combo_rows(entries, is_live=is_live_val, had_rev=had_rev_val)
+                    # CLV só pre-match
+                    clv_mean = clv_ci = None
+                    n_clv = m_clv = 0
+                    if is_live_val is False:
+                        clv_mean, clv_ci, n_clv, m_clv = _summ_ci(
+                            filt,
+                            "clv_t0",
+                            clip_low=-50,
+                            clip_high=50,
+                        )
+                    # ROI (t0). Back: ROI/stake. Lay: ROI/liability (já calculado assim no entry_metrics)
+                    roi_clip_hi = 500.0 if side == "Back" else 5000.0
+                    roi_mean, roi_ci, n_roi, m_roi = _summ_ci(
+                        filt,
+                        "roi_t0",
+                        clip_low=-200.0,
+                        clip_high=roi_clip_hi,
+                    )
+                    n_total = len(filt)
+                    m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
+                    # critério "valor p90": limite inferior do IC90 > 0 (quando aplicável)
+                    ci_use = clv_ci if (is_live_val is False and clv_ci is not None) else roi_ci
+                    val_lbl = "—"
+                    if ci_use:
+                        val_lbl = "sim" if float(ci_use[0]) > 0 else "não"
+
+                    clv_str = f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)}" if (is_live_val is False) else "—"
+                    roi_str = f"{_fmt_pct(roi_mean,2)} {_fmt_ci(roi_ci,2)}"
+                    lines.append(
+                        f"| {side} | {regime_label} | {rev_label} | {n_total} | {m_total} | {clv_str} | {roi_str} | {val_lbl} |\n"
+                    )
+
+        lines.append(
+            "\nNotas:\n"
+            "- Se você quiser operar **cada combinação como uma estratégia separada**, o sizing (Kelly/caps) deve ser estimado e governado separadamente por estratégia.\n"
+            "- Esta tabela é **in-sample** na janela (`--lookback-days`). A seção OOS (walk-forward) pode ser habilitada com `--walkforward`.\n\n"
+        )
 
         # ============================================================
         # 9) Combinações de valor (regime x linha x lag)
@@ -2770,6 +2853,9 @@ async def main() -> int:
                 bs, _, _, _ = finance_for_row(d)
                 return float(bs)
             if scheme.startswith("KELLY"):
+                # Kelly/closing só é interpretável pre-match
+                if d.get("is_live") is True:
+                    return None
                 # KELLY_xx: xx = fração (0.10, 0.25, 0.50)
                 frac = float(scheme.split("_")[1])
                 f = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
@@ -2800,6 +2886,9 @@ async def main() -> int:
                 _, _, _, ll = finance_for_row(d)
                 return (float(ll), float(lay_odd))
             if scheme.startswith("KELLY"):
+                # Kelly/closing só é interpretável pre-match
+                if d.get("is_live") is True:
+                    return None
                 frac = float(scheme.split("_")[1])
                 f = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
                 if f is None:
@@ -2929,6 +3018,56 @@ async def main() -> int:
             "- Em Lay, é comum observar ROI alto por **liability**, mas sizing menor em **stake**: isso é uma decisão deliberada de governança de risco (liability tem cauda pior).\n"
             "- DD é estimado por bootstrap i.i.d de dias (aproximação). Para uma curva mais fiel, use bootstrap por dia com blocos maiores.\n\n"
         )
+
+        # 9.3b) Sizing separado por estratégia (8 combinações)
+        lines.append("### 9.3b Stake sizing por estratégia (8 combinações)\n")
+        lines.append(
+            "Abaixo repetimos o backtest de sizing **separado** por cada combinação `Side × Pre/In × Reversal`. "
+            "Isso responde diretamente sua necessidade: **se várias combinações tiverem valor, o Kelly/caps deve ser calibrado por estratégia**.\n\n"
+            "Observações:\n"
+            "- Kelly é calculado **somente pre-match** (depende de `closing_odd`). Em combinações `In`, reportamos apenas `FLAT` e `PROXY`.\n"
+            "- ROI do Lay é por **liability**; turnover é mostrado em stake equivalente.\n\n"
+        )
+        lines.append("| Side | Pre/In | Reversal | Scheme | N (placar) | Turnover | Lucro | ROI/turnover | p99 exp | DD30 p95 |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
+
+        def _rows_for_combo(side: str, is_live_val: bool, had_rev_val: bool) -> List[dict]:
+            # usa entries para filtrar e volta para o d original (necessário para sizing)
+            ent = back_entries if side == "Back" else lay_entries
+            flt = [r for r in ent if r.get("is_live") is is_live_val and bool(r.get("had_reversal")) is bool(had_rev_val)]
+            out = []
+            for r in flt:
+                aid = r.get("audit_id")
+                if aid is None:
+                    continue
+                d0 = by_audit_id.get(int(aid))
+                if d0:
+                    # filtra por coorte de edge (Back/Lay) para evitar misturar lados
+                    if side == "Back" and int(aid) not in back_edge_ids:
+                        continue
+                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                        continue
+                    out.append(d0)
+            return out
+
+        for side in ["Back", "Lay"]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
+                    rows_combo = _rows_for_combo(side, is_live_val, had_rev_val)
+                    # apenas eventos com placar, como no backtest geral
+                    if side == "Back":
+                        rows_fin = [d for d in rows_combo if d.get("roi_bs") is not None]
+                        for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
+                            eb = _eval_back(rows_fin, sc)
+                            lines.append(
+                                f"| {side} | {regime_label} | {rev_label} | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | {_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
+                            )
+                    else:
+                        rows_fin = [d for d in rows_combo if d.get("home_score") is not None and d.get("away_score") is not None]
+                        for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
+                            el = _eval_lay(rows_fin, sc)
+                            lines.append(
+                                f"| {side} | {regime_label} | {rev_label} | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | {_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
+                            )
 
         # ============================================================
         # 9.4) Estratégias candidatas (com sizing recomendado)
@@ -3309,6 +3448,135 @@ async def main() -> int:
             "\nPróximo passo (se quiser operar in‑match): definir um benchmark de preço justo in‑match (ex.: referência por minuto, VWAP, ou odds externas) "
             "e calibrar sizing/risco específico do live.\n\n"
         )
+
+        # ============================================================
+        # 12) OOS rolling-forward (walk-forward)
+        # ============================================================
+        lines.append("## 12) OOS rolling-forward (walk-forward): seleção e validação\n")
+        lines.append(
+            "Até aqui o relatório é **in-sample** (na janela `--lookback-days`). "
+            "Este bloco (opcional) faz um walk-forward simples por dia:\n\n"
+            "- Em cada passo, usamos os últimos `wf_train_days` para **selecionar** combinações com evidência de valor (IC90 lb>0).\n"
+            "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
+            "Isso aproxima o fluxo operacional que você descreveu (seleciona no rolling atual e mede no próximo rolling).\n\n"
+        )
+
+        if not bool(getattr(args, "walkforward", False)):
+            lines.append(
+                "Walk-forward **desligado**. Para habilitar: rode com `--walkforward` "
+                "(e ajuste `--wf-train-days/--wf-test-days/--wf-min-matches` se quiser).\n\n"
+            )
+        else:
+            wf_train = int(max(1, getattr(args, "wf_train_days", 3)))
+            wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
+            wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
+
+            # dataset de entradas com timestamp
+            combo_events: List[dict] = []
+            for side, ent in [("Back", back_entries), ("Lay", lay_entries)]:
+                for r in ent:
+                    aid = r.get("audit_id")
+                    if aid is None:
+                        continue
+                    # mantém apenas eventos de edge do lado correspondente
+                    if side == "Back" and int(aid) not in back_edge_ids:
+                        continue
+                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                        continue
+                    ts = r.get("audited_at")
+                    if not isinstance(ts, datetime):
+                        continue
+                    combo_events.append(
+                        {
+                            "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                            "side": side,
+                            "regime": "Pre" if r.get("is_live") is False else "In",
+                            "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
+                            "match_id": int(r.get("match_id")),
+                            # seleção: CLV pre-match, ROI in-match
+                            "sel": r.get("clv_t0") if (r.get("is_live") is False) else r.get("roi_t0"),
+                            # avaliação OOS: ROI em t0 quando houver
+                            "roi": r.get("roi_t0"),
+                        }
+                    )
+
+            days = sorted({e["day"] for e in combo_events})
+            if len(days) < (wf_train + wf_test + 1):
+                lines.append(
+                    f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test + 1}.\n\n"
+                )
+            else:
+                def _key(e: dict) -> str:
+                    return f"{e['side']}_{e['regime']}_{e['reversal']}"
+
+                def _ci90_lb_positive(vals_by_match: Dict[int, List[float]]) -> Tuple[bool, Optional[float], Optional[Tuple[float, float]], int]:
+                    mean_hat, ci = cluster_bootstrap_ci(vals_by_match, n_boot=2000, alpha=0.10, seed=int(args.seed))
+                    nm = len(vals_by_match)
+                    return (bool(ci and float(ci[0]) > 0), mean_hat, ci, nm)
+
+                steps = []
+                active_counts: Dict[str, int] = {}
+                for i in range(wf_train, len(days) - wf_test):
+                    train_days = set(days[i - wf_train : i])
+                    test_days = set(days[i : i + wf_test])
+
+                    train = [e for e in combo_events if e["day"] in train_days and e.get("sel") is not None]
+                    test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None]
+
+                    # seleção por combinação
+                    active: List[str] = []
+                    diag = {}
+                    for k in sorted({_key(e) for e in train}):
+                        sub = [e for e in train if _key(e) == k]
+                        bym: Dict[int, List[float]] = {}
+                        for e in sub:
+                            bym.setdefault(int(e["match_id"]), []).append(float(e["sel"]))
+                        if len(bym) < wf_min_m:
+                            continue
+                        ok, mhat, ci, nm = _ci90_lb_positive(bym)
+                        diag[k] = (ok, mhat, ci, nm)
+                        if ok:
+                            active.append(k)
+                            active_counts[k] = active_counts.get(k, 0) + 1
+
+                    # avaliação OOS: ROI agregado nas combinações ativas
+                    test_active = [e for e in test if _key(e) in set(active)]
+                    bym_roi: Dict[int, List[float]] = {}
+                    for e in test_active:
+                        bym_roi.setdefault(int(e["match_id"]), []).append(float(e["roi"]))
+                    oos_mean, oos_ci = cluster_bootstrap_ci(bym_roi, n_boot=2000, alpha=0.10, seed=int(args.seed))
+
+                    steps.append(
+                        {
+                            "train": f"{min(train_days)}→{max(train_days)}",
+                            "test": f"{min(test_days)}→{max(test_days)}",
+                            "active_n": len(active),
+                            "oos_matches": len(bym_roi),
+                            "oos_mean": oos_mean,
+                            "oos_ci": oos_ci,
+                        }
+                    )
+
+                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) |\n|---|---|---:|---:|---:|\n")
+                for s in steps[:20]:
+                    lines.append(
+                        f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} |\n"
+                    )
+                if len(steps) > 20:
+                    lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
+
+                lines.append("\n**Frequência de ativação por combinação (quantas janelas ela entrou como ativa)**\n\n")
+                lines.append("| Combinação | #steps ativa |\n|---|---:|\n")
+                for k, c in sorted(active_counts.items(), key=lambda x: x[1], reverse=True):
+                    lines.append(f"| {k} | {c} |\n")
+
+                lines.append(
+                    "\nNotas importantes:\n"
+                    "- Se `Jogos OOS` for baixo em muitos passos, você ainda não tem volume suficiente para decisões por combinação. "
+                    "Nesse cenário faz sentido **Bayes hierárquico (partial pooling)** para estabilizar estimativas.\n"
+                    "- Este walk-forward usa ROI em t0 como avaliação OOS. Para pre-match, você também pode avaliar por CLV OOS "
+                    "(menos dependente de resultados), mas isso mede qualidade de entrada, não P&L.\n\n"
+                )
 
         # ============================================================
         # 10) Diagnóstico de ROI / atualização de resultados
