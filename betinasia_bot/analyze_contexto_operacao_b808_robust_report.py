@@ -623,6 +623,22 @@ async def main() -> int:
         default=int(os.getenv("WF_MIN_MATCHES", "30")),
         help="Mínimo de jogos por combinação para ser elegível (default 30).",
     )
+    parser.add_argument(
+        "--wf-scheme-pre",
+        default=os.getenv("WF_SCHEME_PRE", "KELLY_0.25"),
+        help="Scheme de sizing para OOS pre-match (default KELLY_0.25). Ex.: PROXY, FLAT, KELLY_0.10",
+    )
+    parser.add_argument(
+        "--wf-scheme-in",
+        default=os.getenv("WF_SCHEME_IN", "PROXY"),
+        help="Scheme de sizing para OOS in-match (default PROXY). Ex.: PROXY, FLAT",
+    )
+    parser.add_argument(
+        "--wf-expand-missing-roi",
+        action="store_true",
+        default=(os.getenv("WF_EXPAND_MISSING_ROI", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Expande lucro observado (com ROI) para população elegível via scaling por exposição/turnover (default=on).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -3552,6 +3568,12 @@ async def main() -> int:
             wf_train = int(max(1, getattr(args, "wf_train_days", 3)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
             wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
+            wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
+            wf_scheme_in = str(getattr(args, "wf_scheme_in", "PROXY") or "PROXY").strip()
+            wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
+
+            # index para recuperar campos de sizing/liquidez
+            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
 
             # dataset de entradas com timestamp
             combo_events: List[dict] = []
@@ -3571,6 +3593,7 @@ async def main() -> int:
                     combo_events.append(
                         {
                             "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                            "audit_id": int(aid),
                             "side": side,
                             "regime": "Pre" if r.get("is_live") is False else "In",
                             "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
@@ -3623,6 +3646,81 @@ async def main() -> int:
 
                 steps = []
                 active_counts: Dict[str, int] = {}
+                # séries para estimativa 30d (OOS)
+                daily_turn = {}  # day -> turnover stake eq (todas elegíveis)
+                daily_pnl_obs = {}  # day -> pnl observado (somente ROI disponível)
+                daily_pnl_exp = {}  # day -> pnl expandido (se wf_expand)
+                # exposições para banca/liquidez (todas elegíveis)
+                oos_back_stakes_all: List[float] = []
+                oos_lay_liab_all: List[float] = []
+                oos_jobs: List[Tuple[datetime, datetime, float]] = []  # (t0, t1, exposure)
+
+                def _scheme_for_event(ev: dict) -> str:
+                    return wf_scheme_pre if ev.get("regime") == "Pre" else wf_scheme_in
+
+                def _sizing_for_event(ev: dict) -> Tuple[Optional[float], Optional[float]]:
+                    """
+                    Retorna (stake_turnover_equivalente, exposure_risk).
+                    - Back: stake=exposure=stake
+                    - Lay: stake_turnover = liab/(odd-1), exposure_risk=liab
+                    """
+                    aid = int(ev.get("audit_id"))
+                    d0 = audit_by_id.get(aid)
+                    if not d0:
+                        return (None, None)
+                    sc = _scheme_for_event(ev)
+                    if ev.get("side") == "Back":
+                        st = _sizing_back(d0, sc)
+                        if st is None or float(st) <= 0:
+                            return (None, None)
+                        return (float(st), float(st))
+                    # Lay
+                    sized = _sizing_lay_liab(d0, sc)
+                    if not sized:
+                        return (None, None)
+                    liab, lay_odd = sized
+                    if liab is None or float(liab) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
+                        return (None, None)
+                    stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                    return (float(stake_eq), float(liab))
+
+                def _append_job(ev: dict, exposure: float):
+                    """Para banca de liquidez: capital simultaneamente travado."""
+                    aid = int(ev.get("audit_id"))
+                    d0 = audit_by_id.get(aid)
+                    if not d0:
+                        return
+                    t0 = d0.get("audited_at") or d0.get("hypothesis_detected_at")
+                    if not isinstance(t0, datetime):
+                        return
+                    settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+                    ko = d0.get("kickoff") or d0.get("kickoff_time")
+                    t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                    if t1 <= t0:
+                        t1 = t0 + timedelta(hours=settle_h)
+                    oos_jobs.append((t0, t1, float(exposure)))
+
+                def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
+                    if not jobs:
+                        return None
+                    grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+                    buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
+                    step = max(1, grid_min)
+                    t_min = min(j[0] for j in jobs)
+                    t_max = max(j[1] for j in jobs)
+                    t = t_min
+                    vals = []
+                    while t <= t_max:
+                        s = 0.0
+                        for a, b, exp in jobs:
+                            if a <= t <= b:
+                                s += float(exp)
+                        vals.append(float(s))
+                        t = t + timedelta(minutes=step)
+                    if not vals:
+                        return None
+                    p99 = float(np.quantile(vals, 0.99))
+                    return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
                 for i in range(wf_train, len(days) - wf_test):
                     train_days = set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
@@ -3685,6 +3783,65 @@ async def main() -> int:
                         bym_roi.setdefault(int(e["match_id"]), []).append(float(e["roi"]))
                     oos_mean, oos_ci = cluster_bootstrap_ci(bym_roi, n_boot=2000, alpha=0.10, seed=int(args.seed))
 
+                    # sizing + P&L (observado e expandido) no período de teste
+                    # Conjunto elegível no teste (inclui jogos sem ROI para turnover)
+                    test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active)]
+                    back_st_all = back_st_roi = 0.0
+                    lay_liab_all = lay_liab_roi = 0.0
+                    turn_all = turn_roi = 0.0
+                    pnl_obs = 0.0
+                    for ev in test_elig:
+                        st_eq, exp = _sizing_for_event(ev)
+                        if st_eq is None or exp is None:
+                            continue
+                        turn_all += float(st_eq)
+                        if ev.get("side") == "Back":
+                            back_st_all += float(exp)
+                        else:
+                            lay_liab_all += float(exp)
+                        _append_job(ev, float(exp))
+                        # lucro observado se ROI existe
+                        if ev.get("roi") is None:
+                            continue
+                        turn_roi += float(st_eq)
+                        roi_pct = float(ev.get("roi"))
+                        if ev.get("side") == "Back":
+                            back_st_roi += float(exp)
+                            pnl_obs += float(exp) * roi_pct / 100.0
+                        else:
+                            lay_liab_roi += float(exp)
+                            pnl_obs += float(exp) * roi_pct / 100.0
+
+                    pnl_exp = pnl_obs
+                    if wf_expand:
+                        # expande separadamente por tipo de exposição (stake Back, liability Lay)
+                        scale_back = (back_st_all / back_st_roi) if back_st_roi > 0 else 1.0
+                        scale_lay = (lay_liab_all / lay_liab_roi) if lay_liab_roi > 0 else 1.0
+                        # aproxima: separa pnl por lado no loop acima? como não guardamos, re-estima com base em shares
+                        # fallback: escala global por turnover quando não há como separar
+                        if back_st_roi > 0 and lay_liab_roi > 0:
+                            # estima split por peso de exposição observada
+                            w_back = back_st_roi / (back_st_roi + lay_liab_roi)
+                            w_lay = 1.0 - w_back
+                            pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                        elif back_st_roi > 0:
+                            pnl_exp = float(pnl_obs) * float(scale_back)
+                        elif lay_liab_roi > 0:
+                            pnl_exp = float(pnl_obs) * float(scale_lay)
+                        else:
+                            pnl_exp = float(pnl_obs)
+
+                    # acumula séries diárias (test pode ter vários dias)
+                    for dday in test_days:
+                        daily_turn[dday] = daily_turn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                        daily_pnl_obs[dday] = daily_pnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
+                        daily_pnl_exp[dday] = daily_pnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+
+                    if back_st_all > 0:
+                        oos_back_stakes_all.append(float(back_st_all))
+                    if lay_liab_all > 0:
+                        oos_lay_liab_all.append(float(lay_liab_all))
+
                     steps.append(
                         {
                             "train": f"{min(train_days)}→{max(train_days)}",
@@ -3693,13 +3850,17 @@ async def main() -> int:
                             "oos_matches": len(bym_roi),
                             "oos_mean": oos_mean,
                             "oos_ci": oos_ci,
+                            "turn_all": turn_all,
+                            "pnl_obs": pnl_obs,
+                            "pnl_exp": pnl_exp,
                         }
                     )
 
-                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) |\n|---|---|---:|---:|---:|\n")
+                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro obs. | Lucro exp. |\n|---|---|---:|---:|---:|---:|---:|---:|\n")
                 for s in steps[:20]:
                     lines.append(
-                        f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} |\n"
+                        f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
+                        f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_obs'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                     )
                 if len(steps) > 20:
                     lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
@@ -3716,6 +3877,61 @@ async def main() -> int:
                     "- Este walk-forward usa ROI em t0 como avaliação OOS. Para pre-match, você também pode avaliar por CLV OOS "
                     "(menos dependente de resultados), mas isso mede qualidade de entrada, não P&L.\n\n"
                 )
+
+                # ------------------------------------------------------------
+                # 12.1 Estimativa do tamanho da oportunidade (30 dias) — OOS
+                # ------------------------------------------------------------
+                lines.append("### 12.1 Estimativa 30 dias (OOS): turnover, lucro, banca, ROI/banca e drawdown\n")
+                lines.append(
+                    "Esta estimativa usa o walk-forward acima como **simulador OOS**. "
+                    "O lucro pode ser reportado em duas versões:\n\n"
+                    "- **obs.**: apenas jogos com ROI (placar) disponível.\n"
+                    "- **exp.**: expande o lucro para a população elegível usando scaling por exposição/turnover (assume missing-at-random condicional à estratégia).\n\n"
+                )
+
+                oos_days = sorted(daily_turn.keys())
+                n_oos_days = len(oos_days) if oos_days else 0
+                turn_sum = float(sum(daily_turn.values())) if daily_turn else 0.0
+                pnl_obs_sum = float(sum(daily_pnl_obs.values())) if daily_pnl_obs else 0.0
+                pnl_exp_sum = float(sum(daily_pnl_exp.values())) if daily_pnl_exp else 0.0
+                horizon = 30.0
+                scale = (horizon / float(n_oos_days)) if n_oos_days > 0 else None
+                turn_30d = float(turn_sum) * float(scale) if scale is not None else None
+                profit_obs_30d = float(pnl_obs_sum) * float(scale) if scale is not None else None
+                profit_exp_30d = float(pnl_exp_sum) * float(scale) if scale is not None else None
+
+                # banca por risco (unitária) e por liquidez (simultânea)
+                bank_back_p99 = _pctl(oos_back_stakes_all, 99) if oos_back_stakes_all else None
+                bank_lay_p99 = _pctl(oos_lay_liab_all, 99) if oos_lay_liab_all else None
+                bank_risk = (float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)) if (bank_back_p99 is not None or bank_lay_p99 is not None) else None
+                bank_liq = _liq_p99_from_jobs(oos_jobs)
+                bank_eff = None
+                if bank_risk is not None or bank_liq is not None:
+                    bank_eff = max(float(bank_risk or 0.0), float(bank_liq or 0.0))
+
+                # drawdown p95 via bootstrap de dias OOS (obs/exp)
+                dd_obs_mean, dd_obs_p95 = _bootstrap_dd(list(daily_pnl_obs.values()), horizon_days=30, n_boot=2000)
+                dd_exp_mean, dd_exp_p95 = _bootstrap_dd(list(daily_pnl_exp.values()), horizon_days=30, n_boot=2000)
+
+                roi_bank_obs = (float(profit_obs_30d) / float(bank_eff) * 100.0) if (profit_obs_30d is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_exp = (float(profit_exp_30d) / float(bank_eff) * 100.0) if (profit_exp_30d is not None and bank_eff and bank_eff > 0) else None
+
+                lines.append("| Premissa | Valor |\n|---|---:|\n")
+                lines.append(f"| Scheme pre-match (OOS) | `{wf_scheme_pre}` |\n")
+                lines.append(f"| Scheme in-match (OOS) | `{wf_scheme_in}` |\n")
+                lines.append(f"| Expansão missing ROI | {'ON' if wf_expand else 'OFF'} |\n")
+                lines.append(f"| Dias OOS usados | {n_oos_days} |\n")
+                lines.append(f"| Turnover 30d (proj.) | {_fmt_num(turn_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs.) | {_fmt_num(profit_obs_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp.) | {_fmt_num(profit_exp_30d,2)} |\n")
+                lines.append(f"| Banca risco p99 (Back+Lay) | {_fmt_num(bank_risk,2)} |\n")
+                lines.append(f"| Banca liquidez p99 (+buf) | {_fmt_num(bank_liq,2)} |\n")
+                lines.append(f"| Banca recomendada (max) | {_fmt_num(bank_eff,2)} |\n")
+                lines.append(f"| ROI/banca 30d (obs.) | {_fmt_num(roi_bank_obs,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (exp.) | {_fmt_num(roi_bank_exp,2)}% |\n")
+                lines.append(f"| DD 30d p95 (obs.) | {_fmt_num(dd_obs_p95,2)} |\n")
+                lines.append(f"| DD 30d p95 (exp.) | {_fmt_num(dd_exp_p95,2)} |\n")
+                lines.append("\n")
 
         # ============================================================
         # 10) Diagnóstico de ROI / atualização de resultados
