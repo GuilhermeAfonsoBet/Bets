@@ -639,6 +639,12 @@ async def main() -> int:
         default=(os.getenv("WF_EXPAND_MISSING_ROI", "1").strip() not in ("0", "false", "False", "no", "NO")),
         help="Expande lucro observado (com ROI) para população elegível via scaling por exposição/turnover (default=on).",
     )
+    parser.add_argument(
+        "--wf-match-budget",
+        action="store_true",
+        default=(os.getenv("WF_MATCH_BUDGET", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Inclui simulação de governança por jogo (budget por match_id) na seção OOS (default=on).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -3915,6 +3921,8 @@ async def main() -> int:
                         {
                             "train": f"{min(train_days)}→{max(train_days)}",
                             "test": f"{min(test_days)}→{max(test_days)}",
+                            "test_days": sorted(test_days),
+                            "active_keys": list(active),
                             "active_n": len(active),
                             "oos_matches": len(bym_roi),
                             "oos_mean": oos_mean,
@@ -4016,6 +4024,193 @@ async def main() -> int:
                 lines.append(f"| DD 30d p95 (obs.) | {_fmt_num(dd_obs_p95,2)} |\n")
                 lines.append(f"| DD 30d p95 (exp.) | {_fmt_num(dd_exp_p95,2)} |\n")
                 lines.append("\n")
+
+                # ------------------------------------------------------------
+                # 12.2 Governança por jogo (budget por match_id) — sensibilidade
+                # ------------------------------------------------------------
+                if bool(getattr(args, "wf_match_budget", True)):
+                    lines.append("### 12.2 Governança de exposição por jogo (budget por `match_id`) — sensibilidade\n")
+                    lines.append(
+                        "Objetivo: evitar concentração quando um mesmo jogo gera muitos sinais. "
+                        "Simulamos um orçamento de exposição por jogo, consumido ao longo do tempo.\n\n"
+                        "- **Back** consome budget em **stake**.\n"
+                        "- **Lay** consome budget em **liability**.\n"
+                        "- Também aplicamos um cap por sinal como fração do budget do jogo (para não gastar tudo no 1º sinal).\n\n"
+                        "Importante: o budget é parametrizado como fração de uma referência de banca. Aqui usamos:\n"
+                        "- se `--kelly-bankroll` estiver setado: essa banca explícita;\n"
+                        "- senão: a `Banca recomendada (max)` estimada na 12.1 (baseline).\n\n"
+                    )
+
+                    bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
+                    if bank_ref_budget is None or bank_ref_budget <= 0:
+                        bank_ref_budget = bank_eff
+                    bank_ref_budget = float(bank_ref_budget or 1.0)
+
+                    def _simulate_with_budget(
+                        *,
+                        bud_back_frac: float,
+                        bud_lay_frac: float,
+                        cap_signal_frac: float,
+                    ) -> Dict[str, Any]:
+                        bud_back = float(bud_back_frac) * float(bank_ref_budget)
+                        bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                        cap_sig_back = float(cap_signal_frac) * float(bud_back)
+                        cap_sig_lay = float(cap_signal_frac) * float(bud_lay)
+
+                        dturn: Dict[str, float] = {}
+                        dpnl_obs: Dict[str, float] = {}
+                        dpnl_exp: Dict[str, float] = {}
+                        back_exps: List[float] = []
+                        lay_exps: List[float] = []
+                        jobs: List[Tuple[datetime, datetime, float]] = []
+
+                        for st in steps:
+                            test_days = set(st.get("test_days") or [])
+                            active_keys = set(st.get("active_keys") or [])
+                            if not test_days or not active_keys:
+                                continue
+
+                            # elegíveis no teste (inclui sem ROI para turnover)
+                            test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in active_keys]
+                            # ordena por tempo para consumir budget de forma realista
+                            def _ts_ev(ev: dict) -> float:
+                                d0 = audit_by_id.get(int(ev.get("audit_id")))
+                                ts = d0.get("audited_at") if d0 else None
+                                if isinstance(ts, datetime):
+                                    return ts.timestamp()
+                                return 0.0
+                            test_elig.sort(key=_ts_ev)
+
+                            spent_back: Dict[int, float] = {}
+                            spent_lay: Dict[int, float] = {}
+
+                            back_all = back_roi = 0.0
+                            lay_all = lay_roi = 0.0
+                            pnl_obs = 0.0
+                            turn_all = 0.0
+
+                            for ev in test_elig:
+                                aid = int(ev.get("audit_id"))
+                                d0 = audit_by_id.get(aid)
+                                if not d0:
+                                    continue
+                                sc = _scheme_for_event(ev)
+                                mid = int(ev.get("match_id"))
+                                if ev.get("side") == "Back":
+                                    raw = _sizing_back(d0, sc)
+                                    if raw is None or float(raw) <= 0:
+                                        continue
+                                    rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    use = min(float(raw), float(rem), float(cap_sig_back))
+                                    if use <= 0:
+                                        continue
+                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(use)
+                                    exp = float(use)
+                                    st_eq = float(use)
+                                    turn_all += st_eq
+                                    back_all += exp
+                                    _append_job(ev, exp)
+                                    if ev.get("roi") is not None:
+                                        pnl_obs += exp * float(ev.get("roi")) / 100.0
+                                        back_roi += exp
+                                else:
+                                    sized = _sizing_lay_liab(d0, sc)
+                                    if not sized:
+                                        continue
+                                    liab_raw, lay_odd = sized
+                                    if liab_raw is None or float(liab_raw) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
+                                        continue
+                                    rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    liab_use = min(float(liab_raw), float(rem), float(cap_sig_lay))
+                                    if liab_use <= 0:
+                                        continue
+                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(liab_use)
+                                    exp = float(liab_use)  # liability
+                                    st_eq = float(liab_use) / max(1e-9, (float(lay_odd) - 1.0))
+                                    turn_all += st_eq
+                                    lay_all += exp
+                                    _append_job(ev, exp)
+                                    if ev.get("roi") is not None:
+                                        pnl_obs += exp * float(ev.get("roi")) / 100.0
+                                        lay_roi += exp
+
+                            pnl_exp = pnl_obs
+                            if wf_expand:
+                                scale_back = (back_all / back_roi) if back_roi > 0 else 1.0
+                                scale_lay = (lay_all / lay_roi) if lay_roi > 0 else 1.0
+                                if back_roi > 0 and lay_roi > 0:
+                                    w_back = back_roi / (back_roi + lay_roi)
+                                    w_lay = 1.0 - w_back
+                                    pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                                elif back_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_back)
+                                elif lay_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_lay)
+
+                            for dday in test_days:
+                                dturn[dday] = dturn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                                dpnl_obs[dday] = dpnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
+                                dpnl_exp[dday] = dpnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+
+                            if back_all > 0:
+                                back_exps.append(float(back_all))
+                            if lay_all > 0:
+                                lay_exps.append(float(lay_all))
+                        # projeção 30d
+                        oos_days2 = sorted(dturn.keys())
+                        n_days2 = len(oos_days2) if oos_days2 else 0
+                        scale2 = (30.0 / float(n_days2)) if n_days2 > 0 else None
+                        turn_30 = float(sum(dturn.values())) * float(scale2) if scale2 is not None else None
+                        prof_obs_30 = float(sum(dpnl_obs.values())) * float(scale2) if scale2 is not None else None
+                        prof_exp_30 = float(sum(dpnl_exp.values())) * float(scale2) if scale2 is not None else None
+                        # banca
+                        bank_back = _pctl(back_exps, 99) if back_exps else None
+                        bank_lay = _pctl(lay_exps, 99) if lay_exps else None
+                        bank_risk2 = (float(bank_back or 0.0) + float(bank_lay or 0.0)) if (bank_back is not None or bank_lay is not None) else None
+                        bank_liq2 = _liq_p99_from_jobs(jobs)
+                        bank_eff2 = None
+                        if bank_risk2 is not None or bank_liq2 is not None:
+                            bank_eff2 = max(float(bank_risk2 or 0.0), float(bank_liq2 or 0.0))
+                        roi_bank2 = (float(prof_exp_30) / float(bank_eff2) * 100.0) if (prof_exp_30 is not None and bank_eff2 and bank_eff2 > 0) else None
+                        dd_mean2, dd_p952 = _bootstrap_dd(list(dpnl_exp.values()), horizon_days=30, n_boot=2000)
+                        return {
+                            "turn_30d": turn_30,
+                            "profit_30d_exp": prof_exp_30,
+                            "bank_eff": bank_eff2,
+                            "roi_bank_30d": roi_bank2,
+                            "dd_p95": dd_p952,
+                            "days": n_days2,
+                        }
+
+                    scenarios = [
+                        ("BUDGET_0.50%/0.25% cap25%", 0.005, 0.0025, 0.25),
+                        ("BUDGET_1.00%/0.50% cap33%", 0.010, 0.0050, 0.33),
+                        ("BUDGET_2.00%/1.00% cap50%", 0.020, 0.0100, 0.50),
+                    ]
+                    lines.append(
+                        f"Referência de banca p/ budget: {_fmt_num(bank_ref_budget,2)} | "
+                        f"budgets por jogo aplicados em stake (Back) e liability (Lay).\n\n"
+                    )
+                    lines.append("| Cenário | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                    lines.append("|---|---:|---:|---:|---:|---:|\n")
+                    # baseline = sem budget por jogo (12.1)
+                    lines.append(
+                        f"| BASELINE (sem budget) | {_fmt_num(turn_30d,2)} | {_fmt_num(profit_exp_30d,2)} | {_fmt_num(bank_eff,2)} | {_fmt_num(roi_bank_exp,2)}% | {_fmt_num(dd_exp_p95,2)} |\n"
+                    )
+                    for name, bbf, blf, csf in scenarios:
+                        r = _simulate_with_budget(bud_back_frac=bbf, bud_lay_frac=blf, cap_signal_frac=csf)
+                        lines.append(
+                            f"| {name} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                        )
+                    lines.append(
+                        "\nLeitura:\n"
+                        "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
+                        "- Se tudo continuar negativo, o problema é **edge OOS** (principalmente in‑match) e budget só reduz a escala da perda.\n\n"
+                    )
 
         # ============================================================
         # 10) Diagnóstico de ROI / atualização de resultados
