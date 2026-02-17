@@ -194,6 +194,46 @@ def cluster_bootstrap_ci(
     return mean_hat, (lo, hi)
 
 
+def cluster_bootstrap_quantile(
+    values_by_match: Dict[int, List[float]],
+    q: float,
+    *,
+    n_boot: int = 4000,
+    seed: int = 1337,
+) -> Optional[float]:
+    """
+    Quantil bootstrap por cluster (match_id) do estimador "média dos means por jogo".
+    Útil para decisões one-sided (ex.: p10/p30/p90).
+    """
+    try:
+        qf = float(q)
+    except Exception:
+        return None
+    qf = min(1.0, max(0.0, qf))
+    match_ids = list(values_by_match.keys())
+    if not match_ids:
+        return None
+
+    per_match_means: Dict[int, float] = {}
+    for mid, vals in values_by_match.items():
+        if not vals:
+            continue
+        per_match_means[mid] = float(sum(vals) / len(vals))
+    match_ids = list(per_match_means.keys())
+    if not match_ids:
+        return None
+    if len(match_ids) < 2:
+        return per_match_means[match_ids[0]]
+
+    rng = random.Random(int(seed))
+    boot = []
+    for _ in range(int(n_boot)):
+        sample = [per_match_means[rng.choice(match_ids)] for _ in range(len(match_ids))]
+        boot.append(float(sum(sample) / len(sample)))
+    boot_arr = np.asarray(boot, dtype=float)
+    return float(np.quantile(boot_arr, qf))
+
+
 def summarize_metric(
     values: Sequence[float],
     match_ids: Sequence[int],
@@ -2389,6 +2429,11 @@ async def main() -> int:
             clv0 = _clv_pct_lay_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
             clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
             clvl = _clv_pct_lay_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
+            # Convenção "única" de CLV para tabela de estratégias (8.3):
+            # usamos (entry - closing) / closing, então Lay "bom" tende a ser NEGATIVO.
+            clv0_conv = (-float(clv0)) if clv0 is not None else None
+            clve_conv = (-float(clve)) if clve is not None else None
+            clvl_conv = (-float(clvl)) if clvl is not None else None
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
@@ -2401,6 +2446,9 @@ async def main() -> int:
                 "clv_t0": clv0,
                 "clv_ext": clve,
                 "clv_last": clvl,
+                "clv_conv_t0": clv0_conv,
+                "clv_conv_ext": clve_conv,
+                "clv_conv_last": clvl_conv,
                 "roi_t0": roi0,
                 "roi_ext": roival,
                 "roi_last": roilast,
@@ -2526,8 +2574,9 @@ async def main() -> int:
         lines.append(
             "Esta tabela resume as **8 combinações** possíveis: `Back/Lay × Pre/In × Reversal(Sim/Não)`.\n\n"
             "- **CLV** aqui é medido em `t0` e **somente pre‑match** (closing pré‑jogo).\n"
+            "- Para **Lay**, o CLV nesta tabela usa a convenção única **(entry - closing)/closing**; logo, **Lay “bom” tende a CLV < 0**.\n"
             "- **ROI** aqui é em `t0` (se houver placar). Para Lay, o ROI é **por liability**.\n"
-            "- **IC90** é bootstrap por jogo (cluster em `match_id`).\n\n"
+            "- **IC90** é bootstrap por jogo (cluster em `match_id`). Para critério “p30” usamos o quantil bootstrap **p30** do estimador.\n\n"
         )
 
         by_audit_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
@@ -2535,31 +2584,44 @@ async def main() -> int:
         def _combo_rows(entries: List[dict], *, is_live: bool, had_rev: bool) -> List[dict]:
             return [r for r in entries if r.get("is_live") is is_live and bool(r.get("had_reversal")) is bool(had_rev)]
 
-        def _summ_ci(rows: List[dict], key: str, clip_low: float, clip_high: float) -> Tuple[Optional[float], Optional[Tuple[float, float]], int, int]:
+        def _summ_ci(rows: List[dict], key: str, clip_low: float, clip_high: float) -> Tuple[Optional[float], Optional[Tuple[float, float]], Optional[float], Optional[float], int, int]:
             vals = [r.get(key) for r in rows]
             mids = [r.get("match_id") for r in rows]
             s = summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
-            return s.mean_cluster, s.ci90_cluster, s.n_events, s.n_matches
+            bym: Dict[int, List[float]] = {}
+            for v, mid in zip(vals, mids):
+                vf = _safe_float(v)
+                if vf is None:
+                    continue
+                if clip_low is not None and vf < clip_low:
+                    continue
+                if clip_high is not None and vf > clip_high:
+                    continue
+                bym.setdefault(int(mid), []).append(float(vf))
+            q10 = cluster_bootstrap_quantile(bym, 0.10, n_boot=2000, seed=int(args.seed))
+            q30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+            return s.mean_cluster, s.ci90_cluster, q10, q30, s.n_events, s.n_matches
 
-        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI t0 (mean; IC90) | Valor (IC90 lb>0) |\n")
-        lines.append("|---|---|---|---:|---:|---:|---:|---|\n")
+        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI t0 (mean; IC90) | ROI p30 | Ativa? (critério) |\n")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|\n")
         for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
             for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
                 for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
                     filt = _combo_rows(entries, is_live=is_live_val, had_rev=had_rev_val)
                     # CLV só pre-match
-                    clv_mean = clv_ci = None
+                    clv_mean = clv_ci = clv_q10 = clv_q30 = None
                     n_clv = m_clv = 0
                     if is_live_val is False:
-                        clv_mean, clv_ci, n_clv, m_clv = _summ_ci(
+                        clv_key = "clv_t0" if side == "Back" else "clv_conv_t0"
+                        clv_mean, clv_ci, clv_q10, clv_q30, n_clv, m_clv = _summ_ci(
                             filt,
-                            "clv_t0",
+                            clv_key,
                             clip_low=-50,
                             clip_high=50,
                         )
                     # ROI (t0). Back: ROI/stake. Lay: ROI/liability (já calculado assim no entry_metrics)
                     roi_clip_hi = 500.0 if side == "Back" else 5000.0
-                    roi_mean, roi_ci, n_roi, m_roi = _summ_ci(
+                    roi_mean, roi_ci, roi_q10, roi_q30, n_roi, m_roi = _summ_ci(
                         filt,
                         "roi_t0",
                         clip_low=-200.0,
@@ -2567,16 +2629,36 @@ async def main() -> int:
                     )
                     n_total = len(filt)
                     m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
-                    # critério "valor p90": limite inferior do IC90 > 0 (quando aplicável)
-                    ci_use = clv_ci if (is_live_val is False and clv_ci is not None) else roi_ci
-                    val_lbl = "—"
-                    if ci_use:
-                        val_lbl = "sim" if float(ci_use[0]) > 0 else "não"
+
+                    # Critérios do usuário (direcionamento):
+                    # Back Pre: CLV>0 significativo p90 (IC90 lb>0) e ROI>0 (não precisa ser sig)
+                    # Back In: apenas ROI com p30>0
+                    # Lay Pre: CLV<0 significativo p90 (IC90 ub<0) e ROI significativo p30 (p30>0)
+                    # Lay In: apenas ROI p30>0
+                    active = None
+                    crit = ""
+                    if side == "Back" and regime_label == "Pre":
+                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
+                        roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
+                        active = clv_sig and roi_pos
+                        crit = "CLV p90>0 AND ROI>0"
+                    elif side == "Back" and regime_label == "In":
+                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        crit = "ROI p30>0"
+                    elif side == "Lay" and regime_label == "Pre":
+                        clv_sig = bool(clv_ci and float(clv_ci[1]) < 0)
+                        roi_sig = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        active = clv_sig and roi_sig
+                        crit = "CLV p90<0 AND ROI p30>0"
+                    else:
+                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        crit = "ROI p30>0"
+                    active_lbl = ("sim" if active else "não") if active is not None else "—"
 
                     clv_str = f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)}" if (is_live_val is False) else "—"
                     roi_str = f"{_fmt_pct(roi_mean,2)} {_fmt_ci(roi_ci,2)}"
                     lines.append(
-                        f"| {side} | {regime_label} | {rev_label} | {n_total} | {m_total} | {clv_str} | {roi_str} | {val_lbl} |\n"
+                        f"| {side} | {regime_label} | {rev_label} | {n_total} | {m_total} | {clv_str} | {roi_str} | {_fmt_pct(roi_q30,2)} | {active_lbl} ({crit}) |\n"
                     )
 
         lines.append(
@@ -3493,14 +3575,29 @@ async def main() -> int:
                             "regime": "Pre" if r.get("is_live") is False else "In",
                             "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
                             "match_id": int(r.get("match_id")),
-                            # seleção: CLV pre-match, ROI in-match
-                            "sel": r.get("clv_t0") if (r.get("is_live") is False) else r.get("roi_t0"),
-                            # avaliação OOS: ROI em t0 quando houver
+                            # métricas (t0)
+                            "clv_back": r.get("clv_t0") if (r.get("is_live") is False and side == "Back") else None,
+                            "clv_lay_conv": r.get("clv_conv_t0") if (r.get("is_live") is False and side == "Lay") else None,
                             "roi": r.get("roi_t0"),
                         }
                     )
 
             days = sorted({e["day"] for e in combo_events})
+            # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
+            uniq_matches_total = len({int(e["match_id"]) for e in combo_events})
+            uniq_matches_roi = len({int(e["match_id"]) for e in combo_events if e.get("roi") is not None})
+            uniq_matches_clv = len(
+                {int(e["match_id"]) for e in combo_events if (e.get("clv_back") is not None or e.get("clv_lay_conv") is not None)}
+            )
+            lines.append("### 12.0 Diagnóstico de cobertura OOS (por que N cai)\n")
+            lines.append("| Filtro | Jogos únicos |\n|---|---:|\n")
+            lines.append(f"| Combinações elegíveis (edge + timing + t0) | {uniq_matches_total} |\n")
+            lines.append(f"| Com ROI disponível (precisa de placar) | {uniq_matches_roi} |\n")
+            lines.append(f"| Com CLV disponível (pre-match + closing) | {uniq_matches_clv} |\n")
+            lines.append(
+                "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
+                "Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.\n\n"
+            )
             if len(days) < (wf_train + wf_test + 1):
                 lines.append(
                     f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test + 1}.\n\n"
@@ -3509,10 +3606,20 @@ async def main() -> int:
                 def _key(e: dict) -> str:
                     return f"{e['side']}_{e['regime']}_{e['reversal']}"
 
-                def _ci90_lb_positive(vals_by_match: Dict[int, List[float]]) -> Tuple[bool, Optional[float], Optional[Tuple[float, float]], int]:
-                    mean_hat, ci = cluster_bootstrap_ci(vals_by_match, n_boot=2000, alpha=0.10, seed=int(args.seed))
-                    nm = len(vals_by_match)
-                    return (bool(ci and float(ci[0]) > 0), mean_hat, ci, nm)
+                def _bym(sub: List[dict], key: str) -> Dict[int, List[float]]:
+                    bym: Dict[int, List[float]] = {}
+                    for e in sub:
+                        v = _safe_float(e.get(key))
+                        if v is None:
+                            continue
+                        bym.setdefault(int(e["match_id"]), []).append(float(v))
+                    return bym
+
+                def _q(bym: Dict[int, List[float]], q: float) -> Optional[float]:
+                    return cluster_bootstrap_quantile(bym, q, n_boot=2000, seed=int(args.seed))
+
+                def _mean_ci90(bym: Dict[int, List[float]]) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+                    return cluster_bootstrap_ci(bym, n_boot=2000, alpha=0.10, seed=int(args.seed))
 
                 steps = []
                 active_counts: Dict[str, int] = {}
@@ -3520,7 +3627,7 @@ async def main() -> int:
                     train_days = set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
 
-                    train = [e for e in combo_events if e["day"] in train_days and e.get("sel") is not None]
+                    train = [e for e in combo_events if e["day"] in train_days]
                     test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None]
 
                     # seleção por combinação
@@ -3528,14 +3635,46 @@ async def main() -> int:
                     diag = {}
                     for k in sorted({_key(e) for e in train}):
                         sub = [e for e in train if _key(e) == k]
-                        bym: Dict[int, List[float]] = {}
-                        for e in sub:
-                            bym.setdefault(int(e["match_id"]), []).append(float(e["sel"]))
-                        if len(bym) < wf_min_m:
-                            continue
-                        ok, mhat, ci, nm = _ci90_lb_positive(bym)
-                        diag[k] = (ok, mhat, ci, nm)
-                        if ok:
+                        # aplica critérios do usuário (mesmos da 8.3), com thresholds p90/p30
+                        # parse key
+                        parts = k.split("_")
+                        side = parts[0]
+                        regime = parts[1]
+                        # Back Pre: CLV p90>0 (q10>0) AND ROI mean>0 (se existir)
+                        # Back In: ROI p30>0
+                        # Lay Pre: CLV p90<0 (q90<0) AND ROI p30>0
+                        # Lay In: ROI p30>0
+                        ok_sel = False
+                        reason = ""
+                        if side == "Back" and regime == "Pre":
+                            bym_clv = _bym(sub, "clv_back")
+                            if len(bym_clv) >= wf_min_m:
+                                q10 = _q(bym_clv, 0.10)
+                                clv_ok = bool(q10 is not None and float(q10) > 0)
+                            else:
+                                clv_ok = False
+                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                            roi_mean, _ = _mean_ci90(bym_roi) if bym_roi else (None, None)
+                            roi_ok = bool(roi_mean is not None and float(roi_mean) > 0) if len(bym_roi) >= max(5, int(wf_min_m // 3)) else True
+                            ok_sel = bool(clv_ok and roi_ok)
+                            reason = f"BackPre: clv_q10>0={clv_ok}, roi_mean>0={roi_ok}"
+                        elif side == "Back" and regime == "In":
+                            bym_roi = _bym(sub, "roi")
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
+                            reason = "BackIn: roi_q30>0"
+                        elif side == "Lay" and regime == "Pre":
+                            bym_clv = _bym(sub, "clv_lay_conv")
+                            clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.90) or 1e9) < 0)
+                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                            roi_ok = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
+                            ok_sel = bool(clv_ok and roi_ok)
+                            reason = f"LayPre: clv_q90<0={clv_ok}, roi_q30>0={roi_ok}"
+                        else:
+                            bym_roi = _bym(sub, "roi")
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
+                            reason = "In: roi_q30>0"
+                        diag[k] = {"ok": ok_sel, "reason": reason, "n_matches": len({e['match_id'] for e in sub})}
+                        if ok_sel:
                             active.append(k)
                             active_counts[k] = active_counts.get(k, 0) + 1
 
