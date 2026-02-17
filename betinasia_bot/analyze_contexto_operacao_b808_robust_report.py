@@ -2595,9 +2595,15 @@ async def main() -> int:
         lines.append("- Opcional: com `--kelly-bankroll`, usamos `bank_ref = bankroll` para simular capacidade com banca explícita.\n")
         lines.append("- `stake_back = min(f * back_bank_ref, cap_back, cap_evento_limit)`.\n")
         lines.append("- `liab_lay = min(f_liab * lay_bank_ref, cap_lay, cap_evento_limit)`.\n")
+        _bk = max(0.0, float(getattr(args, "kelly_back_cap_frac", 0.02)))
+        _lk = max(0.0, float(getattr(args, "kelly_lay_cap_frac", 0.01)))
+        _ms = max(0.0, float(getattr(args, "max_stake_pct_of_limit", 1.0)))
+        _msc = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
         lines.append(
-            f"- Caps atuais (guardrail): `cap_back = {BACK_CAP_FRAC:.1%} * ref`, `cap_lay = {LAY_CAP_FRAC:.1%} * ref`. "
-            f"Cap por evento: `max_stake = {MAX_STAKE_PCT_OF_LIMIT:.0%} * limit` (e `--max-stake-cap` se usado).\n"
+            f"- Caps atuais (guardrail): `cap_back = {_bk:.1%} * ref`, `cap_lay = {_lk:.1%} * ref`. "
+            f"Cap por evento: `max_stake = {_ms:.0%} * limit`"
+            + (f" e `max_stake_cap={_msc:.2f}`" if _msc > 0 else "")
+            + ".\n"
         )
         lines.append(
             "- **Implicação importante**: se o cap estiver frequentemente ativo, aumentar `frac` (ex.: >0,25×Kelly) "
