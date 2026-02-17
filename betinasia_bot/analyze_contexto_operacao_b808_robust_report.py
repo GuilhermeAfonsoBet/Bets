@@ -534,6 +534,42 @@ async def main() -> int:
         help="Mensagem do commit (opcional). Se omitida, usa uma mensagem padrão.",
     )
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
+    # Sizing / oportunidade (Kelly + capacidade)
+    parser.add_argument(
+        "--kelly-fractions",
+        default="0.10,0.25,0.50,1.00",
+        help="Frações de Kelly a reportar (CSV). Default: 0.10,0.25,0.50,1.00",
+    )
+    parser.add_argument(
+        "--kelly-bankroll",
+        type=float,
+        default=None,
+        help="Se definido (>0), usa esta banca (em USD/unidade do relatório) como escala do Kelly (em vez de p99 proxy).",
+    )
+    parser.add_argument(
+        "--kelly-back-cap-frac",
+        type=float,
+        default=float(os.getenv("KELLY_BACK_CAP_FRAC", "0.02")),
+        help="Cap por aposta Back como fração da banca de referência do Kelly. Default: 0.02 (2%%).",
+    )
+    parser.add_argument(
+        "--kelly-lay-cap-frac",
+        type=float,
+        default=float(os.getenv("KELLY_LAY_CAP_FRAC", "0.01")),
+        help="Cap por aposta Lay (liability) como fração da banca de referência do Kelly. Default: 0.01 (1%%).",
+    )
+    parser.add_argument(
+        "--max-stake-pct-of-limit",
+        type=float,
+        default=float(os.getenv("MAX_STAKE_PCT_OF_LIMIT", "1.0")),
+        help="Cap por evento via limit (stake máximo como %% do limit). Default: 1.0 (100%%).",
+    )
+    parser.add_argument(
+        "--max-stake-cap",
+        type=float,
+        default=float(os.getenv("MAX_STAKE_CAP", "0.0")),
+        help="Cap absoluto adicional para stake máximo por evento (0=sem cap).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -2555,9 +2591,14 @@ async def main() -> int:
             "Derivando e igualando a zero, obtém-se \\(f^* = 1 - p\\cdot o\\).\n\n"
         )
         lines.append("Parâmetros de escala (proxy de banca) e caps:\n\n")
-        lines.append("- `back_bank_ref = p99(stake)` e `lay_bank_ref = p99(liability)` observados no sizing **PROXY** da janela.\n")
-        lines.append("- `stake_back = min(f * back_bank_ref, cap_back)` e `liab_lay = min(f_liab * lay_bank_ref, cap_lay)`.\n")
-        lines.append("- Caps atuais (guardrail): `cap_back = 2% * back_bank_ref`, `cap_lay = 1% * lay_bank_ref`.\n")
+        lines.append("- Por padrão: `back_bank_ref = p99(stake)` e `lay_bank_ref = p99(liability)` observados no sizing **PROXY** da janela.\n")
+        lines.append("- Opcional: com `--kelly-bankroll`, usamos `bank_ref = bankroll` para simular capacidade com banca explícita.\n")
+        lines.append("- `stake_back = min(f * back_bank_ref, cap_back, cap_evento_limit)`.\n")
+        lines.append("- `liab_lay = min(f_liab * lay_bank_ref, cap_lay, cap_evento_limit)`.\n")
+        lines.append(
+            f"- Caps atuais (guardrail): `cap_back = {BACK_CAP_FRAC:.1%} * ref`, `cap_lay = {LAY_CAP_FRAC:.1%} * ref`. "
+            f"Cap por evento: `max_stake = {MAX_STAKE_PCT_OF_LIMIT:.0%} * limit` (e `--max-stake-cap` se usado).\n"
+        )
         lines.append(
             "- **Implicação importante**: se o cap estiver frequentemente ativo, aumentar `frac` (ex.: >0,25×Kelly) "
             "**não aumenta** tamanho real — a curva satura.\n\n"
@@ -2681,11 +2722,37 @@ async def main() -> int:
             return float(x) * (horizon_days / window_days)
 
         # Bancas de referência (proxy): p99 exposição observada no sizing proxy atual
-        back_bank_ref = float(_pctl(back_stakes, 99) or 0.0)
-        lay_bank_ref = float(_pctl(lay_liability, 99) or 0.0)
-        # caps fracionários (guardrail)
-        BACK_CAP_FRAC = 0.02
-        LAY_CAP_FRAC = 0.01
+        back_bank_ref_proxy = float(_pctl(back_stakes, 99) or 0.0)
+        lay_bank_ref_proxy = float(_pctl(lay_liability, 99) or 0.0)
+        # Escala do Kelly: por padrão usa p99 proxy; opcionalmente usa bankroll explícito.
+        kelly_bankroll = _safe_float(getattr(args, "kelly_bankroll", None))
+        use_bankroll = (kelly_bankroll is not None) and (float(kelly_bankroll) > 0)
+        back_bank_ref = float(kelly_bankroll) if use_bankroll else float(back_bank_ref_proxy)
+        lay_bank_ref = float(kelly_bankroll) if use_bankroll else float(lay_bank_ref_proxy)
+
+        # caps fracionários (guardrail) — configuráveis
+        BACK_CAP_FRAC = max(0.0, float(getattr(args, "kelly_back_cap_frac", 0.02)))
+        LAY_CAP_FRAC = max(0.0, float(getattr(args, "kelly_lay_cap_frac", 0.01)))
+
+        # cap por evento via limit (capacidade operacional)
+        MAX_STAKE_PCT_OF_LIMIT = max(0.0, float(getattr(args, "max_stake_pct_of_limit", 1.0)))
+        MAX_STAKE_CAP = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
+
+        def _max_stake_from_limit(limit_value: float) -> float:
+            s = max(0.0, float(limit_value)) * float(MAX_STAKE_PCT_OF_LIMIT)
+            if MAX_STAKE_CAP > 0:
+                s = min(s, float(MAX_STAKE_CAP))
+            return float(s)
+
+        def _max_back_stake_event(d: dict) -> float:
+            return _max_stake_from_limit(float(d.get("limit") or 0.0))
+
+        def _max_lay_stake_event(d: dict) -> float:
+            h = d.get("hypothesis_details") or {}
+            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+            if lay_lim is None:
+                lay_lim = _safe_float(d.get("limit"))
+            return _max_stake_from_limit(float(lay_lim or 0.0))
 
         def _sizing_back(d: dict, scheme: str) -> Optional[float]:
             """
@@ -2704,7 +2771,10 @@ async def main() -> int:
                     return None
                 f = max(0.0, f) * frac
                 cap = BACK_CAP_FRAC * max(1e-9, back_bank_ref)
-                return min(f * back_bank_ref, cap)
+                st = min(f * back_bank_ref, cap)
+                # cap adicional por evento (limit)
+                st = min(float(st), float(_max_back_stake_event(d)))
+                return float(st)
             return None
 
         def _sizing_lay_liab(d: dict, scheme: str) -> Optional[Tuple[float, float]]:
@@ -2730,10 +2800,23 @@ async def main() -> int:
                     return None
                 f = max(0.0, f) * frac
                 cap = LAY_CAP_FRAC * max(1e-9, lay_bank_ref)
-                return (min(f * lay_bank_ref, cap), float(lay_odd))
+                liab = min(f * lay_bank_ref, cap)
+                # cap adicional por evento (limit): converte stake max -> liab max
+                max_st = _max_lay_stake_event(d)
+                liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                return (float(liab), float(lay_odd))
             return None
 
-        schemes = ["FLAT", "PROXY", "KELLY_0.10", "KELLY_0.25", "KELLY_0.50", "KELLY_1.00"]
+        # Frações a reportar (configurável por CLI)
+        try:
+            frac_list = [float(x.strip()) for x in str(getattr(args, "kelly_fractions", "")).split(",") if x.strip()]
+        except Exception:
+            frac_list = []
+        frac_list = [f for f in frac_list if f > 0]
+        if not frac_list:
+            frac_list = [0.10, 0.25, 0.50, 1.00]
+
+        schemes = ["FLAT", "PROXY"] + [f"KELLY_{f:.2f}" for f in frac_list]
 
         def _eval_back(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
             pnls = []
@@ -2955,6 +3038,8 @@ async def main() -> int:
             turn_win = float(eb["turnover"] + el["turnover_stake"])
             prof_win = float(eb["profit"] + el["profit"])
             roi_turn_win = (prof_win / turn_win * 100.0) if turn_win > 0 else None
+            lay_roi_liab_win = el.get("roi_liab")
+            lay_roi_turn_win = el.get("roi_turn")
 
             turn_30d = _proj_30(turn_win)
             profit_30d = _proj_30(prof_win)
@@ -3004,6 +3089,8 @@ async def main() -> int:
                 "turn_win": turn_win,
                 "prof_win": prof_win,
                 "roi_turn_win": roi_turn_win,
+                "lay_roi_liab_win": lay_roi_liab_win,
+                "lay_roi_turn_win": lay_roi_turn_win,
                 # 30d
                 "turn_30d": turn_30d,
                 "profit_30d": profit_30d,
@@ -3024,17 +3111,20 @@ async def main() -> int:
         lines.append(
             "| Estratégia | Scheme | N Back (janela) | N Lay (janela) | N Back 30d (proj.) | N Lay 30d (proj.) | "
             "Stake médio Back | Stake médio Lay | Liability média Lay | "
-            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | ROI Lay/liability (janela) | ROI Lay/turnover (janela) | "
             "Banca p99 (Back) | Banca p99 (Lay) | Banca risco p99 (soma) | Banca liquidez p99 (+buf) | Banca recomendada (max) | ROI/banca 30d | "
             "Turnover 30d (R$) | Lucro 30d (R$) | Banca rec. (R$) | DD 30d p95 |\n"
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         )
-        for sc in ["FLAT", "KELLY_0.25"]:
+        base_schemes_94 = ["FLAT"] + [f"KELLY_{f:.2f}" for f in frac_list if abs(f - 0.25) < 1e-9]  # mantém o foco em 0.25
+        if len(base_schemes_94) == 1:
+            base_schemes_94.append("KELLY_0.25")
+        for sc in base_schemes_94:
             s1 = _summ_strategy("BackFast (<5s, PM) + LayReversal (t_ext<=3s)", strat_back, strat_lay, sc)
             lines.append(
                 f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
                 f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
-                f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | "
+                f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | {_fmt_num(s1['lay_roi_liab_win'],2)}% | {_fmt_num(s1['lay_roi_turn_win'],2)}% | "
                 f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_risk_p99'],2)} | {_fmt_num(s1['bank_liq_p99'],2)} | {_fmt_num(s1['bank_eff'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
                 f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_eff_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
             )
@@ -3107,24 +3197,89 @@ async def main() -> int:
                 n += 1
             return (100.0 * hits / n) if n > 0 else None
 
+        def _hit_rates_back(rows_b_all: List[dict], scheme: str) -> Tuple[Optional[float], Optional[float]]:
+            """Retorna (cap_hit_pct, limit_hit_pct) para Back em Kelly."""
+            if not str(scheme).startswith("KELLY"):
+                return (None, None)
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return (None, None)
+            cap = BACK_CAP_FRAC * max(1e-9, float(back_bank_ref))
+            cap_hits = 0
+            lim_hits = 0
+            n = 0
+            for d in rows_b_all:
+                f0 = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(back_bank_ref)
+                st1 = min(raw, cap)
+                lim = float(_max_back_stake_event(d))
+                st2 = min(st1, lim)
+                if raw > cap + 1e-12:
+                    cap_hits += 1
+                if st1 > lim + 1e-12:
+                    lim_hits += 1
+                n += 1
+            return ((100.0 * cap_hits / n) if n > 0 else None, (100.0 * lim_hits / n) if n > 0 else None)
+
+        def _hit_rates_lay(rows_l_all: List[dict], scheme: str) -> Tuple[Optional[float], Optional[float]]:
+            """Retorna (cap_hit_pct, limit_hit_pct) para Lay em Kelly (liability)."""
+            if not str(scheme).startswith("KELLY"):
+                return (None, None)
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return (None, None)
+            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+            cap_hits = 0
+            lim_hits = 0
+            n = 0
+            for d in rows_l_all:
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d.get("bs_odd"))
+                if lay_odd is None:
+                    continue
+                f0 = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(lay_bank_ref)
+                liab1 = min(raw, cap)
+                max_st = float(_max_lay_stake_event(d))
+                lim = float(max_st) * max(0.0, float(lay_odd) - 1.0)
+                liab2 = min(liab1, lim)
+                if raw > cap + 1e-12:
+                    cap_hits += 1
+                if liab1 > lim + 1e-12:
+                    lim_hits += 1
+                n += 1
+            return ((100.0 * cap_hits / n) if n > 0 else None, (100.0 * lim_hits / n) if n > 0 else None)
+
         lines.append(
-            "| Strategy | Scheme | cap_hit Back (%) | cap_hit Lay (%) | Stake médio Back | Stake médio Lay | Liability média Lay | "
-            "Turnover 30d (proj.) | Lucro 30d (proj.) | Banca rec. (max) | ROI/banca 30d | DD 30d p95 |\n"
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+            f"**Escala Kelly usada nesta curva**: {'BANKROLL' if use_bankroll else 'P99_PROXY'} | "
+            f"ref_back={_fmt_num(back_bank_ref,2)} ref_lay={_fmt_num(lay_bank_ref,2)} | "
+            f"cap_back={BACK_CAP_FRAC:.1%} cap_lay={LAY_CAP_FRAC:.1%} | max_stake_event={MAX_STAKE_PCT_OF_LIMIT:.0%}*limit\n\n"
         )
-        for sc in ["KELLY_0.10", "KELLY_0.25", "KELLY_0.50", "KELLY_1.00"]:
+        lines.append(
+            "| Strategy | Scheme | cap_hit Back (%) | limit_hit Back (%) | cap_hit Lay (%) | limit_hit Lay (%) | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/banca 30d | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        )
+        for sc in [f"KELLY_{f:.2f}" for f in frac_list]:
             s = _summ_strategy("BackFast+LayReversal", strat_back, strat_lay, sc)
-            crb = _cap_rate_back(strat_back, sc)
-            crl = _cap_rate_lay(strat_lay, sc)
+            crb, lrb = _hit_rates_back(strat_back, sc)
+            crl, lrl = _hit_rates_lay(strat_lay, sc)
             lines.append(
-                f"| {s['name']} | {sc} | {_fmt_num(crb,1)}% | {_fmt_num(crl,1)}% | "
-                f"{_fmt_num(s['stake_avg_back'],2)} | {_fmt_num(s['stake_avg_lay'],2)} | {_fmt_num(s['liab_avg_lay'],2)} | "
-                f"{_fmt_num(s['turn_30d'],2)} | {_fmt_num(s['profit_30d'],2)} | {_fmt_num(s['bank_eff'],2)} | "
-                f"{_fmt_num(s['roi_bank_30d'],2)}% | {_fmt_num(s['dd_p95'],2)} |\n"
+                f"| {s['name']} | {sc} | {_fmt_num(crb,1)}% | {_fmt_num(lrb,1)}% | {_fmt_num(crl,1)}% | {_fmt_num(lrl,1)}% | "
+                f"{_fmt_num(s['turn_30d'],2)} | {_fmt_num(s['profit_30d'],2)} | {_fmt_num(s['roi_bank_30d'],2)}% | {_fmt_num(s['dd_p95'],2)} |\n"
             )
         lines.append(
             "\nLeitura rápida:\n"
             "- Se `cap_hit` estiver alto, a alavancagem adicional (ex.: 0,50× ou 1,00×) não vira turnover — o cap está “travando” o tamanho.\n"
+            "- Se `limit_hit` estiver alto, você está batendo no **limit operacional** (capacidade da conta/mercado) — aumentar banca ou frac não aumenta turnover.\n"
             "- Se `cap_hit` estiver baixo, a curva deve escalar quase linearmente com `frac` (até bater em limites reais/operacionais).\n"
             "- Lay normalmente satura antes por ter cap mais conservador (liability) e por ter risco de cauda mais assimétrico.\n\n"
         )
