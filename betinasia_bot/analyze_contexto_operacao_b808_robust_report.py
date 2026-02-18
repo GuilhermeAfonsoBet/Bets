@@ -3887,10 +3887,28 @@ async def main() -> int:
                             roi_ok = bool(roi_mean is not None and float(roi_mean) > 0) if len(bym_roi) >= max(5, int(wf_min_m // 3)) else True
                             ok_sel = bool(clv_ok and roi_ok)
                             reason = f"BackPre: clv_q10>0={clv_ok}, roi_mean>0={roi_ok}"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_clv": len(bym_clv),
+                                "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
+                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_mean": roi_mean,
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
                         elif side == "Back" and regime == "In":
                             bym_roi = _bym(sub, "roi")
                             ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
                             reason = "BackIn: roi_q30>0"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
                         elif side == "Lay" and regime == "Pre":
                             bym_clv = _bym(sub, "clv_lay_conv")
                             clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.90) or 1e9) < 0)
@@ -3898,11 +3916,27 @@ async def main() -> int:
                             roi_ok = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
                             ok_sel = bool(clv_ok and roi_ok)
                             reason = f"LayPre: clv_q90<0={clv_ok}, roi_q30>0={roi_ok}"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_clv": len(bym_clv),
+                                "clv_q90": _q(bym_clv, 0.90) if bym_clv else None,
+                                "clv_ci90_ub": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][1] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
                         else:
                             bym_roi = _bym(sub, "roi")
                             ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
                             reason = "In: roi_q30>0"
-                        diag[k] = {"ok": ok_sel, "reason": reason, "n_matches": len({e['match_id'] for e in sub})}
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
                         if ok_sel:
                             active.append(k)
                             active_counts[k] = active_counts.get(k, 0) + 1
@@ -4093,6 +4127,7 @@ async def main() -> int:
                             "turn_all": turn_all,
                             "pnl_obs": pnl_obs,
                             "pnl_exp": pnl_exp,
+                            "diag": diag,
                         }
                     )
 
@@ -4109,6 +4144,45 @@ async def main() -> int:
                 lines.append("| Combinação | #steps ativa |\n|---|---:|\n")
                 for k, c in sorted(active_counts.items(), key=lambda x: x[1], reverse=True):
                     lines.append(f"| {k} | {c} |\n")
+
+                # Transparência: métricas por combinação no treino (por janela)
+                lines.append("\n### 12.A Transparência da seleção: métricas por combinação no treino\n")
+                lines.append(
+                    "Para cada janela de treino, mostramos as métricas usadas para decidir se cada combinação ficou **ativa** ou não. "
+                    "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente ou ROI p30 <= 0).\n\n"
+                )
+                combos_all = [
+                    "Back_Pre_Yes", "Back_Pre_No", "Back_In_Yes", "Back_In_No",
+                    "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
+                ]
+                for st in steps[:10]:
+                    lines.append(f"**Train {st['train']} → Test {st['test']}**\n\n")
+                    lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV q10/q90 ou CI | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---|\n")
+                    diag = st.get("diag") or {}
+                    for k in combos_all:
+                        d = diag.get(k) or {}
+                        ok = bool(d.get("ok"))
+                        tm = int(d.get("train_matches_total") or 0)
+                        tclv = d.get("train_matches_clv")
+                        troi = d.get("train_matches_roi")
+                        tclv_s = str(int(tclv)) if tclv is not None else "—"
+                        troi_s = str(int(troi)) if troi is not None else "—"
+                        clv_val = "—"
+                        if k.startswith("Back_Pre"):
+                            clv_val = _fmt_num(_safe_float(d.get("clv_q10")), 2)
+                            lb = _safe_float(d.get("clv_ci90_lb"))
+                            if lb is not None:
+                                clv_val = f"q10={_fmt_num(_safe_float(d.get('clv_q10')),2)} | CI90_lb={_fmt_num(lb,2)}"
+                        if k.startswith("Lay_Pre"):
+                            q90 = _safe_float(d.get("clv_q90"))
+                            ub = _safe_float(d.get("clv_ci90_ub"))
+                            if q90 is not None or ub is not None:
+                                clv_val = f"q90={_fmt_num(q90,2)} | CI90_ub={_fmt_num(ub,2)}"
+                        roi_q30 = _safe_float(d.get("roi_q30"))
+                        lines.append(
+                            f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
+                        )
+                    lines.append("\n")
 
                 lines.append(
                     "\nNotas importantes:\n"
