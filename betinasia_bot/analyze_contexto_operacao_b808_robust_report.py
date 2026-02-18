@@ -3647,18 +3647,26 @@ async def main() -> int:
         # ============================================================
         # 12) OOS rolling-forward (walk-forward)
         # ============================================================
-        lines.append("## 12) OOS rolling-forward (walk-forward): seleção e validação\n")
+        wf_train_mode_hdr = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
+        if wf_train_mode_hdr not in ("rolling", "expanding"):
+            wf_train_mode_hdr = "rolling"
+        wf_mode_label = "expanding window" if wf_train_mode_hdr == "expanding" else "rolling window"
+        lines.append(f"## 12) OOS walk-forward ({wf_mode_label}): seleção e validação\n")
         lines.append(
             "Até aqui o relatório é **in-sample** (na janela `--lookback-days`). "
-            "Este bloco (opcional) faz um walk-forward simples por dia:\n\n"
-            "- Em cada passo, usamos os últimos `wf_train_days` para **selecionar** combinações (das 8: `Side×Pre/In×Reversal`) com evidência de valor.\n"
+            "Este bloco (opcional) faz um walk-forward por dia:\n\n"
+            f"- **Train mode**: `{wf_train_mode_hdr}`.\n"
+            "- Em cada passo, usamos uma janela de treino para **selecionar** combinações (Side×Pre/In×Reversal) com evidência de valor.\n"
+            "  - `rolling`: usa os **últimos** `wf_train_days`.\n"
+            "  - `expanding`: usa **todos os dias anteriores** (com `wf_train_days` só definindo quando o teste começa).\n"
             "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
-            "**Evidência de valor (por combinação, no treino)** segue seus critérios:\n"
+            "**Evidência de valor (por combinação, no treino)** segue seus critérios (com elegibilidade por volume):\n"
+            "- Elegibilidade: `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino).\n"
             "- Back/Pre: CLV p90>0 (IC90 lb>0) e ROI>0 (não precisa ser sig.)\n"
             "- Back/In: ROI p30>0\n"
-            "- Lay/Pre: CLV p90<0 (IC90 ub<0) e ROI p30>0\n"
+            "- Lay/Pre: CLV_CONV p90>0 (IC90 lb>0) e ROI p30>0\n"
             "- Lay/In: ROI p30>0\n\n"
-            "Isso aproxima o fluxo operacional que você descreveu (seleciona no rolling atual e mede no próximo rolling).\n\n"
+            "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
         )
 
         if not bool(getattr(args, "walkforward", False)):
@@ -3716,7 +3724,15 @@ async def main() -> int:
                         }
                     )
 
-            days = sorted({e["day"] for e in combo_events})
+            # Calendário do walk-forward: usa os dias com dados no recorte (OK) para não “perder” dias.
+            def _day_utc_from_ts(ts: Any) -> Optional[str]:
+                if isinstance(ts, datetime):
+                    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                return None
+
+            days_all = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
+            days_combo = sorted({e["day"] for e in combo_events})
+            days = days_all if days_all else days_combo
             # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
             uniq_matches_total = len({int(e["match_id"]) for e in combo_events})
             uniq_matches_roi = len({int(e["match_id"]) for e in combo_events if e.get("roi") is not None})
@@ -3728,13 +3744,18 @@ async def main() -> int:
             lines.append(f"| Combinações elegíveis (edge + timing + t0) | {uniq_matches_total} |\n")
             lines.append(f"| Com ROI disponível (precisa de placar) | {uniq_matches_roi} |\n")
             lines.append(f"| Com CLV disponível (pre-match + closing) | {uniq_matches_clv} |\n")
+            lines.append("\n**Calendário do walk-forward (dias únicos)**\n\n")
+            lines.append("| Tipo | Dias |\n|---|---:|\n")
+            lines.append(f"| Dias com dados no recorte (OK) | {len(days_all)} |\n")
+            lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
+            lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
             lines.append(
                 "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
                 "Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.\n\n"
             )
-            if len(days) < (wf_train + wf_test + 1):
+            if len(days) < (wf_train + wf_test):
                 lines.append(
-                    f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test + 1}.\n\n"
+                    f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test}.\n\n"
                 )
             else:
                 def _key(e: dict) -> str:
@@ -3875,7 +3896,8 @@ async def main() -> int:
                         return None
                     p99 = float(np.quantile(vals, 0.99))
                     return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
-                for i in range(wf_train, len(days) - wf_test):
+                # Inclui o último dia possível como teste (ex.: com wf_test_days=1, testa também o último dia do recorte).
+                for i in range(wf_train, len(days) - wf_test + 1):
                     train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
 
