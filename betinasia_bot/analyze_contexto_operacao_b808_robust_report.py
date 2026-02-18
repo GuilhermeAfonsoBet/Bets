@@ -2676,7 +2676,7 @@ async def main() -> int:
                     clv_mean = clv_ci = clv_q10 = clv_q30 = None
                     n_clv = m_clv = 0
                     if is_live_val is False:
-                        clv_key = "clv_t0" if side == "Back" else "clv_conv_t0"
+                        clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
                         clv_mean, clv_ci, clv_q10, clv_q30, n_clv, m_clv = _summ_ci(
                             filt,
                             clv_key,
@@ -3716,7 +3716,9 @@ async def main() -> int:
                             "match_id": int(r.get("match_id")),
                             # métricas (t0)
                             "clv_back": r.get("clv_t0") if (r.get("is_live") is False and side == "Back") else None,
-                            "clv_lay_conv": r.get("clv_conv_t0") if (r.get("is_live") is False and side == "Lay") else None,
+                            # Para Lay, faz mais sentido avaliar CLV no **ponto de entrada da estratégia** (pós-reversão ou último ponto),
+                            # e na convenção unificada `clv_conv = -(entry-closing)/closing` (Lay "bom" -> positivo).
+                            "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False and side == "Lay") else None,
                             # ROI no ponto de entrada (Back=t0; Lay=após reversão se existir, senão último ponto)
                             "roi": r.get("roi_t0") if side == "Back" else r.get("roi_entry"),
                             # odd de entrada para sizing Lay coerente com o ponto de entrada
@@ -3752,6 +3754,51 @@ async def main() -> int:
             lines.append(f"| Dias com eventos OK/betslip conf. | {len(days_ok)} |\n")
             lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
             lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
+
+            # Diagnóstico por dia: ajuda a distinguir "dia vazio por falta de oportunidade" vs "dia vazio por falha de qualidade/execução"
+            day_all_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in all_data if _day_utc_from_ts(d.get("audited_at")))
+            day_bs_raw_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs_raw if _day_utc_from_ts(d.get("audited_at")))
+            day_bs_conf_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs if _day_utc_from_ts(d.get("audited_at")))
+            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_bs if _day_utc_from_ts(d.get("audited_at")))
+            day_back_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in back_edge if _day_utc_from_ts(d.get("audited_at")))
+            day_lay_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in lay_edge if _day_utc_from_ts(d.get("audited_at")))
+
+            day_non_ok_top: Dict[str, str] = {}
+            tmp: Dict[str, Counter] = {}
+            for d in with_bs:
+                day = _day_utc_from_ts(d.get("audited_at"))
+                if not day:
+                    continue
+                st = str(d.get("status", "") or "").upper()
+                if st == "OK":
+                    continue
+                tmp.setdefault(day, Counter())
+                tmp[day][st or "NA"] += 1
+            for day, c in tmp.items():
+                day_non_ok_top[day] = str(c.most_common(1)[0][0]) if c else "—"
+
+            lines.append("\n**Diagnóstico por dia (audited_at): betslip vs qualidade vs edge**\n\n")
+            lines.append(
+                "| Dia | Auditorias carregadas | Betslip bruto | Betslip conf. | OK (conf.) | Edge Back/Lay | %OK/conf. | Status não-OK dominante |\n"
+                "|---|---:|---:|---:|---:|---:|---:|---|\n"
+            )
+            for day in days_loaded:
+                a = int(day_all_cnt.get(day, 0))
+                br = int(day_bs_raw_cnt.get(day, 0))
+                conf = int(day_bs_conf_cnt.get(day, 0))
+                ok = int(day_ok_cnt.get(day, 0))
+                eb = int(day_back_edge_cnt.get(day, 0))
+                el = int(day_lay_edge_cnt.get(day, 0))
+                ok_rate = (100.0 * ok / conf) if conf > 0 else None
+                lines.append(
+                    f"| {day} | {a} | {br} | {conf} | {ok} | {eb}/{el} | {_fmt_num(ok_rate,1)}% | {day_non_ok_top.get(day,'—')} |\n"
+                )
+            lines.append(
+                "\nLeitura:\n"
+                "- Se `Auditorias carregadas > 0` mas `Betslip conf.` ≈ 0, geralmente houve **mismatch/parse** (diff fora de [-10,+10]) ou ausência de betslip.\n"
+                "- Se `Betslip conf. > 0` mas `OK (conf.) = 0`, o robô coletou betslip, mas os eventos falharam por **status != OK** (ver coluna de status).\n"
+                "- Dias com `OK (conf.) = 0` **não devem ser tratados como “0 oportunidade”** sem investigar o operacional.\n\n"
+            )
             lines.append(
                 "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
                 "Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.\n\n"
@@ -4284,6 +4331,12 @@ async def main() -> int:
 
                 oos_days = sorted(daily_turn.keys())
                 n_oos_days = len(oos_days) if oos_days else 0
+                # Dias "operacionais": houve ao menos 1 evento OK+conf naquele dia (evita tratar downtime como 0 oportunidade)
+                try:
+                    oos_days_ok = [d for d in oos_days if int(day_ok_cnt.get(d, 0)) > 0]
+                except Exception:
+                    oos_days_ok = []
+                n_oos_days_ok = len(oos_days_ok)
                 turn_sum = float(sum(daily_turn.values())) if daily_turn else 0.0
                 pnl_obs_sum = float(sum(daily_pnl_obs.values())) if daily_pnl_obs else 0.0
                 pnl_exp_sum = float(sum(daily_pnl_exp.values())) if daily_pnl_exp else 0.0
@@ -4295,9 +4348,17 @@ async def main() -> int:
                 turn_in_sum = float(sum(daily_turn_in.values())) if daily_turn_in else 0.0
                 horizon = 30.0
                 scale = (horizon / float(n_oos_days)) if n_oos_days > 0 else None
+                scale_ok = (horizon / float(n_oos_days_ok)) if n_oos_days_ok > 0 else None
+
+                # Projeção "calendário": inclui dias sem OK como 0 (boa para refletir downtime).
                 turn_30d = float(turn_sum) * float(scale) if scale is not None else None
                 profit_obs_30d = float(pnl_obs_sum) * float(scale) if scale is not None else None
                 profit_exp_30d = float(pnl_exp_sum) * float(scale) if scale is not None else None
+
+                # Projeção "condicional a dia OK": exclui dias sem OK do denominador (boa para não deturpar edge quando operacional falhou).
+                turn_30d_ok = float(turn_sum) * float(scale_ok) if scale_ok is not None else None
+                profit_obs_30d_ok = float(pnl_obs_sum) * float(scale_ok) if scale_ok is not None else None
+                profit_exp_30d_ok = float(pnl_exp_sum) * float(scale_ok) if scale_ok is not None else None
                 profit_obs_pre_30d = float(pnl_obs_pre_sum) * float(scale) if scale is not None else None
                 profit_obs_in_30d = float(pnl_obs_in_sum) * float(scale) if scale is not None else None
                 profit_exp_pre_30d = float(pnl_exp_pre_sum) * float(scale) if scale is not None else None
@@ -4317,29 +4378,41 @@ async def main() -> int:
                 # drawdown p95 via bootstrap de dias OOS (obs/exp)
                 dd_obs_mean, dd_obs_p95 = _bootstrap_dd(list(daily_pnl_obs.values()), horizon_days=30, n_boot=2000)
                 dd_exp_mean, dd_exp_p95 = _bootstrap_dd(list(daily_pnl_exp.values()), horizon_days=30, n_boot=2000)
+                dd_obs_mean_ok, dd_obs_p95_ok = _bootstrap_dd([daily_pnl_obs.get(d, 0.0) for d in oos_days_ok], horizon_days=30, n_boot=2000)
+                dd_exp_mean_ok, dd_exp_p95_ok = _bootstrap_dd([daily_pnl_exp.get(d, 0.0) for d in oos_days_ok], horizon_days=30, n_boot=2000)
 
                 roi_bank_obs = (float(profit_obs_30d) / float(bank_eff) * 100.0) if (profit_obs_30d is not None and bank_eff and bank_eff > 0) else None
                 roi_bank_exp = (float(profit_exp_30d) / float(bank_eff) * 100.0) if (profit_exp_30d is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_obs_ok = (float(profit_obs_30d_ok) / float(bank_eff) * 100.0) if (profit_obs_30d_ok is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_exp_ok = (float(profit_exp_30d_ok) / float(bank_eff) * 100.0) if (profit_exp_30d_ok is not None and bank_eff and bank_eff > 0) else None
 
                 lines.append("| Premissa | Valor |\n|---|---:|\n")
                 lines.append(f"| Train mode (OOS) | `{wf_train_mode}` |\n")
                 lines.append(f"| Scheme pre-match (OOS) | `{wf_scheme_pre}` |\n")
                 lines.append(f"| Scheme in-match (OOS) | `{wf_scheme_in}` |\n")
                 lines.append(f"| Expansão missing ROI | {'ON' if wf_expand else 'OFF'} |\n")
-                lines.append(f"| Dias OOS usados | {n_oos_days} |\n")
-                lines.append(f"| Turnover 30d (proj.) | {_fmt_num(turn_30d,2)} |\n")
+                lines.append(f"| Dias OOS (calendário de teste) | {n_oos_days} |\n")
+                lines.append(f"| Dias OOS com OK (>=1 evento OK/conf) | {n_oos_days_ok} |\n")
+                lines.append(f"| Turnover 30d (proj., calendário) | {_fmt_num(turn_30d,2)} |\n")
+                lines.append(f"| Turnover 30d (proj., cond OK) | {_fmt_num(turn_30d_ok,2)} |\n")
                 lines.append(f"| Turnover 30d (Pre/In) | {_fmt_num(turn_pre_30d,2)} / {_fmt_num(turn_in_30d,2)} |\n")
-                lines.append(f"| Lucro 30d (obs.) | {_fmt_num(profit_obs_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs., calendário) | {_fmt_num(profit_obs_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs., cond OK) | {_fmt_num(profit_obs_30d_ok,2)} |\n")
                 lines.append(f"| Lucro 30d (obs.) Pre/In | {_fmt_num(profit_obs_pre_30d,2)} / {_fmt_num(profit_obs_in_30d,2)} |\n")
-                lines.append(f"| Lucro 30d (exp.) | {_fmt_num(profit_exp_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp., calendário) | {_fmt_num(profit_exp_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp., cond OK) | {_fmt_num(profit_exp_30d_ok,2)} |\n")
                 lines.append(f"| Lucro 30d (exp.) Pre/In | {_fmt_num(profit_exp_pre_30d,2)} / {_fmt_num(profit_exp_in_30d,2)} |\n")
                 lines.append(f"| Banca risco p99 (Back+Lay) | {_fmt_num(bank_risk,2)} |\n")
                 lines.append(f"| Banca liquidez p99 (+buf) | {_fmt_num(bank_liq,2)} |\n")
                 lines.append(f"| Banca recomendada (max) | {_fmt_num(bank_eff,2)} |\n")
-                lines.append(f"| ROI/banca 30d (obs.) | {_fmt_num(roi_bank_obs,2)}% |\n")
-                lines.append(f"| ROI/banca 30d (exp.) | {_fmt_num(roi_bank_exp,2)}% |\n")
-                lines.append(f"| DD 30d p95 (obs.) | {_fmt_num(dd_obs_p95,2)} |\n")
-                lines.append(f"| DD 30d p95 (exp.) | {_fmt_num(dd_exp_p95,2)} |\n")
+                lines.append(f"| ROI/banca 30d (obs., calendário) | {_fmt_num(roi_bank_obs,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (obs., cond OK) | {_fmt_num(roi_bank_obs_ok,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (exp., calendário) | {_fmt_num(roi_bank_exp,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (exp., cond OK) | {_fmt_num(roi_bank_exp_ok,2)}% |\n")
+                lines.append(f"| DD 30d p95 (obs., calendário) | {_fmt_num(dd_obs_p95,2)} |\n")
+                lines.append(f"| DD 30d p95 (obs., cond OK) | {_fmt_num(dd_obs_p95_ok,2)} |\n")
+                lines.append(f"| DD 30d p95 (exp., calendário) | {_fmt_num(dd_exp_p95,2)} |\n")
+                lines.append(f"| DD 30d p95 (exp., cond OK) | {_fmt_num(dd_exp_p95_ok,2)} |\n")
                 lines.append("\n")
 
                 # ------------------------------------------------------------
