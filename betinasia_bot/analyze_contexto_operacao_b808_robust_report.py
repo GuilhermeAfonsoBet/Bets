@@ -3724,15 +3724,17 @@ async def main() -> int:
                         }
                     )
 
-            # Calendário do walk-forward: usa os dias com dados no recorte (OK) para não “perder” dias.
+            # Calendário do walk-forward: usar os dias com dados carregados no recorte (mesmo que não haja eventos OK/edge),
+            # para não “sumir” dias recentes (ex.: 17/18) na tabela OOS.
             def _day_utc_from_ts(ts: Any) -> Optional[str]:
                 if isinstance(ts, datetime):
                     return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
                 return None
 
-            days_all = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
+            days_loaded = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in all_data) if d})
+            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
             days_combo = sorted({e["day"] for e in combo_events})
-            days = days_all if days_all else days_combo
+            days = days_loaded if days_loaded else days_combo
             # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
             uniq_matches_total = len({int(e["match_id"]) for e in combo_events})
             uniq_matches_roi = len({int(e["match_id"]) for e in combo_events if e.get("roi") is not None})
@@ -3746,7 +3748,8 @@ async def main() -> int:
             lines.append(f"| Com CLV disponível (pre-match + closing) | {uniq_matches_clv} |\n")
             lines.append("\n**Calendário do walk-forward (dias únicos)**\n\n")
             lines.append("| Tipo | Dias |\n|---|---:|\n")
-            lines.append(f"| Dias com dados no recorte (OK) | {len(days_all)} |\n")
+            lines.append(f"| Dias com dados carregados (audited_at) | {len(days_loaded)} |\n")
+            lines.append(f"| Dias com eventos OK/betslip conf. | {len(days_ok)} |\n")
             lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
             lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
             lines.append(
@@ -3900,6 +3903,19 @@ async def main() -> int:
                 for i in range(wf_train, len(days) - wf_test + 1):
                     train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
+
+                    # Garante que dias de teste apareçam no acumulado, mesmo com turnover/lucro zero
+                    # (importante para refletir “dias sem operação” no OOS e não encurtar artificialmente o horizonte).
+                    for dday in test_days:
+                        daily_turn.setdefault(dday, 0.0)
+                        daily_turn_pre.setdefault(dday, 0.0)
+                        daily_turn_in.setdefault(dday, 0.0)
+                        daily_pnl_obs.setdefault(dday, 0.0)
+                        daily_pnl_exp.setdefault(dday, 0.0)
+                        daily_pnl_obs_pre.setdefault(dday, 0.0)
+                        daily_pnl_obs_in.setdefault(dday, 0.0)
+                        daily_pnl_exp_pre.setdefault(dday, 0.0)
+                        daily_pnl_exp_in.setdefault(dday, 0.0)
 
                     train = [e for e in combo_events if e["day"] in train_days]
                     test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None]
