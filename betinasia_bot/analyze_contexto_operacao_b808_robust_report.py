@@ -630,8 +630,8 @@ async def main() -> int:
     )
     parser.add_argument(
         "--wf-scheme-in",
-        default=os.getenv("WF_SCHEME_IN", "PROXY"),
-        help="Scheme de sizing para OOS in-match (default PROXY). Ex.: PROXY, FLAT",
+        default=os.getenv("WF_SCHEME_IN", "FLAT"),
+        help="Scheme de sizing para OOS in-match (default FLAT). Ex.: FLAT, PROXY",
     )
     parser.add_argument(
         "--wf-expand-missing-roi",
@@ -2623,12 +2623,12 @@ async def main() -> int:
         # ============================================================
         # 8.3) Resumo das 8 combinações (Side × Pre/In × Reversal)
         # ============================================================
-        lines.append("### 8.3 Resumo de estratégias — 8 combinações (Side × Pre/In × Reversal)\n")
+        lines.append("### 8.3 Resumo de estratégias — combinações (Side × Pre/In × Reversal)\n")
         lines.append(
-            "Esta tabela resume as **8 combinações** possíveis: `Back/Lay × Pre/In × Reversal(Sim/Não)`.\n\n"
-            "- **Back**: entrada em `t0`.\n"
+            "Esta tabela resume as combinações possíveis. Observação importante:\n\n"
+            "- **Back**: a estratégia é **entrar rápido em `t0`**, então **não faz sentido separar por Reversal(Sim/Não)** (agregamos como `Any`).\n"
             "- **Lay**: entrada **após reversão** quando ela existe (`odd_reversal`), senão no **último ponto** (~t+20s).\n"
-            "- **CLV** aqui é **somente pre‑match** (closing pré‑jogo). Para **Lay**, reportamos CLV na convenção única **(entry - closing)/closing**; logo, **Lay “bom” tende a CLV < 0**.\n"
+            "- **CLV** aqui é **somente pre‑match** (closing pré‑jogo). Para **Lay**, usamos a convenção unificada `clv_conv = -(entry - closing)/closing`, logo **Lay “bom” tende a CLV_CONV > 0**.\n"
             "- **ROI** é calculado no **ponto de entrada da estratégia** (se houver placar). Para Lay, ROI é **por liability**.\n"
             "- **IC90** é bootstrap por jogo (cluster em `match_id`). Para critério “p30” usamos o quantil bootstrap **p30** do estimador.\n\n"
         )
@@ -2656,12 +2656,16 @@ async def main() -> int:
             q30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
             return s.mean_cluster, s.ci90_cluster, q10, q30, s.n_events, s.n_matches
 
-        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI t0 (mean; IC90) | ROI p30 | Ativa? (critério) |\n")
+        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI (mean; IC90) | ROI p30 | Ativa? (critério) |\n")
         lines.append("|---|---|---|---:|---:|---:|---:|---:|---|\n")
         for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
             for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
-                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
-                    filt = _combo_rows(entries, is_live=is_live_val, had_rev=had_rev_val)
+                rev_iters = [(None, "Any")] if side == "Back" else [(True, "Yes"), (False, "No")]
+                for had_rev_val, rev_label in rev_iters:
+                    if had_rev_val is None:
+                        filt = [r for r in entries if r.get("is_live") is is_live_val]
+                    else:
+                        filt = _combo_rows(entries, is_live=is_live_val, had_rev=had_rev_val)
                     # CLV só pre-match
                     clv_mean = clv_ci = clv_q10 = clv_q30 = None
                     n_clv = m_clv = 0
@@ -2688,7 +2692,7 @@ async def main() -> int:
                     # Critérios do usuário (direcionamento):
                     # Back Pre: CLV>0 significativo p90 (IC90 lb>0) e ROI>0 (não precisa ser sig)
                     # Back In: apenas ROI com p30>0
-                    # Lay Pre: CLV<0 significativo p90 (IC90 ub<0) e ROI significativo p30 (p30>0)
+                    # Lay Pre: CLV_CONV>0 significativo p90 (IC90 lb>0) e ROI significativo p30 (p30>0)
                     # Lay In: apenas ROI p30>0
                     active = None
                     crit = ""
@@ -2701,10 +2705,10 @@ async def main() -> int:
                         active = bool(roi_q30 is not None and float(roi_q30) > 0)
                         crit = "ROI p30>0"
                     elif side == "Lay" and regime_label == "Pre":
-                        clv_sig = bool(clv_ci and float(clv_ci[1]) < 0)
+                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
                         roi_sig = bool(roi_q30 is not None and float(roi_q30) > 0)
                         active = clv_sig and roi_sig
-                        crit = "CLV p90<0 AND ROI p30>0"
+                        crit = "CLV_CONV p90>0 AND ROI p30>0"
                     else:
                         active = bool(roi_q30 is not None and float(roi_q30) > 0)
                         crit = "ROI p30>0"
@@ -3661,7 +3665,7 @@ async def main() -> int:
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
             wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
-            wf_scheme_in = str(getattr(args, "wf_scheme_in", "PROXY") or "PROXY").strip()
+            wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
             bud_back_frac = max(0.0, float(getattr(args, "wf_budget_back_frac", 0.01)))
             bud_lay_frac = max(0.0, float(getattr(args, "wf_budget_lay_frac", 0.005)))
@@ -3725,7 +3729,17 @@ async def main() -> int:
                 )
             else:
                 def _key(e: dict) -> str:
-                    return f"{e['side']}_{e['regime']}_{e['reversal']}"
+                    """
+                    Chave de combinação para OOS.
+                    - Back: não depende de reversão (estratégia é "entrar rápido"), então agregamos Yes/No como 'Any'.
+                    - Lay: mantém Yes/No porque a política de entrada depende de reversão (reversal -> entra após; senão entra no último ponto).
+                    """
+                    side = str(e.get("side"))
+                    regime = str(e.get("regime"))
+                    rev = str(e.get("reversal"))
+                    if side == "Back":
+                        rev = "Any"
+                    return f"{side}_{regime}_{rev}"
 
                 def _bym(sub: List[dict], key: str) -> Dict[int, List[float]]:
                     bym: Dict[int, List[float]] = {}
@@ -3869,9 +3883,9 @@ async def main() -> int:
                         parts = k.split("_")
                         side = parts[0]
                         regime = parts[1]
-                        # Back Pre: CLV p90>0 (q10>0) AND ROI mean>0 (se existir)
+                    # Back Pre: CLV p90>0 (q10>0) AND ROI mean>0 (se existir)
                         # Back In: ROI p30>0
-                        # Lay Pre: CLV p90<0 (q90<0) AND ROI p30>0
+                    # Lay Pre: CLV_CONV p90>0 (q10>0) AND ROI p30>0
                         # Lay In: ROI p30>0
                         ok_sel = False
                         reason = ""
@@ -3911,18 +3925,20 @@ async def main() -> int:
                             }
                         elif side == "Lay" and regime == "Pre":
                             bym_clv = _bym(sub, "clv_lay_conv")
-                            clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.90) or 1e9) < 0)
+                            # `clv_lay_conv` é a convenção com sinal "unificado":
+                            # clv_conv = -(entry - closing) / closing  => Lay "bom" tende a ser POSITIVO.
+                            clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.10) or -1e9) > 0)
                             bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
                             roi_ok = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
                             ok_sel = bool(clv_ok and roi_ok)
-                            reason = f"LayPre: clv_q90<0={clv_ok}, roi_q30>0={roi_ok}"
+                            reason = f"LayPre: clv_conv_q10>0={clv_ok}, roi_q30>0={roi_ok}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
-                                "clv_q90": _q(bym_clv, 0.90) if bym_clv else None,
-                                "clv_ci90_ub": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][1] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
+                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
                             }
@@ -4152,7 +4168,7 @@ async def main() -> int:
                     "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente ou ROI p30 <= 0).\n\n"
                 )
                 combos_all = [
-                    "Back_Pre_Yes", "Back_Pre_No", "Back_In_Yes", "Back_In_No",
+                    "Back_Pre_Any", "Back_In_Any",
                     "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
                 ]
                 for st in steps[:10]:
@@ -4174,10 +4190,10 @@ async def main() -> int:
                             if lb is not None:
                                 clv_val = f"q10={_fmt_num(_safe_float(d.get('clv_q10')),2)} | CI90_lb={_fmt_num(lb,2)}"
                         if k.startswith("Lay_Pre"):
-                            q90 = _safe_float(d.get("clv_q90"))
-                            ub = _safe_float(d.get("clv_ci90_ub"))
-                            if q90 is not None or ub is not None:
-                                clv_val = f"q90={_fmt_num(q90,2)} | CI90_ub={_fmt_num(ub,2)}"
+                            q10 = _safe_float(d.get("clv_q10"))
+                            lb = _safe_float(d.get("clv_ci90_lb"))
+                            if q10 is not None or lb is not None:
+                                clv_val = f"q10={_fmt_num(q10,2)} | CI90_lb={_fmt_num(lb,2)}"
                         roi_q30 = _safe_float(d.get("roi_q30"))
                         lines.append(
                             f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
@@ -4190,7 +4206,15 @@ async def main() -> int:
                     "Nesse cenário faz sentido **Bayes hierárquico (partial pooling)** para estabilizar estimativas.\n"
                     "- **Lucro (estratégia, budget)** acima já incorpora a política de risco por jogo (match budget) e é a métrica principal.\n"
                     "- O walk-forward usa ROI no **ponto de entrada**: Back em `t0`; Lay em `t_reversal` quando existir, senão `t_last` (~t+20s).\n"
+                    "- Para Lay pre-match, o CLV usado na seleção é `clv_conv = -(entry-closing)/closing`, ou seja **Lay “bom” tende a ser positivo**.\n"
                     "- Para pre-match, também é útil monitorar CLV OOS (menos dependente de resultados), mas CLV mede qualidade de entrada, não P&L.\n\n"
+                )
+                lines.append(
+                    "**O que significa 'Bayes hierárquico / partial pooling' aqui?**\n\n"
+                    "Quando você tem poucas partidas por combinação na janela de treino/teste, o estimador (ex.: ROI p30) fica muito ruidoso e pode alternar sinal por acaso. "
+                    "O Bayes hierárquico modela cada combinação como um desvio de um **efeito global** (ex.: ROI médio global do live) e aplica **shrinkage**: "
+                    "combinações com pouco N são puxadas para o global; combinações com muito N “ganham identidade própria”.\n\n"
+                    "Na prática isso reduz falsos positivos/negativos no rolling e torna a seleção mais estável quando o volume ainda é baixo.\n\n"
                 )
 
                 # ------------------------------------------------------------
@@ -4432,6 +4456,10 @@ async def main() -> int:
                         ("BUDGET_0.50%/0.25% cap25%", 0.005, 0.0025, 0.25),
                         ("BUDGET_1.00%/0.50% cap33%", 0.010, 0.0050, 0.33),
                         ("BUDGET_2.00%/1.00% cap50%", 0.020, 0.0100, 0.50),
+                        ("BUDGET_3.00%/1.50% cap33%", 0.030, 0.0150, 0.33),
+                        ("BUDGET_4.00%/2.00% cap33%", 0.040, 0.0200, 0.33),
+                        ("BUDGET_3.00%/1.50% cap50%", 0.030, 0.0150, 0.50),
+                        ("BUDGET_4.00%/2.00% cap50%", 0.040, 0.0200, 0.50),
                     ]
                     lines.append(
                         f"Referência de banca p/ budget: {_fmt_num(bank_ref_budget,2)} | "
