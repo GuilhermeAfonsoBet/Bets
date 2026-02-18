@@ -3403,11 +3403,55 @@ async def main() -> int:
             "Turnover 30d (R$) | Lucro 30d (R$) | Banca rec. (R$) | DD 30d p95 |\n"
             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         )
-        base_schemes_94 = ["FLAT"] + [f"KELLY_{f:.2f}" for f in frac_list if abs(f - 0.25) < 1e-9]  # mantém o foco em 0.25
+        # Consolida estratégia pre-match como união das combinações ativas (8.3) — somente PRE (Kelly depende de closing).
+        by_audit_id_94: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+
+        def _combo_active_83(side: str, had_rev: bool) -> bool:
+            # Aplica os mesmos critérios da tabela 8.3 (PRE apenas)
+            ent = back_entries if side == "Back" else lay_entries
+            filt = [r for r in ent if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev)]
+            if not filt:
+                return False
+            # CLV
+            clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+            s_clv = summarize_metric([r.get(clv_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-50, clip_high=50)
+            # ROI (entry)
+            roi_key = "roi_t0" if side == "Back" else "roi_entry"
+            s_roi = summarize_metric([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-200, clip_high=(500.0 if side == "Back" else 5000.0))
+            if side == "Back":
+                clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[0]) > 0)
+                roi_ok = bool(s_roi.mean_cluster is not None and float(s_roi.mean_cluster) > 0)
+                return bool(clv_ok and roi_ok)
+            # Lay: CLV bom tende a ser negativo nesta convenção
+            clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[1]) < 0)
+            # “sig a p30” ≈ p30 > 0
+            bym = {}
+            for v, mid in zip([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt]):
+                vf = _safe_float(v)
+                if vf is None:
+                    continue
+                bym.setdefault(int(mid), []).append(float(vf))
+            roi_p30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+            roi_ok = bool(roi_p30 is not None and float(roi_p30) > 0)
+            return bool(clv_ok and roi_ok)
+
+        active_back_aids = set()
+        for had_rev in (True, False):
+            if _combo_active_83("Back", had_rev):
+                active_back_aids.update(int(r.get("audit_id")) for r in back_entries if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev) and r.get("audit_id") is not None)
+        active_lay_aids = set()
+        for had_rev in (True, False):
+            if _combo_active_83("Lay", had_rev):
+                active_lay_aids.update(int(r.get("audit_id")) for r in lay_entries if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev) and r.get("audit_id") is not None)
+
+        rows_back_active = [by_audit_id_94[aid] for aid in active_back_aids if aid in by_audit_id_94 and aid in back_edge_ids]
+        rows_lay_active = [by_audit_id_94[aid] for aid in active_lay_aids if aid in by_audit_id_94 and aid in lay_edge_ids]
+
+        base_schemes_94 = ["FLAT"] + [f"KELLY_{f:.2f}" for f in frac_list if abs(f - 0.25) < 1e-9]
         if len(base_schemes_94) == 1:
             base_schemes_94.append("KELLY_0.25")
         for sc in base_schemes_94:
-            s1 = _summ_strategy("BackFast (<5s, PM) + LayReversal (t_ext<=3s)", strat_back, strat_lay, sc)
+            s1 = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
             lines.append(
                 f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
                 f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
@@ -3418,8 +3462,7 @@ async def main() -> int:
         lines.append(
             "\nNotas:\n"
             "- **N Back/Lay** na tabela é **na janela observada**. As colunas `N 30d (proj.)` são uma **escala linear** por dias observados.\n"
-            "- `BackFast` implementa sua hipótese **Back só quando execução <5s** e pre‑match.\n"
-            "- `LayReversal` usa o diagnóstico da seção 8.2b: **subcoorte com reversão** e vale cedo (t_ext<=3s) como proxy de “logo após a reversão”.\n"
+            "- Esta linha usa a união das **combinações pre‑match ativas** sob os critérios da 8.3 (é um resumo, não substitui a tabela 8.3).\n"
             "- `Stake médio` e `Liability média` são **proxies** na unidade monetária do seu limit/finance; valores em **R$** usam fx `--fx-usdbrl`.\n"
             "- `Banca recomendada` = max( banca por risco p99 (unitária, soma) ; banca por liquidez p99 (+buffer) ).\n"
             "- **Por que Lay pode ter stake médio menor mesmo com ROI maior**: (i) Lay é governado por **liability** (risco) e usamos cap mais conservador; "
@@ -3556,9 +3599,9 @@ async def main() -> int:
             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         )
         for sc in [f"KELLY_{f:.2f}" for f in frac_list]:
-            s = _summ_strategy("BackFast+LayReversal", strat_back, strat_lay, sc)
-            crb, lrb = _hit_rates_back(strat_back, sc)
-            crl, lrl = _hit_rates_lay(strat_lay, sc)
+            s = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
+            crb, lrb = _hit_rates_back(rows_back_active, sc)
+            crl, lrl = _hit_rates_lay(rows_lay_active, sc)
             lines.append(
                 f"| {s['name']} | {sc} | {_fmt_num(crb,1)}% | {_fmt_num(lrb,1)}% | {_fmt_num(crl,1)}% | {_fmt_num(lrl,1)}% | "
                 f"{_fmt_num(s['turn_30d'],2)} | {_fmt_num(s['profit_30d'],2)} | {_fmt_num(s['roi_bank_30d'],2)}% | {_fmt_num(s['dd_p95'],2)} |\n"
