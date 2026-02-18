@@ -645,6 +645,9 @@ async def main() -> int:
         default=(os.getenv("WF_MATCH_BUDGET", "1").strip() not in ("0", "false", "False", "no", "NO")),
         help="Inclui simulação de governança por jogo (budget por match_id) na seção OOS (default=on).",
     )
+    parser.add_argument("--wf-budget-back-frac", type=float, default=float(os.getenv("WF_BUDGET_BACK_FRAC", "0.01")), help="Budget Back por jogo (fração da banca ref).")
+    parser.add_argument("--wf-budget-lay-frac", type=float, default=float(os.getenv("WF_BUDGET_LAY_FRAC", "0.005")), help="Budget Lay por jogo (fração da banca ref, em liability).")
+    parser.add_argument("--wf-budget-cap-signal-frac", type=float, default=float(os.getenv("WF_BUDGET_CAP_SIGNAL_FRAC", "0.33")), help="Cap por sinal como fração do budget do jogo.")
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -1914,6 +1917,9 @@ async def main() -> int:
         # Banca por liquidez (capital travado ao longo do tempo)
         # ------------------------------------------------------------
         LIQUIDITY_SETTLE_BUFFER_HOURS = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+        # Aproximação de tempo até liquidação: duração média do jogo + buffer operacional.
+        # Isso reduz subestimação de liquidez (e “giro de banca” irreal).
+        LIQUIDITY_MATCH_DURATION_HOURS = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
         LIQUIDITY_GRID_MINUTES = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
         LIQUIDITY_BANK_BUFFER_PCT = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))  # margem extra
 
@@ -1929,11 +1935,11 @@ async def main() -> int:
                     continue
                 ko = d.get("kickoff") or d.get("kickoff_time")
                 if isinstance(ko, datetime):
-                    t1 = ko + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+                    t1 = ko + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
                 else:
-                    t1 = t0 + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+                    t1 = t0 + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
                 if not isinstance(t1, datetime) or t1 <= t0:
-                    t1 = t0 + timedelta(hours=LIQUIDITY_SETTLE_BUFFER_HOURS)
+                    t1 = t0 + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
 
                 bs, _, _, ll = finance_for_row(d)
                 exp = float(bs) if mode == "back" else float(ll)
@@ -2028,7 +2034,7 @@ async def main() -> int:
 
         lines.append("**Banca por liquidez (capital simultaneamente travado)**\n\n")
         lines.append(
-            f"Definição operacional: cada aposta trava capital de `audited_at` até `kickoff + {LIQUIDITY_SETTLE_BUFFER_HOURS:.2f}h` "
+            f"Definição operacional: cada aposta trava capital de `audited_at` até `kickoff + {LIQUIDITY_MATCH_DURATION_HOURS:.2f}h + {LIQUIDITY_SETTLE_BUFFER_HOURS:.2f}h` "
             f"(grid={LIQUIDITY_GRID_MINUTES}min). A banca recomendada aplica buffer de +{LIQUIDITY_BANK_BUFFER_PCT:.0f}%.\n\n"
         )
         lines.append("| Bloco | Liquidez mean | Liquidez p95 | Liquidez p99 | Liquidez max | Banca liq p99 (+buffer) |\n|---|---:|---:|---:|---:|---:|\n")
@@ -2199,6 +2205,8 @@ async def main() -> int:
             after = diffs[idx_ext + 1 :] if idx_ext + 1 < len(diffs) else []
             had_rev = False
             t_rev = None
+            odd_rev = None
+            diff_rev = None
             if after:
                 if mode == "back":
                     threshold = ext["diff_pct"] - EPS_REV
@@ -2206,6 +2214,8 @@ async def main() -> int:
                         if p["diff_pct"] <= threshold:
                             had_rev = True
                             t_rev = p["t"]
+                            odd_rev = p.get("odd")
+                            diff_rev = p.get("diff_pct")
                             break
                 else:
                     threshold = ext["diff_pct"] + EPS_REV
@@ -2213,6 +2223,8 @@ async def main() -> int:
                         if p["diff_pct"] >= threshold:
                             had_rev = True
                             t_rev = p["t"]
+                            odd_rev = p.get("odd")
+                            diff_rev = p.get("diff_pct")
                             break
             ext_at_end = abs(last["diff_pct"] - ext["diff_pct"]) <= EPS_DIFF_STABLE
             return {
@@ -2227,6 +2239,8 @@ async def main() -> int:
                 "ext_at_end": bool(ext_at_end),
                 "had_reversal": bool(had_rev),
                 "t_reversal": float(t_rev) if t_rev is not None else None,
+                "odd_reversal": float(odd_rev) if odd_rev is not None else None,
+                "diff_reversal": float(diff_rev) if diff_rev is not None else None,
             }
 
         def _clv_pct_from_odd(odd: Optional[float], closing_odd: Any) -> Optional[float]:
@@ -2447,6 +2461,8 @@ async def main() -> int:
             roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
             roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
+            odd_rev = _safe_float(a.get("odd_reversal"))
+            roirev = _roi_lay_pct_per_liability(odd_rev, mult) if (mult is not None and odd_rev is not None) else None
             # CLV só faz sentido pre-match (closing_odd é pré-jogo).
             clv0 = _clv_pct_lay_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
             clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
@@ -2456,6 +2472,15 @@ async def main() -> int:
             clv0_conv = (-float(clv0)) if clv0 is not None else None
             clve_conv = (-float(clve)) if clve is not None else None
             clvl_conv = (-float(clvl)) if clvl is not None else None
+
+            # Política de entrada Lay (para 8.3 e OOS):
+            # - se há reversão: entrar **logo após a reversão** (odd_reversal)
+            # - se não há reversão: entrar no **último ponto** (t_last, ~t+20s)
+            has_rev = bool(a.get("had_reversal")) and (odd_rev is not None)
+            odd_entry = float(odd_rev) if has_rev else float(plast["odd"])
+            roi_entry = roirev if has_rev else roilast
+            clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
+            clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
@@ -2474,6 +2499,12 @@ async def main() -> int:
                 "roi_t0": roi0,
                 "roi_ext": roival,
                 "roi_last": roilast,
+                "odd_reversal": odd_rev,
+                "roi_rev": roirev,
+                "odd_entry": odd_entry,
+                "roi_entry": roi_entry,
+                "clv_entry": clv_entry,
+                "clv_conv_entry": clv_entry_conv,
             }
 
         def _summarize_entry(rows: List[dict], key: str, *, clip_low: Optional[float] = None, clip_high: Optional[float] = None) -> MetricSummary:
@@ -2595,9 +2626,10 @@ async def main() -> int:
         lines.append("### 8.3 Resumo de estratégias — 8 combinações (Side × Pre/In × Reversal)\n")
         lines.append(
             "Esta tabela resume as **8 combinações** possíveis: `Back/Lay × Pre/In × Reversal(Sim/Não)`.\n\n"
-            "- **CLV** aqui é medido em `t0` e **somente pre‑match** (closing pré‑jogo).\n"
-            "- Para **Lay**, o CLV nesta tabela usa a convenção única **(entry - closing)/closing**; logo, **Lay “bom” tende a CLV < 0**.\n"
-            "- **ROI** aqui é em `t0` (se houver placar). Para Lay, o ROI é **por liability**.\n"
+            "- **Back**: entrada em `t0`.\n"
+            "- **Lay**: entrada **após reversão** quando ela existe (`odd_reversal`), senão no **último ponto** (~t+20s).\n"
+            "- **CLV** aqui é **somente pre‑match** (closing pré‑jogo). Para **Lay**, reportamos CLV na convenção única **(entry - closing)/closing**; logo, **Lay “bom” tende a CLV < 0**.\n"
+            "- **ROI** é calculado no **ponto de entrada da estratégia** (se houver placar). Para Lay, ROI é **por liability**.\n"
             "- **IC90** é bootstrap por jogo (cluster em `match_id`). Para critério “p30” usamos o quantil bootstrap **p30** do estimador.\n\n"
         )
 
@@ -2643,9 +2675,10 @@ async def main() -> int:
                         )
                     # ROI (t0). Back: ROI/stake. Lay: ROI/liability (já calculado assim no entry_metrics)
                     roi_clip_hi = 500.0 if side == "Back" else 5000.0
+                    roi_key = "roi_t0" if side == "Back" else "roi_entry"
                     roi_mean, roi_ci, roi_q10, roi_q30, n_roi, m_roi = _summ_ci(
                         filt,
-                        "roi_t0",
+                        roi_key,
                         clip_low=-200.0,
                         clip_high=roi_clip_hi,
                     )
@@ -3176,43 +3209,47 @@ async def main() -> int:
         # ============================================================
         # 9.4) Estratégias candidatas (com sizing recomendado)
         # ============================================================
-        lines.append("### 9.4 Estratégias candidatas (filtros + sizing recomendado)\n")
+        lines.append("### 9.4 Estratégias candidatas (combinações 8.3 + sizing recomendado)\n")
         lines.append(
-            "Aqui consolidamos duas hipóteses operacionais do usuário e reportamos resultados esperados no recorte "
-            "(e projeção simples para 30 dias). **Recomendação de sizing**: comece com `KELLY_0.25` + caps, "
-            "e compare contra `FLAT` como baseline.\n\n"
+            "Esta seção foi atualizada para refletir as **combinações** que você está analisando (Back/Lay × Pre/In × Reversal). "
+            "Ela não assume mais apenas `BackFast` e `LayReversal`.\n\n"
+            "**Política de entrada**:\n"
+            "- Back: `t0`.\n"
+            "- Lay: **após reversão** quando existir; senão no **último ponto** (~t+20s).\n\n"
+            "**Política de sizing sugerida** (padrão):\n"
+            "- Pre‑match: `KELLY_0.25` (com caps e cap por evento).\n"
+            "- In‑match: `FLAT` ou `PROXY` capado, até existir um benchmark live (Kelly live não é confiável sem referência).\n\n"
         )
 
-        # Estratégia 1: Back only when exec < 5s
-        strat_back = [
-            d for d in back_edge
-            if str(d.get("exec_bucket")) == "< 5s" and d.get("is_live") is False
-        ]
-
-        # Estratégia 2: Lay only when há reversão e entrar logo após (aprox: vale até 3s)
-        lay_entry_by_id = {}
-        try:
-            for em in lay_entries:
-                # lay_entries tem match_id, mas não id. Guardamos por (match_id, line, side, event_id?) se existir.
-                # fallback por match_id apenas (suficiente para estatística agregada por jogo).
-                lay_entry_by_id.setdefault(int(em.get("match_id")), []).append(em)
-        except Exception:
-            lay_entry_by_id = {}
-
-        strat_lay = []
-        for d in lay_edge:
-            # Mantemos pre-match aqui para consistência com closing/Kelly e com a lógica de lay_entries (pré-jogo).
-            if d.get("is_live") is True:
-                continue
-            mids = lay_entry_by_id.get(int(d.get("match_id")), [])
-            # usa qualquer entry com reversão e vale cedo
-            ok = False
-            for em in mids:
-                if bool(em.get("had_reversal")) and (_safe_float(em.get("t_ext")) is not None) and float(em.get("t_ext")) <= 3.0:
-                    ok = True
-                    break
-            if ok:
-                strat_lay.append(d)
+        # Estratégias candidatas = 8 combinações; aqui apenas listamos métricas de entrada (CLV/ROI) e N
+        lines.append("| Side | Pre/In | Reversal | N (janela) | Jogos | CLV (entry; IC90) | ROI (entry; IC90) | ROI p30 | Observação |\n")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|\n")
+        for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
+                    filt = [r for r in entries if r.get("is_live") is is_live_val and bool(r.get("had_reversal")) is bool(had_rev_val)]
+                    m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
+                    # CLV: pre-match only
+                    clv_mean = clv_ci = None
+                    if is_live_val is False:
+                        clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+                        s_clv = summarize_metric([r.get(clv_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-50, clip_high=50)
+                        clv_mean, clv_ci = s_clv.mean_cluster, s_clv.ci90_cluster
+                    # ROI: entry policy
+                    roi_key = "roi_t0" if side == "Back" else "roi_entry"
+                    s_roi = summarize_metric([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-200, clip_high=(500.0 if side == "Back" else 5000.0))
+                    bym = {}
+                    for v, mid in zip([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt]):
+                        vf = _safe_float(v)
+                        if vf is None:
+                            continue
+                        bym.setdefault(int(mid), []).append(float(vf))
+                    roi_p30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+                    obs = "pre: Kelly OK" if regime_label == "Pre" else "in: use FLAT/PROXY"
+                    lines.append(
+                        f"| {side} | {regime_label} | {rev_label} | {len(filt)} | {m_total} | "
+                        f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)} | {_fmt_pct(s_roi.mean_cluster,2)} {_fmt_ci(s_roi.ci90_cluster,2)} | {_fmt_pct(roi_p30,2)} | {obs} |\n"
+                    )
 
         FX = float(args.fx_usdbrl or 5.20)
 
@@ -3220,6 +3257,7 @@ async def main() -> int:
             """Banca por liquidez: p99 do capital simultaneamente travado (com buffer)."""
             # Reusa premissas de liquidez do 7.3 (defaults/env)
             settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+            dur_h = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
             grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
             buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
 
@@ -3230,9 +3268,9 @@ async def main() -> int:
                 if not isinstance(t0, datetime):
                     continue
                 ko = d.get("kickoff") or d.get("kickoff_time")
-                t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
                 if t1 <= t0:
-                    t1 = t0 + timedelta(hours=settle_h)
+                    t1 = t0 + timedelta(hours=(dur_h + settle_h))
                 st = _sizing_back(d, scheme)
                 if st is None or float(st) <= 0:
                     continue
@@ -3243,9 +3281,9 @@ async def main() -> int:
                 if not isinstance(t0, datetime):
                     continue
                 ko = d.get("kickoff") or d.get("kickoff_time")
-                t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
                 if t1 <= t0:
-                    t1 = t0 + timedelta(hours=settle_h)
+                    t1 = t0 + timedelta(hours=(dur_h + settle_h))
                 sized = _sizing_lay_liab(d, scheme)
                 if not sized:
                     continue
@@ -3560,8 +3598,13 @@ async def main() -> int:
         lines.append(
             "Até aqui o relatório é **in-sample** (na janela `--lookback-days`). "
             "Este bloco (opcional) faz um walk-forward simples por dia:\n\n"
-            "- Em cada passo, usamos os últimos `wf_train_days` para **selecionar** combinações com evidência de valor (IC90 lb>0).\n"
+            "- Em cada passo, usamos os últimos `wf_train_days` para **selecionar** combinações (das 8: `Side×Pre/In×Reversal`) com evidência de valor.\n"
             "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
+            "**Evidência de valor (por combinação, no treino)** segue seus critérios:\n"
+            "- Back/Pre: CLV p90>0 (IC90 lb>0) e ROI>0 (não precisa ser sig.)\n"
+            "- Back/In: ROI p30>0\n"
+            "- Lay/Pre: CLV p90<0 (IC90 ub<0) e ROI p30>0\n"
+            "- Lay/In: ROI p30>0\n\n"
             "Isso aproxima o fluxo operacional que você descreveu (seleciona no rolling atual e mede no próximo rolling).\n\n"
         )
 
@@ -3577,6 +3620,9 @@ async def main() -> int:
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
             wf_scheme_in = str(getattr(args, "wf_scheme_in", "PROXY") or "PROXY").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
+            bud_back_frac = max(0.0, float(getattr(args, "wf_budget_back_frac", 0.01)))
+            bud_lay_frac = max(0.0, float(getattr(args, "wf_budget_lay_frac", 0.005)))
+            bud_cap_sig_frac = max(0.0, float(getattr(args, "wf_budget_cap_signal_frac", 0.33)))
 
             # index para recuperar campos de sizing/liquidez
             audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
@@ -3607,7 +3653,10 @@ async def main() -> int:
                             # métricas (t0)
                             "clv_back": r.get("clv_t0") if (r.get("is_live") is False and side == "Back") else None,
                             "clv_lay_conv": r.get("clv_conv_t0") if (r.get("is_live") is False and side == "Lay") else None,
-                            "roi": r.get("roi_t0"),
+                            # ROI no ponto de entrada (Back=t0; Lay=após reversão se existir, senão último ponto)
+                            "roi": r.get("roi_t0") if side == "Back" else r.get("roi_entry"),
+                            # odd de entrada para sizing Lay coerente com o ponto de entrada
+                            "entry_odd": r.get("odd_t0") if side == "Back" else r.get("odd_entry"),
                         }
                     )
 
@@ -3687,10 +3736,36 @@ async def main() -> int:
                             return (None, None)
                         return (float(st), float(st))
                     # Lay
-                    sized = _sizing_lay_liab(d0, sc)
-                    if not sized:
+                    # Usa odd de entrada (reversão/último) para sizing coerente com a estratégia
+                    lay_odd = _safe_float(ev.get("entry_odd"))
+                    if lay_odd is None:
+                        h = d0.get("hypothesis_details") or {}
+                        lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
+                    if lay_odd is None or float(lay_odd) <= 1.0:
                         return (None, None)
-                    liab, lay_odd = sized
+                    if sc == "FLAT":
+                        liab = 1.0
+                    elif sc == "PROXY":
+                        # replica finance_for_row, mas com odd de entrada
+                        h = d0.get("hypothesis_details") or {}
+                        lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                        if lay_lim is None:
+                            lay_lim = _safe_float(d0.get("limit"))
+                        st = stake_from_limit(float(lay_lim or 0.0))
+                        liab = float(st) * max(0.0, float(lay_odd) - 1.0)
+                    elif sc.startswith("KELLY"):
+                        frac = float(sc.split("_")[1])
+                        f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
+                        if f0 is None:
+                            return (None, None)
+                        f = max(0.0, float(f0)) * float(frac)
+                        cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                        liab = min(f * float(lay_bank_ref), cap)
+                    else:
+                        return (None, None)
+                    # cap por evento (limit): converte stake max -> liab max
+                    max_st = _max_lay_stake_event(d0)
+                    liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                     if liab is None or float(liab) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
                         return (None, None)
                     stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
@@ -3706,10 +3781,11 @@ async def main() -> int:
                     if not isinstance(t0, datetime):
                         return
                     settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+                    dur_h = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
                     ko = d0.get("kickoff") or d0.get("kickoff_time")
-                    t1 = (ko + timedelta(hours=settle_h)) if isinstance(ko, datetime) else (t0 + timedelta(hours=settle_h))
+                    t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
                     if t1 <= t0:
-                        t1 = t0 + timedelta(hours=settle_h)
+                        t1 = t0 + timedelta(hours=(dur_h + settle_h))
                     oos_jobs.append((t0, t1, float(exposure)))
 
                 def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
@@ -3795,17 +3871,61 @@ async def main() -> int:
                         bym_roi.setdefault(int(e["match_id"]), []).append(float(e["roi"]))
                     oos_mean, oos_ci = cluster_bootstrap_ci(bym_roi, n_boot=2000, alpha=0.10, seed=int(args.seed))
 
-                    # sizing + P&L (observado e expandido) no período de teste
-                    # Conjunto elegível no teste (inclui jogos sem ROI para turnover)
+                    # sizing + P&L no período de teste
+                    # Conjunto elegível no teste (inclui sem ROI para turnover)
                     test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active)]
                     back_st_all = back_st_roi = 0.0
                     lay_liab_all = lay_liab_roi = 0.0
                     turn_all = turn_roi = 0.0
                     pnl_obs = 0.0
+                    # budget por jogo (padrão)
+                    bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
+                    if bank_ref_budget is None or float(bank_ref_budget) <= 0:
+                        bank_ref_budget = max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0)
+                    bud_back = float(bud_back_frac) * float(bank_ref_budget)
+                    bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                    cap_sig_back = float(bud_cap_sig_frac) * float(bud_back)
+                    cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
+                    spent_back: Dict[int, float] = {}
+                    spent_lay: Dict[int, float] = {}
+
+                    # ordena por tempo para consumir budget de forma realista
+                    def _ts_ev(ev: dict) -> float:
+                        d0 = audit_by_id.get(int(ev.get("audit_id")))
+                        ts = d0.get("audited_at") if d0 else None
+                        if isinstance(ts, datetime):
+                            return ts.timestamp()
+                        return 0.0
+                    test_elig.sort(key=_ts_ev)
                     for ev in test_elig:
                         st_eq, exp = _sizing_for_event(ev)
                         if st_eq is None or exp is None:
                             continue
+                        # aplica budget por jogo como padrão
+                        mid = int(ev.get("match_id"))
+                        if ev.get("side") == "Back":
+                            rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_back))
+                            if exp_use <= 0:
+                                continue
+                            # proporcionalmente reduz stake_eq
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
+                        else:
+                            rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_lay))
+                            if exp_use <= 0:
+                                continue
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
                         turn_all += float(st_eq)
                         if ev.get("side") == "Back":
                             back_st_all += float(exp)
@@ -3964,6 +4084,10 @@ async def main() -> int:
                     "O lucro pode ser reportado em duas versões:\n\n"
                     "- **obs.**: apenas jogos com ROI (placar) disponível.\n"
                     "- **exp.**: expande o lucro para a população elegível usando scaling por exposição/turnover (assume missing-at-random condicional à estratégia).\n\n"
+                )
+                lines.append(
+                    f"**Padrão de risco**: P&L aqui já é calculado com **budget por jogo (match_id)** consumido ao longo do tempo "
+                    f"(Back={bud_back_frac:.2%} da banca ref; Lay={bud_lay_frac:.2%} em liability; cap por sinal={bud_cap_sig_frac:.0%} do budget).\n\n"
                 )
 
                 oos_days = sorted(daily_turn.keys())
