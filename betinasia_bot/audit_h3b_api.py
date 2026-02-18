@@ -92,6 +92,34 @@ class H3bApiAudit:
         self.dropped_stale_queue_wait: int = 0
         # Backoff global do betslip API (ex.: rate limit). Evita flood e “lock” prolongado.
         self._api_backoff_until_ts: float = 0.0
+        self._relogin_lock = asyncio.Lock()
+        self._last_relogin_ts: float = 0.0
+
+    async def _force_relogin(self, reason: str):
+        """
+        Força um novo login quando a API começa a retornar 401/auth_error.
+        Usa lock + cooldown para evitar loop de relogin.
+        """
+        if not self.scraper:
+            return
+        now = time.time()
+        async with self._relogin_lock:
+            if self._last_relogin_ts and (now - self._last_relogin_ts) < 60.0:
+                return
+            self._last_relogin_ts = now
+            try:
+                logger.warning(f"[AUTH] Forçando relogin (reason={reason})")
+                await self.scraper.login(force=True)
+                # Reabre football para reativar WS e reduzir chance de contexto inválido
+                try:
+                    page = self.scraper._page
+                    await page.goto(FOOTBALL_URL)
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.warning(f"[AUTH] Falha ao reabrir football após relogin: {e}")
+            except Exception as e:
+                logger.error(f"[AUTH] Relogin falhou: {e}")
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -905,6 +933,14 @@ class H3bApiAudit:
             back_err = back_result.error if back_result else 'Back failed'
             if lay_result and not lay_result.success and lay_result.error:
                 back_err = f"{back_err} | lay={lay_result.error}"
+
+            # Se a API retorna 401/auth_error, isso é quase sempre sessão inválida/ausente.
+            # Forçamos relogin com cooldown para recuperar automaticamente.
+            back_http = int(getattr(back_result, "http_status", 0) or 0) if back_result else 0
+            lay_http = int(getattr(lay_result, "http_status", 0) or 0) if lay_result else 0
+            if (back_http == 401) or (lay_http == 401) or ("auth_error" in str(back_err)) or ("HTTP_401" in str(back_err)) or ("NO_ROOT_SESSION_COOKIE" in str(back_err)):
+                telemetry["auth_401"] = True
+                await self._force_relogin("HTTP_401/auth_error")
 
             # Rate limit: aplica backoff global para evitar “lock” por flood.
             retry_after = int(getattr(back_result, "rate_limit_retry_after_sec", 0) or 0) if back_result else 0
