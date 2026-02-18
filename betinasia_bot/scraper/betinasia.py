@@ -225,6 +225,16 @@ class BetinAsiaScraper:
             if "login" in current_url.lower():
                 logger.info("Sessão expirada, necessário novo login")
                 return False
+
+            # Garante que o cookie root-session exista (necessário para API /v1/betslips/).
+            try:
+                cookies = await self._context.cookies()
+                has_root = any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
+            except Exception:
+                has_root = False
+            if not has_root:
+                logger.info("Sessão sem cookie root-session (API não autenticará) — necessário novo login")
+                return False
                 
             logger.info("Sessão válida!")
             self._logged_in = True

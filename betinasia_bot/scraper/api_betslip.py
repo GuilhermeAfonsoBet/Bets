@@ -21,7 +21,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from loguru import logger
 from playwright.async_api import Page
 
@@ -97,6 +97,20 @@ class ApiBetslipClient:
         self._pmm_messages: Dict[str, List[dict]] = {}  # betslip_id -> [pmm_data]
         self._betslip_info: Dict[str, dict] = {}  # betslip_id -> betslip creation data
         self._listening = False
+
+    async def _get_root_session_token(self) -> str:
+        """
+        Obtém o cookie `root-session` via Playwright (inclui HttpOnly).
+        O site às vezes marca cookies como HttpOnly, então `document.cookie` pode retornar vazio.
+        """
+        try:
+            cookies = await self.page.context.cookies()
+        except Exception:
+            return ""
+        for c in cookies or []:
+            if c.get("name") == "root-session" and isinstance(c.get("value"), str) and c.get("value"):
+                return c["value"]
+        return ""
     
     def setup_listener(self):
         """Configura listener de WebSocket para PMM messages.
@@ -200,28 +214,23 @@ class ApiBetslipClient:
                     return 0
 
             # === 1. POST /v1/betslips/ via browser fetch ===
+            session_token = await self._get_root_session_token()
+            result.has_session_token = bool(session_token)
+            if not session_token:
+                result.error = "NO_ROOT_SESSION_COOKIE"
+                return result
             t_post = time.time()
             
             response = await self.page.evaluate("""
                 async (params) => {
                     try {
-                        // Extrai session token do cookie root-session
-                        const cookies = document.cookie.split(';');
-                        let sessionToken = '';
-                        for (const c of cookies) {
-                            const [name, val] = c.trim().split('=');
-                            if (name === 'root-session') {
-                                sessionToken = val;
-                                break;
-                            }
-                        }
-                        
                         const resp = await fetch('/v1/betslips/', {
                             method: 'POST',
+                            credentials: 'same-origin',
                             headers: {
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json, text/plain, */*',
-                                'session': sessionToken,
+                                'session': params.sessionToken,
                                 'x-molly-client-name': 'sonic',
                                 'x-molly-client-version': '2.5.34'
                             },
@@ -238,16 +247,15 @@ class ApiBetslipClient:
                         try { text = await resp.text(); } catch(e) { text = ''; }
                         try { data = JSON.parse(text); } catch(e) { data = null; }
                         const prefix = (text || '').slice(0, 220);
-                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix, session: sessionToken};
+                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                     } catch(e) {
                         return {ok: false, error: e.message};
                     }
                 }
-            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type})
+            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type, "sessionToken": session_token})
             
             result.request_time_ms = int((time.time() - t_post) * 1000)
             result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
-            result.has_session_token = bool(response.get("session")) if isinstance(response, dict) else False
             
             logger.info(f"POST /v1/betslips/: status={response.get('status') if response else 'none'}, "
                         f"ok={response.get('ok') if response else False}, "
@@ -455,39 +463,69 @@ class ApiBetslipClient:
         t0 = time.time()
         
         try:
+            session_token = await self._get_root_session_token()
+            result.has_session_token = bool(session_token)
+            if not session_token:
+                result.error = "NO_ROOT_SESSION_COOKIE"
+                return result
+
             # Limpa PMMs antigos para este betslip
             self._pmm_messages[betslip_id] = []
             
             response = await self.page.evaluate("""
                 async (params) => {
                     try {
-                        const cookies = document.cookie.split(';');
-                        let sessionToken = '';
-                        for (const c of cookies) {
-                            const [name, val] = c.trim().split('=');
-                            if (name === 'root-session') { sessionToken = val; break; }
-                        }
                         const resp = await fetch('/v1/betslips/' + params.betslip_id + '/refresh/', {
                             method: 'POST',
+                            credentials: 'same-origin',
                             headers: {
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json',
-                                'session': sessionToken,
+                                'session': params.sessionToken,
                                 'x-molly-client-name': 'sonic',
                                 'x-molly-client-version': '2.5.35'
                             },
                             body: JSON.stringify({betslipId: params.betslip_id})
                         });
-                        const data = await resp.json();
-                        return {ok: true, status: resp.status, data: data};
+                        let text = '';
+                        let data = null;
+                        try { text = await resp.text(); } catch(e) { text = ''; }
+                        try { data = JSON.parse(text); } catch(e) { data = null; }
+                        const prefix = (text || '').slice(0, 220);
+                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                     } catch(e) { return {ok: false, error: e.message}; }
                 }
-            """, {"betslip_id": betslip_id})
+            """, {"betslip_id": betslip_id, "sessionToken": session_token})
             
             result.request_time_ms = int((time.time() - t0) * 1000)
+            result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
             
-            if not response or not response.get('ok'):
-                result.error = response.get('error', 'Refresh failed') if response else 'No response'
+            if not response or not isinstance(response, dict):
+                result.error = "No response"
+                return result
+
+            status_code = int(response.get("status") or 0)
+            ok = bool(response.get("ok"))
+            data = response.get("data")
+            prefix = str(response.get("text_prefix") or "")
+
+            retry_after = 0
+            try:
+                if isinstance(data, dict):
+                    retry_after = int(float((data.get("data") or {}).get("retry_after", 0) or 0))
+            except Exception:
+                retry_after = 0
+            if retry_after > 0:
+                result.rate_limit_retry_after_sec = int(retry_after)
+                result.error = f"RATE_LIMIT retry_after={int(retry_after)}s"
+                return result
+
+            if (not ok) or (status_code and status_code != 200):
+                result.error = response.get("error") or f"HTTP_{status_code}"
+                if status_code:
+                    result.error = f"HTTP_{status_code}: {result.error}"
+                if prefix:
+                    result.error = f"{result.error} | resp_prefix={prefix[:160]}"
                 return result
             
             # Espera PMMs atualizados
