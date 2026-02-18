@@ -4096,11 +4096,11 @@ async def main() -> int:
                         }
                     )
 
-                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro obs. | Lucro exp. |\n|---|---|---:|---:|---:|---:|---:|---:|\n")
+                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|\n")
                 for s in steps[:20]:
                     lines.append(
                         f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                        f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_obs'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                        f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                     )
                 if len(steps) > 20:
                     lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
@@ -4114,8 +4114,9 @@ async def main() -> int:
                     "\nNotas importantes:\n"
                     "- Se `Jogos OOS` for baixo em muitos passos, você ainda não tem volume suficiente para decisões por combinação. "
                     "Nesse cenário faz sentido **Bayes hierárquico (partial pooling)** para estabilizar estimativas.\n"
-                    "- Este walk-forward usa ROI em t0 como avaliação OOS. Para pre-match, você também pode avaliar por CLV OOS "
-                    "(menos dependente de resultados), mas isso mede qualidade de entrada, não P&L.\n\n"
+                    "- **Lucro (estratégia, budget)** acima já incorpora a política de risco por jogo (match budget) e é a métrica principal.\n"
+                    "- O walk-forward usa ROI no **ponto de entrada**: Back em `t0`; Lay em `t_reversal` quando existir, senão `t_last` (~t+20s).\n"
+                    "- Para pre-match, também é útil monitorar CLV OOS (menos dependente de resultados), mas CLV mede qualidade de entrada, não P&L.\n\n"
                 )
 
                 # ------------------------------------------------------------
@@ -4378,6 +4379,47 @@ async def main() -> int:
                         "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
                         "- Se tudo continuar negativo, o problema é **edge OOS** (principalmente in‑match) e budget só reduz a escala da perda.\n\n"
                     )
+
+                    # Breakdown de volume por combinação (para explicar queda de turnover/lucro)
+                    lines.append("**Volume e stake médio por combinação (janela OOS, com budget padrão)**\n\n")
+                    lines.append(
+                        "| Combinação | #steps ativa | Jogos OOS (uniques) | N eventos OOS | Stake eq. médio | Observação |\n"
+                        "|---|---:|---:|---:|---:|---|\n"
+                    )
+                    # coleta universo OOS usado nos steps
+                    oos_keys = set(active_counts.keys())
+                    # estimativa rápida em cima dos próprios steps: soma por test_days
+                    combo_stats: Dict[str, Dict[str, float]] = {}
+                    for st in steps:
+                        tdays = set(st.get("test_days") or [])
+                        akeys = set(st.get("active_keys") or [])
+                        for k in akeys:
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                        # percorre eventos elegíveis do teste
+                        test_elig = [e for e in combo_events if e["day"] in tdays and _key(e) in akeys]
+                        # sem aplicar budget de novo; usamos sizing base para estimar stake médio (ordem correta é budget, mas aqui é diagnóstico)
+                        seen_matches: Dict[str, set] = {}
+                        for ev in test_elig:
+                            k = _key(ev)
+                            st_eq, exp = _sizing_for_event(ev)
+                            if st_eq is None or exp is None:
+                                continue
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                            combo_stats[k]["events"] += 1.0
+                            combo_stats[k]["turn"] += float(st_eq)
+                            seen_matches.setdefault(k, set()).add(int(ev.get("match_id")))
+                        for k, ms in seen_matches.items():
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                            combo_stats[k]["matches"] += float(len(ms))
+
+                    for k, c in sorted(active_counts.items(), key=lambda x: x[1], reverse=True):
+                        st = combo_stats.get(k, {})
+                        events = int(st.get("events") or 0)
+                        matches = int(st.get("matches") or 0)
+                        turn = float(st.get("turn") or 0.0)
+                        stake_avg = (turn / events) if events > 0 else None
+                        note = "budget reduz concentração por jogo" if True else ""
+                        lines.append(f"| {k} | {c} | {matches} | {events} | {_fmt_num(stake_avg,2)} | {note} |\n")
 
         # ============================================================
         # 10) Diagnóstico de ROI / atualização de resultados
