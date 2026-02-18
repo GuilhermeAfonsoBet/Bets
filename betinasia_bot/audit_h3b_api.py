@@ -90,6 +90,8 @@ class H3bApiAudit:
         self._temporal_queue_ref: Optional[asyncio.Queue] = None
         self.dropped_full_queue: int = 0
         self.dropped_stale_queue_wait: int = 0
+        # Backoff global do betslip API (ex.: rate limit). Evita flood e “lock” prolongado.
+        self._api_backoff_until_ts: float = 0.0
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -783,6 +785,30 @@ class H3bApiAudit:
             'pmm_ms': 0,
         }
 
+        # Backoff global: não chama API enquanto bloqueado (rate limit / instabilidade),
+        # preserva a operação e reduz STALE por fila acumulada.
+        now_ts = time.time()
+        if self._api_backoff_until_ts and now_ts < float(self._api_backoff_until_ts):
+            end_to_end_ms = int((time.time() - detected_at) * 1000)
+            telemetry.update({
+                'api_backoff': True,
+                'api_backoff_until_ts': float(self._api_backoff_until_ts),
+                'parallel_fetch_ms': 0,
+                'temporal_total_ms': 0,
+                'execution_ms': int((time.time() - execution_start) * 1000),
+                'end_to_end_ms': end_to_end_ms,
+                'pipeline_overhead_ms': max(0, end_to_end_ms - telemetry.get('queue_wait_ms', 0)),
+            })
+            base.update({
+                'success': False,
+                'status': 'API_BACKOFF',
+                'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
+                'error': f"API_BACKOFF until_ts={float(self._api_backoff_until_ts):.0f}",
+                'total_ms': end_to_end_ms,
+                'telemetry': telemetry,
+            })
+            return base
+
         # Drop explícito: evento ficou velho demais na fila.
         # Objetivo: preservar baixa latência e evitar gastar API em oportunidades já inválidas.
         if self.max_queue_wait_ms > 0 and queue_wait_ms > self.max_queue_wait_ms:
@@ -880,6 +906,23 @@ class H3bApiAudit:
             if lay_result and not lay_result.success and lay_result.error:
                 back_err = f"{back_err} | lay={lay_result.error}"
 
+            # Rate limit: aplica backoff global para evitar “lock” por flood.
+            retry_after = int(getattr(back_result, "rate_limit_retry_after_sec", 0) or 0) if back_result else 0
+            if retry_after <= 0 and lay_result:
+                retry_after = int(getattr(lay_result, "rate_limit_retry_after_sec", 0) or 0)
+            if retry_after > 0:
+                # margem de segurança
+                self._api_backoff_until_ts = time.time() + float(retry_after) + 5.0
+                status_code = "API_RATE_LIMIT"
+            else:
+                status_code = "API_FAILED"
+                if "Execution context was destroyed" in str(back_err):
+                    status_code = "API_CTX_DESTROYED"
+                elif "Failed to fetch" in str(back_err):
+                    status_code = "API_FETCH_FAILED"
+                elif "No betslip_id received" in str(back_err):
+                    status_code = "API_NO_BETSLIP_ID"
+
             end_to_end_ms = int((time.time() - detected_at) * 1000)
             telemetry['temporal_total_ms'] = 0
             telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
@@ -890,7 +933,7 @@ class H3bApiAudit:
             )
             base.update({
                 'success': False,
-                'status': 'API_FAILED',
+                'status': status_code,
                 'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0,
                 'error': back_err,
                 'total_ms': end_to_end_ms,

@@ -67,6 +67,9 @@ class BetslipApiResult:
     # Status
     success: bool = False
     error: str = ""
+    http_status: int = 0
+    has_session_token: bool = False
+    rate_limit_retry_after_sec: int = 0
 
 
 class ApiBetslipClient:
@@ -85,6 +88,9 @@ class ApiBetslipClient:
     
     # Se não receber novo PMM por este tempo, considera completo
     PMM_IDLE_TIMEOUT = 0.8  # segundos
+
+    # Espera por betslip_id via resposta/WS
+    BETSLIP_ID_TIMEOUT = 3.0  # segundos (para compatibilidade com histórico)
     
     def __init__(self, page: Page):
         self.page = page
@@ -162,6 +168,37 @@ class ApiBetslipClient:
         t0 = time.time()
         
         try:
+            def _find_betslip_id(obj, depth: int = 0) -> str:
+                if depth > 4:
+                    return ""
+                if isinstance(obj, dict):
+                    for k in ("betslip_id", "betslipId", "id"):
+                        v = obj.get(k)
+                        if isinstance(v, str) and v.strip():
+                            return v.strip()
+                    for v in obj.values():
+                        bid = _find_betslip_id(v, depth + 1)
+                        if bid:
+                            return bid
+                if isinstance(obj, list):
+                    for it in obj:
+                        bid = _find_betslip_id(it, depth + 1)
+                        if bid:
+                            return bid
+                return ""
+
+            def _extract_retry_after_sec(obj) -> int:
+                try:
+                    if isinstance(obj, dict):
+                        for k in ("retry_after", "retryAfter"):
+                            if k in obj:
+                                return int(float(obj[k]))
+                        if "data" in obj:
+                            return _extract_retry_after_sec(obj.get("data"))
+                    return 0
+                except Exception:
+                    return 0
+
             # === 1. POST /v1/betslips/ via browser fetch ===
             t_post = time.time()
             
@@ -196,8 +233,12 @@ class ApiBetslipClient:
                                 equivalent_bets: true
                             })
                         });
-                        const data = await resp.json();
-                        return {ok: true, status: resp.status, data: data, session: sessionToken};
+                        let text = '';
+                        let data = null;
+                        try { text = await resp.text(); } catch(e) { text = ''; }
+                        try { data = JSON.parse(text); } catch(e) { data = null; }
+                        const prefix = (text || '').slice(0, 220);
+                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix, session: sessionToken};
                     } catch(e) {
                         return {ok: false, error: e.message};
                     }
@@ -205,27 +246,51 @@ class ApiBetslipClient:
             """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type})
             
             result.request_time_ms = int((time.time() - t_post) * 1000)
+            result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
+            result.has_session_token = bool(response.get("session")) if isinstance(response, dict) else False
             
             logger.info(f"POST /v1/betslips/: status={response.get('status') if response else 'none'}, "
                         f"ok={response.get('ok') if response else False}, "
                         f"time={result.request_time_ms}ms, "
                         f"data_keys={list(response.get('data', {}).keys()) if response and isinstance(response.get('data'), dict) else 'n/a'}")
             
-            if not response or not response.get('ok'):
-                result.error = response.get('error', 'POST failed') if response else 'No response'
+            if not response or not isinstance(response, dict):
+                result.error = "No response"
+                logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
+                return result
+
+            status_code = int(response.get("status") or 0)
+            ok = bool(response.get("ok"))
+            data = response.get("data")
+            prefix = str(response.get("text_prefix") or "")
+
+            retry_after = _extract_retry_after_sec(data)
+            if retry_after > 0:
+                result.rate_limit_retry_after_sec = int(retry_after)
+                result.error = f"RATE_LIMIT retry_after={int(retry_after)}s"
+                logger.warning(f"POST /v1/betslips/ rate limit: {result.error} | status={status_code} | prefix={prefix[:120]}")
+                return result
+
+            if (not ok) or (status_code and status_code != 200):
+                # Status != 200 pode ocorrer como 401/403/429 etc. (resp.ok=False)
+                result.error = response.get("error") or f"HTTP_{status_code}"
+                if status_code:
+                    result.error = f"HTTP_{status_code}: {result.error}"
+                if prefix:
+                    result.error = f"{result.error} | resp_prefix={prefix[:160]}"
                 logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
                 return result
             
             # Extrai betslip_id da resposta
-            resp_data = response.get('data', {})
-            logger.debug(f"POST data: status={response.get('status')}, resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
-            betslip_id = resp_data.get('betslip_id', '')
+            resp_data = data or {}
+            logger.debug(f"POST data: status={status_code}, resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
+            betslip_id = _find_betslip_id(resp_data)
             
             if not betslip_id:
                 # Betslip_id vem via WebSocket ["betslip", {betslip_id: "..."}]
                 # Espera até 3 segundos pelo WS message
                 wait_start = time.time()
-                while time.time() - wait_start < 3.0:
+                while time.time() - wait_start < float(self.BETSLIP_ID_TIMEOUT):
                     for bid in reversed(list(self._betslip_info.keys())):
                         info = self._betslip_info[bid]
                         if info.get('event_id') == event_id:
@@ -243,7 +308,8 @@ class ApiBetslipClient:
                     logger.debug(f"Usando último betslip_id: {betslip_id}")
             
             if not betslip_id:
-                result.error = 'No betslip_id received after 3s'
+                keys = list(resp_data.keys()) if isinstance(resp_data, dict) else []
+                result.error = f'No betslip_id received after {float(self.BETSLIP_ID_TIMEOUT):.0f}s (status=200 keys={keys}, has_session={result.has_session_token})'
                 return result
             
             result.betslip_id = betslip_id
