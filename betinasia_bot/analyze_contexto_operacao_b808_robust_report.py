@@ -626,8 +626,8 @@ async def main() -> int:
     parser.add_argument(
         "--wf-min-matches",
         type=int,
-        default=int(os.getenv("WF_MIN_MATCHES", "30")),
-        help="Mínimo de jogos por combinação para ser elegível (default 30).",
+        default=int(os.getenv("WF_MIN_MATCHES", "20")),
+        help="Mínimo de jogos por combinação para ser elegível (default 20).",
     )
     parser.add_argument(
         "--wf-scheme-pre",
