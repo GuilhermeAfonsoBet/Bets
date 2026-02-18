@@ -618,6 +618,12 @@ async def main() -> int:
     parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "3")), help="Dias de treino por passo (default 3).")
     parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
     parser.add_argument(
+        "--wf-train-mode",
+        default=os.getenv("WF_TRAIN_MODE", "rolling"),
+        choices=["rolling", "expanding"],
+        help="Modo de janela de treino no walk-forward: rolling (últimos N dias) ou expanding (tudo até t-1). Default: rolling.",
+    )
+    parser.add_argument(
         "--wf-min-matches",
         type=int,
         default=int(os.getenv("WF_MIN_MATCHES", "30")),
@@ -3664,6 +3670,9 @@ async def main() -> int:
             wf_train = int(max(1, getattr(args, "wf_train_days", 3)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
             wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
+            wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
+            if wf_train_mode not in ("rolling", "expanding"):
+                wf_train_mode = "rolling"
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
             wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
@@ -3867,7 +3876,7 @@ async def main() -> int:
                     p99 = float(np.quantile(vals, 0.99))
                     return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
                 for i in range(wf_train, len(days) - wf_test):
-                    train_days = set(days[i - wf_train : i])
+                    train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
 
                     train = [e for e in combo_events if e["day"] in train_days]
@@ -3914,14 +3923,15 @@ async def main() -> int:
                             }
                         elif side == "Back" and regime == "In":
                             bym_roi = _bym(sub, "roi")
-                            ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
-                            reason = "BackIn: roi_q30>0"
+                            q30 = _q(bym_roi, 0.30) if bym_roi else None
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
+                            reason = f"BackIn: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
-                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                                "roi_q30": q30,
                             }
                         elif side == "Lay" and regime == "Pre":
                             bym_clv = _bym(sub, "clv_lay_conv")
@@ -3944,14 +3954,15 @@ async def main() -> int:
                             }
                         else:
                             bym_roi = _bym(sub, "roi")
-                            ok_sel = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
-                            reason = "In: roi_q30>0"
+                            q30 = _q(bym_roi, 0.30) if bym_roi else None
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
+                            reason = f"In: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
-                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                                "roi_q30": q30,
                             }
                         if ok_sel:
                             active.append(k)
@@ -4167,6 +4178,7 @@ async def main() -> int:
                     "Para cada janela de treino, mostramos as métricas usadas para decidir se cada combinação ficou **ativa** ou não. "
                     "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente ou ROI p30 <= 0).\n\n"
                 )
+                lines.append(f"**Regra de elegibilidade (todas as combinações):** exige `N_ROI >= wf_min_matches` (aqui: {wf_min_m}).\n\n")
                 combos_all = [
                     "Back_Pre_Any", "Back_In_Any",
                     "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
@@ -4272,6 +4284,7 @@ async def main() -> int:
                 roi_bank_exp = (float(profit_exp_30d) / float(bank_eff) * 100.0) if (profit_exp_30d is not None and bank_eff and bank_eff > 0) else None
 
                 lines.append("| Premissa | Valor |\n|---|---:|\n")
+                lines.append(f"| Train mode (OOS) | `{wf_train_mode}` |\n")
                 lines.append(f"| Scheme pre-match (OOS) | `{wf_scheme_pre}` |\n")
                 lines.append(f"| Scheme in-match (OOS) | `{wf_scheme_in}` |\n")
                 lines.append(f"| Expansão missing ROI | {'ON' if wf_expand else 'OFF'} |\n")
