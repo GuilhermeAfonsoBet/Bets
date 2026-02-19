@@ -163,9 +163,11 @@ class H3bApiAudit:
         Objetivo: permitir análises futuras de turnover, lucro, ROI e drawdown
         com stake baseada em % do limite disponível.
         """
-        stake_pct = max(0.0, self._safe_num(self.finance_stake_pct_of_limit, 0.25))
-        stake_cap = max(0.0, self._safe_num(self.finance_stake_cap, 0.0))
-        fx_brl = max(0.0, self._safe_num(self.finance_fx_brl, 5.20))
+        # Guard rails: evita quebrar o save caso o processo esteja com versão antiga/hot-restart
+        # onde os atributos financeiros ainda não existam.
+        stake_pct = max(0.0, self._safe_num(getattr(self, "finance_stake_pct_of_limit", 0.25), 0.25))
+        stake_cap = max(0.0, self._safe_num(getattr(self, "finance_stake_cap", 0.0), 0.0))
+        fx_brl = max(0.0, self._safe_num(getattr(self, "finance_fx_brl", 5.20), 5.20))
 
         def _stake_from_limit(limit_value: float) -> float:
             raw_stake = max(0.0, limit_value) * stake_pct
@@ -195,7 +197,7 @@ class H3bApiAudit:
             "policy": {
                 "stake_pct_of_limit": stake_pct,
                 "stake_cap": stake_cap,
-                "base_currency": self.finance_base_currency,
+                "base_currency": getattr(self, "finance_base_currency", "USD"),
                 "fx_brl": fx_brl,
             },
             "back": {
