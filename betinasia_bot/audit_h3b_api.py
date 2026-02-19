@@ -266,7 +266,10 @@ class H3bApiAudit:
         # Browser (necessário para WS e fetch autenticado)
         self.scraper = BetinAsiaScraper()
         await self.scraper.start()
-        await self.scraper.login()
+        ok_login = await self.scraper.login()
+        if not ok_login:
+            logger.error("Login falhou. Abortando auditoria (necessário para /v1/betslips/).")
+            raise RuntimeError("LOGIN_FAILED")
         logger.info("Login OK")
 
         # API client (usa o page do scraper)

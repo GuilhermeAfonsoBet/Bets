@@ -295,6 +295,35 @@ class BetinAsiaScraper:
         logger.info("Tentando fazer login no BetinAsia...")
         
         try:
+            def _ts_label() -> str:
+                try:
+                    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                except Exception:
+                    return "ts"
+
+            async def _dump_login_debug(tag: str):
+                ts = _ts_label()
+                try:
+                    os.makedirs("logs", exist_ok=True)
+                except Exception:
+                    pass
+                try:
+                    await self.take_screenshot(f"logs/{tag}_{ts}.png")
+                except Exception:
+                    pass
+                try:
+                    html = await self.get_page_html()
+                    with open(f"logs/{tag}_{ts}.html", "w", encoding="utf-8") as fh:
+                        fh.write(html or "")
+                except Exception:
+                    pass
+                try:
+                    txt = await self.get_page_text()
+                    with open(f"logs/{tag}_{ts}.txt", "w", encoding="utf-8") as fh:
+                        fh.write(txt or "")
+                except Exception:
+                    pass
+
             # Navega para página de login
             await self._page.goto(
                 self.LOGIN_URL,
@@ -305,19 +334,49 @@ class BetinAsiaScraper:
             # Aguarda os campos de login aparecerem
             # O site usa inputs dentro de um form
             await self._page.wait_for_selector("input", timeout=self.DEFAULT_TIMEOUT_MS)
+
+            # Tenta aceitar banners/modais comuns (cookies/consent)
+            try:
+                btn = await self._page.query_selector("button:has-text('Accept'), button:has-text('Aceitar'), button:has-text('I agree'), button:has-text('Concordo')")
+                if btn:
+                    await btn.click()
+                    await self._page.wait_for_timeout(500)
+            except Exception:
+                pass
             
-            # Preenche APENAS o primeiro input de texto (username)
-            # O site tem múltiplos inputs, precisamos ser específicos
-            text_inputs = await self._page.query_selector_all("input[type='text']")
+            # Inputs (alguns layouts usam type=email)
+            user_inputs = await self._page.query_selector_all("input[type='text'], input[type='email']")
             password_input = await self._page.query_selector("input[type='password']")
             
-            if not text_inputs or not password_input:
+            if not user_inputs or not password_input:
                 logger.error("Não encontrou campos de login")
-                await self.take_screenshot("login_error_fields.png")
+                await _dump_login_debug("login_error_fields")
                 return False
+
+            # Escolhe input de usuário mais provável (por placeholder/name)
+            best = user_inputs[0]
+            try:
+                best_score = -1
+                for el in user_inputs:
+                    ph = (await el.get_attribute("placeholder")) or ""
+                    nm = (await el.get_attribute("name")) or ""
+                    tp = (await el.get_attribute("type")) or ""
+                    score = 0
+                    s = f"{ph} {nm} {tp}".lower()
+                    if "user" in s:
+                        score += 3
+                    if "email" in s:
+                        score += 2
+                    if "login" in s:
+                        score += 2
+                    if score > best_score:
+                        best_score = score
+                        best = el
+            except Exception:
+                pass
             
             # Preenche credenciais
-            await text_inputs[0].fill(username)  # Primeiro input de texto = username
+            await best.fill(username)
             await self._page.wait_for_timeout(500)
             await password_input.fill(password)
             await self._page.wait_for_timeout(500)
@@ -336,12 +395,24 @@ class BetinAsiaScraper:
                 await password_input.press("Enter")
                 
             # Aguarda redirecionamento
-            await self._page.wait_for_timeout(3000)
+            try:
+                await self._page.wait_for_load_state("domcontentloaded", timeout=self.DEFAULT_NAV_TIMEOUT_MS)
+            except Exception:
+                pass
+            await self._page.wait_for_timeout(2500)
             
             # Verifica se logou (URL mudou ou apareceu elemento de usuário logado)
             current_url = self._page.url
             
-            if "login" not in current_url.lower():
+            # Além de sair do /login, validamos que root-session exista
+            has_root = False
+            try:
+                cookies = await self._context.cookies()
+                has_root = any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
+            except Exception:
+                has_root = False
+
+            if ("login" not in current_url.lower()) and has_root:
                 self._logged_in = True
                 logger.success("Login realizado com sucesso!")
                 
@@ -358,14 +429,14 @@ class BetinAsiaScraper:
                     error_text = await error_el.inner_text()
                     logger.error(f"Erro no login: {error_text}")
                 else:
-                    logger.error("Login falhou - ainda na página de login")
+                    logger.error("Login falhou (ainda em /login ou sem root-session)")
                     
-                await self.take_screenshot("login_failed.png")
+                await _dump_login_debug("login_failed")
                 return False
                 
         except Exception as e:
             logger.error(f"Exceção no login: {e}")
-            await self.take_screenshot("login_exception.png")
+            await _dump_login_debug("login_exception")
             return False
             
     async def navigate_to_football(self) -> bool:
