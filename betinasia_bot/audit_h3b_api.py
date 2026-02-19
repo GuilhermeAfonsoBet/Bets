@@ -29,6 +29,7 @@ import random
 
 sys.path.insert(0, '.')
 
+from config import settings
 from scraper.betinasia import BetinAsiaScraper
 from scraper.api_betslip import ApiBetslipClient, BetslipApiResult
 from hypothesis.detectors import HypothesisDetector
@@ -370,6 +371,7 @@ class H3bApiAudit:
             logger.info("AUDITORIA H3B (WS vs BS no mesmo timestamp)")
         else:
             logger.info("AUDITORIA H3B VIA API (~2-3s)")
+        logger.info(f"mode={self.mode} ws_offsets={self.ws_sample_offsets_sec}")
         logger.info("=" * 60)
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'running', False))
@@ -1635,15 +1637,17 @@ async def main():
     parser.add_argument("--num-audits", type=int, default=0, help="0=infinito")
     parser.add_argument("--direction", choices=["up", "down", "all"], default="up")
     parser.add_argument("--no-db", action="store_true")
+    default_mode = (os.getenv("AUDIT_MODE") or getattr(settings, "audit_mode", None) or "api").strip() or "api"
+    default_offsets = os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC") or getattr(settings, "audit_ws_sample_offsets_sec", None) or "0,3,6,9,12,15,18,21,24,27,30"
     parser.add_argument(
         "--mode",
         choices=["api", "ws_only", "ws_vs_bs"],
-        default=(os.getenv("AUDIT_MODE", "api").strip() or "api"),
+        default=default_mode,
         help="Modo de execução: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo WS vs BS).",
     )
     parser.add_argument(
         "--ws-sample-offsets-sec",
-        default=os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC", "0,3,6,9,12,15,18,21,24,27,30"),
+        default=str(default_offsets),
         help="Offsets (segundos) para amostragem WS (ex: '0,3,6,...,30').",
     )
     parser.add_argument(
