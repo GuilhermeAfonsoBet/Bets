@@ -95,6 +95,19 @@ class H3bApiAudit:
         self._relogin_lock = asyncio.Lock()
         self._last_relogin_ts: float = 0.0
 
+        # Política financeira (insumos para análise econômica posterior)
+        # Não afeta execução, apenas persistência de variáveis para analytics.
+        self.finance_stake_pct_of_limit = self._parse_env_float(
+            "FINANCE_STAKE_PCT_OF_LIMIT", 0.25
+        )
+        self.finance_stake_cap = self._parse_env_float(
+            "FINANCE_STAKE_CAP", 0.0
+        )
+        self.finance_fx_brl = self._parse_env_float(
+            "FINANCE_FX_BRL", 5.20
+        )
+        self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
+
     async def _force_relogin(self, reason: str):
         """
         Força um novo login quando a API começa a retornar 401/auth_error.
@@ -120,19 +133,6 @@ class H3bApiAudit:
                     logger.warning(f"[AUTH] Falha ao reabrir football após relogin: {e}")
             except Exception as e:
                 logger.error(f"[AUTH] Relogin falhou: {e}")
-
-        # Política financeira (insumos para análise econômica posterior)
-        # Não afeta execução, apenas persistência de variáveis para analytics.
-        self.finance_stake_pct_of_limit = self._parse_env_float(
-            "FINANCE_STAKE_PCT_OF_LIMIT", 0.25
-        )
-        self.finance_stake_cap = self._parse_env_float(
-            "FINANCE_STAKE_CAP", 0.0
-        )
-        self.finance_fx_brl = self._parse_env_float(
-            "FINANCE_FX_BRL", 5.20
-        )
-        self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
 
     @staticmethod
     def _parse_env_float(name: str, default: float) -> float:
