@@ -269,7 +269,12 @@ class H3bApiAudit:
         ok_login = await self.scraper.login()
         if not ok_login:
             logger.error("Login falhou. Abortando auditoria (necessário para /v1/betslips/).")
-            raise RuntimeError("LOGIN_FAILED")
+            try:
+                await self.scraper.close()
+            except Exception:
+                pass
+            self.scraper = None
+            return False
         logger.info("Login OK")
 
         # API client (usa o page do scraper)
@@ -325,8 +330,21 @@ class H3bApiAudit:
         return True
 
     async def run(self):
-        ok = await self.start()
-        if not ok:
+        # Se o login falhar (proxy/bloqueio/captcha), não derrubamos o processo
+        # para não bater StartLimit do systemd. Re-tenta com backoff.
+        backoff_s = 15.0
+        while self.running:
+            try:
+                ok = await self.start()
+            except Exception as e:
+                logger.error(f"Falha na inicialização: {e}")
+                ok = False
+            if ok:
+                break
+            logger.warning(f"Start falhou (provável login/bloqueio). Re-tentando em {int(backoff_s)}s...")
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(300.0, backoff_s * 1.5)
+        if not self.running:
             return
 
         audit_queue = asyncio.Queue(maxsize=self.max_queue_depth) if self.max_queue_depth > 0 else asyncio.Queue()
