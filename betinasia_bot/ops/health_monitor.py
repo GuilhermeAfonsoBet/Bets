@@ -170,6 +170,40 @@ async def _db_metrics(db: Database, since: datetime) -> Dict[str, Any]:
         return dict(row._mapping)
 
 
+async def _db_audit_friction(db: Database, since: datetime) -> Dict[str, Any]:
+    """
+    Sinais de fricção/bloqueio da API de betslip.
+    - 401/auth_error (sessão ausente)
+    - NO_ROOT_SESSION_COOKIE (login/sessão não gerou cookie)
+    - No betslip_id received (POST/WS api/betslip não retornou id)
+    """
+    q = text(
+        """
+        SELECT
+          count(*) AS total_n,
+          count(*) FILTER (WHERE upper(status)='OK') AS ok_n,
+          count(*) FILTER (WHERE upper(status) LIKE 'API_%') AS api_n,
+          count(*) FILTER (WHERE upper(status)='STALE_QUEUE_WAIT') AS stale_queue_n,
+          count(*) FILTER (
+            WHERE (hypothesis_details::text) ILIKE '%HTTP_401%'
+               OR (hypothesis_details::text) ILIKE '%auth_error%'
+          ) AS auth_401_n,
+          count(*) FILTER (
+            WHERE (hypothesis_details::text) ILIKE '%NO_ROOT_SESSION_COOKIE%'
+          ) AS no_root_session_n,
+          count(*) FILTER (
+            WHERE (hypothesis_details::text) ILIKE '%No betslip_id received%'
+          ) AS no_betslip_id_n
+        FROM betslip_audit_results
+        WHERE audited_at >= :since
+        """
+    )
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since})
+        row = r.fetchone()
+        return dict(row._mapping) if row else {}
+
+
 async def run_checks(
     *,
     since_minutes: int,
@@ -230,6 +264,11 @@ async def run_checks(
     await db.connect()
     try:
         m = await _db_metrics(db, since)
+        # Sinais rápidos de fricção/bloqueio (janela menor)
+        fric_min = _safe_int(os.getenv("OPS_AUDIT_FRICTION_MINUTES", "10"), 10)
+        fric_min = max(1, min(int(since_minutes), int(fric_min)))
+        fric_since = now - timedelta(minutes=int(fric_min))
+        fr = await _db_audit_friction(db, fric_since)
     finally:
         await db.close()
 
@@ -260,6 +299,64 @@ async def run_checks(
         exit_code = max(exit_code, 1)
 
     results.append(CheckResult("PASS", f"DB: h3b_temporal_reversal_events (n={h3b_n} desde {since_minutes}m)"))
+
+    # 4) Audit API friction / possible block (Telegram alert)
+    try:
+        total_n = int(fr.get("total_n") or 0)
+        ok_n = int(fr.get("ok_n") or 0)
+        auth_401_n = int(fr.get("auth_401_n") or 0)
+        no_root_n = int(fr.get("no_root_session_n") or 0)
+        no_bid_n = int(fr.get("no_betslip_id_n") or 0)
+        staleq_n = int(fr.get("stale_queue_n") or 0)
+        min_n = _safe_int(os.getenv("OPS_AUDIT_FRICTION_MIN_AUDITS", "10"), 10)
+        warn_pct = float(os.getenv("OPS_AUDIT_FRICTION_WARN_PCT", "0.20"))
+        fail_pct = float(os.getenv("OPS_AUDIT_FRICTION_FAIL_PCT", "0.50"))
+        warn_pct = max(0.0, min(1.0, warn_pct))
+        fail_pct = max(0.0, min(1.0, fail_pct))
+        denom = max(1, total_n)
+        auth_n = auth_401_n + no_root_n
+        auth_rate = auth_n / float(denom)
+        ok_rate = ok_n / float(denom)
+        no_bid_rate = no_bid_n / float(denom)
+
+        if total_n >= int(min_n):
+            if auth_rate >= float(fail_pct):
+                results.append(
+                    CheckResult(
+                        "FAIL",
+                        f"audit-api: possível bloqueio/auth (janela={fric_min}m) "
+                        f"auth401+no_root={auth_n}/{total_n} ({auth_rate:.0%}), ok={ok_n}/{total_n} ({ok_rate:.0%}), "
+                        f"no_betslip_id={no_bid_n}/{total_n} ({no_bid_rate:.0%}), staleq={staleq_n}",
+                    )
+                )
+                exit_code = max(exit_code, 2)
+            elif auth_rate >= float(warn_pct):
+                results.append(
+                    CheckResult(
+                        "WARN",
+                        f"audit-api: fricção/auth elevada (janela={fric_min}m) "
+                        f"auth401+no_root={auth_n}/{total_n} ({auth_rate:.0%}), ok={ok_n}/{total_n} ({ok_rate:.0%}), "
+                        f"no_betslip_id={no_bid_n}/{total_n} ({no_bid_rate:.0%}), staleq={staleq_n}",
+                    )
+                )
+                exit_code = max(exit_code, 1)
+            else:
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"audit-api: auth OK (janela={fric_min}m) ok={ok_n}/{total_n} ({ok_rate:.0%}), no_betslip_id={no_bid_n} staleq={staleq_n}",
+                    )
+                )
+        else:
+            results.append(
+                CheckResult(
+                    "PASS",
+                    f"audit-api: amostra baixa p/ fricção (janela={fric_min}m) n={total_n} < min={min_n}",
+                )
+            )
+    except Exception:
+        # Nunca deixa o monitor quebrar por esse check
+        pass
 
     return results, exit_code, {
         "now_utc": now.isoformat(),
