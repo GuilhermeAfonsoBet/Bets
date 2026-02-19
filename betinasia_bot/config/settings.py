@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=True, env="DRY_RUN")
     base_stake: float = Field(default=10.0, env="BASE_STAKE")
     max_stake: float = Field(default=100.0, env="MAX_STAKE")
+
+    # ===========================================
+    # Auditoria / Operação (scripts)
+    # ===========================================
+    # Importante: alguns scripts (ex.: `audit_h3b_api.py`) leem essas configs via `os.getenv`,
+    # mas como o Settings carrega o `.env`, precisamos declarar aqui para não falhar com
+    # "extra_forbidden" quando as variáveis estiverem presentes no arquivo.
+    audit_mode: str = Field(default="api", env="AUDIT_MODE")
+    audit_ws_sample_offsets_sec: str = Field(
+        default="0,3,6,9,12,15,18,21,24,27,30",
+        env="AUDIT_WS_SAMPLE_OFFSETS_SEC",
+    )
     
     # ===========================================
     # Logging
