@@ -22,9 +22,10 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
 from loguru import logger
+import random
 
 sys.path.insert(0, '.')
 
@@ -53,6 +54,8 @@ class H3bApiAudit:
         temporal_workers: int = 2,
         max_queue_depth: int = 50,
         max_queue_wait_ms: int = 5000,
+        mode: str = "api",
+        ws_sample_offsets_sec: Optional[List[float]] = None,
     ):
         self.num_audits = num_audits
         self.direction = direction
@@ -72,6 +75,8 @@ class H3bApiAudit:
         self._last_ws_time: float = 0
         self._start_time: float = 0
         self._events_info: Dict[str, dict] = {}
+        # Estado mais recente de odds via WS por (event_id, market_type, market_period, line)
+        self._ws_odds_state: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
 
         # Detector
         self.detector = HypothesisDetector()
@@ -97,6 +102,13 @@ class H3bApiAudit:
         self._shutdown_lock = asyncio.Lock()
         self._tasks: List[asyncio.Task] = []
 
+        # Modos:
+        # - api: comportamento atual (WS detecta + BS via API para validar)
+        # - ws_only: coleta só WS (t0..t+30) e prepara dados para motor de decisão
+        # - ws_vs_bs: auditoria comparativa (WS + BS no mesmo timestamp)
+        self.mode = str(mode or "api").strip().lower()
+        self.ws_sample_offsets_sec = ws_sample_offsets_sec or [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]
+
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
         self.finance_stake_pct_of_limit = self._parse_env_float(
@@ -109,6 +121,59 @@ class H3bApiAudit:
             "FINANCE_FX_BRL", 5.20
         )
         self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
+
+    @staticmethod
+    def _parse_offsets(raw: str, *, default: List[float]) -> List[float]:
+        s = (raw or "").strip()
+        if not s:
+            return list(default)
+        out: List[float] = []
+        for part in s.replace(";", ",").split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                out.append(float(p))
+            except Exception:
+                continue
+        if not out:
+            return list(default)
+        # normaliza: >=0, ordenado, únicos, limita a 60s para segurança
+        cleaned = sorted({round(x, 3) for x in out if x >= 0.0 and x <= 60.0})
+        return cleaned or list(default)
+
+    def _ws_state_key(self, event_id: str, market_type: str, market_period: str, line: str) -> Tuple[str, str, str, str]:
+        return (str(event_id), str(market_type), str(market_period), str(line))
+
+    def _ws_get_snapshot(self, key: Tuple[str, str, str, str]) -> Optional[dict]:
+        snap = self._ws_odds_state.get(key)
+        if not snap:
+            return None
+        # retorna cópia pequena (evita mutações acidentais)
+        return {
+            "ts": float(snap.get("ts") or 0.0),
+            "side_a_name": snap.get("side_a_name"),
+            "side_b_name": snap.get("side_b_name"),
+            "side_a_odd": snap.get("side_a_odd"),
+            "side_b_odd": snap.get("side_b_odd"),
+        }
+
+    def _ws_get_side_odd(self, key: Tuple[str, str, str, str], side: str) -> Optional[float]:
+        snap = self._ws_get_snapshot(key)
+        if not snap:
+            return None
+        side = str(side or "").strip().lower()
+        if side and side == str(snap.get("side_a_name") or "").lower():
+            try:
+                return float(snap.get("side_a_odd"))
+            except Exception:
+                return None
+        if side and side == str(snap.get("side_b_name") or "").lower():
+            try:
+                return float(snap.get("side_b_odd"))
+            except Exception:
+                return None
+        return None
 
     async def shutdown(self, reason: str = ""):
         """
@@ -299,7 +364,12 @@ class H3bApiAudit:
 
     async def start(self):
         logger.info("=" * 60)
-        logger.info("AUDITORIA H3B VIA API (~2-3s)")
+        if self.mode in ("ws_only", "ws"):
+            logger.info("MONITOR H3B (WS-only) + série temporal (t0..t+30)")
+        elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+            logger.info("AUDITORIA H3B (WS vs BS no mesmo timestamp)")
+        else:
+            logger.info("AUDITORIA H3B VIA API (~2-3s)")
         logger.info("=" * 60)
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'running', False))
@@ -310,7 +380,7 @@ class H3bApiAudit:
         await self.scraper.start()
         ok_login = await self.scraper.login()
         if not ok_login:
-            logger.error("Login falhou. Abortando auditoria (necessário para /v1/betslips/).")
+            logger.error("Login falhou. Abortando (necessário para WS + endpoints /v1/betslips/ quando usado).")
             try:
                 await self.scraper.close()
             except Exception:
@@ -515,6 +585,23 @@ class H3bApiAudit:
                 continue
             self.events_processed += 1
 
+            # Atualiza estado WS (para amostragem temporal WS-only e auditoria WS vs BS)
+            try:
+                key = self._ws_state_key(event_id, market_type, period, str(line_val))
+                if over_under:
+                    side_a_name, side_b_name = "over", "under"
+                else:
+                    side_a_name, side_b_name = "home", "away"
+                self._ws_odds_state[key] = {
+                    "ts": time.time(),
+                    "side_a_name": side_a_name,
+                    "side_b_name": side_b_name,
+                    "side_a_odd": float(home_odds),
+                    "side_b_odd": float(away_odds),
+                }
+            except Exception:
+                pass
+
             try:
                 if abs(float(line_val)) > MAX_AH_LINE:
                     continue
@@ -566,6 +653,7 @@ class H3bApiAudit:
                         'line': str(h3b.ah_line),
                         'side': h3b.side,
                         'websocket_odd': h3b.odd_at_reversal,
+                        'ws_state_key': self._ws_state_key(event_id, market_type, period, str(h3b.ah_line)),
                         'direction': h3b.direction_after,
                         'detected_at': time.time(),
                         'queue_depth_at_enqueue': queue_depth_at_enqueue,
@@ -593,7 +681,12 @@ class H3bApiAudit:
             h3b['dequeued_at'] = time.time()
             h3b['queue_depth_after_dequeue'] = queue.qsize()
             defer_temporal = self.save_to_db and self.temporal_workers > 0
-            result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
+            if self.mode in ("ws_only", "ws"):
+                result = await self._execute_ws_only(h3b, run_ws_series=not defer_temporal)
+            elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+                result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
+            else:
+                result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
             telemetry = result.setdefault('telemetry', {})
             telemetry['worker_id'] = worker_id
             telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
@@ -609,27 +702,50 @@ class H3bApiAudit:
             self.results.append(result)
 
             temporal_refs = result.get('_temporal_refs')
-            if defer_temporal and record_id and temporal_refs and self._temporal_queue_ref:
-                temporal_job = {
-                    'record_id': record_id,
-                    'event_id': result.get('event_id'),
-                    'home_team': result.get('home_team'),
-                    'away_team': result.get('away_team'),
-                    'ws_odd': temporal_refs.get('ws_odd'),
-                    'back_betslip_id': temporal_refs.get('back_betslip_id', ''),
-                    'lay_betslip_id': temporal_refs.get('lay_betslip_id', ''),
-                    'telemetry_base': dict(telemetry),
-                    'queued_at': time.time(),
-                }
-                self._temporal_queue_ref.put_nowait(temporal_job)
-                self.max_temporal_queue_depth_observed = max(
-                    self.max_temporal_queue_depth_observed,
-                    self._temporal_queue_ref.qsize()
-                )
+            ws_refs = result.get('_ws_series_refs')
+            if defer_temporal and record_id and self._temporal_queue_ref:
+                job: Optional[dict] = None
+                if temporal_refs:
+                    job = {
+                        'kind': 'betslip_temporal',
+                        'record_id': record_id,
+                        'event_id': result.get('event_id'),
+                        'home_team': result.get('home_team'),
+                        'away_team': result.get('away_team'),
+                        'ws_odd': temporal_refs.get('ws_odd'),
+                        'ws_state_key': temporal_refs.get('ws_state_key'),
+                        'ws_side': temporal_refs.get('ws_side'),
+                        'refresh_times': temporal_refs.get('refresh_times'),
+                        'back_betslip_id': temporal_refs.get('back_betslip_id', ''),
+                        'lay_betslip_id': temporal_refs.get('lay_betslip_id', ''),
+                        'telemetry_base': dict(telemetry),
+                        'queued_at': time.time(),
+                    }
+                elif ws_refs:
+                    job = {
+                        'kind': 'ws_series',
+                        'record_id': record_id,
+                        'event_id': result.get('event_id'),
+                        'home_team': result.get('home_team'),
+                        'away_team': result.get('away_team'),
+                        'ws_state_key': ws_refs.get('ws_state_key'),
+                        'ws_side': ws_refs.get('ws_side'),
+                        'offsets_sec': ws_refs.get('offsets_sec'),
+                        'telemetry_base': dict(telemetry),
+                        'queued_at': time.time(),
+                    }
+                if job:
+                    self._temporal_queue_ref.put_nowait(job)
+                    self.max_temporal_queue_depth_observed = max(
+                        self.max_temporal_queue_depth_observed,
+                        self._temporal_queue_ref.qsize()
+                    )
 
             # Log
             live = "LIVE" if result.get('is_live') else "PRE" if result.get('is_live') is not None else "?"
-            if result.get('success'):
+            bs_odd = result.get('bs_odd', None)
+            has_bs = isinstance(bs_odd, (int, float)) and float(bs_odd) > 0
+            if result.get('success') and has_bs:
                 self.consecutive_errors = 0
                 lay_str = ""
                 if result.get('lay_odd'):
@@ -645,6 +761,18 @@ class H3bApiAudit:
                     f"({result['num_bk']} bk){lay_str} | "
                     f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_part} w={worker_id} | "
                     f"{len(self.results)}")
+            elif result.get('success') and (not has_bs):
+                self.consecutive_errors = 0
+                q_ms = telemetry.get('queue_wait_ms', 0)
+                total_ms = result.get('total_ms')
+                ver = str(result.get("audit_version") or "")
+                ws_part = "ws_series=inline" if result.get("ws_series") else "ws_series=deferred" if result.get("_ws_series_refs") else "ws_series=none"
+                logger.info(
+                    f"[WS][{live}] {result['home_team']} vs {result['away_team']} | "
+                    f"{result['market_type']} {result['line']} {result['side']} | "
+                    f"ws={result['ws_odd']:.3f} | {ws_part} ver={ver} | "
+                    f"lag={total_ms}ms q={q_ms}ms w={worker_id} | {len(self.results)}"
+                )
             else:
                 status = result.get("status", "FAIL")
                 if status == "STALE_QUEUE_WAIT":
@@ -666,8 +794,17 @@ class H3bApiAudit:
             if len(self.results) % STATS_INTERVAL == 0:
                 self._log_stats()
 
-    async def _collect_temporal_series(self, ws_odd: float, back_betslip_id: str, lay_betslip_id: str):
-        refresh_times = [3, 6, 10, 15, 20]
+    async def _collect_temporal_series(
+        self,
+        ws_odd: float,
+        back_betslip_id: str,
+        lay_betslip_id: str,
+        *,
+        ws_state_key: Optional[Tuple[str, str, str, str]] = None,
+        ws_side: str = "",
+        refresh_times: Optional[List[float]] = None,
+    ):
+        refresh_times = [3, 6, 10, 15, 20] if (not refresh_times) else [float(x) for x in refresh_times if x is not None]
         back_temporal = []
         lay_temporal = []
         temporal_points = []
@@ -715,12 +852,19 @@ class H3bApiAudit:
                 refresh_ms = int((time.time() - refresh_t0) * 1000)
                 temporal_refresh_durations.append(refresh_ms)
                 actual_t = round(time.time() - t_start, 1)
+                # Snapshot WS no momento do refresh (para comparar "mesmo timestamp")
+                ws_now = ws_odd
+                if ws_state_key:
+                    cur = self._ws_get_side_odd(ws_state_key, ws_side)
+                    if isinstance(cur, (int, float)) and float(cur) > 0:
+                        ws_now = float(cur)
                 point_meta = {
                     'target_s': target_t,
                     'actual_s': actual_t,
                     'refresh_ms': refresh_ms,
                     'back_ok': False,
                     'lay_ok': False,
+                    'ws_odd': ws_now,
                 }
 
                 for label, ref in zip(labels, refresh_results):
@@ -731,7 +875,7 @@ class H3bApiAudit:
                         continue
 
                     if label == "back":
-                        ref_diff = ((ref.best_odd - ws_odd) / ws_odd) * 100 if ws_odd else 0
+                        ref_diff = ((ref.best_odd - ws_now) / ws_now) * 100 if ws_now else 0
                         back_temporal.append({
                             't': actual_t,
                             'bs_odd': ref.best_odd,
@@ -739,12 +883,13 @@ class H3bApiAudit:
                             'bookie': ref.best_bookie,
                             'limit': ref.best_limit,
                             'num_bk': ref.num_bookmakers,
+                            'ws_odd': ws_now,
                         })
                         point_meta['back_ok'] = True
                     else:
                         lay_ref = _extract_lay_snapshot(ref)
                         if lay_ref:
-                            lay_diff = ((lay_ref['odd'] - ws_odd) / ws_odd) * 100 if ws_odd else 0
+                            lay_diff = ((lay_ref['odd'] - ws_now) / ws_now) * 100 if ws_now else 0
                             lay_temporal.append({
                                 't': actual_t,
                                 'lay_odd': lay_ref['odd'],
@@ -752,6 +897,7 @@ class H3bApiAudit:
                                 'bookie': lay_ref['bookie'],
                                 'limit': lay_ref['limit'],
                                 'num_bk': lay_ref['num_bk'],
+                                'ws_odd': ws_now,
                             })
                             point_meta['lay_ok'] = True
 
@@ -768,6 +914,82 @@ class H3bApiAudit:
             'temporal_deferred': False,
         }
         return back_temporal, lay_temporal, telemetry_patch
+
+    async def _collect_ws_series(
+        self,
+        *,
+        ws_state_key: Tuple[str, str, str, str],
+        ws_side: str,
+        offsets_sec: List[float],
+    ) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        Coleta série de odds via WS em offsets específicos.
+        Retorna (series, telemetry_patch).
+        """
+        offsets = [float(x) for x in offsets_sec if x is not None and float(x) >= 0.0]
+        offsets = sorted({round(x, 3) for x in offsets})
+        if not offsets:
+            offsets = [0.0]
+
+        t_start = time.time()
+        series: List[dict] = []
+        points_meta: List[dict] = []
+        wait_ms = 0
+
+        for target in offsets:
+            elapsed = time.time() - t_start
+            wait = float(target) - float(elapsed)
+            if wait > 0:
+                await asyncio.sleep(wait)
+                wait_ms += int(wait * 1000)
+            snap = self._ws_get_snapshot(ws_state_key)
+            now_ts = time.time()
+            actual = round(now_ts - t_start, 3)
+
+            side_odd = self._ws_get_side_odd(ws_state_key, ws_side)
+            point = {
+                "t_target_s": float(target),
+                "t_actual_s": float(actual),
+                "ts": now_ts,
+                "ws_side": ws_side,
+                "ws_odd": side_odd,
+                "ws_side_a_name": snap.get("side_a_name") if snap else None,
+                "ws_side_b_name": snap.get("side_b_name") if snap else None,
+                "ws_side_a_odd": snap.get("side_a_odd") if snap else None,
+                "ws_side_b_odd": snap.get("side_b_odd") if snap else None,
+                "ws_state_age_ms": int(max(0.0, (now_ts - float(snap.get("ts") or 0.0)) * 1000)) if snap else None,
+                "ws_state_missing": bool(snap is None),
+            }
+            # série principal: sempre inclui o lado alvo + par (se houver)
+            series.append(point)
+            points_meta.append({"t_target_s": float(target), "t_actual_s": float(actual), "ws_ok": bool(side_odd)})
+
+        telemetry_patch = {
+            "ws_series_total_ms": int((time.time() - t_start) * 1000),
+            "ws_series_wait_ms": int(wait_ms),
+            "ws_series_points": points_meta,
+            "ws_series_deferred": False,
+        }
+        return series, telemetry_patch
+
+    async def _patch_ws_series_result(self, record_id: int, ws_series: list, telemetry: dict, meta: dict):
+        if not self.db or not record_id:
+            return
+        patch = {"telemetry": telemetry, "ws_series": ws_series, "ws_series_meta": meta}
+        async with self.db.async_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE betslip_audit_results
+                    SET hypothesis_details = (
+                        COALESCE(hypothesis_details::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)
+                    )::json
+                    WHERE id = :id
+                    """
+                ),
+                {"id": record_id, "patch": json.dumps(patch, ensure_ascii=False)},
+            )
+            await session.commit()
 
     async def _patch_temporal_result(self, record_id: int, back_temporal: list, lay_temporal: list, telemetry: dict):
         if not self.db or not record_id:
@@ -800,28 +1022,55 @@ class H3bApiAudit:
                 continue
 
             try:
-                back_temporal, lay_temporal, telemetry_patch = await self._collect_temporal_series(
-                    ws_odd=job.get('ws_odd', 0) or 0,
-                    back_betslip_id=job.get('back_betslip_id', ''),
-                    lay_betslip_id=job.get('lay_betslip_id', ''),
-                )
-                telemetry_final = dict(job.get('telemetry_base') or {})
-                telemetry_final.update(telemetry_patch)
-                telemetry_final['temporal_worker_id'] = worker_id
-                telemetry_final['temporal_async_latency_ms'] = int((time.time() - job.get('queued_at', time.time())) * 1000)
-                await self._patch_temporal_result(
-                    record_id=job.get('record_id'),
-                    back_temporal=back_temporal,
-                    lay_temporal=lay_temporal,
-                    telemetry=telemetry_final,
-                )
-
-                if back_temporal or lay_temporal:
-                    logger.info(
-                        f"[TEMPORAL][w={worker_id}] id={job.get('record_id')} "
-                        f"back_pts={len(back_temporal)} lay_pts={len(lay_temporal)} "
-                        f"ms={telemetry_patch.get('temporal_total_ms', 0)}"
+                kind = str(job.get("kind") or "betslip_temporal").strip().lower()
+                if kind == "ws_series":
+                    ws_state_key = job.get("ws_state_key")
+                    ws_side = str(job.get("ws_side") or "")
+                    offsets = job.get("offsets_sec") or self.ws_sample_offsets_sec
+                    ws_series, telemetry_patch = await self._collect_ws_series(
+                        ws_state_key=tuple(ws_state_key) if isinstance(ws_state_key, (list, tuple)) else ws_state_key,
+                        ws_side=ws_side,
+                        offsets_sec=[float(x) for x in offsets],
                     )
+                    telemetry_final = dict(job.get("telemetry_base") or {})
+                    telemetry_final.update(telemetry_patch)
+                    telemetry_final["temporal_worker_id"] = worker_id
+                    telemetry_final["temporal_async_latency_ms"] = int((time.time() - job.get("queued_at", time.time())) * 1000)
+                    meta = {"offsets_sec": [float(x) for x in offsets], "ws_side": ws_side}
+                    await self._patch_ws_series_result(
+                        record_id=int(job.get("record_id") or 0),
+                        ws_series=ws_series,
+                        telemetry=telemetry_final,
+                        meta=meta,
+                    )
+                    if ws_series:
+                        logger.info(f"[WS_SERIES][w={worker_id}] id={job.get('record_id')} pts={len(ws_series)}")
+                else:
+                    back_temporal, lay_temporal, telemetry_patch = await self._collect_temporal_series(
+                        ws_odd=job.get('ws_odd', 0) or 0,
+                        back_betslip_id=job.get('back_betslip_id', ''),
+                        lay_betslip_id=job.get('lay_betslip_id', ''),
+                        ws_state_key=tuple(job.get("ws_state_key")) if isinstance(job.get("ws_state_key"), (list, tuple)) else None,
+                        ws_side=str(job.get("ws_side") or ""),
+                        refresh_times=job.get("refresh_times") if isinstance(job.get("refresh_times"), list) else None,
+                    )
+                    telemetry_final = dict(job.get('telemetry_base') or {})
+                    telemetry_final.update(telemetry_patch)
+                    telemetry_final['temporal_worker_id'] = worker_id
+                    telemetry_final['temporal_async_latency_ms'] = int((time.time() - job.get('queued_at', time.time())) * 1000)
+                    await self._patch_temporal_result(
+                        record_id=job.get('record_id'),
+                        back_temporal=back_temporal,
+                        lay_temporal=lay_temporal,
+                        telemetry=telemetry_final,
+                    )
+
+                    if back_temporal or lay_temporal:
+                        logger.info(
+                            f"[TEMPORAL][w={worker_id}] id={job.get('record_id')} "
+                            f"back_pts={len(back_temporal)} lay_pts={len(lay_temporal)} "
+                            f"ms={telemetry_patch.get('temporal_total_ms', 0)}"
+                        )
             except Exception as e:
                 logger.warning(f"[TEMPORAL][w={worker_id}] falha no processamento: {e}")
             finally:
@@ -1065,10 +1314,17 @@ class H3bApiAudit:
         lay_betslip_id = lay_result.betslip_id if lay_result and lay_result.success else ""
         has_temporal_refs = bool(back_betslip_id or lay_betslip_id)
         if run_temporal and has_temporal_refs:
+            rt = None
+            if self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+                # Compara WS vs BS nos mesmos timestamps (t+offsets); t0 já foi coletado no get_betslip_odds
+                rt = [x for x in (self.ws_sample_offsets_sec or []) if float(x) > 0.0]
             back_temporal, lay_temporal, telemetry_patch = await self._collect_temporal_series(
                 ws_odd=ws_odd,
                 back_betslip_id=back_betslip_id,
                 lay_betslip_id=lay_betslip_id,
+                ws_state_key=h3b.get("ws_state_key"),
+                ws_side=str(h3b.get("side") or ""),
+                refresh_times=rt,
             )
             telemetry.update(telemetry_patch)
             if back_temporal:
@@ -1088,10 +1344,16 @@ class H3bApiAudit:
             telemetry['temporal_points'] = []
             telemetry['temporal_deferred'] = has_temporal_refs and (not run_temporal)
             if has_temporal_refs and (not run_temporal):
+                rt = None
+                if self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+                    rt = [x for x in (self.ws_sample_offsets_sec or []) if float(x) > 0.0]
                 base['_temporal_refs'] = {
                     'ws_odd': ws_odd,
                     'back_betslip_id': back_betslip_id,
                     'lay_betslip_id': lay_betslip_id,
+                    'ws_state_key': h3b.get("ws_state_key"),
+                    'ws_side': str(h3b.get("side") or ""),
+                    'refresh_times': rt,
                 }
 
         end_to_end_ms = int((time.time() - detected_at) * 1000)
@@ -1102,6 +1364,78 @@ class H3bApiAudit:
 
         base['total_ms'] = end_to_end_ms
         base['telemetry'] = telemetry
+        return base
+
+    async def _execute_ws_only(self, h3b: dict, run_ws_series: bool = True) -> dict:
+        """
+        Modo WS-only: não chama betslip API. Coleta série WS (t0..t+30) para motor de análise.
+        """
+        detected_at = h3b['detected_at']
+        execution_start = time.time()
+        queue_wait_ms = int((execution_start - detected_at) * 1000)
+        queue_depth_at_enqueue = h3b.get('queue_depth_at_enqueue')
+        queue_depth_after_dequeue = h3b.get('queue_depth_after_dequeue')
+
+        telemetry: Dict[str, Any] = {
+            'queue_wait_ms': queue_wait_ms,
+            'queue_depth_at_enqueue': queue_depth_at_enqueue,
+            'queue_depth_after_dequeue': queue_depth_after_dequeue,
+            'ws_series_deferred': False,
+        }
+
+        base: Dict[str, Any] = {
+            'event_id': h3b['event_id'],
+            'home_team': h3b['home_team'],
+            'away_team': h3b['away_team'],
+            'league': h3b.get('league', ''),
+            'kickoff': h3b.get('kickoff'),
+            'market_type': h3b['market_type'],
+            'market_period': h3b.get('market_period', 'full_time'),
+            'line': h3b['line'],
+            'side': h3b['side'],
+            'ws_odd': h3b['websocket_odd'],
+            'is_live': h3b.get('is_live'),
+            'direction': h3b.get('direction', 'up'),
+            'detected_at': detected_at,
+            'post_ms': 0,
+            'pmm_ms': 0,
+            'audit_version': "v5.0-ws-only",
+        }
+
+        ws_state_key = h3b.get("ws_state_key")
+        offsets = list(self.ws_sample_offsets_sec or [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30])
+        if run_ws_series:
+            ws_series, telemetry_patch = await self._collect_ws_series(
+                ws_state_key=ws_state_key,
+                ws_side=str(h3b.get("side") or ""),
+                offsets_sec=offsets,
+            )
+            telemetry.update(telemetry_patch)
+            base["ws_series"] = ws_series
+        else:
+            telemetry["ws_series_deferred"] = True
+            base["_ws_series_refs"] = {
+                "ws_state_key": ws_state_key,
+                "ws_side": str(h3b.get("side") or ""),
+                "offsets_sec": offsets,
+            }
+
+        end_to_end_ms = int((time.time() - detected_at) * 1000)
+        telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
+        telemetry['end_to_end_ms'] = end_to_end_ms
+        telemetry['pipeline_overhead_ms'] = max(0, end_to_end_ms - telemetry.get('queue_wait_ms', 0))
+
+        base.update({
+            'success': True,
+            'status': 'OK',
+            'bs_odd': None,
+            'bs_limit': 0,
+            'num_bk': 0,
+            'diff_pct': None,
+            'error': '',
+            'total_ms': end_to_end_ms,
+            'telemetry': telemetry,
+        })
         return base
 
     # ================================================================
@@ -1141,6 +1475,17 @@ class H3bApiAudit:
             if not status:
                 status = "OK" if r.get("success") else "API_FAILED"
 
+            bs_odd = r.get("bs_odd", None)
+            has_bs = isinstance(bs_odd, (int, float)) and float(bs_odd) > 0
+            diff_pct = r.get("diff_pct") if has_bs else None
+            diff_abs = (float(bs_odd) - float(r.get("ws_odd") or 0.0)) if has_bs else None
+            is_valid = r.get("is_valid_opportunity")
+            if is_valid is None:
+                try:
+                    is_valid = bool(has_bs and (diff_pct is not None) and abs(float(diff_pct)) < 2.0)
+                except Exception:
+                    is_valid = bool(has_bs)
+
             record = BetslipAuditResult(
                 hypothesis_type="H3B",
                 event_id=r['event_id'],
@@ -1156,19 +1501,19 @@ class H3bApiAudit:
                 side=r['side'],
                 bet_description=f"{r['market_type']} {r['line']} {r['side']}",
                 websocket_odd=r['ws_odd'],
-                betslip_odd=r.get('bs_odd') if r.get('success') else None,
-                difference_pct=r.get('diff_pct') if r.get('success') else None,
-                difference_absolute=(r['bs_odd'] - r['ws_odd']) if r.get('success') else None,
-                betslip_limit=r.get('bs_limit', 0),
+                betslip_odd=float(bs_odd) if has_bs else None,
+                difference_pct=float(diff_pct) if isinstance(diff_pct, (int, float)) else None,
+                difference_absolute=float(diff_abs) if isinstance(diff_abs, (int, float)) else None,
+                betslip_limit=r.get('bs_limit', 0) if has_bs else 0,
                 status=status,
-                is_valid_opportunity=r.get('success', False),
+                is_valid_opportunity=bool(is_valid),
                 is_live=r.get('is_live'),
                 reversal_direction=r.get('direction', 'up'),
                 hypothesis_detected_at=detected_dt,
                 lag_detection_to_click_ms=telemetry.get('queue_wait_ms', 0) + r.get('post_ms', 0),
                 lag_click_to_betslip_ms=r.get('pmm_ms', 0),
                 audit_total_duration_ms=telemetry.get('pipeline_total_ms_pre_db', telemetry.get('pipeline_total_ms', r.get('total_ms', 0))),
-                audit_version="v4.0-api",
+                audit_version=str(r.get("audit_version") or "v4.0-api"),
                 hypothesis_details=hypothesis_details or None,
             )
             async with self.db.async_session() as session:
@@ -1219,7 +1564,7 @@ class H3bApiAudit:
         if not ok:
             return
         lags = [r['total_ms'] for r in ok]
-        diffs = [r['diff_pct'] for r in ok]
+        diffs = [r.get('diff_pct') for r in ok if isinstance(r.get('diff_pct'), (int, float))]
         queue_ms = [r.get('telemetry', {}).get('queue_wait_ms', 0) for r in ok]
         post_ms = [r.get('telemetry', {}).get('back_post_ms', r.get('post_ms', 0)) for r in ok]
         pmm_ms = [r.get('telemetry', {}).get('back_pmm_ms', r.get('pmm_ms', 0)) for r in ok]
@@ -1233,7 +1578,10 @@ class H3bApiAudit:
         logger.info(f"{'=' * 50}")
         logger.info(f"STATS — {len(self.results)} auditorias ({len(ok)} OK)")
         logger.info(f"  Lag: min={min(lags)}ms med={sorted(lags)[len(lags)//2]}ms avg={sum(lags)//len(lags)}ms max={max(lags)}ms")
-        logger.info(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+        if diffs:
+            logger.info(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+        else:
+            logger.info("  Diff: (sem BS) — modo WS-only")
         if qdepth_enq:
             logger.info(
                 f"  Fila avg(itens): enq={self._avg(qdepth_enq):.2f} "
@@ -1259,7 +1607,7 @@ class H3bApiAudit:
         print(f"RESUMO — {len(self.results)} auditorias ({len(ok)} OK, {len(fail)} FAIL)")
         if ok:
             lags = [r['total_ms'] for r in ok]
-            diffs = [r['diff_pct'] for r in ok]
+            diffs = [r.get('diff_pct') for r in ok if isinstance(r.get('diff_pct'), (int, float))]
             queue_ms = [r.get('telemetry', {}).get('queue_wait_ms', 0) for r in ok]
             post_ms = [r.get('telemetry', {}).get('back_post_ms', r.get('post_ms', 0)) for r in ok]
             pmm_ms = [r.get('telemetry', {}).get('back_pmm_ms', r.get('pmm_ms', 0)) for r in ok]
@@ -1268,7 +1616,10 @@ class H3bApiAudit:
             qdepth_enq = [r.get('telemetry', {}).get('queue_depth_at_enqueue') for r in ok if r.get('telemetry', {}).get('queue_depth_at_enqueue') is not None]
             qdepth_deq = [r.get('telemetry', {}).get('queue_depth_after_dequeue') for r in ok if r.get('telemetry', {}).get('queue_depth_after_dequeue') is not None]
             print(f"  Lag: min={min(lags)} med={sorted(lags)[len(lags)//2]} max={max(lags)}ms")
-            print(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+            if diffs:
+                print(f"  Diff: avg={sum(diffs)/len(diffs):+.2f}% med={sorted(diffs)[len(diffs)//2]:+.2f}%")
+            else:
+                print("  Diff: (sem BS) — modo WS-only")
             if qdepth_enq:
                 print(f"  Fila avg(itens): enq={self._avg(qdepth_enq):.2f} deq={self._avg(qdepth_deq):.2f}")
             print(
@@ -1284,6 +1635,17 @@ async def main():
     parser.add_argument("--num-audits", type=int, default=0, help="0=infinito")
     parser.add_argument("--direction", choices=["up", "down", "all"], default="up")
     parser.add_argument("--no-db", action="store_true")
+    parser.add_argument(
+        "--mode",
+        choices=["api", "ws_only", "ws_vs_bs"],
+        default=(os.getenv("AUDIT_MODE", "api").strip() or "api"),
+        help="Modo de execução: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo WS vs BS).",
+    )
+    parser.add_argument(
+        "--ws-sample-offsets-sec",
+        default=os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC", "0,3,6,9,12,15,18,21,24,27,30"),
+        help="Offsets (segundos) para amostragem WS (ex: '0,3,6,...,30').",
+    )
     parser.add_argument(
         "--executor-workers",
         type=int,
@@ -1317,6 +1679,11 @@ async def main():
                filter=lambda r: "H6:" not in r["message"] and "H1:" not in r["message"])
     logger.add("logs/audit_api_{time:YYYY-MM-DD}.log", rotation="00:00", retention="60 days", level="DEBUG")
 
+    ws_offsets = H3bApiAudit._parse_offsets(
+        str(args.ws_sample_offsets_sec),
+        default=[0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30],
+    )
+
     audit = H3bApiAudit(
         num_audits=args.num_audits,
         direction=args.direction,
@@ -1325,6 +1692,8 @@ async def main():
         temporal_workers=args.temporal_workers,
         max_queue_depth=args.max_queue_depth,
         max_queue_wait_ms=args.max_queue_wait_ms,
+        mode=str(args.mode),
+        ws_sample_offsets_sec=ws_offsets,
     )
 
     # SIGTERM/SIGINT: encerra gracioso (evita chrome órfão e stop timeout)
