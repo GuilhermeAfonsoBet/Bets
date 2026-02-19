@@ -114,6 +114,9 @@ class Settings(BaseSettings):
         env_file = str(Path(__file__).resolve().parents[1] / ".env")
         env_file_encoding = "utf-8"
         case_sensitive = False
+        # Evita quebrar o processo quando adicionarmos novas variáveis no `.env`
+        # (muito comum em operação). Se quiser validação forte, declare os campos.
+        extra = "ignore"
 
 
 # Instância global das configurações
