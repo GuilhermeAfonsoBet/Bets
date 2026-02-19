@@ -94,6 +94,8 @@ class H3bApiAudit:
         self._api_backoff_until_ts: float = 0.0
         self._relogin_lock = asyncio.Lock()
         self._last_relogin_ts: float = 0.0
+        self._shutdown_lock = asyncio.Lock()
+        self._tasks: List[asyncio.Task] = []
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -107,6 +109,44 @@ class H3bApiAudit:
             "FINANCE_FX_BRL", 5.20
         )
         self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
+
+    async def shutdown(self, reason: str = ""):
+        """
+        Desligamento gracioso: cancela tasks, fecha browser/DB.
+        Ajuda a evitar stop timeout e processos chrome órfãos no systemd.
+        """
+        async with self._shutdown_lock:
+            if not self.running and not self._tasks:
+                return
+            self.running = False
+            if reason:
+                logger.warning(f"[SHUTDOWN] Encerrando (reason={reason})")
+            else:
+                logger.warning("[SHUTDOWN] Encerrando")
+
+            tasks = list(self._tasks)
+            self._tasks = []
+            for t in tasks:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    pass
+
+            if self.scraper:
+                try:
+                    await self.scraper.close()
+                except Exception as e:
+                    logger.warning(f"[SHUTDOWN] Falha ao fechar browser: {e}")
+            if self.db:
+                try:
+                    await self.db.close()
+                except Exception as e:
+                    logger.warning(f"[SHUTDOWN] Falha ao fechar DB: {e}")
 
     async def _force_relogin(self, reason: str):
         """
@@ -361,6 +401,7 @@ class H3bApiAudit:
         for twid in range(1, self.temporal_workers + 1):
             tasks.append(asyncio.create_task(self._temporal_loop(temporal_queue, worker_id=twid)))
         tasks.append(asyncio.create_task(self._maintenance_loop()))
+        self._tasks = list(tasks)
         logger.info(
             f"Executores T+0 ativos: {self.executor_workers} | Temporal workers: {self.temporal_workers} | "
             f"max_queue_depth={self.max_queue_depth or 'inf'} | max_queue_wait_ms={self.max_queue_wait_ms or 'inf'}"
@@ -374,15 +415,10 @@ class H3bApiAudit:
         except KeyboardInterrupt:
             pass
         finally:
-            self.running = False
-            for t in tasks:
-                t.cancel()
+            await self.shutdown("run_finally")
 
         self._print_summary()
-        if self.scraper:
-            await self.scraper.close()
-        if self.db:
-            await self.db.close()
+        # fechamento já tratado em shutdown()
 
     # ================================================================
     # MONITOR
@@ -1290,7 +1326,31 @@ async def main():
         max_queue_depth=args.max_queue_depth,
         max_queue_wait_ms=args.max_queue_wait_ms,
     )
-    await audit.run()
+
+    # SIGTERM/SIGINT: encerra gracioso (evita chrome órfão e stop timeout)
+    try:
+        loop = asyncio.get_running_loop()
+
+        async def _on_signal(sig_name: str):
+            await audit.shutdown(f"signal:{sig_name}")
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_on_signal(s.name)))
+            except NotImplementedError:
+                pass
+    except Exception:
+        pass
+
+    try:
+        await audit.run()
+    except Exception:
+        logger.exception("Falha fatal no audit_h3b_api")
+        try:
+            await audit.shutdown("fatal_exception")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
