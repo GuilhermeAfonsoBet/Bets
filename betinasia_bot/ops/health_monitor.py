@@ -311,8 +311,12 @@ async def run_checks(
         min_n = _safe_int(os.getenv("OPS_AUDIT_FRICTION_MIN_AUDITS", "10"), 10)
         warn_pct = float(os.getenv("OPS_AUDIT_FRICTION_WARN_PCT", "0.20"))
         fail_pct = float(os.getenv("OPS_AUDIT_FRICTION_FAIL_PCT", "0.50"))
+        nobid_warn_pct = float(os.getenv("OPS_AUDIT_NOBETSLIP_WARN_PCT", "0.25"))
+        nobid_fail_pct = float(os.getenv("OPS_AUDIT_NOBETSLIP_FAIL_PCT", "0.60"))
         warn_pct = max(0.0, min(1.0, warn_pct))
         fail_pct = max(0.0, min(1.0, fail_pct))
+        nobid_warn_pct = max(0.0, min(1.0, nobid_warn_pct))
+        nobid_fail_pct = max(0.0, min(1.0, nobid_fail_pct))
         denom = max(1, total_n)
         auth_n = auth_401_n + no_root_n
         auth_rate = auth_n / float(denom)
@@ -320,21 +324,24 @@ async def run_checks(
         no_bid_rate = no_bid_n / float(denom)
 
         if total_n >= int(min_n):
-            if auth_rate >= float(fail_pct):
+            hard_fail = (auth_rate >= float(fail_pct)) or (no_bid_rate >= float(nobid_fail_pct))
+            hard_warn = (auth_rate >= float(warn_pct)) or (no_bid_rate >= float(nobid_warn_pct))
+
+            if hard_fail:
                 results.append(
                     CheckResult(
                         "FAIL",
-                        f"audit-api: possível bloqueio/auth (janela={fric_min}m) "
+                        f"audit-api: fricção crítica (possível bloqueio/rate-limit/WS) (janela={fric_min}m) "
                         f"auth401+no_root={auth_n}/{total_n} ({auth_rate:.0%}), ok={ok_n}/{total_n} ({ok_rate:.0%}), "
                         f"no_betslip_id={no_bid_n}/{total_n} ({no_bid_rate:.0%}), staleq={staleq_n}",
                     )
                 )
                 exit_code = max(exit_code, 2)
-            elif auth_rate >= float(warn_pct):
+            elif hard_warn:
                 results.append(
                     CheckResult(
                         "WARN",
-                        f"audit-api: fricção/auth elevada (janela={fric_min}m) "
+                        f"audit-api: fricção elevada (possível bloqueio/rate-limit/WS) (janela={fric_min}m) "
                         f"auth401+no_root={auth_n}/{total_n} ({auth_rate:.0%}), ok={ok_n}/{total_n} ({ok_rate:.0%}), "
                         f"no_betslip_id={no_bid_n}/{total_n} ({no_bid_rate:.0%}), staleq={staleq_n}",
                     )
