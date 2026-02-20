@@ -681,10 +681,10 @@ Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual 
 
 | Tipo | Dias |
 |---|---:|
-| Dias com dados carregados (audited_at) | 7 |
+| Dias com dados considerados (audited_at) | 5 |
 | Dias com eventos OK/betslip conf. | 5 |
 | Dias com eventos elegíveis p/ WF (edge) | 5 |
-| Dias usados no walk-forward | 7 |
+| Dias usados no walk-forward | 5 |
 
 **Diagnóstico por dia (audited_at): betslip vs qualidade vs edge**
 
@@ -695,13 +695,13 @@ Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual 
 | 2026-02-14 | 1167 | 893 | 506 | 506 | 177/77 | 100.0% | — |
 | 2026-02-15 | 796 | 682 | 444 | 444 | 142/51 | 100.0% | — |
 | 2026-02-16 | 454 | 336 | 226 | 226 | 93/13 | 100.0% | — |
-| 2026-02-17 | 264 | 0 | 0 | 0 | 0/0 | —% | — |
-| 2026-02-18 | 266 | 0 | 0 | 0 | 0/0 | —% | — |
 
 Leitura:
 - Se `Auditorias carregadas > 0` mas `Betslip conf.` ≈ 0, geralmente houve **mismatch/parse** (diff fora de [-10,+10]) ou ausência de betslip.
 - Se `Betslip conf. > 0` mas `OK (conf.) = 0`, o robô coletou betslip, mas os eventos falharam por **status != OK** (ver coluna de status).
 - Dias com `OK (conf.) = 0` **não devem ser tratados como “0 oportunidade”** sem investigar o operacional.
+
+**Obs. importante (para não distorcer OOS e agregações diárias):** os dias **2026-02-17** e **2026-02-18** foram **desconsiderados** neste reporte por terem `Auditorias carregadas > 0` mas `Betslip bruto = 0` (falha operacional de captura de betslip). A exclusão evita que pareça “dia sem apostas/oportunidades” e evita diluir as métricas do walk-forward.
 
 
 Leitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.
@@ -710,15 +710,13 @@ Leitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe 
 |---|---|---:|---:|---:|---:|---:|
 | 2026-02-12→2026-02-14 | 2026-02-15→2026-02-15 | 2 | 48 | +11.53% [-8.69%, +31.86%] | 769.69 | 138.94 |
 | 2026-02-12→2026-02-15 | 2026-02-16→2026-02-16 | 3 | 42 | -0.74% [-29.99%, +35.06%] | 865.51 | -100.54 |
-| 2026-02-12→2026-02-16 | 2026-02-17→2026-02-17 | 2 | 0 | — — | 0.00 | 0.00 |
-| 2026-02-12→2026-02-17 | 2026-02-18→2026-02-18 | 2 | 0 | — — | 0.00 | 0.00 |
 
 **Frequência de ativação por combinação (quantas janelas ela entrou como ativa)**
 
 | Combinação | #steps ativa |
 |---|---:|
-| Back_Pre_Any | 4 |
-| Back_In_Any | 3 |
+| Back_Pre_Any | 2 |
+| Back_In_Any | 1 |
 | Lay_In_No | 2 |
 
 ### 12.A Transparência da seleção: métricas por combinação no treino
@@ -748,29 +746,6 @@ Para cada janela de treino, mostramos as métricas usadas para decidir se cada c
 | Lay_In_Yes | NÃO | 25 / — / 19 | — | +6.49% | In: roi_q30>0 AND N_ROI>=min (N=19/20) |
 | Lay_In_No | SIM | 41 / — / 38 | — | +2.04% | In: roi_q30>0 AND N_ROI>=min (N=38/20) |
 
-**Train 2026-02-12→2026-02-16 → Test 2026-02-17→2026-02-17**
-
-| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV q10/q90 ou CI | ROI q30 | Motivo |
-|---|---|---:|---:|---:|---|
-| Back_Pre_Any | SIM | 132 / 119 / 122 | q10=6.46 | CI90_lb=6.39 | -0.53% | BackPre: clv_q10>0=True, roi_mean>0=True |
-| Back_In_Any | SIM | 136 / — / 117 | — | +6.17% | BackIn: roi_q30>0 AND N_ROI>=min (N=117/20) |
-| Lay_Pre_Yes | NÃO | 13 / 10 / 13 | q10=-6.31 | CI90_lb=-6.92 | +14.17% | LayPre: clv_conv_q10>0=False, roi_q30>0=False |
-| Lay_Pre_No | NÃO | 34 / 28 / 31 | q10=-6.80 | CI90_lb=-7.09 | +4.67% | LayPre: clv_conv_q10>0=False, roi_q30>0=True |
-| Lay_In_Yes | NÃO | 26 / — / 19 | — | +6.49% | In: roi_q30>0 AND N_ROI>=min (N=19/20) |
-| Lay_In_No | NÃO | 43 / — / 39 | — | -0.11% | In: roi_q30>0 AND N_ROI>=min (N=39/20) |
-
-**Train 2026-02-12→2026-02-17 → Test 2026-02-18→2026-02-18**
-
-| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV q10/q90 ou CI | ROI q30 | Motivo |
-|---|---|---:|---:|---:|---|
-| Back_Pre_Any | SIM | 132 / 119 / 122 | q10=6.46 | CI90_lb=6.39 | -0.53% | BackPre: clv_q10>0=True, roi_mean>0=True |
-| Back_In_Any | SIM | 136 / — / 117 | — | +6.17% | BackIn: roi_q30>0 AND N_ROI>=min (N=117/20) |
-| Lay_Pre_Yes | NÃO | 13 / 10 / 13 | q10=-6.31 | CI90_lb=-6.92 | +14.17% | LayPre: clv_conv_q10>0=False, roi_q30>0=False |
-| Lay_Pre_No | NÃO | 34 / 28 / 31 | q10=-6.80 | CI90_lb=-7.09 | +4.67% | LayPre: clv_conv_q10>0=False, roi_q30>0=True |
-| Lay_In_Yes | NÃO | 26 / — / 19 | — | +6.49% | In: roi_q30>0 AND N_ROI>=min (N=19/20) |
-| Lay_In_No | NÃO | 43 / — / 39 | — | -0.11% | In: roi_q30>0 AND N_ROI>=min (N=39/20) |
-
-
 Notas importantes:
 - Se `Jogos OOS` for baixo em muitos passos, você ainda não tem volume suficiente para decisões por combinação. Nesse cenário faz sentido **Bayes hierárquico (partial pooling)** para estabilizar estimativas.
 - **Lucro (estratégia, budget)** acima já incorpora a política de risco por jogo (match budget) e é a métrica principal.
@@ -798,28 +773,20 @@ Esta estimativa usa o walk-forward acima como **simulador OOS**. O lucro pode se
 | Scheme pre-match (OOS) | `KELLY_0.25` |
 | Scheme in-match (OOS) | `FLAT` |
 | Expansão missing ROI | ON |
-| Dias OOS (calendário de teste) | 4 |
-| Dias OOS com OK (>=1 evento OK/conf) | 2 |
-| Turnover 30d (proj., calendário) | 12264.00 |
-| Turnover 30d (proj., cond OK) | 24528.01 |
+| Dias OOS (teste, após excluir dias sem apostas) | 2 |
+| Turnover 30d (proj.) | 24528.01 |
 | Turnover 30d (Pre/In) | 46942.55 / 420.68 |
-| Lucro 30d (obs., calendário) | 292.74 |
-| Lucro 30d (obs., cond OK) | 585.49 |
+| Lucro 30d (obs.) | 585.49 |
 | Lucro 30d (obs.) Pre/In | 1336.34 / 48.95 |
-| Lucro 30d (exp., calendário) | 288.04 |
-| Lucro 30d (exp., cond OK) | 576.07 |
+| Lucro 30d (exp.) | 576.07 |
 | Lucro 30d (exp.) Pre/In | 1336.34 / 66.18 |
 | Banca risco p99 (Back+Lay) | 869.03 |
 | Banca liquidez p99 (+buf) | 1374.55 |
 | Banca recomendada (max) | 1374.55 |
-| ROI/banca 30d (obs., calendário) | 21.30% |
-| ROI/banca 30d (obs., cond OK) | 42.59% |
-| ROI/banca 30d (exp., calendário) | 20.96% |
-| ROI/banca 30d (exp., cond OK) | 41.91% |
-| DD 30d p95 (obs., calendário) | 742.26 |
-| DD 30d p95 (obs., cond OK) | 997.24 |
-| DD 30d p95 (exp., calendário) | 727.49 |
-| DD 30d p95 (exp., cond OK) | 976.75 |
+| ROI/banca 30d (obs.) | 42.59% |
+| ROI/banca 30d (exp.) | 41.91% |
+| DD 30d p95 (obs.) | 997.24 |
+| DD 30d p95 (exp.) | 976.75 |
 
 ### 12.2 Governança de exposição por jogo (budget por `match_id`) — sensibilidade
 Objetivo: evitar concentração quando um mesmo jogo gera muitos sinais. Simulamos um orçamento de exposição por jogo, consumido ao longo do tempo.
@@ -836,14 +803,14 @@ Referência de banca p/ budget: 1374.55 | budgets por jogo aplicados em stake (B
 
 | Cenário | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |
 |---|---:|---:|---:|---:|---:|
-| BASELINE (sem budget) | 12264.00 | 288.04 | 1374.55 | 20.96% | 727.49 |
-| BUDGET_0.50%/0.25% cap25% | 1874.20 | 38.20 | 135.43 | 28.20% | 81.72 |
-| BUDGET_1.00%/0.50% cap33% | 4199.61 | 118.86 | 296.61 | 40.07% | 216.83 |
-| BUDGET_2.00%/1.00% cap50% | 10206.83 | 269.36 | 688.40 | 39.13% | 672.94 |
-| BUDGET_3.00%/1.50% cap33% | 11557.32 | 267.76 | 818.98 | 32.69% | 691.38 |
-| BUDGET_4.00%/2.00% cap33% | 15104.44 | 401.03 | 1069.25 | 37.51% | 823.71 |
-| BUDGET_3.00%/1.50% cap50% | 14777.93 | 519.69 | 992.49 | 52.36% | 852.84 |
-| BUDGET_4.00%/2.00% cap50% | 18862.79 | 881.10 | 1263.84 | 69.72% | 835.16 |
+| BASELINE (sem budget) | 24528.01 | 576.07 | 1374.55 | 41.91% | 976.75 |
+| BUDGET_0.50%/0.25% cap25% | 3748.40 | 76.40 | 135.43 | 56.40% | 109.72 |
+| BUDGET_1.00%/0.50% cap33% | 8399.22 | 237.72 | 296.61 | 80.14% | 291.20 |
+| BUDGET_2.00%/1.00% cap50% | 20413.66 | 538.72 | 688.40 | 78.26% | 904.11 |
+| BUDGET_3.00%/1.50% cap33% | 23114.64 | 535.52 | 818.98 | 65.38% | 928.93 |
+| BUDGET_4.00%/2.00% cap33% | 30208.88 | 802.06 | 1069.25 | 75.02% | 1105.88 |
+| BUDGET_3.00%/1.50% cap50% | 29555.86 | 1039.38 | 992.49 | 104.72% | 1145.02 |
+| BUDGET_4.00%/2.00% cap50% | 37725.58 | 1762.20 | 1263.84 | 139.44% | 1121.27 |
 
 Leitura:
 - Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.
@@ -853,8 +820,8 @@ Leitura:
 
 | Combinação | #steps ativa | Jogos OOS (uniques) | N eventos OOS | Stake eq. médio | Observação |
 |---|---:|---:|---:|---:|---|
-| Back_Pre_Any | 4 | 65 | 121 | 51.73 | budget reduz concentração por jogo |
-| Back_In_Any | 3 | 14 | 19 | 1.00 | budget reduz concentração por jogo |
+| Back_Pre_Any | 2 | 65 | 121 | 51.73 | budget reduz concentração por jogo |
+| Back_In_Any | 1 | 14 | 19 | 1.00 | budget reduz concentração por jogo |
 | Lay_In_No | 2 | 12 | 15 | 2.47 | budget reduz concentração por jogo |
 ## 10) Diagnóstico: por que o ROI pode estar zerado
 ROI aqui é calculado por placar do jogo (`matches.home_score/away_score`). Se os placares não estiverem preenchidos no banco, a cobertura de ROI será 0.
