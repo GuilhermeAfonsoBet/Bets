@@ -547,6 +547,12 @@ async def main() -> int:
         default=None,
         help="Se definido, renderiza o markdown para PDF (requer reportlab). Ex.: docs/relatorio.pdf",
     )
+    parser.add_argument(
+        "--exclude-audited-days",
+        default=os.getenv("EXCLUDE_AUDITED_DAYS", ""),
+        help="CSV de dias UTC (YYYY-MM-DD) a excluir do recorte antes de todas as métricas "
+        "(útil para dias com falha operacional que parecem 'sem apostas'). Ex.: 2026-02-17,2026-02-18",
+    )
     parser.add_argument("--back-diff-min", type=float, default=2.0, help="Corte de edge Back (default: 2.0)")
     parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
     # OBS: argparse usa interpolação estilo `%` na help string; por isso `%` precisa ser escapado como `%%`.
@@ -785,6 +791,22 @@ async def main() -> int:
             d["exec_bucket"] = exec_time_bucket(_safe_float(d.get("lag_total_ms")))
 
             all_data.append(d)
+
+        # ------------------------------------------------------------
+        # Exclusão de dias (audited_at UTC) para evitar distorções
+        # ------------------------------------------------------------
+        exclude_days = {x.strip() for x in str(getattr(args, "exclude_audited_days", "") or "").split(",") if x.strip()}
+        if exclude_days:
+            def _day_utc(ts: Any) -> Optional[str]:
+                if isinstance(ts, datetime):
+                    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                return None
+
+            before_n = len(all_data)
+            all_data = [d for d in all_data if (_day_utc(d.get("audited_at")) not in exclude_days)]
+            after_n = len(all_data)
+            if before_n != after_n:
+                print(f"[INFO] Excluídos {before_n - after_n} registros por exclude_audited_days={sorted(exclude_days)}")
 
         # ------------------------------------------------------------
         # Closing odds em batch (melhora muito performance em janelas longas)
