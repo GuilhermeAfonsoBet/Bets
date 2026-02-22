@@ -2757,11 +2757,12 @@ async def main() -> int:
             clv0 = _clv_pct_lay_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
             clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
             clvl = _clv_pct_lay_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
-            # Convenção "única" de CLV para tabela de estratégias (8.3):
-            # usamos (entry - closing) / closing, então Lay "bom" tende a ser NEGATIVO.
-            clv0_conv = (-float(clv0)) if clv0 is not None else None
-            clve_conv = (-float(clve)) if clve is not None else None
-            clvl_conv = (-float(clvl)) if clvl is not None else None
+            # Convenção unificada de CLV para Lay (8.3/OOS):
+            # clv_conv = -(entry - closing)/closing = (closing - entry)/closing
+            # Portanto, Lay "bom" tende a ser POSITIVO.
+            clv0_conv = float(clv0) if clv0 is not None else None
+            clve_conv = float(clve) if clve is not None else None
+            clvl_conv = float(clvl) if clvl is not None else None
 
             # Política de entrada Lay (para 8.3 e OOS):
             # - se há reversão: entrar **logo após a reversão** (odd_reversal)
@@ -2770,7 +2771,7 @@ async def main() -> int:
             odd_entry = float(odd_rev) if has_rev else float(plast["odd"])
             roi_entry = roirev if has_rev else roilast
             clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
-            clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
+            clv_entry_conv = float(clv_entry) if clv_entry is not None else None
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
@@ -3716,8 +3717,8 @@ async def main() -> int:
                 clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[0]) > 0)
                 roi_ok = bool(s_roi.mean_cluster is not None and float(s_roi.mean_cluster) > 0)
                 return bool(clv_ok and roi_ok)
-            # Lay: CLV bom tende a ser negativo nesta convenção
-            clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[1]) < 0)
+            # Lay: CLV_CONV bom tende a ser POSITIVO nesta convenção (closing - entry)/closing
+            clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[0]) > 0)
             # “sig a p30” ≈ p30 > 0
             bym = {}
             for v, mid in zip([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt]):
