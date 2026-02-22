@@ -425,7 +425,11 @@ class H3bApiAudit:
         payload = {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "event_id": result.get("event_id"),
+            # status simples para dashboards rápidos
             "status": "OK" if result.get("success") else "FAIL",
+            # status detalhado do pipeline (ex.: GATE_BLOCKED_CAP, API_RATE_LIMIT, OK, etc.)
+            "status_code": result.get("status"),
+            "audit_version": result.get("audit_version"),
             "market_type": result.get("market_type"),
             "line": result.get("line"),
             "side": result.get("side"),
