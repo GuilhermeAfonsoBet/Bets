@@ -625,8 +625,13 @@ async def main() -> int:
         action="store_true",
         help="Habilita estudo OOS rolling-forward (walk-forward) por dia, com seleção de estratégias por IC90/p90.",
     )
-    parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "3")), help="Dias de treino por passo (default 3).")
+    parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "2")), help="Dias de treino por passo (default 2).")
     parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
+    parser.add_argument(
+        "--wf-start-date",
+        default=os.getenv("WF_START_DATE", "").strip(),
+        help="Se definido (YYYY-MM-DD), força o calendário do walk-forward a iniciar a partir desta data (UTC).",
+    )
     parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
@@ -1428,6 +1433,153 @@ async def main() -> int:
         lines.append("\nNotas de robustez (IC 90% por jogo):  \n")
         lines.append(f"- API ROI betslip (cluster): média {_fmt_pct(api_roi.mean_cluster)}; IC90 {_fmt_ci(api_roi.ci90_cluster)}  \n")
         lines.append(f"- API ROI WS (cluster): média {_fmt_pct(api_roi_ws.mean_cluster)}; IC90 {_fmt_ci(api_roi_ws.ci90_cluster)}  \n")
+        lines.append("\n---\n")
+
+        # 4.1) Validade do CLV: CLV vs ROI (pre-match)
+        lines.append("## 4.1) Validade do CLV: relação CLV × ROI (pre-match)\n")
+        lines.append(
+            "Objetivo: avaliar se **CLV** (vs closing) é um bom proxy de **ROI realizado** (por placar), ao menos no regime **pre‑match**.\n\n"
+        )
+        lines.append(
+            "Regras do recorte desta seção:\n\n"
+            "- Apenas `status=OK` com betslip confiável (diff ∈ [-10%, +10%])\n"
+            "- Apenas `PRE_MATCH` (`is_live=False`)\n"
+            "- Exige **closing_odd** (para CLV) e **placar** (para ROI)\n\n"
+        )
+
+        clv_roi_rows = [
+            d
+            for d in ok_bs
+            if d.get("is_live") is False
+            and d.get("clv_bs") is not None
+            and d.get("roi_bs") is not None
+            and _safe_float(d.get("closing_odd")) is not None
+        ]
+        bym_clv: Dict[int, List[float]] = {}
+        bym_roi: Dict[int, List[float]] = {}
+        for d in clv_roi_rows:
+            mid = int(d.get("match_id"))
+            cv = _safe_float(d.get("clv_bs"))
+            rv = _safe_float(d.get("roi_bs"))
+            if cv is None or rv is None:
+                continue
+            if not (-50.0 <= float(cv) <= 50.0):
+                continue
+            if not (-100.0 <= float(rv) <= 500.0):
+                continue
+            bym_clv.setdefault(mid, []).append(float(cv))
+            bym_roi.setdefault(mid, []).append(float(rv))
+
+        # per-match means (cada jogo pesa 1)
+        match_ids = sorted(set(bym_clv.keys()) & set(bym_roi.keys()))
+        xs = [float(sum(bym_clv[mid]) / len(bym_clv[mid])) for mid in match_ids if bym_clv.get(mid)]
+        ys = [float(sum(bym_roi[mid]) / len(bym_roi[mid])) for mid in match_ids if bym_roi.get(mid)]
+
+        def _pearson(x: List[float], y: List[float]) -> Optional[float]:
+            if len(x) < 3 or len(y) < 3:
+                return None
+            try:
+                xa = np.asarray(x, dtype=float)
+                ya = np.asarray(y, dtype=float)
+                if float(np.std(xa)) <= 1e-12 or float(np.std(ya)) <= 1e-12:
+                    return None
+                return float(np.corrcoef(xa, ya)[0, 1])
+            except Exception:
+                return None
+
+        def _rankdata(a: np.ndarray) -> np.ndarray:
+            # ranks simples (sem empates perfeitos; empates recebem ranks consecutivos)
+            order = np.argsort(a, kind="mergesort")
+            ranks = np.empty_like(order, dtype=float)
+            ranks[order] = np.arange(1, len(a) + 1, dtype=float)
+            return ranks
+
+        def _spearman(x: List[float], y: List[float]) -> Optional[float]:
+            if len(x) < 3 or len(y) < 3:
+                return None
+            try:
+                xa = np.asarray(x, dtype=float)
+                ya = np.asarray(y, dtype=float)
+                rx = _rankdata(xa)
+                ry = _rankdata(ya)
+                return _pearson(rx.tolist(), ry.tolist())
+            except Exception:
+                return None
+
+        rho_p = _pearson(xs, ys)
+        rho_s = _spearman(xs, ys)
+        n_matches_clv_roi = len(match_ids)
+        n_events_clv_roi = len(clv_roi_rows)
+
+        # matriz de sinais (por jogo)
+        pos_pos = sum(1 for x, y in zip(xs, ys) if x > 0 and y > 0)
+        pos_neg = sum(1 for x, y in zip(xs, ys) if x > 0 and y <= 0)
+        neg_pos = sum(1 for x, y in zip(xs, ys) if x <= 0 and y > 0)
+        neg_neg = sum(1 for x, y in zip(xs, ys) if x <= 0 and y <= 0)
+
+        lines.append("### 4.1a Estatística global (por jogo)\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Jogos com CLV+ROI | {n_matches_clv_roi} |\n")
+        lines.append(f"| Eventos (auditorias) usados | {n_events_clv_roi} |\n")
+        lines.append(f"| Correlação Pearson (mean por jogo) | {_fmt_num(rho_p, 3)} |\n")
+        lines.append(f"| Correlação Spearman (mean por jogo) | {_fmt_num(rho_s, 3)} |\n")
+        lines.append("\n")
+
+        lines.append("### 4.1b Concordância de sinal (CLV vs ROI)\n")
+        lines.append("| CLV (jogo) | ROI (jogo) | Jogos |\n|---|---|---:|\n")
+        lines.append(f"| > 0 | > 0 | {pos_pos} |\n")
+        lines.append(f"| > 0 | ≤ 0 | {pos_neg} |\n")
+        lines.append(f"| ≤ 0 | > 0 | {neg_pos} |\n")
+        lines.append(f"| ≤ 0 | ≤ 0 | {neg_neg} |\n")
+        lines.append("\n")
+        lines.append(
+            "Leitura: CLV e ROI podem divergir por **variância do resultado** (ROI) e por **missingness** (jogos sem closing/sem placar). "
+            "A correlação acima é um diagnóstico de “alinhamento”, não causalidade.\n\n"
+        )
+
+        # bucket por quantis de CLV (por jogo)
+        lines.append("### 4.1c ROI por bucket de CLV (quintis; por jogo)\n")
+        if n_matches_clv_roi >= 10:
+            clv_means = np.asarray(xs, dtype=float)
+            q_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            cuts = [float(np.quantile(clv_means, q)) for q in q_edges]
+            # garante cortes estritamente crescentes para evitar buckets vazios por empate
+            cuts = [cuts[0]] + [max(cuts[i], cuts[i - 1] + 1e-12) for i in range(1, len(cuts))]
+
+            def _bucket_idx(v: float) -> int:
+                for i in range(5):
+                    if v < cuts[i + 1]:
+                        return i
+                return 4
+
+            buckets: List[List[int]] = [[] for _ in range(5)]
+            for mid in match_ids:
+                mclv = float(sum(bym_clv[mid]) / len(bym_clv[mid]))
+                buckets[_bucket_idx(mclv)].append(int(mid))
+
+            lines.append("| Bucket (CLV por jogo) | Jogos | CLV mean (IC90) | ROI mean (IC90) | Win rate ROI |\n|---|---:|---:|---:|---:|\n")
+            for i, mids in enumerate(buckets):
+                if not mids:
+                    continue
+                b_clv = {mid: bym_clv[mid] for mid in mids if mid in bym_clv}
+                b_roi = {mid: bym_roi[mid] for mid in mids if mid in bym_roi}
+                clv_mean, clv_ci = cluster_bootstrap_ci(b_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))
+                roi_mean, roi_ci = cluster_bootstrap_ci(b_roi, n_boot=2000, alpha=0.10, seed=int(args.seed))
+                # win rate por jogo (média ROI do jogo >0)
+                wr = None
+                try:
+                    roi_game = [float(sum(bym_roi[mid]) / len(bym_roi[mid])) for mid in mids if bym_roi.get(mid)]
+                    wr = 100.0 * sum(1 for v in roi_game if v > 0) / len(roi_game) if roi_game else None
+                except Exception:
+                    wr = None
+                label = f"Q{i+1} ({_fmt_pct(cuts[i],2)}→{_fmt_pct(cuts[i+1],2)})"
+                lines.append(
+                    f"| {label} | {len(mids)} | {_fmt_pct(clv_mean)} {_fmt_ci(clv_ci)} | {_fmt_pct(roi_mean)} {_fmt_ci(roi_ci)} | {_fmt_num(wr,1)}% |\n"
+                )
+            lines.append("\n")
+        else:
+            lines.append("Amostra insuficiente (jogos com CLV+ROI < 10) para buckets estáveis.\n\n")
+
         lines.append("\n---\n")
 
         # 5) Diferença de preço BS vs WS
@@ -3792,12 +3944,13 @@ async def main() -> int:
             "  - `rolling`: usa os **últimos** `wf_train_days`.\n"
             "  - `expanding`: usa **todos os dias anteriores** (com `wf_train_days` só definindo quando o teste começa).\n"
             "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
-            "**Evidência de valor (por combinação, no treino)** segue seus critérios (com elegibilidade por volume):\n"
-            "- Elegibilidade: `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino).\n"
-            "- Back/Pre: CLV p90>0 (IC90 lb>0) e ROI>0 (não precisa ser sig.)\n"
-            "- Back/In: ROI p30>0\n"
-            "- Lay/Pre: CLV_CONV p90>0 (IC90 lb>0) e ROI p30>0\n"
-            "- Lay/In: ROI p30>0\n\n"
+            "**Evidência de valor (por combinação, no treino)** (atualizado para dar mais peso a ROI):\n"
+            "- Elegibilidade (todas): `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino).\n"
+            "- **Regra de bloqueio**: se `ROI` for **significativamente negativo** (IC90 inteiro < 0), **não ativa**.\n"
+            "- Se `ROI` for **significativamente positivo** (IC90 inteiro > 0), **ativa**.\n"
+            "- Caso `ROI` seja **>0 mas não sig.**:\n"
+            "  - Pre-match: ativa apenas se `CLV > 0` (não precisa ser sig.)\n"
+            "  - In-match: ativa se `ROI > 0` (não precisa ser sig.; CLV não é aplicável)\n\n"
             "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
         )
 
@@ -3807,7 +3960,7 @@ async def main() -> int:
                 "(e ajuste `--wf-train-days/--wf-test-days/--wf-min-matches` se quiser).\n\n"
             )
         else:
-            wf_train = int(max(1, getattr(args, "wf_train_days", 3)))
+            wf_train = int(max(1, getattr(args, "wf_train_days", 2)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
             wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
@@ -3869,6 +4022,14 @@ async def main() -> int:
             days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
             days_combo = sorted({e["day"] for e in combo_events})
             days = days_loaded if days_loaded else days_combo
+            # Ajuste do início do calendário:
+            # - Se o usuário definir `--wf-start-date`, respeita.
+            # - Caso contrário, começa no 1º dia com eventos elegíveis (edge), para evitar warmup longo em dias sem operação.
+            wf_start = str(getattr(args, "wf_start_date", "") or "").strip()
+            if not wf_start and days_combo:
+                wf_start = min(days_combo)
+            if wf_start:
+                days = [d for d in days if str(d) >= wf_start]
             # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
             uniq_matches_total = len({int(e["match_id"]) for e in combo_events})
             uniq_matches_roi = len({int(e["match_id"]) for e in combo_events if e.get("roi") is not None})
@@ -4104,82 +4265,145 @@ async def main() -> int:
                     diag = {}
                     for k in sorted({_key(e) for e in train}):
                         sub = [e for e in train if _key(e) == k]
-                        # aplica critérios do usuário (mesmos da 8.3), com thresholds p90/p30
+                        # aplica critérios OOS (mais peso em ROI; CLV é gate apenas quando ROI é >0 mas não-sig em pre-match)
                         # parse key
                         parts = k.split("_")
                         side = parts[0]
                         regime = parts[1]
-                    # Back Pre: CLV p90>0 (q10>0) AND ROI mean>0 (se existir)
-                        # Back In: ROI p30>0
-                    # Lay Pre: CLV_CONV p90>0 (q10>0) AND ROI p30>0
-                        # Lay In: ROI p30>0
                         ok_sel = False
                         reason = ""
+
+                        def _ci_sig_pos(ci: Optional[Tuple[float, float]]) -> bool:
+                            return bool(ci and float(ci[0]) > 0)
+
+                        def _ci_sig_neg(ci: Optional[Tuple[float, float]]) -> bool:
+                            return bool(ci and float(ci[1]) < 0)
+
+                        # ROI por jogo (cluster)
+                        bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                        roi_mean, roi_ci = _mean_ci90(bym_roi) if bym_roi else (None, None)
+                        roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
+                        roi_sig_pos = _ci_sig_pos(roi_ci)
+                        roi_sig_neg = _ci_sig_neg(roi_ci)
+                        eligible = bool(len(bym_roi) >= wf_min_m)
+
                         if side == "Back" and regime == "Pre":
                             bym_clv = _bym(sub, "clv_back")
-                            if len(bym_clv) >= wf_min_m:
-                                q10 = _q(bym_clv, 0.10)
-                                clv_ok = bool(q10 is not None and float(q10) > 0)
+                            clv_mean, clv_ci = _mean_ci90(bym_clv) if bym_clv else (None, None)
+                            clv_pos = bool(clv_mean is not None and float(clv_mean) > 0)
+                            if not eligible:
+                                ok_sel = False
+                                reason = f"BackPre: N_ROI<{wf_min_m} (N={len(bym_roi)})"
+                            elif roi_sig_neg:
+                                ok_sel = False
+                                reason = "BackPre: ROI sig<0 (bloqueia)"
+                            elif roi_sig_pos:
+                                ok_sel = True
+                                reason = "BackPre: ROI sig>0"
+                            elif roi_pos and clv_pos:
+                                ok_sel = True
+                                reason = "BackPre: ROI>0 (NS) AND CLV>0"
                             else:
-                                clv_ok = False
-                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
-                            roi_mean, _ = _mean_ci90(bym_roi) if bym_roi else (None, None)
-                            roi_ok = bool(roi_mean is not None and float(roi_mean) > 0) if len(bym_roi) >= max(5, int(wf_min_m // 3)) else True
-                            ok_sel = bool(clv_ok and roi_ok)
-                            reason = f"BackPre: clv_q10>0={clv_ok}, roi_mean>0={roi_ok}"
+                                ok_sel = False
+                                reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
-                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "clv_mean": clv_mean,
+                                "clv_ci90": clv_ci,
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
+                                "roi_ci90": roi_ci,
+                                "roi_sig_neg": roi_sig_neg,
+                                "roi_sig_pos": roi_sig_pos,
                                 "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
                             }
                         elif side == "Back" and regime == "In":
-                            bym_roi = _bym(sub, "roi")
-                            q30 = _q(bym_roi, 0.30) if bym_roi else None
-                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
-                            reason = f"BackIn: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
+                            if not eligible:
+                                ok_sel = False
+                                reason = f"BackIn: N_ROI<{wf_min_m} (N={len(bym_roi)})"
+                            elif roi_sig_neg:
+                                ok_sel = False
+                                reason = "BackIn: ROI sig<0 (bloqueia)"
+                            elif roi_sig_pos:
+                                ok_sel = True
+                                reason = "BackIn: ROI sig>0"
+                            else:
+                                ok_sel = bool(roi_pos)
+                                reason = f"BackIn: ROI>0={roi_pos}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
-                                "roi_q30": q30,
+                                "roi_mean": roi_mean,
+                                "roi_ci90": roi_ci,
+                                "roi_sig_neg": roi_sig_neg,
+                                "roi_sig_pos": roi_sig_pos,
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
                             }
                         elif side == "Lay" and regime == "Pre":
                             bym_clv = _bym(sub, "clv_lay_conv")
                             # `clv_lay_conv` é a convenção com sinal "unificado":
                             # clv_conv = -(entry - closing) / closing  => Lay "bom" tende a ser POSITIVO.
-                            clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.10) or -1e9) > 0)
-                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
-                            roi_ok = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
-                            ok_sel = bool(clv_ok and roi_ok)
-                            reason = f"LayPre: clv_conv_q10>0={clv_ok}, roi_q30>0={roi_ok}"
+                            clv_mean, clv_ci = _mean_ci90(bym_clv) if bym_clv else (None, None)
+                            clv_pos = bool(clv_mean is not None and float(clv_mean) > 0)
+                            if not eligible:
+                                ok_sel = False
+                                reason = f"LayPre: N_ROI<{wf_min_m} (N={len(bym_roi)})"
+                            elif roi_sig_neg:
+                                ok_sel = False
+                                reason = "LayPre: ROI sig<0 (bloqueia)"
+                            elif roi_sig_pos:
+                                ok_sel = True
+                                reason = "LayPre: ROI sig>0"
+                            elif roi_pos and clv_pos:
+                                ok_sel = True
+                                reason = "LayPre: ROI>0 (NS) AND CLV_CONV>0"
+                            else:
+                                ok_sel = False
+                                reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
-                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "clv_mean": clv_mean,
+                                "clv_ci90": clv_ci,
                                 "train_matches_roi": len(bym_roi),
+                                "roi_mean": roi_mean,
+                                "roi_ci90": roi_ci,
+                                "roi_sig_neg": roi_sig_neg,
+                                "roi_sig_pos": roi_sig_pos,
                                 "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
                             }
                         else:
-                            bym_roi = _bym(sub, "roi")
-                            q30 = _q(bym_roi, 0.30) if bym_roi else None
-                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
-                            reason = f"In: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
+                            if not eligible:
+                                ok_sel = False
+                                reason = f"In: N_ROI<{wf_min_m} (N={len(bym_roi)})"
+                            elif roi_sig_neg:
+                                ok_sel = False
+                                reason = "In: ROI sig<0 (bloqueia)"
+                            elif roi_sig_pos:
+                                ok_sel = True
+                                reason = "In: ROI sig>0"
+                            else:
+                                ok_sel = bool(roi_pos)
+                                reason = f"In: ROI>0={roi_pos}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
-                                "roi_q30": q30,
+                                "roi_mean": roi_mean,
+                                "roi_ci90": roi_ci,
+                                "roi_sig_neg": roi_sig_neg,
+                                "roi_sig_pos": roi_sig_pos,
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
                             }
                         if ok_sel:
                             active.append(k)
@@ -4393,7 +4617,7 @@ async def main() -> int:
                 lines.append("\n### 12.A Transparência da seleção: métricas por combinação no treino\n")
                 lines.append(
                     "Para cada janela de treino, mostramos as métricas usadas para decidir se cada combinação ficou **ativa** ou não. "
-                    "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente ou ROI p30 <= 0).\n\n"
+                    "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente, ROI sig<0, ou ROI<=0 com CLV<=0 no pre‑match).\n\n"
                 )
                 lines.append(f"**Regra de elegibilidade (todas as combinações):** exige `N_ROI >= wf_min_matches` (aqui: {wf_min_m}).\n\n")
                 combos_all = [
@@ -4402,7 +4626,7 @@ async def main() -> int:
                 ]
                 for st in steps[:10]:
                     lines.append(f"**Train {st['train']} → Test {st['test']}**\n\n")
-                    lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV q10/q90 ou CI | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---|\n")
+                    lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---|\n")
                     diag = st.get("diag") or {}
                     for k in combos_all:
                         d = diag.get(k) or {}
@@ -4412,20 +4636,19 @@ async def main() -> int:
                         troi = d.get("train_matches_roi")
                         tclv_s = str(int(tclv)) if tclv is not None else "—"
                         troi_s = str(int(troi)) if troi is not None else "—"
+                        clv_mean = _safe_float(d.get("clv_mean"))
+                        clv_ci = d.get("clv_ci90")
                         clv_val = "—"
-                        if k.startswith("Back_Pre"):
-                            clv_val = _fmt_num(_safe_float(d.get("clv_q10")), 2)
-                            lb = _safe_float(d.get("clv_ci90_lb"))
-                            if lb is not None:
-                                clv_val = f"q10={_fmt_num(_safe_float(d.get('clv_q10')),2)} | CI90_lb={_fmt_num(lb,2)}"
-                        if k.startswith("Lay_Pre"):
-                            q10 = _safe_float(d.get("clv_q10"))
-                            lb = _safe_float(d.get("clv_ci90_lb"))
-                            if q10 is not None or lb is not None:
-                                clv_val = f"q10={_fmt_num(q10,2)} | CI90_lb={_fmt_num(lb,2)}"
+                        if clv_mean is not None:
+                            clv_val = f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)}"
+                        roi_mean = _safe_float(d.get("roi_mean"))
+                        roi_ci = d.get("roi_ci90")
+                        roi_val = "—"
+                        if roi_mean is not None:
+                            roi_val = f"{_fmt_pct(roi_mean,2)} {_fmt_ci(roi_ci,2)}"
                         roi_q30 = _safe_float(d.get("roi_q30"))
                         lines.append(
-                            f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
+                            f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {roi_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
                         )
                     lines.append("\n")
 
