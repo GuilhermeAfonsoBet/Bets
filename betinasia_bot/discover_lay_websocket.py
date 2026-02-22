@@ -120,6 +120,23 @@ async def _screenshot(page, path: str) -> None:
     except Exception:
         return
 
+async def _get_root_session_token(page) -> str:
+    """
+    Lê o cookie HttpOnly `root-session` via Playwright, para usar como header `session`
+    em endpoints que exigem autenticação.
+    """
+    try:
+        cookies = await page.context.cookies()
+    except Exception:
+        return ""
+    for c in cookies or []:
+        try:
+            if c.get("name") == "root-session" and isinstance(c.get("value"), str) and c.get("value"):
+                return c["value"]
+        except Exception:
+            continue
+    return ""
+
 
 @dataclass
 class WsStats:
@@ -151,6 +168,8 @@ class LayWsDiscovery:
         self.http_resps: List[dict] = []
         self._resp_tasks: List[asyncio.Task] = []
         self.response_hook_errors: int = 0
+        self.response_hook_seen: int = 0
+        self.response_hook_kept: int = 0
         self.http_reqs_phase_index: Dict[str, int] = {}
 
         # globais
@@ -255,6 +274,7 @@ class LayWsDiscovery:
         Observação: handler do Playwright não é async; então fazemos create_task.
         """
         try:
+            self.response_hook_seen += 1
             # Limita volume
             if len(self.http_resps) >= 60:
                 return
@@ -276,6 +296,34 @@ class LayWsDiscovery:
                 # ainda assim, captura /web/sessions/* que pode ser long-poll
                 if "/web/sessions/" not in low:
                     return
+
+            # Marca que passou no filtro e salva um “mínimo viável” (sem await)
+            self.response_hook_kept += 1
+            try:
+                status = int(getattr(resp, "status", 0) or 0)
+            except Exception:
+                status = 0
+            ctype = ""
+            try:
+                # response.headers é sync
+                hdrs = getattr(resp, "headers", None) or {}
+                if isinstance(hdrs, dict):
+                    ctype = str(hdrs.get("content-type") or hdrs.get("Content-Type") or "")
+            except Exception:
+                ctype = ""
+            self.http_resps.append(
+                {
+                    "ts": _utc_now_iso(),
+                    "phase": self.phase,
+                    "status": status,
+                    "resource_type": rtype,
+                    "url": url.split("#")[0],
+                    "content_type": ctype,
+                    "json_keys": [],
+                    "body_prefix": "",
+                    "mode": "min",
+                }
+            )
 
             async def _collect():
                 try:
@@ -314,6 +362,7 @@ class LayWsDiscovery:
                         "content_type": ctype,
                         "json_keys": json_keys,
                         "body_prefix": body_prefix,
+                        "mode": "body",
                     }
                 )
 
@@ -1249,13 +1298,18 @@ class LayWsDiscovery:
                 return 9
             cand = sorted([u for u in urls if "black.betinasia.com" in (u or "")], key=_prio)[:6]
             probed = []
+            session_token = await _get_root_session_token(page)
+            use_session_hdr = bool(session_token)
             for u in cand:
                 try:
                     res = await page.evaluate(
                         """
-                        async (url) => {
+                        async (params) => {
                           try {
-                            const resp = await fetch(url, {method:'GET', credentials:'same-origin'});
+                            const headers = {};
+                            if (params.session) headers['session'] = params.session;
+                            headers['Accept'] = 'application/json, text/plain, */*';
+                            const resp = await fetch(params.url, {method:'GET', credentials:'same-origin', headers});
                             const status = resp.status;
                             const ct = resp.headers.get('content-type') || '';
                             let text = '';
@@ -1274,7 +1328,7 @@ class LayWsDiscovery:
                           }
                         }
                         """,
-                        u,
+                        {"url": u, "session": session_token},
                     )
                     if isinstance(res, dict):
                         probed.append(
@@ -1291,6 +1345,7 @@ class LayWsDiscovery:
                 except Exception:
                     continue
             out["http_delta"]["probed"] = probed
+            out["http_delta"]["probe_used_session_header"] = use_session_hdr
         except Exception:
             pass
 
@@ -1364,6 +1419,8 @@ class LayWsDiscovery:
                 "offers_keys": sorted(self.global_offers_keys),
                 "offers_nested_keys": sorted(self.global_offers_nested_keys),
                 "response_hook_errors": int(self.response_hook_errors or 0),
+                "response_hook_seen": int(self.response_hook_seen or 0),
+                "response_hook_kept": int(self.response_hook_kept or 0),
             },
             "websockets": ws_summary,
             "http_resps": self.http_resps,
