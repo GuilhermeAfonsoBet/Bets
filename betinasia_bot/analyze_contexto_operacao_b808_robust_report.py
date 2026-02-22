@@ -878,7 +878,13 @@ async def main() -> int:
                 try:
                     h = dd.get("hypothesis_details") or {}
                     ws_series = _get_path(h, ["ws_series"])
-                    return isinstance(ws_series, list) and len(ws_series) > 0
+                    if isinstance(ws_series, list) and len(ws_series) > 0:
+                        return True
+                    # ws_gate_lay grava a série curta t0/t+5 em ws_gate_series
+                    ws_gate = _get_path(h, ["ws_gate_series"])
+                    if isinstance(ws_gate, list) and len(ws_gate) > 0:
+                        return True
+                    return False
                 except Exception:
                     return False
 
