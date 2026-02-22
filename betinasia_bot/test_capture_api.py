@@ -15,11 +15,12 @@ Uso:
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-USERNAME = "JomanaSilva"
-PASSWORD = "Jom1928@"
+USERNAME = os.getenv("BETINASIA_USERNAME", "").strip()
+PASSWORD = os.getenv("BETINASIA_PASSWORD", "").strip()
 BASE_URL = "https://black.betinasia.com"
 
 
@@ -75,7 +76,7 @@ async def main():
 
     username_input = await page.query_selector("input[type='text'], input[name*='user']")
     password_input = await page.query_selector("input[type='password']")
-    if username_input and password_input:
+    if USERNAME and PASSWORD and username_input and password_input:
         await username_input.fill(USERNAME)
         await password_input.fill(PASSWORD)
         await page.wait_for_timeout(500)
@@ -84,8 +85,9 @@ async def main():
             await login_btn.click()
             await page.wait_for_timeout(5000)
     else:
-        print("    Faca login manualmente no browser")
-        input("    Pressione Enter apos fazer login...")
+        print("    Credenciais não encontradas em env (BETINASIA_USERNAME/BETINASIA_PASSWORD).")
+        print("    Faça login manualmente no browser.")
+        input("    Pressione Enter após fazer login...")
 
     if "/login" in page.url:
         print("    Faca login manualmente")

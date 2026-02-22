@@ -17,11 +17,12 @@ Passos manuais no browser:
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-USERNAME = "JomanaSilva"
-PASSWORD = "Jom1928@"
+USERNAME = os.getenv("BETINASIA_USERNAME", "").strip()
+PASSWORD = os.getenv("BETINASIA_PASSWORD", "").strip()
 BASE_URL = "https://black.betinasia.com"
 
 
@@ -73,7 +74,7 @@ async def main():
 
     user_input = await page.query_selector("input[type='text']")
     pass_input = await page.query_selector("input[type='password']")
-    if user_input and pass_input:
+    if USERNAME and PASSWORD and user_input and pass_input:
         await user_input.fill(USERNAME)
         await pass_input.fill(PASSWORD)
         await page.wait_for_timeout(500)
