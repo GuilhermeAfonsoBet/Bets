@@ -339,6 +339,10 @@ def classify_model(audit_version: str) -> str:
     v = (audit_version or "").strip()
     if v == "v4.0-api":
         return "API (2-4s)"
+    # Auditoria WS-only (sem betslip): série temporal inteiramente via WebSocket.
+    # Mantemos como modelo distinto para permitir comparações no relatório.
+    if "ws-only" in v.lower() or v.lower().startswith("v5.") and "ws" in v.lower():
+        return "WS-only (t0..t+N)"
     if v in ("v1.0", "v1.0-recovered"):
         return "DOM (15-30s)"
     return f"Outro ({v})" if v else "Outro"
@@ -521,8 +525,8 @@ async def main() -> int:
     parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
     parser.add_argument(
         "--versions",
-        default="v4.0-api,v1.0,v1.0-recovered",
-        help="Lista de audit_version separada por vírgula (default: v4.0-api,v1.0,v1.0-recovered)",
+        default="v4.0-api,v5.0-ws-only,v1.0,v1.0-recovered",
+        help="Lista de audit_version separada por vírgula (default: v4.0-api,v5.0-ws-only,v1.0,v1.0-recovered)",
     )
     parser.add_argument(
         "--database-url",
@@ -970,6 +974,7 @@ async def main() -> int:
         def _is_nonempty_array(x: Any) -> bool:
             return isinstance(x, list) and len(x) > 0
 
+        ok_any = [d for d in all_data if str(d.get("status", "")).upper() == "OK"]
         n_temporal = sum(
             1
             for d in ok_bs
@@ -979,6 +984,11 @@ async def main() -> int:
             1
             for d in ok_bs
             if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["lay_temporal"]))
+        )
+        n_ws_series = sum(
+            1
+            for d in ok_any
+            if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["ws_series"]))
         )
         n_finance = sum(
             1
@@ -1559,7 +1569,8 @@ async def main() -> int:
             f"- **Coortes (status=OK, betslip confiável)**: `BS>WS` (diff>={back_cut:.1f}%): **{len(back_edge)}**; `BS<WS` (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
         )
         summary_lines.append(
-            f"- **Coberturas em `hypothesis_details` (OK)**: temporal(back)={n_temporal}/{len(ok_bs)}; lay_temporal={n_lay_temporal}/{len(ok_bs)}; finance={n_finance}/{len(ok_bs)}.\n"
+            f"- **Coberturas em `hypothesis_details` (OK)**: temporal(BS)={n_temporal}/{len(ok_bs)}; lay_temporal(BS)={n_lay_temporal}/{len(ok_bs)}; "
+            f"ws_series(WS)={n_ws_series}/{len(ok_any)}; finance={n_finance}/{len(ok_bs)}.\n"
         )
         summary_lines.append(
             f"- **Cobertura de placar (ROI)**: jogos com placar={matches_with_scores}/{unique_matches_all} (status finished={matches_finished_flag}).\n"
@@ -2161,48 +2172,137 @@ async def main() -> int:
                 return ((-mult_back) / liab) * 100.0
             return 0.0
 
-        def _build_back_series(d: dict) -> List[dict]:
+        def _extract_ws_series(d: dict) -> List[dict]:
+            """
+            Normaliza `hypothesis_details.ws_series` (WS-only) para pontos {t, odd}.
+            Observação: os pontos podem vir com `t_target_s` e `t_actual_s`; preferimos `t_actual_s`.
+            """
             h = d.get("hypothesis_details") or {}
-            series = []
-            # T0 (auditoria)
-            t0_diff = _safe_float(d.get("diff_pct"))
-            t0_odd = _safe_float(d.get("bs_odd"))
-            if t0_diff is not None and t0_odd is not None:
-                series.append({"t": 0.0, "diff_pct": t0_diff, "odd": t0_odd})
-            arr = h.get("temporal")
-            if isinstance(arr, list):
+            arr = h.get("ws_series") if isinstance(h, dict) else None
+            if not isinstance(arr, list):
+                return []
+            out: List[dict] = []
+            for e in arr:
+                if not isinstance(e, dict):
+                    continue
+                t = _safe_float(e.get("t_actual_s"))
+                if t is None:
+                    t = _safe_float(e.get("t_target_s"))
+                odd = _safe_float(e.get("ws_odd"))
+                if t is None or odd is None or odd <= 0:
+                    continue
+                out.append({"t": float(t), "odd": float(odd)})
+            out.sort(key=lambda x: x["t"])
+            return out
+
+        def _build_back_series(d: dict) -> List[dict]:
+            """
+            Série temporal do BACK (entrada) para análise de pico/reversão.
+
+            Compatibilidade:
+            - Antigo: `hypothesis_details.temporal` (pontos com BS refresh).
+            - Novo: `hypothesis_details.ws_series` (pontos inteiramente via WS).
+
+            Para manter comparabilidade, definimos `diff_pct` sempre vs `ws_odd` do t0:
+              diff_pct(t) = (odd_t - ws_t0) / ws_t0 * 100
+            onde odd_t é BS(t) quando existir; caso contrário WS(t).
+            """
+            h = d.get("hypothesis_details") or {}
+            ws0 = _safe_float(d.get("ws_odd"))
+            bs0 = _safe_float(d.get("bs_odd"))
+            ws_series = _extract_ws_series(d)
+            # fallback se ws_odd estiver ausente
+            if (ws0 is None or ws0 <= 0) and ws_series:
+                ws0 = _safe_float(ws_series[0].get("odd"))
+            if ws0 is None or ws0 <= 0:
+                return []
+
+            # t0 odd: preferimos BS (execução), senão WS (mercado)
+            t0_odd = bs0 if (bs0 is not None and bs0 > 0) else ws0
+            series: List[dict] = [{"t": 0.0, "odd": float(t0_odd), "diff_pct": float((t0_odd - ws0) / ws0 * 100.0)}]
+
+            arr = h.get("temporal") if isinstance(h, dict) else None
+            if isinstance(arr, list) and len(arr) > 0:
+                # temporal via BS
                 for e in arr:
                     if not isinstance(e, dict):
                         continue
                     t = _safe_float(e.get("t"))
-                    diff = _safe_float(e.get("diff_pct"))
+                    # Pós-mudança BS->WS alguns pipelines podem salvar `ws_odd` no array temporal.
                     odd = _safe_float(e.get("bs_odd"))
-                    if t is None or diff is None or odd is None:
+                    if odd is None:
+                        odd = _safe_float(e.get("ws_odd"))
+                    if t is None or odd is None or odd <= 0:
                         continue
-                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+                    if float(t) <= 0.0005:
+                        continue
+                    series.append({"t": float(t), "odd": float(odd), "diff_pct": float((odd - ws0) / ws0 * 100.0)})
+            else:
+                # temporal via WS
+                for p in ws_series:
+                    t = _safe_float(p.get("t"))
+                    odd = _safe_float(p.get("odd"))
+                    if t is None or odd is None or odd <= 0:
+                        continue
+                    if float(t) <= 0.0005:
+                        continue
+                    series.append({"t": float(t), "odd": float(odd), "diff_pct": float((odd - ws0) / ws0 * 100.0)})
+
             series.sort(key=lambda x: x["t"])
             return series
 
         def _build_lay_series(d: dict) -> List[dict]:
+            """
+            Série temporal do LAY.
+
+            Preferimos dados reais do lay via betslip (`lay`/`lay_temporal`). Se não houver
+            `lay_temporal` mas existir `ws_series`, usamos WS como proxy APENAS para dinâmica temporal
+            (mantendo `diff_pct` vs ws_t0).
+            """
             h = d.get("hypothesis_details") or {}
-            series = []
-            ws_odd = _safe_float(d.get("ws_odd"))
-            lay0 = _safe_float(_get_path(h, ["lay", "odd"]))
-            if ws_odd and lay0:
-                series.append(
-                    {"t": 0.0, "diff_pct": ((lay0 - ws_odd) / ws_odd) * 100.0, "odd": lay0}
-                )
-            arr = h.get("lay_temporal")
-            if isinstance(arr, list):
+            ws0 = _safe_float(d.get("ws_odd"))
+            lay0 = _safe_float(_get_path(h, ["lay", "odd"])) if isinstance(h, dict) else None
+            ws_series = _extract_ws_series(d)
+
+            # base de comparação: ws_t0 (quando disponível)
+            if (ws0 is None or ws0 <= 0) and ws_series:
+                ws0 = _safe_float(ws_series[0].get("odd"))
+            if ws0 is None or ws0 <= 0:
+                return []
+
+            series: List[dict] = []
+            if lay0 is not None and lay0 > 0:
+                series.append({"t": 0.0, "odd": float(lay0), "diff_pct": float((lay0 - ws0) / ws0 * 100.0)})
+            else:
+                # Sem lay0: não inventamos série de lay, a menos que haja dados explícitos.
+                return []
+
+            arr = h.get("lay_temporal") if isinstance(h, dict) else None
+            if isinstance(arr, list) and len(arr) > 0:
                 for e in arr:
                     if not isinstance(e, dict):
                         continue
                     t = _safe_float(e.get("t"))
-                    diff = _safe_float(e.get("diff_pct"))
                     odd = _safe_float(e.get("lay_odd"))
-                    if t is None or diff is None or odd is None:
+                    if odd is None:
+                        odd = _safe_float(e.get("ws_odd"))
+                    if t is None or odd is None or odd <= 0:
                         continue
-                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+                    if float(t) <= 0.0005:
+                        continue
+                    series.append({"t": float(t), "odd": float(odd), "diff_pct": float((odd - ws0) / ws0 * 100.0)})
+            else:
+                # Se não há lay_temporal, mas há ws_series, podemos ao menos medir dinâmica temporal
+                # (proxy do lay) — útil quando o pipeline mudou de BS->WS para t>0.
+                for p in ws_series:
+                    t = _safe_float(p.get("t"))
+                    odd = _safe_float(p.get("odd"))
+                    if t is None or odd is None or odd <= 0:
+                        continue
+                    if float(t) <= 0.0005:
+                        continue
+                    series.append({"t": float(t), "odd": float(odd), "diff_pct": float((odd - ws0) / ws0 * 100.0)})
+
             series.sort(key=lambda x: x["t"])
             return series
 
@@ -2393,15 +2493,25 @@ async def main() -> int:
                 out.append((f"t+{t}s", len(pts), float(np.mean(diffs)), float(np.mean(odds)), float(np.mean(clvs)) if clvs else None, float(np.mean(rois)) if rois else None))
             return out
 
+        # Base para timing: inclui auditorias OK mesmo sem betslip (WS-only),
+        # desde que exista série temporal suficiente (>=2 pontos).
+        ok_timing_back = [d for d in ok_any if len(_build_back_series(d)) >= 2]
+        ok_timing_lay = [d for d in ok_any if len(_build_lay_series(d)) >= 2]
+
         lines.append("## 8) Curva temporal (pico, reversão e melhor timing)\n")
-        lines.append("Esta seção usa `hypothesis_details.temporal` (Back) e `hypothesis_details.lay_temporal` (Lay), coletados em pontos discretos (t≈0,3,6,10,15,20s).\n\n")
+        lines.append(
+            "Esta seção usa séries temporais coletadas em pontos discretos (t≈0,3,6,10,15,20s). Fontes possíveis:\n\n"
+            "- **BS-temporal (legado)**: `hypothesis_details.temporal` (Back) e `hypothesis_details.lay_temporal` (Lay)\n"
+            "- **WS-temporal (novo)**: `hypothesis_details.ws_series` (todos os t’s via WebSocket)\n\n"
+            "Para manter comparabilidade, nesta seção `diff_pct(t)` é sempre calculado contra o **WS do t0** (`ws_odd`): `(odd_t - ws_t0)/ws_t0*100`.\n\n"
+        )
         lines.append(
             "O objetivo é responder: **tempo até o pico/vale**, **% que segue melhorando até t_max**, **% com reversão** e **impacto esperado por timing**. "
             "**CLV é reportado somente pre-match** (closing pré-jogo).\n\n"
         )
 
         # BACK
-        back_stats = _summarize_timing(ok_bs, mode="back")["rows"]
+        back_stats = _summarize_timing(ok_timing_back, mode="back")["rows"]
         back_agg = _agg_by_regime(back_stats)
         lines.append("### 8.1 Back (pico em diff_pct)\n")
         lines.append(
@@ -2431,7 +2541,7 @@ async def main() -> int:
 
         lines.append("\n**Curva média (Back)**: média de `diff_pct` e `odd` por tempo. `CLV` é reportado **somente pre-match** (closing pré-jogo). `ROI` (quando aparece) é o **ROI realizado** se a aposta fosse feita naquele ponto.\n\n")
         lines.append("| Tempo | N pts | diff_pct médio | odd média | CLV médio (pre-match) | ROI médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
-        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="back"):
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_timing_back, mode="back"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
 
         def _entry_metrics_back(d: dict) -> Optional[dict]:
@@ -2541,7 +2651,7 @@ async def main() -> int:
             return summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
 
         # 8.1b) impacto: t0 vs pico vs último, com/sem reversão
-        back_entries = [em for d in ok_bs for em in [_entry_metrics_back(d)] if em is not None]
+        back_entries = [em for d in ok_timing_back for em in [_entry_metrics_back(d)] if em is not None]
         lines.append("\n### 8.1b Back — impacto por timing (t0 vs pico vs último) e reversão\n")
         lines.append(
             "Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
@@ -2589,7 +2699,7 @@ async def main() -> int:
             )
 
         # LAY
-        lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
+        lay_stats = _summarize_timing(ok_timing_lay, mode="lay")["rows"]
         lay_agg = _agg_by_regime(lay_stats)
         lines.append("\n### 8.2 Lay (vale em diff_pct)\n")
         lines.append("| Regime | N | t_vale médio (s) | t_vale p50 (s) | % melhora até fim | % com reversão | t_reversão médio (s) | Δt (rev - vale) médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
@@ -2615,10 +2725,10 @@ async def main() -> int:
 
         lines.append("\n**Curva média (Lay)**: usa `odd=lay_odd`. `CLV` é reportado **somente pre-match** (closing pré-jogo). O ROI mostrado aqui é **ROI por liability** (não por stake), porque Lay é governado por risco.\n\n")
         lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (pre-match) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
-        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="lay"):
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_timing_lay, mode="lay"):
             lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
 
-        lay_entries = [em for d in ok_bs for em in [_entry_metrics_lay(d)] if em is not None]
+        lay_entries = [em for d in ok_timing_lay for em in [_entry_metrics_lay(d)] if em is not None]
         lines.append("\n### 8.2b Lay — impacto por timing (t0 vs vale vs último) e reversão\n")
         lines.append(
             "Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
@@ -2661,7 +2771,7 @@ async def main() -> int:
             "- **IC90** é bootstrap por jogo (cluster em `match_id`). Para critério “p30” usamos o quantil bootstrap **p30** do estimador.\n\n"
         )
 
-        by_audit_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+        by_audit_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_any if d.get("id") is not None}
 
         def _combo_rows(entries: List[dict], *, is_live: bool, had_rev: bool) -> List[dict]:
             return [r for r in entries if r.get("is_live") is is_live and bool(r.get("had_reversal")) is bool(had_rev)]
