@@ -639,6 +639,18 @@ async def main() -> int:
         "Se vazio, não roda a análise de sensibilidade por banca.",
     )
     parser.add_argument(
+        "--wf-flat-stake-back",
+        type=float,
+        default=float(os.getenv("WF_FLAT_STAKE_BACK", "1.0")),
+        help="Stake constante quando o scheme do Back for FLAT (em unidades monetárias do relatório). Default=1.0.",
+    )
+    parser.add_argument(
+        "--wf-flat-liab-lay",
+        type=float,
+        default=float(os.getenv("WF_FLAT_LIAB_LAY", "1.0")),
+        help="Liability constante quando o scheme do Lay for FLAT (em unidades monetárias do relatório). Default=1.0.",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -3982,6 +3994,8 @@ async def main() -> int:
             bud_back_frac = max(0.0, float(getattr(args, "wf_budget_back_frac", 0.01)))
             bud_lay_frac = max(0.0, float(getattr(args, "wf_budget_lay_frac", 0.005)))
             bud_cap_sig_frac = max(0.0, float(getattr(args, "wf_budget_cap_signal_frac", 0.33)))
+            wf_flat_stake_back = max(0.0, float(getattr(args, "wf_flat_stake_back", 1.0)))
+            wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
 
             # index para recuperar campos de sizing/liquidez
             audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
@@ -4172,6 +4186,8 @@ async def main() -> int:
                     sc = _scheme_for_event(ev)
                     if ev.get("side") == "Back":
                         st = _sizing_back(d0, sc)
+                        if sc == "FLAT":
+                            st = float(wf_flat_stake_back)
                         if st is None or float(st) <= 0:
                             return (None, None)
                         return (float(st), float(st))
@@ -4184,7 +4200,7 @@ async def main() -> int:
                     if lay_odd is None or float(lay_odd) <= 1.0:
                         return (None, None)
                     if sc == "FLAT":
-                        liab = 1.0
+                        liab = float(wf_flat_liab_lay)
                     elif sc == "PROXY":
                         # replica finance_for_row, mas com odd de entrada
                         h = d0.get("hypothesis_details") or {}
@@ -4693,6 +4709,9 @@ async def main() -> int:
                     f"**Padrão de risco**: P&L aqui já é calculado com **budget por jogo (match_id)** consumido ao longo do tempo "
                     f"(Back={bud_back_frac:.2%} da banca ref; Lay={bud_lay_frac:.2%} em liability; cap por sinal={bud_cap_sig_frac:.0%} do budget).\n\n"
                 )
+                lines.append(
+                    f"**Sizing FLAT (quando aplicável no WF)**: Back stake={_fmt_num(wf_flat_stake_back,2)} | Lay liability={_fmt_num(wf_flat_liab_lay,2)}.\n\n"
+                )
 
                 oos_days = sorted(daily_turn.keys())
                 n_oos_days = len(oos_days) if oos_days else 0
@@ -5005,7 +5024,7 @@ async def main() -> int:
 
                         if ev.get("side") == "Back":
                             if sc == "FLAT":
-                                st = 1.0
+                                st = float(wf_flat_stake_back)
                             elif sc == "PROXY":
                                 st = _sizing_back(d0, "PROXY")
                             elif str(sc).startswith("KELLY"):
@@ -5038,7 +5057,7 @@ async def main() -> int:
                             return (None, None)
 
                         if sc == "FLAT":
-                            liab = 1.0
+                            liab = float(wf_flat_liab_lay)
                         elif sc == "PROXY":
                             sized = _sizing_lay_liab(d0, "PROXY")
                             if not sized:
