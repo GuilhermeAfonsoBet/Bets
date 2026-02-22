@@ -754,6 +754,51 @@ class LayWsDiscovery:
             except Exception:
                 pass
 
+            # Fallback 2: clicar em qualquer link que pareça ser um evento (href com vírgulas)
+            try:
+                clicked = await page.evaluate(
+                    """
+                    () => {
+                      const links = Array.from(document.querySelectorAll('a[href]'));
+                      for (const a of links) {
+                        const href = (a.getAttribute('href') || '');
+                        if (!href) continue;
+                        if (href.includes(',') && (href.includes('trade') || href.includes('sportsbook'))) {
+                          const r = a.getBoundingClientRect();
+                          if (!r || r.width < 40 || r.height < 12) continue;
+                          if (a.offsetParent === null) continue;
+                          try { a.scrollIntoView({behavior:'instant', block:'center'});} catch(e){}
+                          try { a.click(); return {href: href.slice(0,200)}; } catch(e){}
+                        }
+                      }
+                      return null;
+                    }
+                    """
+                )
+                if clicked:
+                    out["interaction"]["clicked"].append({"what": "event_href_comma", **clicked})
+                    await page.wait_for_timeout(2500)
+            except Exception:
+                pass
+
+            # Fallback 3: tentar clicar em um elemento que pareça "order ticket" (Back/Lay)
+            try:
+                ok, sel = await _try_click_any(
+                    page,
+                    [
+                        "text=/\\bback\\b/i",
+                        "text=/\\blay\\b/i",
+                        "text=/\\border\\b/i",
+                        "text=/\\bprice\\b/i",
+                    ],
+                    timeout_ms=2000,
+                )
+                if ok:
+                    out["interaction"]["clicked"].append({"what": "ticket_hint", "sel": sel})
+                    await page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
             try:
                 ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 p1 = f"logs/lay_ws_screens/{ts}_trade_02_after_interact.png"
@@ -789,6 +834,33 @@ class LayWsDiscovery:
                 }
             )
 
+        # Pairing: mostra que "for" e "against" compartilham o MESMO suffix
+        # (ex.: for,ah,h,-1  vs against,ah,h,-1). Isso demonstra que "against" não é "away".
+        suffix_pair: Dict[str, Dict[str, int]] = {}
+        for bt, c in (self.global_pmm_bet_type_counts or {}).items():
+            if not isinstance(bt, str) or "," not in bt:
+                continue
+            parts = [p.strip() for p in bt.split(",") if p is not None]
+            if len(parts) < 2:
+                continue
+            prefix = parts[0].lower()
+            suffix = ",".join(parts[1:]).strip()
+            if not suffix:
+                continue
+            d = suffix_pair.setdefault(suffix, {"for": 0, "against": 0, "other": 0})
+            if prefix == "for":
+                d["for"] += int(c or 0)
+            elif prefix == "against":
+                d["against"] += int(c or 0)
+            else:
+                d["other"] += int(c or 0)
+
+        paired_suffixes = []
+        for suf, d in suffix_pair.items():
+            if d.get("for", 0) > 0 and d.get("against", 0) > 0:
+                paired_suffixes.append((suf, int(d["for"]), int(d["against"])))
+        paired_suffixes.sort(key=lambda x: -(x[1] + x[2]))
+
         return {
             "ts": _utc_now_iso(),
             "elapsed_sec": round(elapsed, 3),
@@ -800,6 +872,7 @@ class LayWsDiscovery:
                 "pmm_bet_prefix_top": self.global_pmm_bet_prefix_counts.most_common(10),
                 "pmm_against_samples": self.global_pmm_against_samples,
                 "pmm_bet_types_top": self.global_pmm_bet_type_counts.most_common(25),
+                "pmm_suffix_pair_top": paired_suffixes[:25],
                 "offers_keys": sorted(self.global_offers_keys),
                 "offers_nested_keys": sorted(self.global_offers_nested_keys),
             },
