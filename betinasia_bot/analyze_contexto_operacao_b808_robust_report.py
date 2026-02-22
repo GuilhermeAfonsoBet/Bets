@@ -871,8 +871,9 @@ async def main() -> int:
             except Exception:
                 raw_days_missing = []
 
-        # Auto-exclusão: dias WS-only sem Lay (regime onde bs_odd e lay não existem)
+        # Auto-exclusão: dias com falha operacional / regime WS-only sem Lay
         auto_excluded_ws_only_no_lay: List[str] = []
+        auto_excluded_unusable_no_bs_ws_lay: List[str] = []
         if not bool(getattr(args, "no_auto_exclude_days", False)):
             def _has_ws_series(dd: dict) -> bool:
                 try:
@@ -918,15 +919,21 @@ async def main() -> int:
             auto_excluded_ws_only_no_lay = sorted(
                 [day for day, f in day_flags.items() if f.get("has_ws") and (not f.get("has_bs")) and (not f.get("has_lay"))]
             )
+            # Dia "inútil" (falha operacional / bloqueio / mudança de schema):
+            # existe volume de registros, mas não há BS, nem WS series/gate, nem Lay em nenhum registro do dia.
+            auto_excluded_unusable_no_bs_ws_lay = sorted(
+                [day for day, f in day_flags.items() if (not f.get("has_ws")) and (not f.get("has_bs")) and (not f.get("has_lay"))]
+            )
 
         # Exclusão manual via CLI/env
         exclude_days_manual = {x.strip() for x in str(getattr(args, "exclude_audited_days", "") or "").split(",") if x.strip()}
 
         # Conjunto final de dias a excluir do dataset (quando existem registros)
-        exclude_days_all = set(exclude_days_manual) | set(auto_excluded_ws_only_no_lay)
+        exclude_days_all = set(exclude_days_manual) | set(auto_excluded_ws_only_no_lay) | set(auto_excluded_unusable_no_bs_ws_lay)
         excluded_days_summary = {
             "manual": sorted(exclude_days_manual),
             "auto_ws_only_no_lay": list(auto_excluded_ws_only_no_lay),
+            "auto_unusable_no_bs_ws_lay": list(auto_excluded_unusable_no_bs_ws_lay),
             "missing_no_data": list(raw_days_missing),
         }
 
@@ -937,7 +944,8 @@ async def main() -> int:
             if before_n != after_n:
                 print(
                     f"[INFO] Excluídos {before_n - after_n} registros por dias UTC (manual={len(exclude_days_manual)}, "
-                    f"auto_ws_only_no_lay={len(auto_excluded_ws_only_no_lay)})."
+                    f"auto_ws_only_no_lay={len(auto_excluded_ws_only_no_lay)}, "
+                    f"auto_unusable_no_bs_ws_lay={len(auto_excluded_unusable_no_bs_ws_lay)})."
                 )
 
         # ------------------------------------------------------------
@@ -1844,8 +1852,9 @@ async def main() -> int:
         try:
             man = list((excluded_days_summary or {}).get("manual") or [])
             auto_nl = list((excluded_days_summary or {}).get("auto_ws_only_no_lay") or [])
+            auto_unusable = list((excluded_days_summary or {}).get("auto_unusable_no_bs_ws_lay") or [])
             miss = list((excluded_days_summary or {}).get("missing_no_data") or [])
-            if man or auto_nl or miss:
+            if man or auto_nl or auto_unusable or miss:
                 def _fmt_days(xs: List[str], max_show: int = 8) -> str:
                     xs = [str(x) for x in xs if str(x)]
                     if not xs:
@@ -1858,6 +1867,7 @@ async def main() -> int:
                     "- **Dias excluídos / missing** (UTC, não tratados como 0): "
                     f"manual={len(man)} [{_fmt_days(man)}]; "
                     f"auto(ws-only sem Lay)={len(auto_nl)} [{_fmt_days(auto_nl)}]; "
+                    f"auto(sem BS/WS/Lay)={len(auto_unusable)} [{_fmt_days(auto_unusable)}]; "
                     f"missing(sem dados)={len(miss)} [{_fmt_days(miss)}].\n"
                 )
         except Exception:
