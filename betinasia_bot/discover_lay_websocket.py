@@ -136,6 +136,7 @@ class WsStats:
     pmm_bet_type_counts: Counter = field(default_factory=Counter)  # bet_type completo
     pmm_against_samples: List[dict] = field(default_factory=list)  # amostras de PMM com against, se existir
     pmm_for_samples: List[dict] = field(default_factory=list)  # amostras de PMM com for
+    trade_keyword_snippets: List[dict] = field(default_factory=list)  # snippets com palavras de trade (order/bid/ask)
     recv_samples: List[dict] = field(default_factory=list)
     sent_samples: List[dict] = field(default_factory=list)
 
@@ -149,6 +150,7 @@ class LayWsDiscovery:
         self.http_reqs: List[dict] = []
         self.http_resps: List[dict] = []
         self._resp_tasks: List[asyncio.Task] = []
+        self.response_hook_errors: int = 0
         self.http_reqs_phase_index: Dict[str, int] = {}
 
         # globais
@@ -316,12 +318,20 @@ class LayWsDiscovery:
                 )
 
             try:
-                t = asyncio.create_task(_collect())
+                try:
+                    loop = asyncio.get_running_loop()
+                except Exception:
+                    loop = None
+                if not loop:
+                    self.response_hook_errors += 1
+                    return
+                t = loop.create_task(_collect())
                 self._resp_tasks.append(t)
                 # evita crescer sem limite
                 if len(self._resp_tasks) > 120:
                     self._resp_tasks = [x for x in self._resp_tasks if not x.done()][-80:]
             except Exception:
+                self.response_hook_errors += 1
                 return
         except Exception:
             return
@@ -341,6 +351,11 @@ class LayWsDiscovery:
         # Snippet rápido para qualquer coisa com "lay"
         if "lay" in p_low and len(stats.snippets_with_lay) < self.sample_limit:
             stats.snippets_with_lay.append(
+                {"ts": _utc_now_iso(), "phase": self.phase, "direction": direction, "payload": _truncate(payload, 1200)}
+            )
+        # Snippet de trade/orderbook: útil para /trade se o servidor embedar dados no WS
+        if any(k in p_low for k in ("order", "bid", "ask", "orderbook", "trade")) and len(stats.trade_keyword_snippets) < 12:
+            stats.trade_keyword_snippets.append(
                 {"ts": _utc_now_iso(), "phase": self.phase, "direction": direction, "payload": _truncate(payload, 1200)}
             )
 
@@ -812,6 +827,7 @@ class LayWsDiscovery:
                 "betslip_posts": 0,
                 "betslip_refresh_posts": 0,
                 "xhr_fetch_urls_top": [],
+                "probed": [],
             },
             "screenshots": [],
         }
@@ -1217,6 +1233,67 @@ class LayWsDiscovery:
         except Exception:
             pass
 
+        # Probe de endpoints para descobrir payloads (sem depender do hook de response)
+        try:
+            urls = [u for (u, _c) in (out.get("http_delta", {}).get("xhr_fetch_urls_top") or [])]
+            def _prio(u: str) -> int:
+                ul = (u or "").lower()
+                if "/web/sessions/" in ul and "/broadcaster/" in ul:
+                    return 0
+                if "/web/sessions/" in ul and "/announcement/" in ul:
+                    return 1
+                if "/web/sessions/" in ul:
+                    return 2
+                if "/web/" in ul:
+                    return 3
+                return 9
+            cand = sorted([u for u in urls if "black.betinasia.com" in (u or "")], key=_prio)[:6]
+            probed = []
+            for u in cand:
+                try:
+                    res = await page.evaluate(
+                        """
+                        async (url) => {
+                          try {
+                            const resp = await fetch(url, {method:'GET', credentials:'same-origin'});
+                            const status = resp.status;
+                            const ct = resp.headers.get('content-type') || '';
+                            let text = '';
+                            try { text = await resp.text(); } catch(e) { text = ''; }
+                            let jsonKeys = [];
+                            try {
+                              const j = JSON.parse(text);
+                              if (j && typeof j === 'object' && !Array.isArray(j)) {
+                                jsonKeys = Object.keys(j).slice(0, 60);
+                              }
+                            } catch(e) {}
+                            const prefix = (text || '').slice(0, 800);
+                            return {ok: resp.ok, status, content_type: ct, json_keys: jsonKeys, prefix};
+                          } catch(e) {
+                            return {ok:false, error: e.message};
+                          }
+                        }
+                        """,
+                        u,
+                    )
+                    if isinstance(res, dict):
+                        probed.append(
+                            {
+                                "url": u,
+                                "ok": bool(res.get("ok")),
+                                "status": res.get("status"),
+                                "content_type": res.get("content_type"),
+                                "json_keys": res.get("json_keys") or [],
+                                "prefix": _truncate(str(res.get("prefix") or ""), 800),
+                                "error": res.get("error") or "",
+                            }
+                        )
+                except Exception:
+                    continue
+            out["http_delta"]["probed"] = probed
+        except Exception:
+            pass
+
         await page.wait_for_timeout(int(float(wait_sec) * 1000))
         return out
 
@@ -1236,6 +1313,7 @@ class LayWsDiscovery:
                     "pmm_bet_types_top": st.pmm_bet_type_counts.most_common(15),
                     "pmm_against_samples": st.pmm_against_samples,
                     "pmm_for_samples": st.pmm_for_samples,
+                    "trade_keyword_snippets": st.trade_keyword_snippets,
                     "offers_keys": sorted(st.offers_keys),
                     "offers_nested_keys": sorted(st.offers_nested_keys),
                     "snippets_with_lay": st.snippets_with_lay,
@@ -1285,8 +1363,10 @@ class LayWsDiscovery:
                 "pmm_suffix_pair_top": paired_suffixes[:25],
                 "offers_keys": sorted(self.global_offers_keys),
                 "offers_nested_keys": sorted(self.global_offers_nested_keys),
+                "response_hook_errors": int(self.response_hook_errors or 0),
             },
             "websockets": ws_summary,
+            "http_resps": self.http_resps,
         }
 
 
