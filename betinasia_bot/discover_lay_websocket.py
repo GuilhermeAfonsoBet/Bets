@@ -780,6 +780,28 @@ class LayWsDiscovery:
             except Exception:
                 pass
 
+            # Tenta ir diretamente para a rota principal do Trade Football (full-time)
+            try:
+                await page.goto("https://black.betinasia.com/trade/football/full-time")
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(2500)
+                out["interaction"]["clicked"].append({"what": "goto_trade_football_fulltime"})
+            except Exception:
+                pass
+
+            # Tenta clicar em "Top" / "Live" caso exista (Trade geralmente tem essas tabs).
+            try:
+                ok, sel = await _try_click_any(
+                    page,
+                    ["text=/\\btop\\b/i", "text=/\\blive\\b/i", "button:has-text('Top')", "button:has-text('Live')"],
+                    timeout_ms=2000,
+                )
+                if ok:
+                    out["interaction"]["clicked"].append({"what": "top_or_live", "sel": sel})
+                    await page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
             try:
                 # tenta clicar em qualquer linha/list item que contenha "vs"
                 clicked = await page.evaluate(
@@ -835,6 +857,16 @@ class LayWsDiscovery:
             except Exception:
                 pass
 
+            # Fallback 2b: scroll para forçar renderização virtualizada de lista
+            try:
+                await page.mouse.wheel(0, 1400)
+                await page.wait_for_timeout(1200)
+                await page.mouse.wheel(0, 1400)
+                await page.wait_for_timeout(1200)
+                out["interaction"]["clicked"].append({"what": "scroll"})
+            except Exception:
+                pass
+
             # Fallback 3: tentar clicar em um elemento que pareça "order ticket" (Back/Lay)
             try:
                 ok, sel = await _try_click_any(
@@ -858,6 +890,53 @@ class LayWsDiscovery:
                 p1 = f"logs/lay_ws_screens/{ts}_trade_02_after_interact.png"
                 await _screenshot(page, p1)
                 out["screenshots"].append(p1)
+            except Exception:
+                pass
+
+            # Recoleta debug após interações
+            try:
+                out["dom_debug"]["url_after"] = getattr(page, "url", "") or out["dom_debug"].get("url_after", "")
+            except Exception:
+                pass
+            try:
+                out["dom_debug"]["counts"] = await page.evaluate(
+                    """
+                    () => {
+                      const q = (re) => Array.from(document.querySelectorAll('div,span,button,a,li'))
+                        .filter(el => ((el.innerText||'').match(re)||[]).length>0).length;
+                      return {
+                        hasVs: q(/\\bvs\\b/i),
+                        hasBack: q(/\\bback\\b/i),
+                        hasLay: q(/\\blay\\b/i),
+                        hasOrder: q(/\\border\\b/i),
+                        hasPrice: q(/\\bprice\\b/i),
+                        hasMarket: q(/\\bmarket\\b/i),
+                      };
+                    }
+                    """
+                )
+            except Exception:
+                pass
+            try:
+                out["dom_debug"]["link_samples"] = await page.evaluate(
+                    """
+                    () => {
+                      const out = [];
+                      const links = Array.from(document.querySelectorAll('a[href]'));
+                      for (const a of links.slice(0, 450)) {
+                        const href = (a.getAttribute('href') || '').trim();
+                        const t = (a.innerText || '').trim().replace(/\\s+/g,' ').slice(0, 80);
+                        if (!href) continue;
+                        if (href.startsWith('javascript:')) continue;
+                        if (href.includes(',') || href.toLowerCase().includes('trade') || href.toLowerCase().includes('football')) {
+                          out.push({href: href.slice(0, 200), text: t});
+                        }
+                        if (out.length >= 80) break;
+                      }
+                      return out;
+                    }
+                    """
+                )
             except Exception:
                 pass
 
@@ -1001,6 +1080,7 @@ async def main():
                     pass
                 # 3) tenta clicar em "Trade" no menu superior
                 disc.phase = "trade_from_sportsbook"
+                url_before = getattr(page, "url", "")
                 clicked, sel = await _try_click_any(
                     page,
                     ["text=/\\btrade\\b/i", "a:has-text('Trade')", "button:has-text('Trade')"],
@@ -1010,8 +1090,21 @@ async def main():
                     "mode": "trade_from_sportsbook",
                     "trade_clicked": bool(clicked),
                     "trade_selector": sel,
-                    "url_after": getattr(page, "url", ""),
+                    "url_before": url_before,
+                    "url_after_click": getattr(page, "url", ""),
                 }
+                # Se não navegou para /trade, força a rota que vimos no DOM.
+                forced = False
+                try:
+                    if "/trade" not in (getattr(page, "url", "") or ""):
+                        await page.goto("https://black.betinasia.com/trade/football/full-time")
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(2500)
+                        forced = True
+                except Exception:
+                    forced = False
+                click_info["forced_goto_trade"] = forced
+                click_info["url_after"] = getattr(page, "url", "")
                 await page.wait_for_timeout(int(float(args.trade_wait_sec) * 1000))
             else:
                 click_info = await disc.trade_flow(
