@@ -14,6 +14,24 @@
 sudo systemctl status --no-pager -n 80 betinasia-collector betinasia-audit-api
 ```
 
+### Importante (systemd): `.env` vs overrides (`service.d/`)
+Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
+
+```bash
+sudo systemctl show betinasia-audit-api -p EnvironmentFiles --no-pager
+sudo systemctl show betinasia-audit-api -p Environment --no-pager
+sudo systemctl cat betinasia-audit-api --no-pager | sed -n '1,140p'
+```
+
+Para corrigir, edite/remova o drop-in e recarregue o systemd:
+
+```bash
+sudo ls -la /etc/systemd/system/betinasia-audit-api.service.d/ || true
+sudo nano /etc/systemd/system/betinasia-audit-api.service.d/workers.conf
+sudo systemctl daemon-reload
+sudo systemctl restart betinasia-audit-api
+```
+
 ### Frescor (telemetria)
 ```bash
 tail -n 3 logs/collector_telemetry.jsonl

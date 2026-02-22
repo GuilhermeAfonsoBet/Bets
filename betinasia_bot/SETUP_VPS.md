@@ -90,6 +90,16 @@ sudo systemctl restart betinasia-collector
 sudo systemctl status betinasia-collector
 ```
 
+### Dica (systemd): quando `.env` não “pega”
+Se um serviço usa `EnvironmentFile=.../.env` mas as variáveis parecem “travadas”, verifique se há overrides em `/etc/systemd/system/<service>.service.d/*.conf` (criados via `systemctl edit`). Linhas `Environment="X=..."` nesses drop-ins **sobrescrevem** o `.env`.
+
+```bash
+sudo systemctl show <service> -p EnvironmentFiles --no-pager
+sudo systemctl show <service> -p Environment --no-pager
+sudo systemctl cat <service> --no-pager | sed -n '1,160p'
+sudo ls -la /etc/systemd/system/<service>.service.d/ || true
+```
+
 ### Ver estatísticas do banco
 ```bash
 cd /home/betbot/Bets/betinasia_bot
