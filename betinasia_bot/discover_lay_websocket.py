@@ -132,6 +132,8 @@ class WsStats:
     offers_keys: Set[str] = field(default_factory=set)
     offers_nested_keys: Set[str] = field(default_factory=set)
     snippets_with_lay: List[dict] = field(default_factory=list)  # amostras de frames com 'lay'
+    pmm_bet_prefix_counts: Counter = field(default_factory=Counter)  # for vs against
+    pmm_against_samples: List[dict] = field(default_factory=list)  # amostras de PMM com against, se existir
     recv_samples: List[dict] = field(default_factory=list)
     sent_samples: List[dict] = field(default_factory=list)
 
@@ -150,6 +152,8 @@ class LayWsDiscovery:
         self.global_api_subtypes: Counter = Counter()
         self.global_offers_keys: Set[str] = set()
         self.global_offers_nested_keys: Set[str] = set()
+        self.global_pmm_bet_prefix_counts: Counter = Counter()
+        self.global_pmm_against_samples: List[dict] = []
 
         self._start_ts = time.time()
 
@@ -272,6 +276,36 @@ class LayWsDiscovery:
                             if isinstance(sub, str):
                                 stats.api_subtype_counts[sub] += 1
                                 self.global_api_subtypes[sub] += 1
+                            # PMM: extrair bet_type e procurar "against" (Lay)
+                            if sub == "pmm" and isinstance(entry[1], dict):
+                                bt = entry[1].get("bet_type")
+                                if isinstance(bt, str) and bt:
+                                    prefix = bt.split(",", 1)[0].strip().lower()
+                                    if prefix:
+                                        stats.pmm_bet_prefix_counts[prefix] += 1
+                                        self.global_pmm_bet_prefix_counts[prefix] += 1
+                                    if prefix == "against":
+                                        if len(stats.pmm_against_samples) < 10:
+                                            stats.pmm_against_samples.append(
+                                                {
+                                                    "ts": _utc_now_iso(),
+                                                    "phase": self.phase,
+                                                    "bet_type": bt,
+                                                    "bookie": entry[1].get("bookie"),
+                                                    "price0": (entry[1].get("price_list") or [{}])[0].get("effective", {}).get("price")
+                                                    if isinstance(entry[1].get("price_list"), list) and entry[1].get("price_list")
+                                                    else None,
+                                                }
+                                            )
+                                        if len(self.global_pmm_against_samples) < 10:
+                                            self.global_pmm_against_samples.append(
+                                                {
+                                                    "ts": _utc_now_iso(),
+                                                    "phase": self.phase,
+                                                    "bet_type": bt,
+                                                    "bookie": entry[1].get("bookie"),
+                                                }
+                                            )
 
     async def click_flow(self, page) -> dict:
         """
@@ -289,6 +323,13 @@ class LayWsDiscovery:
             "lay_selector": "",
             "exchange_candidates": 0,
             "lay_candidates": 0,
+            "pmm_before": 0,
+            "pmm_after_odd_click": 0,
+            "pmm_after_exchange_click": 0,
+            "http_betslip_posts": 0,
+            "http_betslip_refresh_posts": 0,
+            "exchange_elements": [],
+            "classic_elements": [],
             "screenshots": [],
         }
 
@@ -353,6 +394,12 @@ class LayWsDiscovery:
             pass
 
         self.phase = "after_click_attempt"
+        # baseline counters (para sabermos se o click abriu betslip de fato)
+        try:
+            out["pmm_before"] = int(self.global_api_subtypes.get("pmm", 0))
+        except Exception:
+            out["pmm_before"] = 0
+        http0 = list(self.http_reqs)
 
         clicked = await page.evaluate(
             """
@@ -440,6 +487,28 @@ class LayWsDiscovery:
         out["clicked"] = clicked
         await page.wait_for_timeout(4000)
 
+        # delta HTTP (betslip/refresh)
+        try:
+            new_http = self.http_reqs[len(http0) :]
+            out["http_betslip_posts"] = sum(
+                1
+                for h in new_http
+                if h.get("method") == "POST" and "/v1/betslips/" in (h.get("url") or "") and "/refresh/" not in (h.get("url") or "")
+            )
+            out["http_betslip_refresh_posts"] = sum(
+                1
+                for h in new_http
+                if h.get("method") == "POST" and "/v1/betslips/" in (h.get("url") or "") and "/refresh/" in (h.get("url") or "")
+            )
+        except Exception:
+            out["http_betslip_posts"] = 0
+            out["http_betslip_refresh_posts"] = 0
+
+        try:
+            out["pmm_after_odd_click"] = int(self.global_api_subtypes.get("pmm", 0))
+        except Exception:
+            out["pmm_after_odd_click"] = out.get("pmm_before", 0)
+
         # screenshot após clicar em odd (betslip deve estar aberto)
         try:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -464,6 +533,74 @@ class LayWsDiscovery:
         except Exception:
             out["lay_candidates"] = 0
 
+        # Captura detalhes dos elementos com texto Exchange/Classic (para debug)
+        try:
+            out["exchange_elements"] = await page.evaluate(
+                """
+                () => {
+                  const re = /\\bexchange\\b/i;
+                  const els = Array.from(document.querySelectorAll('button, a, div, span'));
+                  const out = [];
+                  for (const el of els) {
+                    const t = (el.innerText || '').trim();
+                    if (!t) continue;
+                    if (!re.test(t)) continue;
+                    const r = el.getBoundingClientRect();
+                    const visible = (el.offsetParent !== null) && r.width > 0 && r.height > 0;
+                    out.push({
+                      text: t.slice(0, 120),
+                      tag: el.tagName,
+                      id: el.id || '',
+                      cls: (el.className || '').toString().slice(0, 200),
+                      role: el.getAttribute('role') || '',
+                      aria: el.getAttribute('aria-label') || '',
+                      x: Math.round(r.x), y: Math.round(r.y),
+                      w: Math.round(r.width), h: Math.round(r.height),
+                      visible
+                    });
+                  }
+                  // prioriza visíveis e menores (tabs)
+                  out.sort((a,b) => (b.visible - a.visible) || ((a.w*a.h) - (b.w*b.h)));
+                  return out.slice(0, 20);
+                }
+                """
+            )
+        except Exception:
+            out["exchange_elements"] = []
+
+        try:
+            out["classic_elements"] = await page.evaluate(
+                """
+                () => {
+                  const re = /\\bclassic\\b/i;
+                  const els = Array.from(document.querySelectorAll('button, a, div, span'));
+                  const out = [];
+                  for (const el of els) {
+                    const t = (el.innerText || '').trim();
+                    if (!t) continue;
+                    if (!re.test(t)) continue;
+                    const r = el.getBoundingClientRect();
+                    const visible = (el.offsetParent !== null) && r.width > 0 && r.height > 0;
+                    out.push({
+                      text: t.slice(0, 120),
+                      tag: el.tagName,
+                      id: el.id || '',
+                      cls: (el.className || '').toString().slice(0, 200),
+                      role: el.getAttribute('role') || '',
+                      aria: el.getAttribute('aria-label') || '',
+                      x: Math.round(r.x), y: Math.round(r.y),
+                      w: Math.round(r.width), h: Math.round(r.height),
+                      visible
+                    });
+                  }
+                  out.sort((a,b) => (b.visible - a.visible) || ((a.w*a.h) - (b.w*b.h)));
+                  return out.slice(0, 20);
+                }
+                """
+            )
+        except Exception:
+            out["classic_elements"] = []
+
         # Alguns layouts usam "Classic" vs "Exchange". Tentamos Exchange primeiro.
         exchange_selectors = [
             "text=/\\bexchange\\b/i",
@@ -476,7 +613,25 @@ class LayWsDiscovery:
         exchange_clicked, exchange_sel = await _try_click_any(page, exchange_selectors, timeout_ms=3000)
         out["exchange_selector"] = exchange_sel
 
+        # Se o click por seletor falhou, tenta por coordenada (primeiro elemento visível que contenha Exchange)
+        if not exchange_clicked and out.get("exchange_elements"):
+            try:
+                cand = next((e for e in out["exchange_elements"] if e.get("visible")), None)
+                if cand and all(k in cand for k in ("x", "y", "w", "h")):
+                    cx = float(cand["x"]) + float(cand["w"]) / 2.0
+                    cy = float(cand["y"]) + float(cand["h"]) / 2.0
+                    # click no centro
+                    await page.mouse.click(cx, cy)
+                    exchange_clicked = True
+                    out["exchange_selector"] = f"mouse@({int(cx)},{int(cy)})"
+            except Exception:
+                pass
+
         await page.wait_for_timeout(2500)
+        try:
+            out["pmm_after_exchange_click"] = int(self.global_api_subtypes.get("pmm", 0))
+        except Exception:
+            out["pmm_after_exchange_click"] = out.get("pmm_after_odd_click", 0)
 
         # screenshot após tentativa de ir para Exchange
         try:
@@ -524,6 +679,8 @@ class LayWsDiscovery:
                     "sent_count": st.sent_count,
                     "msg_types_top": st.msg_type_counts.most_common(30),
                     "api_subtypes_top": st.api_subtype_counts.most_common(30),
+                    "pmm_bet_prefix_top": st.pmm_bet_prefix_counts.most_common(10),
+                    "pmm_against_samples": st.pmm_against_samples,
                     "offers_keys": sorted(st.offers_keys),
                     "offers_nested_keys": sorted(st.offers_nested_keys),
                     "snippets_with_lay": st.snippets_with_lay,
@@ -540,6 +697,8 @@ class LayWsDiscovery:
             "global": {
                 "msg_types_top": self.global_msg_types.most_common(50),
                 "api_subtypes_top": self.global_api_subtypes.most_common(50),
+                "pmm_bet_prefix_top": self.global_pmm_bet_prefix_counts.most_common(10),
+                "pmm_against_samples": self.global_pmm_against_samples,
                 "offers_keys": sorted(self.global_offers_keys),
                 "offers_nested_keys": sorted(self.global_offers_nested_keys),
             },
