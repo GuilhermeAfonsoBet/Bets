@@ -628,6 +628,12 @@ async def main() -> int:
     parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "2")), help="Dias de treino por passo (default 2).")
     parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
     parser.add_argument(
+        "--wf-step-days",
+        type=int,
+        default=int(os.getenv("WF_STEP_DAYS", "1")),
+        help="Avanço do walk-forward em dias (default 1). Para evitar janelas de teste sobrepostas, use `wf_step_days = wf_test_days`.",
+    )
+    parser.add_argument(
         "--wf-start-date",
         default=os.getenv("WF_START_DATE", "").strip(),
         help="Se definido (YYYY-MM-DD), força o calendário do walk-forward a iniciar a partir desta data (UTC). "
@@ -3974,6 +3980,8 @@ async def main() -> int:
             "- Caso `ROI` seja **>0 mas não sig.**:\n"
             "  - Pre-match: ativa apenas se `CLV > 0` (não precisa ser sig.)\n"
             "  - In-match: ativa se `ROI > 0` (não precisa ser sig.; CLV não é aplicável)\n\n"
+            f"- **Step do WF**: `wf_step_days={int(getattr(args,'wf_step_days',1))}`. Se `wf_test_days>1` e `wf_step_days=1`, os test windows ficam **sobrepostos**; nesse caso, "
+            "os lucros/prejuízos por linha não são somáveis. Para não sobrepor: use `--wf-step-days` igual a `--wf-test-days`.\n\n"
             "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
         )
 
@@ -3985,6 +3993,7 @@ async def main() -> int:
         else:
             wf_train = int(max(1, getattr(args, "wf_train_days", 2)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
+            wf_step = int(max(1, getattr(args, "wf_step_days", 1)))
             # `wf_min_matches=0` desabilita a elegibilidade por volume no OOS.
             wf_min_m = int(max(0, getattr(args, "wf_min_matches", 20)))
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
@@ -4270,8 +4279,10 @@ async def main() -> int:
                         return None
                     p99 = float(np.quantile(vals, 0.99))
                     return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
-                # Inclui o último dia possível como teste (ex.: com wf_test_days=1, testa também o último dia do recorte).
-                for i in range(wf_train, len(days) - wf_test + 1):
+                # Walk-forward por dia:
+                # - `wf_step=1` (default) cria janelas de teste deslizantes; se `wf_test>1`, haverá sobreposição.
+                # - Para janelas de teste não sobrepostas (resultados somáveis por passo), use `wf_step=wf_test`.
+                for i in range(wf_train, len(days) - wf_test + 1, wf_step):
                     train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
 
