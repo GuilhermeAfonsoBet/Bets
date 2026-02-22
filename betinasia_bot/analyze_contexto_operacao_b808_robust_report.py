@@ -658,6 +658,18 @@ async def main() -> int:
         help="Liability constante quando o scheme do Lay for FLAT (em unidades monetárias do relatório). Default=1.0.",
     )
     parser.add_argument(
+        "--wf-ws-proxy-offset-sec",
+        type=float,
+        default=float(os.getenv("WF_WS_PROXY_OFFSET_SEC", "5.0")),
+        help="Quando houver `ws_series` (ws-only), usa a odd WS neste offset (s) como proxy de BS para entrar no OOS. Default=5.0.",
+    )
+    parser.add_argument(
+        "--wf-ws-proxy-max-gap-sec",
+        type=float,
+        default=float(os.getenv("WF_WS_PROXY_MAX_GAP_SEC", "2.5")),
+        help="Tolerância máxima (s) entre o offset alvo e o ponto WS observado para aceitar o proxy. Default=2.5.",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -4007,48 +4019,149 @@ async def main() -> int:
             bud_cap_sig_frac = max(0.0, float(getattr(args, "wf_budget_cap_signal_frac", 0.33)))
             wf_flat_stake_back = max(0.0, float(getattr(args, "wf_flat_stake_back", 1.0)))
             wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
+            wf_ws_proxy_offset = max(0.0, float(getattr(args, "wf_ws_proxy_offset_sec", 5.0)))
+            wf_ws_proxy_max_gap = max(0.0, float(getattr(args, "wf_ws_proxy_max_gap_sec", 2.5)))
 
             # Para scheme in-match "ROI_TRAIN": usamos ROI médio no treino por combinação como proxy de EV.
             # Mapeamento preenchido por step (train window) e usado no loop de sizing do test.
             roi_train_by_key: Dict[str, float] = {}
 
-            # index para recuperar campos de sizing/liquidez
-            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+            # index para recuperar campos de sizing/liquidez (inclui ws-only)
+            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_any if d.get("id") is not None}
 
             # dataset de entradas com timestamp
             combo_events: List[dict] = []
-            for side, ent in [("Back", back_entries), ("Lay", lay_entries)]:
-                for r in ent:
-                    aid = r.get("audit_id")
-                    if aid is None:
+            def _ws_proxy_odd(d0: dict) -> Optional[Tuple[float, float]]:
+                """
+                Retorna (odd, t_s) do ponto WS mais apropriado para o proxy de BS.
+                Preferimos o primeiro ponto com t>=offset (para simular "execução após lag"),
+                desde que a distância ao offset esteja <= max_gap; senão cai para o ponto mais próximo.
+                """
+                h = d0.get("hypothesis_details") or {}
+                arr = h.get("ws_series") if isinstance(h, dict) else None
+                if not isinstance(arr, list) or not arr:
+                    return None
+                pts: List[Tuple[float, float]] = []
+                for e in arr:
+                    if not isinstance(e, dict):
                         continue
-                    # mantém apenas eventos de edge do lado correspondente
-                    if side == "Back" and int(aid) not in back_edge_ids:
+                    t = _safe_float(e.get("t_actual_s"))
+                    if t is None:
+                        t = _safe_float(e.get("t_target_s"))
+                    odd = _safe_float(e.get("ws_odd"))
+                    if t is None or odd is None or odd <= 0:
                         continue
-                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                    pts.append((float(t), float(odd)))
+                if not pts:
+                    return None
+                pts.sort(key=lambda x: x[0])
+                # preferir t>=offset (primeiro)
+                candidates = [(t, o) for (t, o) in pts if t >= float(wf_ws_proxy_offset)]
+                best = None
+                if candidates:
+                    t, o = candidates[0]
+                    if abs(float(t) - float(wf_ws_proxy_offset)) <= float(wf_ws_proxy_max_gap):
+                        best = (o, t)
+                if best is None:
+                    # ponto mais próximo
+                    t, o = min(pts, key=lambda x: abs(float(x[0]) - float(wf_ws_proxy_offset)))
+                    if abs(float(t) - float(wf_ws_proxy_offset)) <= float(wf_ws_proxy_max_gap):
+                        best = (o, t)
+                return best
+
+            # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
+            for d0 in all_data:
+                if str(d0.get("status", "")).upper() != "OK":
+                    continue
+                aid = d0.get("id")
+                if aid is None:
+                    continue
+                ts = d0.get("audited_at")
+                if not isinstance(ts, datetime):
+                    continue
+                ws0 = _safe_float(d0.get("ws_odd"))
+                if ws0 is None or ws0 <= 0:
+                    continue
+                # entry odd: BS real se existir; senão WS proxy
+                bs = _safe_float(d0.get("bs_odd"))
+                src = "BS"
+                t_proxy = None
+                entry = None
+                if bs is not None and bs > 0:
+                    entry = float(bs)
+                else:
+                    ref = _ws_proxy_odd(d0)
+                    if not ref:
                         continue
-                    ts = r.get("audited_at")
-                    if not isinstance(ts, datetime):
-                        continue
-                    combo_events.append(
-                        {
-                            "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
-                            "audit_id": int(aid),
-                            "side": side,
-                            "regime": "Pre" if r.get("is_live") is False else "In",
-                            "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
-                            "match_id": int(r.get("match_id")),
-                            # métricas (t0)
-                            "clv_back": r.get("clv_t0") if (r.get("is_live") is False and side == "Back") else None,
-                            # Para Lay, faz mais sentido avaliar CLV no **ponto de entrada da estratégia** (pós-reversão ou último ponto),
-                            # e na convenção unificada `clv_conv = -(entry-closing)/closing` (Lay "bom" -> positivo).
-                            "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False and side == "Lay") else None,
-                            # ROI no ponto de entrada (Back=t0; Lay=após reversão se existir, senão último ponto)
-                            "roi": r.get("roi_t0") if side == "Back" else r.get("roi_entry"),
-                            # odd de entrada para sizing Lay coerente com o ponto de entrada
-                            "entry_odd": r.get("odd_t0") if side == "Back" else r.get("odd_entry"),
-                        }
-                    )
+                    entry, t_proxy = float(ref[0]), float(ref[1])
+                    src = f"WS@t+{t_proxy:.1f}s"
+                if entry is None or entry <= 0:
+                    continue
+                diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
+                if diff is None:
+                    continue
+                # filtro de qualidade (mesmo range do BS confiável)
+                if not (-10.0 <= float(diff) <= 10.0):
+                    continue
+                # edge Back
+                if float(diff) < float(back_cut):
+                    continue
+                # ROI no ponto de entrada (stake=1)
+                _, roi_entry = compute_roi_pct(
+                    line=str(d0.get("line", "")),
+                    side=str(d0.get("side", "")),
+                    ws_odd=None,
+                    bs_odd=float(entry),
+                    hs=d0.get("home_score"),
+                    aws=d0.get("away_score"),
+                )
+                # CLV pre-match
+                clv_entry = None
+                if d0.get("is_live") is False:
+                    clo = _safe_float(d0.get("closing_odd"))
+                    if clo is not None and clo > 0:
+                        clv_entry = (float(entry) - float(clo)) / float(clo) * 100.0
+                combo_events.append(
+                    {
+                        "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                        "audit_id": int(aid),
+                        "side": "Back",
+                        "regime": "Pre" if d0.get("is_live") is False else "In",
+                        "reversal": "Any",
+                        "match_id": int(d0.get("match_id")),
+                        "clv_back": clv_entry,
+                        "clv_lay_conv": None,
+                        "roi": roi_entry,
+                        "entry_odd": float(entry),
+                        "entry_source": src,
+                        "diff_pct": float(diff),
+                    }
+                )
+
+            # --- Lay: permanece baseado em betslip (não há lay no ws-only) ---
+            for r in lay_entries:
+                aid = r.get("audit_id")
+                if aid is None:
+                    continue
+                if int(aid) not in lay_edge_ids:
+                    continue
+                ts = r.get("audited_at")
+                if not isinstance(ts, datetime):
+                    continue
+                combo_events.append(
+                    {
+                        "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                        "audit_id": int(aid),
+                        "side": "Lay",
+                        "regime": "Pre" if r.get("is_live") is False else "In",
+                        "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
+                        "match_id": int(r.get("match_id")),
+                        "clv_back": None,
+                        "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False) else None,
+                        "roi": r.get("roi_entry"),
+                        "entry_odd": r.get("odd_entry"),
+                    }
+                )
 
             # Calendário do walk-forward: usar os dias com dados carregados no recorte (mesmo que não haja eventos OK/edge),
             # para não “sumir” dias recentes (ex.: 17/18) na tabela OOS.
@@ -4058,7 +4171,7 @@ async def main() -> int:
                 return None
 
             days_loaded = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in all_data) if d})
-            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
+            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_any) if d})
             days_combo = sorted({e["day"] for e in combo_events})
             days = days_loaded if days_loaded else days_combo
             # Ajuste do início do calendário:
@@ -4086,7 +4199,7 @@ async def main() -> int:
             lines.append("\n**Calendário do walk-forward (dias únicos)**\n\n")
             lines.append("| Tipo | Dias |\n|---|---:|\n")
             lines.append(f"| Dias com dados carregados (audited_at) | {len(days_loaded)} |\n")
-            lines.append(f"| Dias com eventos OK/betslip conf. | {len(days_ok)} |\n")
+            lines.append(f"| Dias com eventos OK (qualquer versão, incl. ws-only) | {len(days_ok)} |\n")
             lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
             lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
 
@@ -4094,9 +4207,9 @@ async def main() -> int:
             day_all_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in all_data if _day_utc_from_ts(d.get("audited_at")))
             day_bs_raw_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs_raw if _day_utc_from_ts(d.get("audited_at")))
             day_bs_conf_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs if _day_utc_from_ts(d.get("audited_at")))
-            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_bs if _day_utc_from_ts(d.get("audited_at")))
-            day_back_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in back_edge if _day_utc_from_ts(d.get("audited_at")))
-            day_lay_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in lay_edge if _day_utc_from_ts(d.get("audited_at")))
+            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_any if _day_utc_from_ts(d.get("audited_at")))
+            day_back_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Back" and e.get("day"))
+            day_lay_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Lay" and e.get("day"))
 
             day_non_ok_top: Dict[str, str] = {}
             tmp: Dict[str, Counter] = {}
@@ -4206,8 +4319,27 @@ async def main() -> int:
                         st = None
                         if sc == "FLAT":
                             st = float(wf_flat_stake_back)
-                        elif sc == "PROXY" or str(sc).startswith("KELLY"):
-                            st = _sizing_back(d0, sc)
+                        elif sc == "PROXY":
+                            st = _sizing_back(d0, "PROXY")
+                        elif str(sc).startswith("KELLY"):
+                            # Kelly no WF deve usar a odd de entrada do evento (pode vir de WS proxy em ws-only)
+                            if d0.get("is_live") is True:
+                                return (None, None)
+                            try:
+                                frac = float(str(sc).split("_")[1])
+                            except Exception:
+                                return (None, None)
+                            entry_odd = _safe_float(ev.get("entry_odd"))
+                            if entry_odd is None:
+                                entry_odd = _safe_float(d0.get("bs_odd"))
+                            f0 = _kelly_back_frac(entry_odd, d0.get("closing_odd"))
+                            if f0 is None:
+                                return (None, None)
+                            f = max(0.0, float(f0)) * float(frac)
+                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
+                            cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
+                            st = min(f * bank_ref_budget_local, cap)
+                            st = min(float(st), float(_max_back_stake_event(d0)))
                         elif str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
                             roi_hat = _safe_float(roi_train_by_key.get(k))
@@ -5105,7 +5237,10 @@ async def main() -> int:
                                     frac = float(str(sc).split("_")[1])
                                 except Exception:
                                     return (None, None)
-                                f0 = _kelly_back_frac(d0.get("bs_odd"), d0.get("closing_odd"))
+                                entry_odd = _safe_float(ev.get("entry_odd"))
+                                if entry_odd is None:
+                                    entry_odd = _safe_float(d0.get("bs_odd"))
+                                f0 = _kelly_back_frac(entry_odd, d0.get("closing_odd"))
                                 if f0 is None:
                                     return (None, None)
                                 f = max(0.0, float(f0)) * float(frac)
