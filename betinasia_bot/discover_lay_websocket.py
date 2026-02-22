@@ -133,7 +133,9 @@ class WsStats:
     offers_nested_keys: Set[str] = field(default_factory=set)
     snippets_with_lay: List[dict] = field(default_factory=list)  # amostras de frames com 'lay'
     pmm_bet_prefix_counts: Counter = field(default_factory=Counter)  # for vs against
+    pmm_bet_type_counts: Counter = field(default_factory=Counter)  # bet_type completo
     pmm_against_samples: List[dict] = field(default_factory=list)  # amostras de PMM com against, se existir
+    pmm_for_samples: List[dict] = field(default_factory=list)  # amostras de PMM com for
     recv_samples: List[dict] = field(default_factory=list)
     sent_samples: List[dict] = field(default_factory=list)
 
@@ -154,6 +156,7 @@ class LayWsDiscovery:
         self.global_offers_nested_keys: Set[str] = set()
         self.global_pmm_bet_prefix_counts: Counter = Counter()
         self.global_pmm_against_samples: List[dict] = []
+        self.global_pmm_bet_type_counts: Counter = Counter()
 
         self._start_ts = time.time()
 
@@ -280,6 +283,8 @@ class LayWsDiscovery:
                             if sub == "pmm" and isinstance(entry[1], dict):
                                 bt = entry[1].get("bet_type")
                                 if isinstance(bt, str) and bt:
+                                    stats.pmm_bet_type_counts[bt] += 1
+                                    self.global_pmm_bet_type_counts[bt] += 1
                                     prefix = bt.split(",", 1)[0].strip().lower()
                                     if prefix:
                                         stats.pmm_bet_prefix_counts[prefix] += 1
@@ -304,6 +309,19 @@ class LayWsDiscovery:
                                                     "phase": self.phase,
                                                     "bet_type": bt,
                                                     "bookie": entry[1].get("bookie"),
+                                                }
+                                            )
+                                    if prefix == "for":
+                                        if len(stats.pmm_for_samples) < 10:
+                                            stats.pmm_for_samples.append(
+                                                {
+                                                    "ts": _utc_now_iso(),
+                                                    "phase": self.phase,
+                                                    "bet_type": bt,
+                                                    "bookie": entry[1].get("bookie"),
+                                                    "price0": (entry[1].get("price_list") or [{}])[0].get("effective", {}).get("price")
+                                                    if isinstance(entry[1].get("price_list"), list) and entry[1].get("price_list")
+                                                    else None,
                                                 }
                                             )
 
@@ -667,6 +685,86 @@ class LayWsDiscovery:
             pass
         return out
 
+    async def trade_flow(self, page, *, wait_sec: float = 10.0, interact: bool = False) -> dict:
+        """
+        Navega para /trade e captura WS/HTTP.
+        Opcionalmente tenta interagir (best effort) para forçar carregamento de preços.
+        """
+        out: Dict[str, Any] = {
+            "start_url": "https://black.betinasia.com/trade",
+            "wait_sec": float(wait_sec),
+            "interact": bool(interact),
+            "interaction": {"clicked": []},
+            "screenshots": [],
+        }
+        await page.goto(out["start_url"])
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(3000)
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            p0 = f"logs/lay_ws_screens/{ts}_trade_01.png"
+            await _screenshot(page, p0)
+            out["screenshots"].append(p0)
+        except Exception:
+            pass
+
+        if interact:
+            # Best-effort: clicar em Football e depois em algum item com "vs"
+            try:
+                ok, sel = await _try_click_any(
+                    page,
+                    [
+                        "text=/\\bfootball\\b/i",
+                        "button:has-text('Football')",
+                        "a:has-text('Football')",
+                    ],
+                    timeout_ms=2500,
+                )
+                if ok:
+                    out["interaction"]["clicked"].append({"what": "football", "sel": sel})
+                    await page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            try:
+                # tenta clicar em qualquer linha/list item que contenha "vs"
+                clicked = await page.evaluate(
+                    """
+                    () => {
+                      const els = Array.from(document.querySelectorAll('a, button, div, span, li'));
+                      for (const el of els) {
+                        const t = (el.innerText || '').trim();
+                        if (!t) continue;
+                        const low = t.toLowerCase();
+                        if (!low.includes(' vs') && !low.includes('vs.') && !low.includes(' vs. ')) continue;
+                        const r = el.getBoundingClientRect();
+                        if (!r || r.width < 80 || r.height < 14) continue;
+                        if (el.offsetParent === null) continue;
+                        try { el.scrollIntoView({behavior:'instant', block:'center'});} catch(e){}
+                        try { el.click(); return {text: t.slice(0,120)}; } catch(e){}
+                        try { el.parentElement && el.parentElement.click(); return {text: t.slice(0,120)}; } catch(e){}
+                      }
+                      return null;
+                    }
+                    """
+                )
+                if clicked:
+                    out["interaction"]["clicked"].append({"what": "event_vs", **clicked})
+                    await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                p1 = f"logs/lay_ws_screens/{ts}_trade_02_after_interact.png"
+                await _screenshot(page, p1)
+                out["screenshots"].append(p1)
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(int(float(wait_sec) * 1000))
+        return out
+
     def build_report(self, click_info: dict) -> dict:
         elapsed = time.time() - self._start_ts
         ws_summary = []
@@ -680,7 +778,9 @@ class LayWsDiscovery:
                     "msg_types_top": st.msg_type_counts.most_common(30),
                     "api_subtypes_top": st.api_subtype_counts.most_common(30),
                     "pmm_bet_prefix_top": st.pmm_bet_prefix_counts.most_common(10),
+                    "pmm_bet_types_top": st.pmm_bet_type_counts.most_common(15),
                     "pmm_against_samples": st.pmm_against_samples,
+                    "pmm_for_samples": st.pmm_for_samples,
                     "offers_keys": sorted(st.offers_keys),
                     "offers_nested_keys": sorted(st.offers_nested_keys),
                     "snippets_with_lay": st.snippets_with_lay,
@@ -699,6 +799,7 @@ class LayWsDiscovery:
                 "api_subtypes_top": self.global_api_subtypes.most_common(50),
                 "pmm_bet_prefix_top": self.global_pmm_bet_prefix_counts.most_common(10),
                 "pmm_against_samples": self.global_pmm_against_samples,
+                "pmm_bet_types_top": self.global_pmm_bet_type_counts.most_common(25),
                 "offers_keys": sorted(self.global_offers_keys),
                 "offers_nested_keys": sorted(self.global_offers_nested_keys),
             },
@@ -712,6 +813,9 @@ async def main():
     ap.add_argument("--sample-limit", type=int, default=30, help="Máx. de amostras por WS (recv/sent/snippets).")
     ap.add_argument("--baseline-wait-sec", type=float, default=8.0, help="Tempo esperando apenas WS (sem cliques).")
     ap.add_argument("--do-click-flow", action="store_true", help="Tenta clicar em odd e alternar Exchange/Lay.")
+    ap.add_argument("--start", choices=["football", "trade"], default="football", help="Página inicial para descoberta.")
+    ap.add_argument("--trade-wait-sec", type=float, default=12.0, help="Tempo de espera na página /trade.")
+    ap.add_argument("--trade-interact", action="store_true", help="Tenta interagir na página /trade (best effort).")
     args = ap.parse_args()
 
     out_path = str(args.out)
@@ -733,14 +837,17 @@ async def main():
         page.on("websocket", disc.on_websocket)
         page.on("request", disc.on_request)
 
-        disc.phase = "baseline"
-        await page.goto("https://black.betinasia.com/sportsbook/football")
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(int(float(args.baseline_wait_sec) * 1000))
-
-        click_info = {"skipped": True}
-        if bool(args.do_click_flow):
-            click_info = await disc.click_flow(page)
+        click_info: dict = {"skipped": True}
+        if str(args.start) == "trade":
+            disc.phase = "trade"
+            click_info = await disc.trade_flow(page, wait_sec=float(args.trade_wait_sec), interact=bool(args.trade_interact))
+        else:
+            disc.phase = "baseline"
+            await page.goto("https://black.betinasia.com/sportsbook/football")
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(int(float(args.baseline_wait_sec) * 1000))
+            if bool(args.do_click_flow):
+                click_info = await disc.click_flow(page)
 
         report = disc.build_report(click_info)
         with open(out_path, "w", encoding="utf-8") as f:
