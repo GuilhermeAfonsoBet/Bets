@@ -2532,14 +2532,17 @@ async def main() -> int:
 
         def _clv_pct_lay_from_odd(lay_odd: Optional[float], closing_odd: Any) -> Optional[float]:
             """
-            Para Lay, o sinal é invertido: é "bom" quando você LAYA barato e o closing sobe.
-            Definição: (closing - entry) / closing * 100
+            CLV "raw" para Lay, compatível com a convenção geral (entry - closing) / closing.
+
+            Interpretação:
+            - Lay "bom" tende a ser NEGATIVO (você entrou barato e o closing subiu).
+            - Se você preferir uma convenção positiva para Lay, use `clv_conv = -clv_raw`.
             """
             lay_odd = _safe_float(lay_odd)
             clo = _safe_float(closing_odd)
             if lay_odd is None or clo is None or clo <= 0:
                 return None
-            return (clo - lay_odd) / clo * 100.0
+            return (lay_odd - clo) / clo * 100.0
 
         def _summarize_timing(rows_in: List[dict], mode: str) -> Dict[str, Any]:
             stats = []
@@ -2760,9 +2763,9 @@ async def main() -> int:
             # Convenção unificada de CLV para Lay (8.3/OOS):
             # clv_conv = -(entry - closing)/closing = (closing - entry)/closing
             # Portanto, Lay "bom" tende a ser POSITIVO.
-            clv0_conv = float(clv0) if clv0 is not None else None
-            clve_conv = float(clve) if clve is not None else None
-            clvl_conv = float(clvl) if clvl is not None else None
+            clv0_conv = (-float(clv0)) if clv0 is not None else None
+            clve_conv = (-float(clve)) if clve is not None else None
+            clvl_conv = (-float(clvl)) if clvl is not None else None
 
             # Política de entrada Lay (para 8.3 e OOS):
             # - se há reversão: entrar **logo após a reversão** (odd_reversal)
@@ -2771,7 +2774,7 @@ async def main() -> int:
             odd_entry = float(odd_rev) if has_rev else float(plast["odd"])
             roi_entry = roirev if has_rev else roilast
             clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
-            clv_entry_conv = float(clv_entry) if clv_entry is not None else None
+            clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
