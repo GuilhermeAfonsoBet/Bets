@@ -205,6 +205,11 @@ class LayWsDiscovery:
         try:
             url = str(getattr(req, "url", "") or "")
             method = str(getattr(req, "method", "") or "")
+            rtype = ""
+            try:
+                rtype = str(getattr(req, "resource_type", "") or "")
+            except Exception:
+                rtype = ""
             post_data = None
             try:
                 post_data = req.post_data
@@ -214,6 +219,7 @@ class LayWsDiscovery:
                 "ts": _utc_now_iso(),
                 "phase": self.phase,
                 "method": method,
+                "resource_type": rtype,
                 "url": url.split("#")[0],
                 "post_data": _truncate(_redact_post_data(post_data) or "", 1000) if post_data else "",
             }
@@ -225,8 +231,16 @@ class LayWsDiscovery:
             if any(x in low for x in ("google", "analytics", "gtm", "doubleclick")):
                 return
 
-            # só mantém endpoints potencialmente úteis
-            if ("/v1/" in low) or ("/api/" in low) or ("betslip" in low) or ("exchange" in low):
+            # Mantém endpoints potencialmente úteis:
+            # - Qualquer XHR/fetch do domínio (Trade costuma usar rotas específicas)
+            # - E também /v1, /api, betslip, exchange
+            keep = False
+            if rtype in ("xhr", "fetch"):
+                if "black.betinasia.com" in low:
+                    keep = True
+            if ("/v1/" in low) or ("/api/" in low) or ("betslip" in low) or ("exchange" in low) or ("/trade" in low):
+                keep = True
+            if keep:
                 self.http_reqs.append(entry)
         except Exception:
             return
@@ -699,9 +713,16 @@ class LayWsDiscovery:
                 "url_after": "",
                 "link_samples": [],
                 "counts": {},
+                "event_candidates": [],
+            },
+            "http_delta": {
+                "betslip_posts": 0,
+                "betslip_refresh_posts": 0,
+                "xhr_fetch_urls_top": [],
             },
             "screenshots": [],
         }
+        http0 = list(self.http_reqs)
         await page.goto(out["start_url"])
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(3000)
@@ -867,6 +888,61 @@ class LayWsDiscovery:
             except Exception:
                 pass
 
+            # Tenta clicar em um possível “evento/mercado” por heurística (preços decimais visíveis)
+            try:
+                candidates = await page.evaluate(
+                    """
+                    () => {
+                      // Procura elementos pequenos com números decimais (preços).
+                      // Em Trade, clicar no preço/linha costuma abrir ticket/market.
+                      const out = [];
+                      const els = Array.from(document.querySelectorAll('div, span, button, a'));
+                      for (const el of els) {
+                        const t0 = (el.innerText || '').trim();
+                        if (!t0) continue;
+                        const t = t0.replace(/\\s+/g,' ');
+                        if (t.length > 10) continue;
+                        if (!t.includes('.')) continue;
+                        const v = parseFloat(t);
+                        if (!isFinite(v)) continue;
+                        if (v < 1.01 || v > 200.0) continue;
+                        const r = el.getBoundingClientRect();
+                        if (!r || r.width < 18 || r.height < 10) continue;
+                        if (r.width > 160 || r.height > 70) continue;
+                        if (el.offsetParent === null) continue;
+                        out.push({
+                          text: t,
+                          v,
+                          tag: el.tagName,
+                          id: el.id || '',
+                          cls: (el.className || '').toString().slice(0, 160),
+                          role: el.getAttribute('role') || '',
+                          x: Math.round(r.x), y: Math.round(r.y),
+                          w: Math.round(r.width), h: Math.round(r.height),
+                        });
+                      }
+                      // Preferir preços perto de 2.0
+                      out.sort((a,b) => Math.abs(a.v - 2.0) - Math.abs(b.v - 2.0));
+                      return out.slice(0, 25);
+                    }
+                    """
+                )
+                out["dom_debug"]["event_candidates"] = candidates or []
+                if candidates:
+                    c = candidates[0]
+                    const_x = float(c.get("x", 0)) + float(c.get("w", 0)) / 2.0
+                    const_y = float(c.get("y", 0)) + float(c.get("h", 0)) / 2.0
+                    try:
+                        await page.mouse.click(const_x, const_y)
+                        out["interaction"]["clicked"].append(
+                            {"what": "price_candidate_click", "text": c.get("text"), "x": int(const_x), "y": int(const_y)}
+                        )
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        pass
+            except Exception:
+                out["dom_debug"]["event_candidates"] = out["dom_debug"].get("event_candidates") or []
+
             # Fallback 3: tentar clicar em um elemento que pareça "order ticket" (Back/Lay)
             try:
                 ok, sel = await _try_click_any(
@@ -939,6 +1015,33 @@ class LayWsDiscovery:
                 )
             except Exception:
                 pass
+
+        # http delta (após interações)
+        try:
+            new_http = self.http_reqs[len(http0) :]
+            out["http_delta"]["betslip_posts"] = sum(
+                1
+                for h in new_http
+                if h.get("method") == "POST" and "/v1/betslips/" in (h.get("url") or "") and "/refresh/" not in (h.get("url") or "")
+            )
+            out["http_delta"]["betslip_refresh_posts"] = sum(
+                1
+                for h in new_http
+                if h.get("method") == "POST" and "/v1/betslips/" in (h.get("url") or "") and "/refresh/" in (h.get("url") or "")
+            )
+            # top URLs XHR/fetch
+            from collections import Counter as _C
+            top = _C()
+            for h in new_http:
+                if h.get("resource_type") in ("xhr", "fetch"):
+                    u = str(h.get("url") or "")
+                    # normaliza (sem query)
+                    u0 = u.split("?", 1)[0]
+                    if "black.betinasia.com" in u0:
+                        top[u0] += 1
+            out["http_delta"]["xhr_fetch_urls_top"] = top.most_common(30)
+        except Exception:
+            pass
 
         await page.wait_for_timeout(int(float(wait_sec) * 1000))
         return out
