@@ -633,6 +633,12 @@ async def main() -> int:
         help="Se definido (YYYY-MM-DD), força o calendário do walk-forward a iniciar a partir desta data (UTC).",
     )
     parser.add_argument(
+        "--wf-bankroll-grid",
+        default=os.getenv("WF_BANKROLL_GRID", "").strip(),
+        help="CSV de bancas para sensibilidade no OOS mantendo budgets/caps (ex.: '1659,5000,10000,25000'). "
+        "Se vazio, não roda a análise de sensibilidade por banca.",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -4964,6 +4970,255 @@ async def main() -> int:
                         "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
                         "- Se tudo continuar negativo, o problema é **edge OOS** (principalmente in‑match) e budget só reduz a escala da perda.\n\n"
                     )
+
+                    # ------------------------------------------------------------
+                    # 12.2b Sensibilidade por banca (mantendo budgets/caps)
+                    # ------------------------------------------------------------
+                    raw_grid = str(getattr(args, "wf_bankroll_grid", "") or "").strip()
+                    grid: List[float] = []
+                    if raw_grid:
+                        for part in raw_grid.replace(";", ",").split(","):
+                            p = part.strip()
+                            if not p:
+                                continue
+                            try:
+                                v = float(p)
+                                if v > 0:
+                                    grid.append(v)
+                            except Exception:
+                                continue
+                    # sempre inclui o baseline da seção 12.2 (referência atual do budget)
+                    if bank_ref_budget and float(bank_ref_budget) > 0:
+                        grid.append(float(bank_ref_budget))
+                    grid = sorted({round(float(x), 6) for x in grid if x and float(x) > 0})
+
+                    def _sizing_for_event_bankroll(ev: dict, bank_ref: float) -> Tuple[Optional[float], Optional[float]]:
+                        """
+                        Sizing do evento no OOS para uma banca explícita `bank_ref`.
+                        Mantém os mesmos caps (BACK_CAP_FRAC/LAY_CAP_FRAC) e caps por evento (limit).
+                        """
+                        aid = int(ev.get("audit_id"))
+                        d0 = audit_by_id.get(aid)
+                        if not d0:
+                            return (None, None)
+                        sc = _scheme_for_event(ev)
+
+                        if ev.get("side") == "Back":
+                            if sc == "FLAT":
+                                st = 1.0
+                            elif sc == "PROXY":
+                                st = _sizing_back(d0, "PROXY")
+                            elif str(sc).startswith("KELLY"):
+                                # Kelly só pre-match
+                                if d0.get("is_live") is True:
+                                    return (None, None)
+                                try:
+                                    frac = float(str(sc).split("_")[1])
+                                except Exception:
+                                    return (None, None)
+                                f0 = _kelly_back_frac(d0.get("bs_odd"), d0.get("closing_odd"))
+                                if f0 is None:
+                                    return (None, None)
+                                f = max(0.0, float(f0)) * float(frac)
+                                cap = BACK_CAP_FRAC * max(1e-9, float(bank_ref))
+                                st = min(f * float(bank_ref), cap)
+                                st = min(float(st), float(_max_back_stake_event(d0)))
+                            else:
+                                return (None, None)
+                            if st is None or float(st) <= 0:
+                                return (None, None)
+                            return (float(st), float(st))
+
+                        # Lay: exposure = liability; turnover = stake equivalente
+                        lay_odd = _safe_float(ev.get("entry_odd"))
+                        if lay_odd is None:
+                            h = d0.get("hypothesis_details") or {}
+                            lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
+                        if lay_odd is None or float(lay_odd) <= 1.0:
+                            return (None, None)
+
+                        if sc == "FLAT":
+                            liab = 1.0
+                        elif sc == "PROXY":
+                            sized = _sizing_lay_liab(d0, "PROXY")
+                            if not sized:
+                                return (None, None)
+                            liab = float(sized[0])
+                        elif str(sc).startswith("KELLY"):
+                            if d0.get("is_live") is True:
+                                return (None, None)
+                            try:
+                                frac = float(str(sc).split("_")[1])
+                            except Exception:
+                                return (None, None)
+                            f0 = _kelly_lay_liab_frac(float(lay_odd), d0.get("closing_odd"))
+                            if f0 is None:
+                                return (None, None)
+                            f = max(0.0, float(f0)) * float(frac)
+                            cap = LAY_CAP_FRAC * max(1e-9, float(bank_ref))
+                            liab = min(f * float(bank_ref), cap)
+                        else:
+                            return (None, None)
+
+                        # cap por evento via limit (stake max -> liab max)
+                        max_st = _max_lay_stake_event(d0)
+                        liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                        if liab is None or float(liab) <= 0:
+                            return (None, None)
+                        stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                        return (float(stake_eq), float(liab))
+
+                    def _simulate_with_bankroll(*, bank_ref: float) -> Dict[str, Any]:
+                        """
+                        Simula todo o OOS (nos steps já selecionados) variando somente a referência de banca.
+                        Mantém budgets/caps (frações) constantes.
+                        """
+                        bud_back = float(bud_back_frac) * float(bank_ref)
+                        bud_lay = float(bud_lay_frac) * float(bank_ref)
+                        cap_sig_back = float(bud_cap_sig_frac) * float(bud_back)
+                        cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
+
+                        dturn: Dict[str, float] = {}
+                        dpnl_exp: Dict[str, float] = {}
+                        back_exps: List[float] = []
+                        lay_exps: List[float] = []
+                        jobs: List[Tuple[datetime, datetime, float]] = []
+
+                        for st in steps:
+                            test_days = set(st.get("test_days") or [])
+                            active_keys = set(st.get("active_keys") or [])
+                            if not test_days or not active_keys:
+                                continue
+
+                            test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in active_keys]
+                            if not test_elig:
+                                continue
+
+                            # ordena por tempo para consumir budget (por jogo) de forma realista
+                            def _ts_ev(ev: dict) -> float:
+                                d0 = audit_by_id.get(int(ev.get("audit_id")))
+                                ts = d0.get("audited_at") if d0 else None
+                                if isinstance(ts, datetime):
+                                    return ts.timestamp()
+                                return 0.0
+
+                            test_elig.sort(key=_ts_ev)
+
+                            turn_all = 0.0
+                            pnl_obs = 0.0
+                            back_all = back_roi = 0.0
+                            lay_all = lay_roi = 0.0
+                            spent_back: Dict[int, float] = {}
+                            spent_lay: Dict[int, float] = {}
+
+                            for ev in test_elig:
+                                st_eq, exp = _sizing_for_event_bankroll(ev, float(bank_ref))
+                                if st_eq is None or exp is None:
+                                    continue
+
+                                mid = int(ev.get("match_id"))
+                                if ev.get("side") == "Back":
+                                    rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_back))
+                                    if exp_use <= 0:
+                                        continue
+                                    ratio = exp_use / max(1e-9, float(exp))
+                                    exp = exp_use
+                                    st_eq = float(st_eq) * float(ratio)
+                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
+                                    back_all += float(exp)
+                                    if ev.get("roi") is not None:
+                                        back_roi += float(exp)
+                                else:
+                                    rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_lay))
+                                    if exp_use <= 0:
+                                        continue
+                                    ratio = exp_use / max(1e-9, float(exp))
+                                    exp = exp_use
+                                    st_eq = float(st_eq) * float(ratio)
+                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
+                                    lay_all += float(exp)
+                                    if ev.get("roi") is not None:
+                                        lay_roi += float(exp)
+
+                                turn_all += float(st_eq)
+                                _append_job(ev, float(exp))
+
+                                if ev.get("roi") is None:
+                                    continue
+                                pnl_obs += float(exp) * float(ev.get("roi")) / 100.0
+
+                            # expansão missing ROI (mesma lógica do WF principal)
+                            pnl_exp = float(pnl_obs)
+                            if wf_expand:
+                                scale_back = (back_all / back_roi) if back_roi > 0 else 1.0
+                                scale_lay = (lay_all / lay_roi) if lay_roi > 0 else 1.0
+                                if back_roi > 0 and lay_roi > 0:
+                                    w_back = back_roi / max(1e-9, (back_roi + lay_roi))
+                                    w_lay = 1.0 - w_back
+                                    pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                                elif back_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_back)
+                                elif lay_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_lay)
+
+                            # acumula por dia (divide por qtd de dias do step, como no principal)
+                            for dday in test_days:
+                                dturn[dday] = dturn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                                dpnl_exp[dday] = dpnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+
+                            if back_all > 0:
+                                back_exps.append(float(back_all))
+                            if lay_all > 0:
+                                lay_exps.append(float(lay_all))
+
+                        oos_days2 = sorted(dturn.keys())
+                        n_days2 = len(oos_days2) if oos_days2 else 0
+                        horizon = 30.0
+                        scale = (horizon / float(n_days2)) if n_days2 > 0 else None
+                        turn_sum = float(sum(dturn.values())) if dturn else 0.0
+                        pnl_exp_sum = float(sum(dpnl_exp.values())) if dpnl_exp else 0.0
+                        turn_30 = float(turn_sum) * float(scale) if scale is not None else None
+                        prof_exp_30 = float(pnl_exp_sum) * float(scale) if scale is not None else None
+
+                        bank_back_p99 = _pctl(back_exps, 99) if back_exps else None
+                        bank_lay_p99 = _pctl(lay_exps, 99) if lay_exps else None
+                        bank_risk = (float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)) if (bank_back_p99 is not None or bank_lay_p99 is not None) else None
+                        bank_liq = _liq_p99_from_jobs(jobs)
+                        bank_eff2 = max(float(bank_risk or 0.0), float(bank_liq or 0.0)) if (bank_risk is not None or bank_liq is not None) else None
+
+                        _, dd_p95 = _bootstrap_dd(list(dpnl_exp.values()), horizon_days=30, n_boot=2000)
+                        roi_bank2 = (float(prof_exp_30) / float(bank_eff2) * 100.0) if (prof_exp_30 is not None and bank_eff2 and bank_eff2 > 0) else None
+                        return {
+                            "bank_ref": float(bank_ref),
+                            "turn_30d": turn_30,
+                            "profit_30d_exp": prof_exp_30,
+                            "bank_eff": bank_eff2,
+                            "roi_bank_30d": roi_bank2,
+                            "dd_p95": dd_p95,
+                            "days": n_days2,
+                        }
+
+                    if grid and len(grid) >= 2:
+                        lines.append("### 12.2b Sensibilidade por banca (mantendo budgets/caps e seleção)\n")
+                        lines.append(
+                            "Aqui variamos a **banca de referência** usada tanto para o **sizing (Kelly/caps)** quanto para o **budget por jogo** "
+                            f"(frações fixas: Back={bud_back_frac:.2%}, Lay={bud_lay_frac:.2%}, cap_sinal={bud_cap_sig_frac:.0%}).\n\n"
+                        )
+                        lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                        lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        for b in grid:
+                            r = _simulate_with_bankroll(bank_ref=float(b))
+                            lines.append(
+                                f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
+                                f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                            )
+                        lines.append("\n")
 
                     # Breakdown de volume por combinação (para explicar queda de turnover/lucro)
                     lines.append("**Volume e stake médio por combinação (janela OOS, com budget padrão)**\n\n")
