@@ -695,11 +695,65 @@ class LayWsDiscovery:
             "wait_sec": float(wait_sec),
             "interact": bool(interact),
             "interaction": {"clicked": []},
+            "dom_debug": {
+                "url_after": "",
+                "link_samples": [],
+                "counts": {},
+            },
             "screenshots": [],
         }
         await page.goto(out["start_url"])
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(3000)
+        try:
+            out["dom_debug"]["url_after"] = getattr(page, "url", "") or ""
+        except Exception:
+            out["dom_debug"]["url_after"] = ""
+
+        # Captura amostra de links/textos para entender a rota/estrutura do Trade.
+        try:
+            out["dom_debug"]["link_samples"] = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const links = Array.from(document.querySelectorAll('a[href]'));
+                  for (const a of links.slice(0, 250)) {
+                    const href = (a.getAttribute('href') || '').trim();
+                    const t = (a.innerText || '').trim().replace(/\\s+/g,' ').slice(0, 80);
+                    if (!href) continue;
+                    if (href.startsWith('javascript:')) continue;
+                    // prioriza links que pareçam levar a eventos/mercados
+                    if (href.includes(',') || href.toLowerCase().includes('trade') || href.toLowerCase().includes('football')) {
+                      out.push({href: href.slice(0, 200), text: t});
+                    }
+                    if (out.length >= 80) break;
+                  }
+                  return out;
+                }
+                """
+            )
+        except Exception:
+            out["dom_debug"]["link_samples"] = []
+
+        try:
+            out["dom_debug"]["counts"] = await page.evaluate(
+                """
+                () => {
+                  const q = (re) => Array.from(document.querySelectorAll('div,span,button,a,li'))
+                    .filter(el => ((el.innerText||'').match(re)||[]).length>0).length;
+                  return {
+                    hasVs: q(/\\bvs\\b/i),
+                    hasBack: q(/\\bback\\b/i),
+                    hasLay: q(/\\blay\\b/i),
+                    hasOrder: q(/\\border\\b/i),
+                    hasPrice: q(/\\bprice\\b/i),
+                    hasMarket: q(/\\bmarket\\b/i),
+                  };
+                }
+                """
+            )
+        except Exception:
+            out["dom_debug"]["counts"] = {}
         try:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             p0 = f"logs/lay_ws_screens/{ts}_trade_01.png"
@@ -889,6 +943,11 @@ async def main():
     ap.add_argument("--start", choices=["football", "trade"], default="football", help="Página inicial para descoberta.")
     ap.add_argument("--trade-wait-sec", type=float, default=12.0, help="Tempo de espera na página /trade.")
     ap.add_argument("--trade-interact", action="store_true", help="Tenta interagir na página /trade (best effort).")
+    ap.add_argument(
+        "--trade-from-sportsbook",
+        action="store_true",
+        help="Fluxo alternativo: abre um jogo no Sportsbook e clica no menu 'Trade' (sem clicar em odds).",
+    )
     args = ap.parse_args()
 
     out_path = str(args.out)
@@ -913,7 +972,51 @@ async def main():
         click_info: dict = {"skipped": True}
         if str(args.start) == "trade":
             disc.phase = "trade"
-            click_info = await disc.trade_flow(page, wait_sec=float(args.trade_wait_sec), interact=bool(args.trade_interact))
+            if bool(getattr(args, "trade_from_sportsbook", False)):
+                # 1) vai para futebol sportsbook
+                await page.goto("https://black.betinasia.com/sportsbook/football")
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(3000)
+                # 2) abre 1º jogo encontrado (sem clicar em odds)
+                try:
+                    game_link = await page.evaluate(
+                        """
+                        () => {
+                          const links = Array.from(document.querySelectorAll('a'));
+                          for (const link of links) {
+                            const href = link.getAttribute('href') || '';
+                            if (href.includes('/sportsbook/football/') && href.includes(',')) return href;
+                          }
+                          return null;
+                        }
+                        """
+                    )
+                    if game_link:
+                        base_url = "https://black.betinasia.com"
+                        game_url = f"{base_url}{game_link}" if str(game_link).startswith("/") else str(game_link)
+                        await page.goto(game_url)
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+                # 3) tenta clicar em "Trade" no menu superior
+                disc.phase = "trade_from_sportsbook"
+                clicked, sel = await _try_click_any(
+                    page,
+                    ["text=/\\btrade\\b/i", "a:has-text('Trade')", "button:has-text('Trade')"],
+                    timeout_ms=3000,
+                )
+                click_info = {
+                    "mode": "trade_from_sportsbook",
+                    "trade_clicked": bool(clicked),
+                    "trade_selector": sel,
+                    "url_after": getattr(page, "url", ""),
+                }
+                await page.wait_for_timeout(int(float(args.trade_wait_sec) * 1000))
+            else:
+                click_info = await disc.trade_flow(
+                    page, wait_sec=float(args.trade_wait_sec), interact=bool(args.trade_interact)
+                )
         else:
             disc.phase = "baseline"
             await page.goto("https://black.betinasia.com/sportsbook/football")
