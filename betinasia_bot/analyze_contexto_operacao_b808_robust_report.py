@@ -630,7 +630,8 @@ async def main() -> int:
     parser.add_argument(
         "--wf-start-date",
         default=os.getenv("WF_START_DATE", "").strip(),
-        help="Se definido (YYYY-MM-DD), força o calendário do walk-forward a iniciar a partir desta data (UTC).",
+        help="Se definido (YYYY-MM-DD), força o calendário do walk-forward a iniciar a partir desta data (UTC). "
+        "Se omitido, o script usa o primeiro dia observado dentro do recorte (`--lookback-days`).",
     )
     parser.add_argument(
         "--wf-bankroll-grid",
@@ -4049,10 +4050,13 @@ async def main() -> int:
             days = days_loaded if days_loaded else days_combo
             # Ajuste do início do calendário:
             # - Se o usuário definir `--wf-start-date`, respeita.
-            # - Caso contrário, começa no 1º dia com eventos elegíveis (edge), para evitar warmup longo em dias sem operação.
+            # - Caso contrário, começa no 1º dia observado no recorte (modular ao `--lookback-days`).
             wf_start = str(getattr(args, "wf_start_date", "") or "").strip()
-            if not wf_start and days_combo:
-                wf_start = min(days_combo)
+            if not wf_start:
+                if days_loaded:
+                    wf_start = min(days_loaded)
+                elif days_combo:
+                    wf_start = min(days_combo)
             if wf_start:
                 days = [d for d in days if str(d) >= wf_start]
             # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
