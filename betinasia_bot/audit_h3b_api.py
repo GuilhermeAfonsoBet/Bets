@@ -62,6 +62,7 @@ class H3bApiAudit:
         gate_drop_ratio: float = 0.98,
         gate_open_window_sec: int = 300,
         gate_open_max: int = 3,
+        gate_max_late_sec: float = 2.5,
         gate_lay_refresh: bool = False,
         gate_lay_refresh_times_sec: Optional[List[float]] = None,
     ):
@@ -126,6 +127,7 @@ class H3bApiAudit:
             self.gate_drop_ratio = 0.98
         self.gate_open_window_sec = max(30, int(gate_open_window_sec))
         self.gate_open_max = max(0, int(gate_open_max))
+        self.gate_max_late_sec = max(0.0, float(gate_max_late_sec))
         self.gate_open_lock = asyncio.Lock()
         self.gate_open_times = deque()
         self.gate_lay_refresh = bool(gate_lay_refresh)
@@ -1576,22 +1578,64 @@ class H3bApiAudit:
 
         ws_state_key = h3b.get("ws_state_key")
         ws_side = str(h3b.get("side") or "")
-        # coleta somente os dois pontos necessários para a decisão
-        offsets_gate = [0.0, float(self.gate_drop_offset_sec)]
-        ws_gate_series, ws_gate_tel = await self._collect_ws_series(
-            ws_state_key=ws_state_key,
-            ws_side=ws_side,
-            offsets_sec=offsets_gate,
-        )
-        telemetry.update(ws_gate_tel)
 
-        ws0 = self._ws_series_get(ws_gate_series, 0.0)
-        ws5 = self._ws_series_get(ws_gate_series, float(self.gate_drop_offset_sec))
+        # WS(t0): usa o valor capturado no instante da detecção (sem depender da fila)
+        ws0 = None
+        try:
+            if isinstance(h3b.get("websocket_odd"), (int, float)) and float(h3b.get("websocket_odd")) > 0:
+                ws0 = float(h3b.get("websocket_odd"))
+        except Exception:
+            ws0 = None
+
+        # WS(t+offset): mede no timestamp alvo (detected_at + offset), não "5s após iniciar o worker"
+        target_abs_ts = float(detected_at) + float(self.gate_drop_offset_sec)
+        now0 = time.time()
+        late_s = float(now0) - float(target_abs_ts)
+        telemetry["gate_target_abs_ts"] = float(target_abs_ts)
+        telemetry["gate_late_s_at_start"] = float(late_s)
+
+        # Se já está tarde demais, marca stale e não tenta abrir ticket (evita distorção)
+        if late_s > float(self.gate_max_late_sec):
+            base['ws_gate_series'] = [
+                {"t_target_s": 0.0, "t_actual_s": max(0.0, float(now0 - float(detected_at))), "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
+            ]
+            base.update({
+                'success': True,
+                'status': 'GATE_STALE',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': f"LATE>{float(self.gate_max_late_sec):.1f}s",
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        wait_s = max(0.0, float(target_abs_ts) - float(now0))
+        telemetry["gate_wait_s"] = float(wait_s)
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
+
+        # lê WS atual do estado
+        ws5 = None
+        try:
+            if ws_state_key and ws_side:
+                cur = self._ws_get_side_odd(ws_state_key, ws_side)
+                if isinstance(cur, (int, float)) and float(cur) > 0:
+                    ws5 = float(cur)
+        except Exception:
+            ws5 = None
+
         telemetry['gate_ws_t0'] = ws0
         telemetry['gate_ws_t5'] = ws5
 
-        # Guarda sempre a série do gate no result (persistimos em hypothesis_details.ws_gate)
-        base['ws_gate_series'] = ws_gate_series
+        # série do gate (para debug/auditoria)
+        t_actual_5 = max(0.0, float(time.time() - float(detected_at)))
+        base['ws_gate_series'] = [
+            {"t_target_s": 0.0, "t_actual_s": 0.0, "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
+            {"t_target_s": float(self.gate_drop_offset_sec), "t_actual_s": t_actual_5, "ts": time.time(), "ws_side": ws_side, "ws_odd": ws5},
+        ]
 
         if not ws_state_key or not ws_side:
             self.gate_ws_missing += 1
@@ -2040,6 +2084,7 @@ async def main():
     parser.add_argument("--gate-drop-ratio", type=float, default=float(os.getenv("GATE_DROP_RATIO", "0.98")), help="Gate: condição WS(t+offset) < ratio * WS(t0). Default=0.98 (queda >2%).")
     parser.add_argument("--gate-open-window-sec", type=int, default=int(os.getenv("GATE_OPEN_WINDOW_SEC", "300")), help="Cap: janela (s) para contar aberturas (POST /v1/betslips/). Default=300 (5 min).")
     parser.add_argument("--gate-open-max", type=int, default=int(os.getenv("GATE_OPEN_MAX", "3")), help="Cap: máximo de aberturas por janela. Default=3 por 5 min (conservador).")
+    parser.add_argument("--gate-max-late-sec", type=float, default=float(os.getenv("GATE_MAX_LATE_SEC", "2.5")), help="Gate: tolerância de atraso (s). Se o worker começar >max_late após o t+offset, marca como stale e não abre ticket. Default=2.5.")
     parser.add_argument("--gate-lay-refresh", action="store_true", help="Se ligado, após abrir ticket LAY coleta lay_temporal via refresh (deferred).")
     parser.add_argument("--gate-lay-refresh-times-sec", type=str, default=os.getenv("GATE_LAY_REFRESH_TIMES_SEC", "0,5,10,15,20"), help="Tempos (s) para refresh do LAY após abrir ticket. Default=0,5,10,15,20.")
     parser.add_argument(
@@ -2099,6 +2144,7 @@ async def main():
         gate_drop_ratio=float(getattr(args, "gate_drop_ratio", 0.98)),
         gate_open_window_sec=int(getattr(args, "gate_open_window_sec", 300)),
         gate_open_max=int(getattr(args, "gate_open_max", 3)),
+        gate_max_late_sec=float(getattr(args, "gate_max_late_sec", 2.5)),
         gate_lay_refresh=bool(getattr(args, "gate_lay_refresh", False)),
         gate_lay_refresh_times_sec=gate_refresh_times,
     )
