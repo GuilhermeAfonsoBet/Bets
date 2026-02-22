@@ -1441,6 +1441,16 @@ async def main():
         action="store_true",
         help="Fluxo alternativo: abre um jogo no Sportsbook e clica no menu 'Trade' (sem clicar em odds).",
     )
+    ap.add_argument(
+        "--probe-event-id",
+        default="",
+        help="Opcional: faz probe de /web/events/external para este event_id (ex.: 2026-02-22,89,1).",
+    )
+    ap.add_argument(
+        "--probe-base-sport",
+        default="fb",
+        help="base_sport para /web/events/external (default: fb).",
+    )
     args = ap.parse_args()
 
     out_path = str(args.out)
@@ -1537,6 +1547,59 @@ async def main():
         await disc.flush_http_responses(timeout_sec=2.0)
 
         report = disc.build_report(click_info)
+
+        # Probe direto do endpoint /web/events/external (pode conter dados de mercado/trade)
+        probe_event_id = str(getattr(args, "probe_event_id", "") or "").strip()
+        if probe_event_id:
+            try:
+                base_sport = str(getattr(args, "probe_base_sport", "fb") or "fb").strip() or "fb"
+                sess = await _get_root_session_token(page)
+                url = f"https://black.betinasia.com/web/events/external/?event_id={probe_event_id}&base_sport={base_sport}"
+                res = await page.evaluate(
+                    """
+                    async (params) => {
+                      try {
+                        const headers = {'Accept': 'application/json, text/plain, */*'};
+                        if (params.session) headers['session'] = params.session;
+                        const resp = await fetch(params.url, {method:'GET', credentials:'same-origin', headers});
+                        const status = resp.status;
+                        const ct = resp.headers.get('content-type') || '';
+                        let text = '';
+                        try { text = await resp.text(); } catch(e) { text = ''; }
+                        let jsonKeys = [];
+                        let topLevelType = '';
+                        try {
+                          const j = JSON.parse(text);
+                          if (Array.isArray(j)) topLevelType = 'array';
+                          else if (j && typeof j === 'object') topLevelType = 'object';
+                          else topLevelType = typeof j;
+                          if (j && typeof j === 'object' && !Array.isArray(j)) jsonKeys = Object.keys(j).slice(0, 80);
+                        } catch(e) {}
+                        return {ok: resp.ok, status, content_type: ct, top_level_type: topLevelType, json_keys: jsonKeys, prefix: (text||'').slice(0, 1200)};
+                      } catch(e) {
+                        return {ok:false, error: e.message};
+                      }
+                    }
+                    """,
+                    {"url": url, "session": sess},
+                )
+                if isinstance(res, dict):
+                    report["probe_web_events_external"] = {
+                        "url": url,
+                        "event_id": probe_event_id,
+                        "base_sport": base_sport,
+                        "used_session_header": bool(sess),
+                        "ok": bool(res.get("ok")),
+                        "status": res.get("status"),
+                        "content_type": res.get("content_type"),
+                        "top_level_type": res.get("top_level_type"),
+                        "json_keys": res.get("json_keys") or [],
+                        "prefix": _truncate(str(res.get("prefix") or ""), 1200),
+                        "error": res.get("error") or "",
+                    }
+            except Exception as e:
+                report["probe_web_events_external"] = {"ok": False, "error": str(e)}
+
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
 
