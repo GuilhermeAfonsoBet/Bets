@@ -660,7 +660,7 @@ async def main() -> int:
         "--wf-min-matches",
         type=int,
         default=int(os.getenv("WF_MIN_MATCHES", "20")),
-        help="Mínimo de jogos por combinação para ser elegível (default 20).",
+        help="Mínimo de jogos por combinação para ser elegível (default 20). Use 0 para desabilitar o mínimo.",
     )
     parser.add_argument(
         "--wf-scheme-pre",
@@ -3967,7 +3967,7 @@ async def main() -> int:
             "  - `expanding`: usa **todos os dias anteriores** (com `wf_train_days` só definindo quando o teste começa).\n"
             "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
             "**Evidência de valor (por combinação, no treino)** (atualizado para dar mais peso a ROI):\n"
-            "- Elegibilidade (todas): `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino).\n"
+            "- Elegibilidade (todas): `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino). Se `wf_min_matches=0`, o mínimo fica desabilitado.\n"
             "- **Regra de bloqueio**: se `ROI` for **significativamente negativo** (IC90 inteiro < 0), **não ativa**.\n"
             "- Se `ROI` for **significativamente positivo** (IC90 inteiro > 0), **ativa**.\n"
             "- Caso `ROI` seja **>0 mas não sig.**:\n"
@@ -3984,7 +3984,8 @@ async def main() -> int:
         else:
             wf_train = int(max(1, getattr(args, "wf_train_days", 2)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
-            wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
+            # `wf_min_matches=0` desabilita a elegibilidade por volume no OOS.
+            wf_min_m = int(max(0, getattr(args, "wf_min_matches", 20)))
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
             if wf_train_mode not in ("rolling", "expanding"):
                 wf_train_mode = "rolling"
@@ -4645,7 +4646,10 @@ async def main() -> int:
                     "Para cada janela de treino, mostramos as métricas usadas para decidir se cada combinação ficou **ativa** ou não. "
                     "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente, ROI sig<0, ou ROI<=0 com CLV<=0 no pre‑match).\n\n"
                 )
+            if wf_min_m > 0:
                 lines.append(f"**Regra de elegibilidade (todas as combinações):** exige `N_ROI >= wf_min_matches` (aqui: {wf_min_m}).\n\n")
+            else:
+                lines.append("**Regra de elegibilidade (todas as combinações):** `wf_min_matches=0` ⇒ mínimo de N **desligado**.\n\n")
                 combos_all = [
                     "Back_Pre_Any", "Back_In_Any",
                     "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
