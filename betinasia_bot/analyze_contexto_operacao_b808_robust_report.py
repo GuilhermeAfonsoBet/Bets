@@ -677,7 +677,7 @@ async def main() -> int:
     parser.add_argument(
         "--wf-scheme-in",
         default=os.getenv("WF_SCHEME_IN", "FLAT"),
-        help="Scheme de sizing para OOS in-match (default FLAT). Ex.: FLAT, PROXY",
+        help="Scheme de sizing para OOS in-match (default FLAT). Ex.: FLAT, PROXY, ROI_TRAIN",
     )
     parser.add_argument(
         "--wf-expand-missing-roi",
@@ -4008,6 +4008,10 @@ async def main() -> int:
             wf_flat_stake_back = max(0.0, float(getattr(args, "wf_flat_stake_back", 1.0)))
             wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
 
+            # Para scheme in-match "ROI_TRAIN": usamos ROI médio no treino por combinação como proxy de EV.
+            # Mapeamento preenchido por step (train window) e usado no loop de sizing do test.
+            roi_train_by_key: Dict[str, float] = {}
+
             # index para recuperar campos de sizing/liquidez
             audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
 
@@ -4199,9 +4203,23 @@ async def main() -> int:
                         return (None, None)
                     sc = _scheme_for_event(ev)
                     if ev.get("side") == "Back":
-                        st = _sizing_back(d0, sc)
+                        st = None
                         if sc == "FLAT":
                             st = float(wf_flat_stake_back)
+                        elif sc == "PROXY" or str(sc).startswith("KELLY"):
+                            st = _sizing_back(d0, sc)
+                        elif str(sc).upper() == "ROI_TRAIN":
+                            k = _key(ev)
+                            roi_hat = _safe_float(roi_train_by_key.get(k))
+                            if roi_hat is None:
+                                return (None, None)
+                            # proxy de Kelly: f ~= EV (assumindo odds típicas ~2.0). Caps + limit controlam.
+                            f = max(0.0, float(roi_hat)) / 100.0
+                            # escala pela mesma referência usada no budget (coerente com governança)
+                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
+                            cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
+                            st = min(f * bank_ref_budget_local, cap)
+                            st = min(float(st), float(_max_back_stake_event(d0)))
                         if st is None or float(st) <= 0:
                             return (None, None)
                         return (float(st), float(st))
@@ -4232,7 +4250,17 @@ async def main() -> int:
                         cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
                         liab = min(f * float(lay_bank_ref), cap)
                     else:
-                        return (None, None)
+                        if str(sc).upper() == "ROI_TRAIN":
+                            k = _key(ev)
+                            roi_hat = _safe_float(roi_train_by_key.get(k))
+                            if roi_hat is None:
+                                return (None, None)
+                            f = max(0.0, float(roi_hat)) / 100.0
+                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
+                            cap = LAY_CAP_FRAC * max(1e-9, bank_ref_budget_local)
+                            liab = min(f * bank_ref_budget_local, cap)
+                        else:
+                            return (None, None)
                     # cap por evento (limit): converte stake max -> liab max
                     max_st = _max_lay_stake_event(d0)
                     liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
@@ -4450,6 +4478,15 @@ async def main() -> int:
                         if ok_sel:
                             active.append(k)
                             active_counts[k] = active_counts.get(k, 0) + 1
+
+                    # Atualiza mapa de ROI do treino para sizing ROI_TRAIN (apenas combos ativos).
+                    roi_train_by_key = {}
+                    for k in active:
+                        d = (diag.get(k) or {})
+                        rm = _safe_float(d.get("roi_mean"))
+                        if rm is None:
+                            continue
+                        roi_train_by_key[str(k)] = float(rm)
 
                     # avaliação OOS: ROI agregado nas combinações ativas
                     test_active = [e for e in test if _key(e) in set(active)]
@@ -5030,7 +5067,12 @@ async def main() -> int:
                         grid.append(float(bank_ref_budget))
                     grid = sorted({round(float(x), 6) for x in grid if x and float(x) > 0})
 
-                    def _sizing_for_event_bankroll(ev: dict, bank_ref: float) -> Tuple[Optional[float], Optional[float]]:
+                    def _sizing_for_event_bankroll(
+                        ev: dict,
+                        bank_ref: float,
+                        *,
+                        roi_train_map: Optional[Dict[str, float]] = None,
+                    ) -> Tuple[Optional[float], Optional[float]]:
                         """
                         Sizing do evento no OOS para uma banca explícita `bank_ref`.
                         Mantém os mesmos caps (BACK_CAP_FRAC/LAY_CAP_FRAC) e caps por evento (limit).
@@ -5046,6 +5088,15 @@ async def main() -> int:
                                 st = float(wf_flat_stake_back)
                             elif sc == "PROXY":
                                 st = _sizing_back(d0, "PROXY")
+                            elif str(sc).upper() == "ROI_TRAIN":
+                                k = _key(ev)
+                                roi_hat = _safe_float((roi_train_map or {}).get(k))
+                                if roi_hat is None:
+                                    return (None, None)
+                                f = max(0.0, float(roi_hat)) / 100.0
+                                cap = BACK_CAP_FRAC * max(1e-9, float(bank_ref))
+                                st = min(f * float(bank_ref), cap)
+                                st = min(float(st), float(_max_back_stake_event(d0)))
                             elif str(sc).startswith("KELLY"):
                                 # Kelly só pre-match
                                 if d0.get("is_live") is True:
@@ -5082,6 +5133,14 @@ async def main() -> int:
                             if not sized:
                                 return (None, None)
                             liab = float(sized[0])
+                        elif str(sc).upper() == "ROI_TRAIN":
+                            k = _key(ev)
+                            roi_hat = _safe_float((roi_train_map or {}).get(k))
+                            if roi_hat is None:
+                                return (None, None)
+                            f = max(0.0, float(roi_hat)) / 100.0
+                            cap = LAY_CAP_FRAC * max(1e-9, float(bank_ref))
+                            liab = min(f * float(bank_ref), cap)
                         elif str(sc).startswith("KELLY"):
                             if d0.get("is_live") is True:
                                 return (None, None)
@@ -5150,7 +5209,11 @@ async def main() -> int:
                             spent_lay: Dict[int, float] = {}
 
                             for ev in test_elig:
-                                st_eq, exp = _sizing_for_event_bankroll(ev, float(bank_ref))
+                                st_eq, exp = _sizing_for_event_bankroll(
+                                    ev,
+                                    float(bank_ref),
+                                    roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys},
+                                )
                                 if st_eq is None or exp is None:
                                     continue
 
