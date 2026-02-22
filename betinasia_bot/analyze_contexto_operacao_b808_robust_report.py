@@ -557,6 +557,11 @@ async def main() -> int:
         help="CSV de dias UTC (YYYY-MM-DD) a excluir do recorte antes de todas as métricas "
         "(útil para dias com falha operacional que parecem 'sem apostas'). Ex.: 2026-02-17,2026-02-18",
     )
+    parser.add_argument(
+        "--no-auto-exclude-days",
+        action="store_true",
+        help="Desliga exclusões automáticas de dias sem dados e dias WS-only sem Lay (qualidade operacional).",
+    )
     parser.add_argument("--back-diff-min", type=float, default=2.0, help="Corte de edge Back (default: 2.0)")
     parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
     # OBS: argparse usa interpolação estilo `%` na help string; por isso `%` precisa ser escapado como `%%`.
@@ -841,18 +846,93 @@ async def main() -> int:
         # ------------------------------------------------------------
         # Exclusão de dias (audited_at UTC) para evitar distorções
         # ------------------------------------------------------------
-        exclude_days = {x.strip() for x in str(getattr(args, "exclude_audited_days", "") or "").split(",") if x.strip()}
-        if exclude_days:
-            def _day_utc(ts: Any) -> Optional[str]:
-                if isinstance(ts, datetime):
+        def _day_utc(ts: Any) -> Optional[str]:
+            if isinstance(ts, datetime):
+                try:
                     return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
-                return None
+                except Exception:
+                    return ts.strftime("%Y-%m-%d")
+            return None
 
+        # Diagnóstico: calendário bruto observado (antes de exclusões)
+        raw_days_obs = sorted({d for d in (_day_utc(x.get("audited_at")) for x in all_data) if d})
+        raw_days_missing: List[str] = []
+        if raw_days_obs:
+            try:
+                d0 = datetime.fromisoformat(raw_days_obs[0]).date()
+                d1 = datetime.fromisoformat(raw_days_obs[-1]).date()
+                cur = d0
+                raw_set = set(raw_days_obs)
+                while cur <= d1:
+                    s = cur.isoformat()
+                    if s not in raw_set:
+                        raw_days_missing.append(s)
+                    cur = cur + timedelta(days=1)
+            except Exception:
+                raw_days_missing = []
+
+        # Auto-exclusão: dias WS-only sem Lay (regime onde bs_odd e lay não existem)
+        auto_excluded_ws_only_no_lay: List[str] = []
+        if not bool(getattr(args, "no_auto_exclude_days", False)):
+            def _has_ws_series(dd: dict) -> bool:
+                try:
+                    h = dd.get("hypothesis_details") or {}
+                    ws_series = _get_path(h, ["ws_series"])
+                    return isinstance(ws_series, list) and len(ws_series) > 0
+                except Exception:
+                    return False
+
+            def _has_lay_any(dd: dict) -> bool:
+                try:
+                    h = dd.get("hypothesis_details") or {}
+                    lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+                    if lay_odd is not None and float(lay_odd) > 1.0:
+                        return True
+                    lay_temporal = _get_path(h, ["lay_temporal"])
+                    if isinstance(lay_temporal, list) and len(lay_temporal) > 0:
+                        return True
+                except Exception:
+                    return False
+                return False
+
+            day_flags: Dict[str, Dict[str, bool]] = {}
+            for dd in all_data:
+                day = _day_utc(dd.get("audited_at"))
+                if not day:
+                    continue
+                f = day_flags.setdefault(day, {"has_ws": False, "has_bs": False, "has_lay": False})
+                if _has_ws_series(dd):
+                    f["has_ws"] = True
+                if _safe_float(dd.get("bs_odd")) is not None and float(dd.get("bs_odd") or 0) > 0:
+                    f["has_bs"] = True
+                if _has_lay_any(dd):
+                    f["has_lay"] = True
+
+            # Dia "WS-only sem Lay": há ws_series, mas não há bs_odd e não há qualquer Lay.
+            auto_excluded_ws_only_no_lay = sorted(
+                [day for day, f in day_flags.items() if f.get("has_ws") and (not f.get("has_bs")) and (not f.get("has_lay"))]
+            )
+
+        # Exclusão manual via CLI/env
+        exclude_days_manual = {x.strip() for x in str(getattr(args, "exclude_audited_days", "") or "").split(",") if x.strip()}
+
+        # Conjunto final de dias a excluir do dataset (quando existem registros)
+        exclude_days_all = set(exclude_days_manual) | set(auto_excluded_ws_only_no_lay)
+        excluded_days_summary = {
+            "manual": sorted(exclude_days_manual),
+            "auto_ws_only_no_lay": list(auto_excluded_ws_only_no_lay),
+            "missing_no_data": list(raw_days_missing),
+        }
+
+        if exclude_days_all:
             before_n = len(all_data)
-            all_data = [d for d in all_data if (_day_utc(d.get("audited_at")) not in exclude_days)]
+            all_data = [d for d in all_data if (_day_utc(d.get("audited_at")) not in exclude_days_all)]
             after_n = len(all_data)
             if before_n != after_n:
-                print(f"[INFO] Excluídos {before_n - after_n} registros por exclude_audited_days={sorted(exclude_days)}")
+                print(
+                    f"[INFO] Excluídos {before_n - after_n} registros por dias UTC (manual={len(exclude_days_manual)}, "
+                    f"auto_ws_only_no_lay={len(auto_excluded_ws_only_no_lay)})."
+                )
 
         # ------------------------------------------------------------
         # Closing odds em batch (melhora muito performance em janelas longas)
@@ -1754,6 +1834,28 @@ async def main() -> int:
                     f"- **Alerta**: lookback_days={args.lookback_days}, mas a janela efetiva observada foi menor (span≈{span_label}). "
                     "Isso costuma indicar falta de auditorias antigas para essas `audit_version` (ou recorte por regime/qualidade).\n"
                 )
+        # Dias excluídos/missing (qualidade operacional)
+        try:
+            man = list((excluded_days_summary or {}).get("manual") or [])
+            auto_nl = list((excluded_days_summary or {}).get("auto_ws_only_no_lay") or [])
+            miss = list((excluded_days_summary or {}).get("missing_no_data") or [])
+            if man or auto_nl or miss:
+                def _fmt_days(xs: List[str], max_show: int = 8) -> str:
+                    xs = [str(x) for x in xs if str(x)]
+                    if not xs:
+                        return "—"
+                    if len(xs) <= max_show:
+                        return ", ".join(xs)
+                    return ", ".join(xs[:max_show]) + f" ... (+{len(xs) - max_show})"
+
+                summary_lines.append(
+                    "- **Dias excluídos / missing** (UTC, não tratados como 0): "
+                    f"manual={len(man)} [{_fmt_days(man)}]; "
+                    f"auto(ws-only sem Lay)={len(auto_nl)} [{_fmt_days(auto_nl)}]; "
+                    f"missing(sem dados)={len(miss)} [{_fmt_days(miss)}].\n"
+                )
+        except Exception:
+            pass
         summary_lines.append(
             f"- **Coortes (status=OK, betslip confiável)**: `BS>WS` (diff>={back_cut:.1f}%): **{len(back_edge)}**; `BS<WS` (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
         )
@@ -2073,8 +2175,10 @@ async def main() -> int:
         )
 
         def _days_for_rate() -> float:
-            if args.lookback_days and int(args.lookback_days) > 0:
-                return float(args.lookback_days)
+            # IMPORTANT: usar dias com dados (após exclusões) — não use lookback_days,
+            # pois dias "zerados" por falha operacional NÃO devem entrar como 0.
+            if audited_unique_days and int(audited_unique_days) > 0:
+                return float(audited_unique_days)
             if audited_span_days is not None and audited_span_days > 0:
                 return float(audited_span_days)
             return 1.0
@@ -3269,7 +3373,8 @@ async def main() -> int:
         # Window days para projeções (mesma lógica do 7.3, mas com fallback seguro)
         window_days = None
         try:
-            window_days = float(args.lookback_days) if args.lookback_days else None
+            # IMPORTANT: usar dias com dados (após exclusões), não lookback_days.
+            window_days = float(audited_unique_days) if audited_unique_days else None
         except Exception:
             window_days = None
         if audited_span_days is not None:
