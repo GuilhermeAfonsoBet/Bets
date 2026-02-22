@@ -148,6 +148,7 @@ class LayWsDiscovery:
         self.ws_by_url: Dict[str, WsStats] = {}
         self.http_reqs: List[dict] = []
         self.http_resps: List[dict] = []
+        self._resp_tasks: List[asyncio.Task] = []
         self.http_reqs_phase_index: Dict[str, int] = {}
 
         # globais
@@ -289,7 +290,7 @@ class LayWsDiscovery:
                 json_keys: List[str] = []
                 try:
                     # Pode falhar se body não estiver disponível (stream)
-                    txt = await resp.text()
+                    txt = await asyncio.wait_for(resp.text(), timeout=0.6)
                     if txt:
                         body_prefix = _truncate(_redact_post_data(txt) or "", 1200)
                         try:
@@ -315,9 +316,23 @@ class LayWsDiscovery:
                 )
 
             try:
-                asyncio.create_task(_collect())
+                t = asyncio.create_task(_collect())
+                self._resp_tasks.append(t)
+                # evita crescer sem limite
+                if len(self._resp_tasks) > 120:
+                    self._resp_tasks = [x for x in self._resp_tasks if not x.done()][-80:]
             except Exception:
                 return
+        except Exception:
+            return
+
+    async def flush_http_responses(self, timeout_sec: float = 2.0) -> None:
+        """Aguarda tasks de coleta de responses (com timeout curto)."""
+        tasks = [t for t in (self._resp_tasks or []) if t and not t.done()]
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_sec)
         except Exception:
             return
 
@@ -1380,6 +1395,9 @@ async def main():
             await page.wait_for_timeout(int(float(args.baseline_wait_sec) * 1000))
             if bool(args.do_click_flow):
                 click_info = await disc.click_flow(page)
+
+        # garante que tasks de capture de response finalizaram (melhor diagnóstico)
+        await disc.flush_http_responses(timeout_sec=2.0)
 
         report = disc.build_report(click_info)
         with open(out_path, "w", encoding="utf-8") as f:
