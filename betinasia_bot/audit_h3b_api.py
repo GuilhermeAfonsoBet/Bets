@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
@@ -57,6 +58,12 @@ class H3bApiAudit:
         max_queue_wait_ms: int = 5000,
         mode: str = "api",
         ws_sample_offsets_sec: Optional[List[float]] = None,
+        gate_drop_offset_sec: float = 5.0,
+        gate_drop_ratio: float = 0.98,
+        gate_open_window_sec: int = 300,
+        gate_open_max: int = 3,
+        gate_lay_refresh: bool = False,
+        gate_lay_refresh_times_sec: Optional[List[float]] = None,
     ):
         self.num_audits = num_audits
         self.direction = direction
@@ -107,8 +114,37 @@ class H3bApiAudit:
         # - api: comportamento atual (WS detecta + BS via API para validar)
         # - ws_only: coleta só WS (t0..t+30) e prepara dados para motor de decisão
         # - ws_vs_bs: auditoria comparativa (WS + BS no mesmo timestamp)
+        # - ws_gate_lay: WS-only para gate (t0,t+5), abre ticket LAY só quando elegível
         self.mode = str(mode or "api").strip().lower()
         self.ws_sample_offsets_sec = ws_sample_offsets_sec or [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]
+
+        # Gate (H3B + queda em 5s) -> abre ticket LAY (Exchange) sob cap
+        self.gate_drop_offset_sec = max(0.0, float(gate_drop_offset_sec))
+        self.gate_drop_ratio = float(gate_drop_ratio)
+        if self.gate_drop_ratio <= 0 or self.gate_drop_ratio >= 1.0:
+            # sane default: 0.98 (= queda >2%)
+            self.gate_drop_ratio = 0.98
+        self.gate_open_window_sec = max(30, int(gate_open_window_sec))
+        self.gate_open_max = max(0, int(gate_open_max))
+        self.gate_open_lock = asyncio.Lock()
+        self.gate_open_times = deque()
+        self.gate_lay_refresh = bool(gate_lay_refresh)
+        self.gate_lay_refresh_times_sec = (
+            [0.0, 5.0, 10.0, 15.0, 20.0]
+            if (gate_lay_refresh_times_sec is None)
+            else [float(x) for x in gate_lay_refresh_times_sec if x is not None and float(x) >= 0.0]
+        )
+
+        # Contadores (observabilidade)
+        self.gate_seen = 0
+        self.gate_ws_missing = 0
+        self.gate_not_eligible = 0
+        self.gate_eligible = 0
+        self.gate_blocked_cap = 0
+        self.gate_blocked_backoff = 0
+        self.gate_open_attempts = 0
+        self.gate_open_success = 0
+        self.gate_open_failed = 0
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -145,6 +181,46 @@ class H3bApiAudit:
 
     def _ws_state_key(self, event_id: str, market_type: str, market_period: str, line: str) -> Tuple[str, str, str, str]:
         return (str(event_id), str(market_type), str(market_period), str(line))
+
+    @staticmethod
+    def _ws_series_get(series: List[dict], target_s: float) -> Optional[float]:
+        """
+        Retorna a ws_odd do ponto com t_target_s == target_s (tolerância pequena).
+        """
+        try:
+            tgt = float(target_s)
+        except Exception:
+            return None
+        for p in series or []:
+            try:
+                if abs(float(p.get("t_target_s", -9999.0)) - tgt) <= 0.15:
+                    v = p.get("ws_odd")
+                    return float(v) if isinstance(v, (int, float)) and float(v) > 0 else None
+            except Exception:
+                continue
+        return None
+
+    async def _gate_try_acquire_open_slot(self) -> Tuple[bool, dict]:
+        """
+        Aplica cap de aberturas de ticket (POST /v1/betslips/) em janela deslizante.
+        Retorna (ok, meta).
+        """
+        now = time.time()
+        async with self.gate_open_lock:
+            # prune
+            w = float(self.gate_open_window_sec)
+            while self.gate_open_times and (now - float(self.gate_open_times[0])) > w:
+                try:
+                    self.gate_open_times.popleft()
+                except Exception:
+                    break
+            cnt = len(self.gate_open_times)
+            if self.gate_open_max <= 0:
+                return False, {"cap_enabled": False, "count_window": cnt, "window_sec": w, "max": self.gate_open_max}
+            if cnt >= int(self.gate_open_max):
+                return False, {"cap_enabled": True, "count_window": cnt, "window_sec": w, "max": int(self.gate_open_max)}
+            self.gate_open_times.append(now)
+            return True, {"cap_enabled": True, "count_window": cnt + 1, "window_sec": w, "max": int(self.gate_open_max)}
 
     def _ws_get_snapshot(self, key: Tuple[str, str, str, str]) -> Optional[dict]:
         snap = self._ws_odds_state.get(key)
@@ -365,13 +441,21 @@ class H3bApiAudit:
 
     async def start(self):
         logger.info("=" * 60)
-        if self.mode in ("ws_only", "ws"):
+        if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
+            logger.info("MONITOR H3B (WS gate t0/t+5) + abre LAY (Exchange) sob cap")
+        elif self.mode in ("ws_only", "ws"):
             logger.info("MONITOR H3B (WS-only) + série temporal (t0..t+30)")
         elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
             logger.info("AUDITORIA H3B (WS vs BS no mesmo timestamp)")
         else:
             logger.info("AUDITORIA H3B VIA API (~2-3s)")
         logger.info(f"mode={self.mode} ws_offsets={self.ws_sample_offsets_sec}")
+        if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
+            logger.info(
+                f"gate: offset={self.gate_drop_offset_sec:.1f}s ratio={self.gate_drop_ratio:.3f} | "
+                f"cap={self.gate_open_max}/{self.gate_open_window_sec}s | "
+                f"lay_refresh={self.gate_lay_refresh}"
+            )
         logger.info("=" * 60)
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'running', False))
@@ -683,7 +767,10 @@ class H3bApiAudit:
             h3b['dequeued_at'] = time.time()
             h3b['queue_depth_after_dequeue'] = queue.qsize()
             defer_temporal = self.save_to_db and self.temporal_workers > 0
-            if self.mode in ("ws_only", "ws"):
+            if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
+                # Gate precisa de WS(t0,t+5) inline para decidir; não pode ser deferred.
+                result = await self._execute_ws_gate_lay(h3b, defer_temporal=defer_temporal)
+            elif self.mode in ("ws_only", "ws"):
                 result = await self._execute_ws_only(h3b, run_ws_series=not defer_temporal)
             elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
                 result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
@@ -1440,6 +1527,284 @@ class H3bApiAudit:
         })
         return base
 
+    async def _execute_ws_gate_lay(self, h3b: dict, *, defer_temporal: bool = True) -> dict:
+        """
+        Gate (H3B UP + queda intensa em 5s):
+          - coleta WS(t0) e WS(t+offset) inline
+          - se WS(t+offset) < gate_drop_ratio * WS(t0): tenta abrir ticket LAY (Exchange)
+          - aplica cap de aberturas por janela e respeita backoff global
+
+        Observação: mesmo quando o cap bloqueia, salvamos um registro com status "GATE_BLOCKED"
+        para medir quantos elegíveis foram perdidos por limitação.
+        """
+        self.gate_seen += 1
+        detected_at = h3b['detected_at']
+        execution_start = time.time()
+        queue_wait_ms = int((execution_start - detected_at) * 1000)
+
+        telemetry: Dict[str, Any] = {
+            'queue_wait_ms': queue_wait_ms,
+            'queue_depth_at_enqueue': h3b.get('queue_depth_at_enqueue'),
+            'queue_depth_after_dequeue': h3b.get('queue_depth_after_dequeue'),
+            'gate_mode': 'ws_gate_lay',
+            'gate_drop_offset_sec': float(self.gate_drop_offset_sec),
+            'gate_drop_ratio': float(self.gate_drop_ratio),
+        }
+
+        base: Dict[str, Any] = {
+            'event_id': h3b['event_id'],
+            'home_team': h3b['home_team'],
+            'away_team': h3b['away_team'],
+            'league': h3b.get('league', ''),
+            'kickoff': h3b.get('kickoff'),
+            'market_type': h3b['market_type'],
+            'market_period': h3b.get('market_period', 'full_time'),
+            'line': h3b['line'],
+            'side': h3b['side'],
+            'ws_odd': h3b['websocket_odd'],
+            'is_live': h3b.get('is_live'),
+            'direction': h3b.get('direction', 'up'),
+            'detected_at': detected_at,
+            'post_ms': 0,
+            'pmm_ms': 0,
+            'audit_version': "v5.1-ws-gate-lay",
+        }
+
+        ws_state_key = h3b.get("ws_state_key")
+        ws_side = str(h3b.get("side") or "")
+        # coleta somente os dois pontos necessários para a decisão
+        offsets_gate = [0.0, float(self.gate_drop_offset_sec)]
+        ws_gate_series, ws_gate_tel = await self._collect_ws_series(
+            ws_state_key=ws_state_key,
+            ws_side=ws_side,
+            offsets_sec=offsets_gate,
+        )
+        telemetry.update(ws_gate_tel)
+
+        ws0 = self._ws_series_get(ws_gate_series, 0.0)
+        ws5 = self._ws_series_get(ws_gate_series, float(self.gate_drop_offset_sec))
+        telemetry['gate_ws_t0'] = ws0
+        telemetry['gate_ws_t5'] = ws5
+
+        # Guarda sempre a série do gate no result (persistimos em hypothesis_details.ws_gate)
+        base['ws_gate_series'] = ws_gate_series
+
+        if not ws_state_key or not ws_side:
+            self.gate_ws_missing += 1
+            base.update({
+                'success': True,
+                'status': 'GATE_WS_MISSING',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': 'WS_STATE_KEY_OR_SIDE_MISSING',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        if not ws0 or not ws5:
+            self.gate_ws_missing += 1
+            base.update({
+                'success': True,
+                'status': 'GATE_WS_POINT_MISSING',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': 'WS_POINT_MISSING',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        gate_ok = bool(float(ws5) < float(self.gate_drop_ratio) * float(ws0))
+        telemetry['gate_eligible'] = gate_ok
+        telemetry['gate_drop_ratio_obs'] = float(ws5) / float(ws0) if ws0 else None
+
+        # Se não elegível, ainda salva para medir taxa do filtro
+        if not gate_ok:
+            self.gate_not_eligible += 1
+            # se existir temporal worker, podemos coletar série completa WS depois (para análises)
+            if defer_temporal:
+                base["_ws_series_refs"] = {
+                    "ws_state_key": ws_state_key,
+                    "ws_side": ws_side,
+                    # garante que inclui offset do gate e os offsets padrões
+                    "offsets_sec": sorted({0.0, float(self.gate_drop_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+                }
+                telemetry["ws_series_deferred"] = True
+            base.update({
+                'success': True,
+                'status': 'GATE_NOT_ELIGIBLE',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': '',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        self.gate_eligible += 1
+
+        # Backoff global (rate limit observado) -> não abre ticket
+        now_ts = time.time()
+        if self._api_backoff_until_ts and now_ts < float(self._api_backoff_until_ts):
+            self.gate_blocked_backoff += 1
+            telemetry['api_backoff'] = True
+            telemetry['api_backoff_until_ts'] = float(self._api_backoff_until_ts)
+            base.update({
+                'success': True,
+                'status': 'GATE_BLOCKED_BACKOFF',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': f"API_BACKOFF until_ts={float(self._api_backoff_until_ts):.0f}",
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        # Cap local de aberturas
+        allowed, cap_meta = await self._gate_try_acquire_open_slot()
+        telemetry['gate_cap'] = cap_meta
+        if not allowed:
+            self.gate_blocked_cap += 1
+            base.update({
+                'success': True,
+                'status': 'GATE_BLOCKED_CAP',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': 'CAP_OPENINGS',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        # --- abre ticket LAY (Exchange) ---
+        self.gate_open_attempts += 1
+        t_build = time.time()
+        lay_bet_type = ApiBetslipClient.build_lay_bet_type(
+            market_type=h3b['market_type'],
+            side=h3b['side'],
+            line=h3b['line'],
+        )
+        telemetry['build_bet_type_ms'] = int((time.time() - t_build) * 1000)
+
+        t_call = time.time()
+        lay_result = await self.api_client.get_betslip_odds(
+            event_id=h3b['event_id'],
+            bet_type=lay_bet_type,
+            betslip_type="lay",
+        )
+        telemetry['lay_post_ms'] = int(lay_result.request_time_ms) if lay_result else 0
+        telemetry['lay_total_ms'] = int(lay_result.total_time_ms) if lay_result else 0
+        telemetry['parallel_fetch_ms'] = int((time.time() - t_call) * 1000)
+        telemetry['lay_success'] = bool(lay_result and lay_result.success)
+        telemetry['lay_error'] = lay_result.error if (lay_result and not lay_result.success and lay_result.error) else ''
+
+        def _extract_lay_snapshot(api_result: Optional[BetslipApiResult]) -> Optional[dict]:
+            if not api_result or not api_result.success:
+                return None
+            lay_bookmakers = [b for b in api_result.bookmakers if b.best_price > 0]
+            if not lay_bookmakers:
+                return None
+            best = min(lay_bookmakers, key=lambda b: b.best_price)
+            return {
+                'odd': best.best_price,
+                'bookie': best.bookie,
+                'limit': best.max_stake,
+                'num_bk': len(lay_bookmakers),
+            }
+
+        lay_snapshot = _extract_lay_snapshot(lay_result)
+        if lay_snapshot:
+            base.update({
+                'lay_odd': lay_snapshot['odd'],
+                'lay_bookie': lay_snapshot['bookie'],
+                'lay_limit': lay_snapshot['limit'],
+                'lay_num_bk': lay_snapshot['num_bk'],
+            })
+
+        retry_after = int(getattr(lay_result, "rate_limit_retry_after_sec", 0) or 0) if lay_result else 0
+        if retry_after > 0:
+            # margem de segurança
+            self._api_backoff_until_ts = time.time() + float(retry_after) + 5.0
+            self.gate_open_failed += 1
+            base.update({
+                'success': False,
+                'status': 'API_RATE_LIMIT',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': f"RATE_LIMIT retry_after={int(retry_after)}s",
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        if not lay_result or not lay_result.success:
+            self.gate_open_failed += 1
+            base.update({
+                'success': False,
+                'status': 'API_FAILED',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': lay_result.error if lay_result else 'Lay failed',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        self.gate_open_success += 1
+        lay_betslip_id = lay_result.betslip_id if lay_result and lay_result.success else ""
+        # Opcional: coletar temporal Lay via refresh (deferred no temporal worker)
+        if self.gate_lay_refresh and lay_betslip_id:
+            base["_temporal_refs"] = {
+                "ws_odd": ws0,
+                "ws_state_key": ws_state_key,
+                "ws_side": ws_side,
+                "refresh_times": list(self.gate_lay_refresh_times_sec or []),
+                "back_betslip_id": "",
+                "lay_betslip_id": lay_betslip_id,
+            }
+
+        # Também opcional: coletar série WS completa de forma assíncrona (para reversão)
+        if defer_temporal:
+            base["_ws_series_refs"] = {
+                "ws_state_key": ws_state_key,
+                "ws_side": ws_side,
+                "offsets_sec": sorted({0.0, float(self.gate_drop_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+            }
+            telemetry["ws_series_deferred"] = True
+
+        end_to_end_ms = int((time.time() - detected_at) * 1000)
+        telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
+        telemetry['end_to_end_ms'] = end_to_end_ms
+        telemetry['pipeline_overhead_ms'] = max(0, end_to_end_ms - telemetry.get('queue_wait_ms', 0))
+
+        base.update({
+            'success': True,
+            'status': 'OK',
+            'bs_odd': None,
+            'bs_limit': 0,
+            'num_bk': 0,
+            'diff_pct': None,
+            'error': '',
+            'total_ms': end_to_end_ms,
+            'telemetry': telemetry,
+        })
+        return base
+
     # ================================================================
     # SAVE
     # ================================================================
@@ -1465,6 +1830,14 @@ class H3bApiAudit:
                 hypothesis_details['temporal'] = r.get('temporal')
             if r.get('lay_temporal'):
                 hypothesis_details['lay_temporal'] = r.get('lay_temporal')
+            # WS series (para ws_only / ws_gate_lay). Pode vir inline.
+            if r.get('ws_series'):
+                hypothesis_details['ws_series'] = r.get('ws_series')
+            if r.get('ws_series_meta'):
+                hypothesis_details['ws_series_meta'] = r.get('ws_series_meta')
+            # Gate series/meta (t0,t+5) — usado para elegibilidade e debug
+            if r.get('ws_gate_series'):
+                hypothesis_details['ws_gate_series'] = r.get('ws_gate_series')
             if (not r.get('success')) and r.get('error'):
                 hypothesis_details['api_error'] = r.get('error')
             finance_snapshot = self._build_finance_snapshot(r)
@@ -1600,6 +1973,14 @@ class H3bApiAudit:
             f"db={int(self._avg(db_ms))} "
             f"pipeline={int(self._avg(pipeline_ms))}"
         )
+        if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
+            logger.info(
+                "  Gate (5s drop -> open LAY): "
+                f"seen={self.gate_seen} elig={self.gate_eligible} not_elig={self.gate_not_eligible} "
+                f"ws_missing={self.gate_ws_missing} "
+                f"blocked_cap={self.gate_blocked_cap} blocked_backoff={self.gate_blocked_backoff} "
+                f"open_attempts={self.gate_open_attempts} open_ok={self.gate_open_success} open_fail={self.gate_open_failed}"
+            )
         logger.info(f"{'=' * 50}")
 
     def _print_summary(self):
@@ -1641,15 +2022,22 @@ async def main():
     default_offsets = os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC") or getattr(settings, "audit_ws_sample_offsets_sec", None) or "0,3,6,9,12,15,18,21,24,27,30"
     parser.add_argument(
         "--mode",
-        choices=["api", "ws_only", "ws_vs_bs"],
+        choices=["api", "ws_only", "ws_vs_bs", "ws_gate_lay"],
         default=default_mode,
-        help="Modo de execução: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo WS vs BS).",
+        help="Modo: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo), ws_gate_lay (WS gate + abre LAY sob cap).",
     )
     parser.add_argument(
         "--ws-sample-offsets-sec",
         default=str(default_offsets),
         help="Offsets (segundos) para amostragem WS (ex: '0,3,6,...,30').",
     )
+    # Gate: H3B UP + queda em 5s -> abre ticket LAY
+    parser.add_argument("--gate-drop-offset-sec", type=float, default=float(os.getenv("GATE_DROP_OFFSET_SEC", "5")), help="Gate: offset (s) para comparar WS(t+offset) vs WS(t0). Default=5.")
+    parser.add_argument("--gate-drop-ratio", type=float, default=float(os.getenv("GATE_DROP_RATIO", "0.98")), help="Gate: condição WS(t+offset) < ratio * WS(t0). Default=0.98 (queda >2%).")
+    parser.add_argument("--gate-open-window-sec", type=int, default=int(os.getenv("GATE_OPEN_WINDOW_SEC", "300")), help="Cap: janela (s) para contar aberturas (POST /v1/betslips/). Default=300 (5 min).")
+    parser.add_argument("--gate-open-max", type=int, default=int(os.getenv("GATE_OPEN_MAX", "3")), help="Cap: máximo de aberturas por janela. Default=3 por 5 min (conservador).")
+    parser.add_argument("--gate-lay-refresh", action="store_true", help="Se ligado, após abrir ticket LAY coleta lay_temporal via refresh (deferred).")
+    parser.add_argument("--gate-lay-refresh-times-sec", type=str, default=os.getenv("GATE_LAY_REFRESH_TIMES_SEC", "0,5,10,15,20"), help="Tempos (s) para refresh do LAY após abrir ticket. Default=0,5,10,15,20.")
     parser.add_argument(
         "--executor-workers",
         type=int,
@@ -1688,6 +2076,11 @@ async def main():
         default=[0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30],
     )
 
+    gate_refresh_times = H3bApiAudit._parse_offsets(
+        str(getattr(args, "gate_lay_refresh_times_sec", "")),
+        default=[0, 5, 10, 15, 20],
+    )
+
     audit = H3bApiAudit(
         num_audits=args.num_audits,
         direction=args.direction,
@@ -1698,6 +2091,12 @@ async def main():
         max_queue_wait_ms=args.max_queue_wait_ms,
         mode=str(args.mode),
         ws_sample_offsets_sec=ws_offsets,
+        gate_drop_offset_sec=float(getattr(args, "gate_drop_offset_sec", 5.0)),
+        gate_drop_ratio=float(getattr(args, "gate_drop_ratio", 0.98)),
+        gate_open_window_sec=int(getattr(args, "gate_open_window_sec", 300)),
+        gate_open_max=int(getattr(args, "gate_open_max", 3)),
+        gate_lay_refresh=bool(getattr(args, "gate_lay_refresh", False)),
+        gate_lay_refresh_times_sec=gate_refresh_times,
     )
 
     # SIGTERM/SIGINT: encerra gracioso (evita chrome órfão e stop timeout)
