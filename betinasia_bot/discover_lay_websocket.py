@@ -92,6 +92,34 @@ def _truncate(s: str, n: int = 800) -> str:
         return s
     return s[:n] + "…"
 
+async def _try_click_any(page, selectors: List[str], *, timeout_ms: int = 2500) -> Tuple[bool, str]:
+    """
+    Tenta clicar em um dos seletores (em ordem). Retorna (ok, selector_usado).
+    Usa `page.click` porque é simples; se falhar, tenta `locator().first.click()`.
+    """
+    for sel in selectors:
+        try:
+            await page.click(sel, timeout=timeout_ms)
+            return True, sel
+        except Exception:
+            pass
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=timeout_ms)
+                return True, sel
+        except Exception:
+            continue
+    return False, ""
+
+
+async def _screenshot(page, path: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        await page.screenshot(path=path, full_page=True)
+    except Exception:
+        return
+
 
 @dataclass
 class WsStats:
@@ -252,7 +280,17 @@ class LayWsDiscovery:
           - tenta clicar numa odd (abre betslip)
           - tenta alternar para Exchange e depois Lay
         """
-        out: Dict[str, Any] = {"game_url": "", "clicked": None, "exchange_clicked": False, "lay_clicked": False}
+        out: Dict[str, Any] = {
+            "game_url": "",
+            "clicked": None,
+            "exchange_clicked": False,
+            "exchange_selector": "",
+            "lay_clicked": False,
+            "lay_selector": "",
+            "exchange_candidates": 0,
+            "lay_candidates": 0,
+            "screenshots": [],
+        }
 
         base_url = "https://black.betinasia.com"
         await page.goto(f"{base_url}/sportsbook/football")
@@ -287,6 +325,15 @@ class LayWsDiscovery:
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(3500)
 
+        # screenshot antes de clicar em odds
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            p0 = f"logs/lay_ws_screens/{ts}_01_game.png"
+            await _screenshot(page, p0)
+            out["screenshots"].append(p0)
+        except Exception:
+            pass
+
         # tenta expandir linhas (não falha se não existir)
         try:
             await page.evaluate(
@@ -310,7 +357,59 @@ class LayWsDiscovery:
         clicked = await page.evaluate(
             """
             () => {
-              // Estratégia: procurar por um elemento com cara de odd decimal e clicar.
+              // Estratégia 1 (preferida): clicar em odds DENTRO da seção Asian Handicap.
+              // Isso aumenta muito a chance de existir Exchange/Lay para a seleção.
+              function findSectionByHeaderText(headerText) {
+                const els = Array.from(document.querySelectorAll('div, span, h1, h2, h3, h4'));
+                for (const h of els) {
+                  const t = (h.innerText || '').trim();
+                  if (!t) continue;
+                  if (t.toLowerCase().includes(headerText.toLowerCase())) {
+                    let p = h.parentElement;
+                    for (let i = 0; i < 10 && p; i++) {
+                      const pt = (p.innerText || '');
+                      if (pt.includes('Home') && pt.includes('Away')) return p;
+                      p = p.parentElement;
+                    }
+                  }
+                }
+                return null;
+              }
+
+              function clickFirstDecimalOddWithin(root, minOdd, maxOdd) {
+                if (!root) return null;
+                const els = Array.from(root.querySelectorAll('span, div, button'));
+                const cands = [];
+                for (const el of els) {
+                  const t = (el.innerText || '').trim();
+                  if (!t || t.length > 6) continue;
+                  if (!t.includes('.')) continue;
+                  const v = parseFloat(t);
+                  if (!isFinite(v)) continue;
+                  if (v < minOdd || v > maxOdd) continue;
+                  const r = el.getBoundingClientRect();
+                  if (!r || r.width < 18 || r.height < 10) continue;
+                  if (r.width > 260 || r.height > 90) continue;
+                  // precisa estar visível
+                  if (el.offsetParent === null) continue;
+                  cands.push({t, v, el});
+                }
+                // Preferir odds moderadas (perto de 2.0)
+                cands.sort((a,b) => Math.abs(a.v - 2.0) - Math.abs(b.v - 2.0));
+                for (let i = 0; i < Math.min(25, cands.length); i++) {
+                  const el = cands[i].el;
+                  try { el.scrollIntoView({behavior: 'instant', block: 'center'}); } catch(e) {}
+                  try { el.click(); return {odd: cands[i].t, method: 'AH/direct'}; } catch(e) {}
+                  try { el.parentElement && el.parentElement.click(); return {odd: cands[i].t, method: 'AH/parent'}; } catch(e) {}
+                }
+                return null;
+              }
+
+              const ahSec = findSectionByHeaderText('Asian Handicap');
+              const clickedAh = clickFirstDecimalOddWithin(ahSec, 1.20, 4.00);
+              if (clickedAh) return clickedAh;
+
+              // Estratégia 2 (fallback): qualquer odd no documento, mas limita range para evitar 7.xx etc.
               const candidates = [];
               const els = Array.from(document.querySelectorAll('span, div, button'));
               for (const el of els) {
@@ -319,20 +418,19 @@ class LayWsDiscovery:
                 if (!t.includes('.')) continue;
                 const v = parseFloat(t);
                 if (!isFinite(v)) continue;
-                if (v < 1.05 || v > 20.0) continue;
+                if (v < 1.20 || v > 6.00) continue;
                 const r = el.getBoundingClientRect();
                 if (!r || r.width < 18 || r.height < 10) continue;
-                if (r.width > 240 || r.height > 80) continue;
-                candidates.push({t, el});
+                if (r.width > 260 || r.height > 90) continue;
+                if (el.offsetParent === null) continue;
+                candidates.push({t, v, el});
               }
-              // tenta clicar nos primeiros 20 candidatos
-              for (let i = 0; i < Math.min(20, candidates.length); i++) {
+              candidates.sort((a,b) => Math.abs(a.v - 2.0) - Math.abs(b.v - 2.0));
+              for (let i = 0; i < Math.min(25, candidates.length); i++) {
                 const el = candidates[i].el;
-                try {
-                  el.scrollIntoView({behavior: 'instant', block: 'center'});
-                } catch(e) {}
-                try { el.click(); return {odd: candidates[i].t, method: 'direct'}; } catch(e) {}
-                try { el.parentElement && el.parentElement.click(); return {odd: candidates[i].t, method: 'parent'}; } catch(e) {}
+                try { el.scrollIntoView({behavior: 'instant', block: 'center'}); } catch(e) {}
+                try { el.click(); return {odd: candidates[i].t, method: 'fallback/direct'}; } catch(e) {}
+                try { el.parentElement && el.parentElement.click(); return {odd: candidates[i].t, method: 'fallback/parent'}; } catch(e) {}
               }
               return null;
             }
@@ -342,32 +440,76 @@ class LayWsDiscovery:
         out["clicked"] = clicked
         await page.wait_for_timeout(4000)
 
+        # screenshot após clicar em odd (betslip deve estar aberto)
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            p1 = f"logs/lay_ws_screens/{ts}_02_after_odd_click.png"
+            await _screenshot(page, p1)
+            out["screenshots"].append(p1)
+        except Exception:
+            pass
+
         # tenta alternar Exchange / Lay (best effort)
         self.phase = "after_exchange_attempt"
         exchange_clicked = False
         lay_clicked = False
 
-        for sel in ("text=Exchange", "button:has-text('Exchange')", "span:has-text('Exchange')"):
-            try:
-                await page.click(sel, timeout=2500)
-                exchange_clicked = True
-                break
-            except Exception:
-                continue
+        # Conta candidatos visíveis (para debug)
+        try:
+            out["exchange_candidates"] = int(await page.locator("text=/exchange/i").count())
+        except Exception:
+            out["exchange_candidates"] = 0
+        try:
+            out["lay_candidates"] = int(await page.locator("text=/\\blay\\b/i").count())
+        except Exception:
+            out["lay_candidates"] = 0
+
+        # Alguns layouts usam "Classic" vs "Exchange". Tentamos Exchange primeiro.
+        exchange_selectors = [
+            "text=/\\bexchange\\b/i",
+            "button:has-text('Exchange')",
+            "span:has-text('Exchange')",
+            "[data-testid*='exchange']",
+            "[class*='exchange']",
+            "a:has-text('Exchange')",
+        ]
+        exchange_clicked, exchange_sel = await _try_click_any(page, exchange_selectors, timeout_ms=3000)
+        out["exchange_selector"] = exchange_sel
 
         await page.wait_for_timeout(2500)
 
-        for sel in ("text=Lay", "button:has-text('Lay')", "span:has-text('Lay')"):
-            try:
-                await page.click(sel, timeout=2500)
-                lay_clicked = True
-                break
-            except Exception:
-                continue
+        # screenshot após tentativa de ir para Exchange
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            p2 = f"logs/lay_ws_screens/{ts}_03_after_exchange_click.png"
+            await _screenshot(page, p2)
+            out["screenshots"].append(p2)
+        except Exception:
+            pass
+
+        lay_selectors = [
+            "text=/\\blay\\b/i",
+            "button:has-text('Lay')",
+            "span:has-text('Lay')",
+            "[data-testid*='lay']",
+            "[class*='lay']",
+            "a:has-text('Lay')",
+        ]
+        lay_clicked, lay_sel = await _try_click_any(page, lay_selectors, timeout_ms=3000)
+        out["lay_selector"] = lay_sel
 
         out["exchange_clicked"] = exchange_clicked
         out["lay_clicked"] = lay_clicked
         await page.wait_for_timeout(2500)
+
+        # screenshot final
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            p3 = f"logs/lay_ws_screens/{ts}_04_final.png"
+            await _screenshot(page, p3)
+            out["screenshots"].append(p3)
+        except Exception:
+            pass
         return out
 
     def build_report(self, click_info: dict) -> dict:
