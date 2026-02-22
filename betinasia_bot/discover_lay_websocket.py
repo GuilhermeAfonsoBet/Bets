@@ -147,6 +147,7 @@ class LayWsDiscovery:
 
         self.ws_by_url: Dict[str, WsStats] = {}
         self.http_reqs: List[dict] = []
+        self.http_resps: List[dict] = []
         self.http_reqs_phase_index: Dict[str, int] = {}
 
         # globais
@@ -242,6 +243,81 @@ class LayWsDiscovery:
                 keep = True
             if keep:
                 self.http_reqs.append(entry)
+        except Exception:
+            return
+
+    def on_response(self, resp):
+        """
+        Captura respostas XHR/fetch úteis do domínio.
+        Observação: handler do Playwright não é async; então fazemos create_task.
+        """
+        try:
+            # Limita volume
+            if len(self.http_resps) >= 60:
+                return
+            url = str(getattr(resp, "url", "") or "")
+            low = url.lower()
+            if "black.betinasia.com" not in low:
+                return
+            # Evita assets
+            if any(ext in low for ext in (".png", ".jpg", ".jpeg", ".svg", ".gif", ".ico", ".css", ".woff", ".woff2")):
+                return
+            req = getattr(resp, "request", None)
+            rtype = ""
+            try:
+                if req:
+                    rtype = str(getattr(req, "resource_type", "") or "")
+            except Exception:
+                rtype = ""
+            if rtype not in ("xhr", "fetch"):
+                # ainda assim, captura /web/sessions/* que pode ser long-poll
+                if "/web/sessions/" not in low:
+                    return
+
+            async def _collect():
+                try:
+                    status = int(getattr(resp, "status", 0) or 0)
+                except Exception:
+                    status = 0
+                ctype = ""
+                try:
+                    hdrs = await resp.all_headers()
+                    ctype = str((hdrs or {}).get("content-type") or "")
+                except Exception:
+                    ctype = ""
+                body_prefix = ""
+                json_keys: List[str] = []
+                try:
+                    # Pode falhar se body não estiver disponível (stream)
+                    txt = await resp.text()
+                    if txt:
+                        body_prefix = _truncate(_redact_post_data(txt) or "", 1200)
+                        try:
+                            j = json.loads(txt)
+                            if isinstance(j, dict):
+                                json_keys = sorted([str(k) for k in j.keys()])[:60]
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                self.http_resps.append(
+                    {
+                        "ts": _utc_now_iso(),
+                        "phase": self.phase,
+                        "status": status,
+                        "resource_type": rtype,
+                        "url": url.split("#")[0],
+                        "content_type": ctype,
+                        "json_keys": json_keys,
+                        "body_prefix": body_prefix,
+                    }
+                )
+
+            try:
+                asyncio.create_task(_collect())
+            except Exception:
+                return
         except Exception:
             return
 
@@ -714,6 +790,8 @@ class LayWsDiscovery:
                 "link_samples": [],
                 "counts": {},
                 "event_candidates": [],
+                "body_text_prefix": "",
+                "scrollables": [],
             },
             "http_delta": {
                 "betslip_posts": 0,
@@ -775,6 +853,56 @@ class LayWsDiscovery:
             )
         except Exception:
             out["dom_debug"]["counts"] = {}
+
+        # Captura um prefixo do texto do body (para ver se a lista está renderizando mesmo sem "vs")
+        try:
+            out["dom_debug"]["body_text_prefix"] = await page.evaluate(
+                """
+                () => {
+                  const t = (document.body && document.body.innerText) ? document.body.innerText : '';
+                  return (t || '').trim().replace(/\\s+/g,' ').slice(0, 500);
+                }
+                """
+            )
+        except Exception:
+            out["dom_debug"]["body_text_prefix"] = ""
+
+        # Encontra containers scrolláveis (lista virtualizada costuma estar aqui)
+        try:
+            out["dom_debug"]["scrollables"] = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const els = Array.from(document.querySelectorAll('div, main, section'));
+                  for (const el of els) {
+                    if (!el) continue;
+                    const sh = el.scrollHeight || 0;
+                    const ch = el.clientHeight || 0;
+                    const sw = el.scrollWidth || 0;
+                    const cw = el.clientWidth || 0;
+                    if (sh <= ch + 120) continue;
+                    const r = el.getBoundingClientRect();
+                    if (!r || r.width < 240 || r.height < 220) continue;
+                    if (el.offsetParent === null) continue;
+                    const style = window.getComputedStyle(el);
+                    const oy = style.overflowY || '';
+                    const ox = style.overflowX || '';
+                    out.push({
+                      tag: el.tagName,
+                      cls: (el.className || '').toString().slice(0, 160),
+                      oy, ox,
+                      x: Math.round(r.x), y: Math.round(r.y),
+                      w: Math.round(r.width), h: Math.round(r.height),
+                      scrollHeight: sh, clientHeight: ch
+                    });
+                    if (out.length >= 10) break;
+                  }
+                  return out;
+                }
+                """
+            )
+        except Exception:
+            out["dom_debug"]["scrollables"] = []
         try:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             p0 = f"logs/lay_ws_screens/{ts}_trade_01.png"
@@ -888,6 +1016,34 @@ class LayWsDiscovery:
             except Exception:
                 pass
 
+            # Se houver container scrollável, tenta scroll via JS para garantir que afeta a lista (não a janela)
+            try:
+                await page.evaluate(
+                    """
+                    () => {
+                      const els = Array.from(document.querySelectorAll('div, main, section'));
+                      let best = null;
+                      for (const el of els) {
+                        const sh = el.scrollHeight || 0;
+                        const ch = el.clientHeight || 0;
+                        if (sh <= ch + 120) continue;
+                        const r = el.getBoundingClientRect();
+                        if (!r || r.width < 240 || r.height < 220) continue;
+                        if (el.offsetParent === null) continue;
+                        best = el;
+                        break;
+                      }
+                      if (best) {
+                        best.scrollTop = Math.min(best.scrollHeight, best.scrollTop + best.clientHeight * 2);
+                      }
+                    }
+                    """
+                )
+                out["interaction"]["clicked"].append({"what": "scroll_js"})
+                await page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
             # Tenta clicar em um possível “evento/mercado” por heurística (preços decimais visíveis)
             try:
                 candidates = await page.evaluate(
@@ -905,11 +1061,14 @@ class LayWsDiscovery:
                         if (!t.includes('.')) continue;
                         const v = parseFloat(t);
                         if (!isFinite(v)) continue;
-                        if (v < 1.01 || v > 200.0) continue;
+                        // Odds típicas: evita saldo (ex.: 58.00) e números muito grandes
+                        if (v < 1.01 || v > 25.0) continue;
                         const r = el.getBoundingClientRect();
                         if (!r || r.width < 18 || r.height < 10) continue;
                         if (r.width > 160 || r.height > 70) continue;
                         if (el.offsetParent === null) continue;
+                        // Evita header/topbar
+                        if (r.y < 90) continue;
                         out.push({
                           text: t,
                           v,
@@ -1150,6 +1309,7 @@ async def main():
         page = scraper._page
         page.on("websocket", disc.on_websocket)
         page.on("request", disc.on_request)
+        page.on("response", disc.on_response)
 
         click_info: dict = {"skipped": True}
         if str(args.start) == "trade":
