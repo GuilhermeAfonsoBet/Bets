@@ -4586,7 +4586,11 @@ async def main() -> int:
                 def _scheme_for_event(ev: dict) -> str:
                     return wf_scheme_pre if ev.get("regime") == "Pre" else wf_scheme_in
 
-                def _sizing_for_event(ev: dict) -> Tuple[Optional[float], Optional[float]]:
+                def _sizing_for_event(
+                    ev: dict,
+                    *,
+                    roi_train_map: Optional[Dict[str, float]] = None,
+                ) -> Tuple[Optional[float], Optional[float]]:
                     """
                     Retorna (stake_turnover_equivalente, exposure_risk).
                     - Back: stake=exposure=stake
@@ -4624,7 +4628,7 @@ async def main() -> int:
                             st = min(float(st), float(_max_back_stake_event(d0)))
                         elif str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
-                            roi_hat = _safe_float(roi_train_by_key.get(k))
+                            roi_hat = _safe_float(((roi_train_map or roi_train_by_key) or {}).get(k))
                             if roi_hat is None:
                                 return (None, None)
                             # proxy de Kelly: f ~= EV (assumindo odds típicas ~2.0). Caps + limit controlam.
@@ -4666,7 +4670,7 @@ async def main() -> int:
                     else:
                         if str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
-                            roi_hat = _safe_float(roi_train_by_key.get(k))
+                            roi_hat = _safe_float(((roi_train_map or roi_train_by_key) or {}).get(k))
                             if roi_hat is None:
                                 return (None, None)
                             f = max(0.0, float(roi_hat)) / 100.0
@@ -5370,6 +5374,11 @@ async def main() -> int:
 
                             # elegíveis no teste (inclui sem ROI para turnover)
                             test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in active_keys]
+                            # ROI do treino por combinação (necessário se wf_scheme_* = ROI_TRAIN)
+                            roi_map = {
+                                k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean"))
+                                for k in active_keys
+                            }
                             # ordena por tempo para consumir budget de forma realista
                             def _ts_ev(ev: dict) -> float:
                                 d0 = audit_by_id.get(int(ev.get("audit_id")))
@@ -5390,16 +5399,11 @@ async def main() -> int:
                             turn_all = 0.0
 
                             for ev in test_elig:
-                                aid = int(ev.get("audit_id"))
-                                d0 = audit_by_id.get(aid)
-                                if not d0:
+                                st_eq, exp = _sizing_for_event(ev, roi_train_map=roi_map)
+                                if st_eq is None or exp is None:
                                     continue
-                                sc = _scheme_for_event(ev)
                                 mid = int(ev.get("match_id"))
                                 if ev.get("side") == "Back":
-                                    raw = _sizing_back(d0, sc)
-                                    if raw is None or float(raw) <= 0:
-                                        continue
                                     bud_m = float(bud_back)
                                     if risk_mode == "signals_sqrt":
                                         bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
@@ -5409,12 +5413,13 @@ async def main() -> int:
                                     rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    use = min(float(raw), float(rem), float(cap_sig_m))
-                                    if use <= 0:
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                                    if exp_use <= 0:
                                         continue
-                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(use)
-                                    exp = float(use)
-                                    st_eq = float(use)
+                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
+                                    ratio = float(exp_use) / max(1e-9, float(exp))
+                                    exp = float(exp_use)
+                                    st_eq = float(st_eq) * float(ratio)
                                     turn_all += st_eq
                                     back_all += exp
                                     _append_job(ev, exp)
@@ -5422,12 +5427,6 @@ async def main() -> int:
                                         pnl_obs += exp * float(ev.get("roi")) / 100.0
                                         back_roi += exp
                                 else:
-                                    sized = _sizing_lay_liab(d0, sc)
-                                    if not sized:
-                                        continue
-                                    liab_raw, lay_odd = sized
-                                    if liab_raw is None or float(liab_raw) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
-                                        continue
                                     bud_m = float(bud_lay)
                                     if risk_mode == "signals_sqrt":
                                         bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
@@ -5437,12 +5436,13 @@ async def main() -> int:
                                     rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    liab_use = min(float(liab_raw), float(rem), float(cap_sig_m))
-                                    if liab_use <= 0:
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                                    if exp_use <= 0:
                                         continue
-                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(liab_use)
-                                    exp = float(liab_use)  # liability
-                                    st_eq = float(liab_use) / max(1e-9, (float(lay_odd) - 1.0))
+                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
+                                    ratio = float(exp_use) / max(1e-9, float(exp))
+                                    exp = float(exp_use)  # liability
+                                    st_eq = float(st_eq) * float(ratio)
                                     turn_all += st_eq
                                     lay_all += exp
                                     _append_job(ev, exp)
