@@ -677,8 +677,19 @@ async def main() -> int:
     parser.add_argument(
         "--wf-exclude-exec-buckets",
         default=os.getenv("WF_EXCLUDE_EXEC_BUCKETS", "").strip(),
-        help="CSV de exec_bucket a excluir SOMENTE no OOS (walk-forward). "
-        "Ex.: '10-20s' para banir execução ruim sem filtrar o relatório inteiro.",
+        help="CSV de exec_bucket a excluir SOMENTE no OOS (walk-forward), aplicado a Back e Lay. "
+        "Ex.: '10-20s' para banir execução ruim sem filtrar o relatório inteiro. "
+        "Se você quer banir só Back (recomendado p/ 10-20s), use --wf-exclude-exec-buckets-back.",
+    )
+    parser.add_argument(
+        "--wf-exclude-exec-buckets-back",
+        default=os.getenv("WF_EXCLUDE_EXEC_BUCKETS_BACK", "").strip(),
+        help="CSV de exec_bucket a excluir SOMENTE no OOS para eventos Back. Ex.: '10-20s'.",
+    )
+    parser.add_argument(
+        "--wf-exclude-exec-buckets-lay",
+        default=os.getenv("WF_EXCLUDE_EXEC_BUCKETS_LAY", "").strip(),
+        help="CSV de exec_bucket a excluir SOMENTE no OOS para eventos Lay.",
     )
     parser.add_argument(
         "--wf-shrinkage",
@@ -4205,7 +4216,11 @@ async def main() -> int:
             wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
             wf_ws_proxy_offset = max(0.0, float(getattr(args, "wf_ws_proxy_offset_sec", 5.0)))
             wf_ws_proxy_max_gap = max(0.0, float(getattr(args, "wf_ws_proxy_max_gap_sec", 2.5)))
-            wf_excl_exec = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets", "") or "").split(",") if x.strip()}
+            wf_excl_exec_all = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets", "") or "").split(",") if x.strip()}
+            wf_excl_exec_back = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets_back", "") or "").split(",") if x.strip()}
+            wf_excl_exec_lay = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets_lay", "") or "").split(",") if x.strip()}
+            wf_excl_exec_back = set(wf_excl_exec_back) | set(wf_excl_exec_all)
+            wf_excl_exec_lay = set(wf_excl_exec_lay) | set(wf_excl_exec_all)
             wf_use_shrink = bool(getattr(args, "wf_shrinkage", False))
 
             # Para scheme in-match "ROI_TRAIN": usamos ROI médio no treino por combinação como proxy de EV.
@@ -4217,9 +4232,11 @@ async def main() -> int:
 
             # dataset de entradas com timestamp
             combo_events: List[dict] = []
-            if wf_excl_exec:
+            if wf_excl_exec_back or wf_excl_exec_lay:
                 lines.append(
-                    f"**Filtro operacional (OOS)**: excluindo exec_bucket={sorted(wf_excl_exec)} apenas no walk-forward.\n\n"
+                    f"**Filtro operacional (OOS)**: excluindo exec_bucket apenas no walk-forward "
+                    f"(Back={sorted(wf_excl_exec_back) if wf_excl_exec_back else '—'}; "
+                    f"Lay={sorted(wf_excl_exec_lay) if wf_excl_exec_lay else '—'}).\n\n"
                 )
             def _ws_proxy_odd(d0: dict) -> Optional[Tuple[float, float]]:
                 """
@@ -4266,7 +4283,7 @@ async def main() -> int:
                 aid = d0.get("id")
                 if aid is None:
                     continue
-                if wf_excl_exec and str(d0.get("exec_bucket")) in wf_excl_exec:
+                if wf_excl_exec_back and str(d0.get("exec_bucket")) in wf_excl_exec_back:
                     continue
                 ts = d0.get("audited_at")
                 if not isinstance(ts, datetime):
@@ -4339,7 +4356,7 @@ async def main() -> int:
                 if int(aid) not in lay_edge_ids:
                     continue
                 d0 = audit_by_id.get(int(aid))
-                if d0 and wf_excl_exec and str(d0.get("exec_bucket")) in wf_excl_exec:
+                if d0 and wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
                     continue
                 ts = r.get("audited_at")
                 if not isinstance(ts, datetime):
