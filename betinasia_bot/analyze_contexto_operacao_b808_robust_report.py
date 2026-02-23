@@ -675,6 +675,18 @@ async def main() -> int:
         help="Tolerância máxima (s) entre o offset alvo e o ponto WS observado para aceitar o proxy. Default=2.5.",
     )
     parser.add_argument(
+        "--wf-exclude-exec-buckets",
+        default=os.getenv("WF_EXCLUDE_EXEC_BUCKETS", "").strip(),
+        help="CSV de exec_bucket a excluir SOMENTE no OOS (walk-forward). "
+        "Ex.: '10-20s' para banir execução ruim sem filtrar o relatório inteiro.",
+    )
+    parser.add_argument(
+        "--wf-shrinkage",
+        action="store_true",
+        default=(os.getenv("WF_SHRINKAGE", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Ativa shrinkage (empirical Bayes) para estabilizar ROI do treino por combinação no WF (reduz liga/desliga por ruído).",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -711,6 +723,12 @@ async def main() -> int:
     parser.add_argument("--wf-budget-back-frac", type=float, default=float(os.getenv("WF_BUDGET_BACK_FRAC", "0.01")), help="Budget Back por jogo (fração da banca ref).")
     parser.add_argument("--wf-budget-lay-frac", type=float, default=float(os.getenv("WF_BUDGET_LAY_FRAC", "0.005")), help="Budget Lay por jogo (fração da banca ref, em liability).")
     parser.add_argument("--wf-budget-cap-signal-frac", type=float, default=float(os.getenv("WF_BUDGET_CAP_SIGNAL_FRAC", "0.33")), help="Cap por sinal como fração do budget do jogo.")
+    parser.add_argument(
+        "--wf-budget-risk-mode",
+        default=os.getenv("WF_BUDGET_RISK_MODE", "fixed").strip() or "fixed",
+        choices=["fixed", "signals_sqrt", "signals_linear"],
+        help="Modo de budget por match_id no OOS: fixed (constante), ou adaptativo por concentração de sinais observada (signals_sqrt/signals_linear).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -1335,6 +1353,50 @@ async def main() -> int:
                 f"| {label} | {len(sub_all)} | {len(sub_bs)} | {len(sub_ok)} | {len(sub_back)} | {len(sub_lay)} | {_fmt_pct(diff_mean)} |\n"
             )
         lines.append("\n---\n")
+
+        # 2.2c Quebra por liga (top por volume)
+        lines.append("### 2.2c Quebra por liga (top por volume)\n")
+        lines.append(
+            "Objetivo: detectar não-uniformidade do edge por **liga**. "
+            "Reporta volume, cobertura de closing (para CLV) e métricas robustas por jogo.\n\n"
+        )
+        ok_conf = [d for d in with_bs if str(d.get("status", "")).upper() == "OK"]
+        if ok_conf:
+            league_cnt = Counter(str(d.get("league") or "—") for d in ok_conf)
+            top_leagues = [lg for lg, _ in league_cnt.most_common(12)]
+            lines.append("| Liga | N OK (conf.) | Jogos | Closing cov (jogos PM) | CLV PM (mean; IC90) | ROI (mean; IC90) | Back edge | Lay edge |\n")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+            for lg in top_leagues:
+                sub = [d for d in ok_conf if str(d.get("league") or "—") == lg]
+                mids = {int(d.get("match_id")) for d in sub if d.get("match_id") is not None}
+                pm_sub = [d for d in sub if d.get("is_live") is False]
+                clv_sum = summarize_metric(
+                    [d.get("clv_bs") for d in pm_sub],
+                    [d.get("match_id") for d in pm_sub],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                roi_sum = summarize_metric(
+                    [d.get("roi_bs") for d in sub],
+                    [d.get("match_id") for d in sub],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                pm_mids = {int(d.get("match_id")) for d in pm_sub if d.get("match_id") is not None}
+                pm_mids_closing = {
+                    int(d.get("match_id"))
+                    for d in pm_sub
+                    if d.get("match_id") is not None and d.get("closing_odd") is not None and float(d.get("closing_odd") or 0.0) > 0
+                }
+                cov = (100.0 * len(pm_mids_closing) / len(pm_mids)) if pm_mids else None
+                be = sum(1 for d in sub if d.get("diff_pct") is not None and float(d.get("diff_pct")) >= float(back_cut))
+                le = sum(1 for d in sub if d.get("diff_pct") is not None and float(d.get("diff_pct")) <= float(lay_cut))
+                clv_txt = f"{_fmt_pct(clv_sum.mean_cluster,2)} {_fmt_ci(clv_sum.ci90_cluster,2)}" if clv_sum.n_events else "—"
+                roi_txt = f"{_fmt_pct(roi_sum.mean_cluster,2)} {_fmt_ci(roi_sum.ci90_cluster,2)}" if roi_sum.n_events else "—"
+                lines.append(f"| {lg} | {len(sub)} | {len(mids)} | {_fmt_num(cov,1)}% | {clv_txt} | {roi_txt} | {be} | {le} |\n")
+            lines.append("\n---\n")
+        else:
+            lines.append("_Sem dados OK+conf suficientes para quebrar por liga._\n\n---\n")
 
         if not args.exec_bucket:
             # 2.3) Regimes operacionais por bucket de tempo total (lag_total_ms)
@@ -4138,10 +4200,13 @@ async def main() -> int:
             bud_back_frac = max(0.0, float(getattr(args, "wf_budget_back_frac", 0.01)))
             bud_lay_frac = max(0.0, float(getattr(args, "wf_budget_lay_frac", 0.005)))
             bud_cap_sig_frac = max(0.0, float(getattr(args, "wf_budget_cap_signal_frac", 0.33)))
+            bud_risk_mode = str(getattr(args, "wf_budget_risk_mode", "fixed") or "fixed").strip()
             wf_flat_stake_back = max(0.0, float(getattr(args, "wf_flat_stake_back", 1.0)))
             wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
             wf_ws_proxy_offset = max(0.0, float(getattr(args, "wf_ws_proxy_offset_sec", 5.0)))
             wf_ws_proxy_max_gap = max(0.0, float(getattr(args, "wf_ws_proxy_max_gap_sec", 2.5)))
+            wf_excl_exec = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets", "") or "").split(",") if x.strip()}
+            wf_use_shrink = bool(getattr(args, "wf_shrinkage", False))
 
             # Para scheme in-match "ROI_TRAIN": usamos ROI médio no treino por combinação como proxy de EV.
             # Mapeamento preenchido por step (train window) e usado no loop de sizing do test.
@@ -4152,6 +4217,10 @@ async def main() -> int:
 
             # dataset de entradas com timestamp
             combo_events: List[dict] = []
+            if wf_excl_exec:
+                lines.append(
+                    f"**Filtro operacional (OOS)**: excluindo exec_bucket={sorted(wf_excl_exec)} apenas no walk-forward.\n\n"
+                )
             def _ws_proxy_odd(d0: dict) -> Optional[Tuple[float, float]]:
                 """
                 Retorna (odd, t_s) do ponto WS mais apropriado para o proxy de BS.
@@ -4196,6 +4265,8 @@ async def main() -> int:
                     continue
                 aid = d0.get("id")
                 if aid is None:
+                    continue
+                if wf_excl_exec and str(d0.get("exec_bucket")) in wf_excl_exec:
                     continue
                 ts = d0.get("audited_at")
                 if not isinstance(ts, datetime):
@@ -4250,6 +4321,7 @@ async def main() -> int:
                         "regime": "Pre" if d0.get("is_live") is False else "In",
                         "reversal": "Any",
                         "match_id": int(d0.get("match_id")),
+                        "league": str(d0.get("league") or ""),
                         "clv_back": clv_entry,
                         "clv_lay_conv": None,
                         "roi": roi_entry,
@@ -4266,6 +4338,9 @@ async def main() -> int:
                     continue
                 if int(aid) not in lay_edge_ids:
                     continue
+                d0 = audit_by_id.get(int(aid))
+                if d0 and wf_excl_exec and str(d0.get("exec_bucket")) in wf_excl_exec:
+                    continue
                 ts = r.get("audited_at")
                 if not isinstance(ts, datetime):
                     continue
@@ -4277,6 +4352,7 @@ async def main() -> int:
                         "regime": "Pre" if r.get("is_live") is False else "In",
                         "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
                         "match_id": int(r.get("match_id")),
+                        "league": str((d0 or {}).get("league") or ""),
                         "clv_back": None,
                         "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False) else None,
                         "roi": r.get("roi_entry"),
@@ -4404,6 +4480,74 @@ async def main() -> int:
 
                 def _mean_ci90(bym: Dict[int, List[float]]) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
                     return cluster_bootstrap_ci(bym, n_boot=2000, alpha=0.10, seed=int(args.seed))
+
+                def _se_from_ci90(ci: Optional[Tuple[float, float]]) -> Optional[float]:
+                    if not ci:
+                        return None
+                    try:
+                        lb, ub = float(ci[0]), float(ci[1])
+                    except Exception:
+                        return None
+                    if not (math.isfinite(lb) and math.isfinite(ub)):
+                        return None
+                    # CI90 ~= mean ± 1.645*SE (aprox Normal)
+                    return max(1e-9, (ub - lb) / (2.0 * 1.645))
+
+                def _shrink_means_empirical_bayes(means_se: Dict[str, Tuple[Optional[float], Optional[float]]]) -> Dict[str, Optional[float]]:
+                    """
+                    Empirical Bayes (Normal-Normal) shrinkage por step:
+                    - cada combinação k tem (mean_k, se_k)
+                    - prior mean = média global dos means_k (ponderada por 1/se^2 quando possível)
+                    - prior variance tau^2 estimada via método dos momentos
+                    Retorna mean_shrunk_k. Se dados insuficientes, retorna mean_k.
+                    """
+                    items = [(k, v[0], v[1]) for k, v in (means_se or {}).items() if v and v[0] is not None]
+                    if len(items) < 2:
+                        return {k: (m if m is not None else None) for k, (m, _) in (means_se or {}).items()}
+
+                    # pesos = 1/se^2 (fallback 1)
+                    ws = []
+                    ms = []
+                    for _, m, se in items:
+                        w = 1.0
+                        if se is not None and float(se) > 0 and math.isfinite(float(se)):
+                            w = 1.0 / (float(se) ** 2)
+                        ws.append(float(w))
+                        ms.append(float(m))
+                    wsum = sum(ws) if sum(ws) > 0 else float(len(ws))
+                    mu0 = sum(w * m for w, m in zip(ws, ms)) / wsum
+
+                    # variância entre-means observada
+                    mean_unw = sum(ms) / float(len(ms))
+                    s2 = sum((m - mean_unw) ** 2 for m in ms) / max(1.0, float(len(ms) - 1))
+                    # variância média do erro
+                    vbar = 0.0
+                    n_v = 0
+                    for _, _, se in items:
+                        if se is None:
+                            continue
+                        v = float(se) ** 2
+                        if not math.isfinite(v):
+                            continue
+                        vbar += v
+                        n_v += 1
+                    vbar = (vbar / float(n_v)) if n_v > 0 else 0.0
+                    tau2 = max(0.0, float(s2) - float(vbar))
+
+                    out: Dict[str, Optional[float]] = {}
+                    for k, (m, se) in (means_se or {}).items():
+                        if m is None:
+                            out[str(k)] = None
+                            continue
+                        if tau2 <= 0:
+                            out[str(k)] = float(m)
+                            continue
+                        if se is None or float(se) <= 0 or not math.isfinite(float(se)):
+                            out[str(k)] = float(m)
+                            continue
+                        w = float(tau2) / (float(tau2) + float(se) ** 2)
+                        out[str(k)] = float(w) * float(m) + float(1.0 - w) * float(mu0)
+                    return out
 
                 steps = []
                 active_counts: Dict[str, int] = {}
@@ -4586,6 +4730,20 @@ async def main() -> int:
                     # seleção por combinação
                     active: List[str] = []
                     diag = {}
+                    # pré-calcula shrinkage de ROI por combinação neste step
+                    shrink_map: Dict[str, Optional[float]] = {}
+                    if wf_use_shrink:
+                        means_se: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+                        for kk in sorted({_key(e) for e in train}):
+                            subk = [e for e in train if _key(e) == kk]
+                            bym_roi_k = _bym([e for e in subk if e.get("roi") is not None], "roi")
+                            if not bym_roi_k:
+                                means_se[kk] = (None, None)
+                                continue
+                            m_k, ci_k = _mean_ci90(bym_roi_k)
+                            se_k = _se_from_ci90(ci_k)
+                            means_se[kk] = (m_k, se_k)
+                        shrink_map = _shrink_means_empirical_bayes(means_se)
                     for k in sorted({_key(e) for e in train}):
                         sub = [e for e in train if _key(e) == k]
                         # aplica critérios OOS (mais peso em ROI; CLV é gate apenas quando ROI é >0 mas não-sig em pre-match)
@@ -4605,7 +4763,12 @@ async def main() -> int:
                         # ROI por jogo (cluster)
                         bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
                         roi_mean, roi_ci = _mean_ci90(bym_roi) if bym_roi else (None, None)
-                        roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
+                        roi_mean_eff = roi_mean
+                        if wf_use_shrink:
+                            roi_sh = _safe_float((shrink_map or {}).get(str(k)))
+                            if roi_sh is not None:
+                                roi_mean_eff = float(roi_sh)
+                        roi_pos = bool(roi_mean_eff is not None and float(roi_mean_eff) > 0)
                         roi_sig_pos = _ci_sig_pos(roi_ci)
                         roi_sig_neg = _ci_sig_neg(roi_ci)
                         eligible = bool(len(bym_roi) >= wf_min_m)
@@ -4639,6 +4802,7 @@ async def main() -> int:
                                 "clv_ci90": clv_ci,
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
+                                "roi_mean_eff": roi_mean_eff,
                                 "roi_ci90": roi_ci,
                                 "roi_sig_neg": roi_sig_neg,
                                 "roi_sig_pos": roi_sig_pos,
@@ -4663,6 +4827,7 @@ async def main() -> int:
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
+                                "roi_mean_eff": roi_mean_eff,
                                 "roi_ci90": roi_ci,
                                 "roi_sig_neg": roi_sig_neg,
                                 "roi_sig_pos": roi_sig_pos,
@@ -4699,6 +4864,7 @@ async def main() -> int:
                                 "clv_ci90": clv_ci,
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
+                                "roi_mean_eff": roi_mean_eff,
                                 "roi_ci90": roi_ci,
                                 "roi_sig_neg": roi_sig_neg,
                                 "roi_sig_pos": roi_sig_pos,
@@ -4723,6 +4889,7 @@ async def main() -> int:
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
+                                "roi_mean_eff": roi_mean_eff,
                                 "roi_ci90": roi_ci,
                                 "roi_sig_neg": roi_sig_neg,
                                 "roi_sig_pos": roi_sig_pos,
@@ -4761,6 +4928,7 @@ async def main() -> int:
                         bank_ref_budget = max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0)
                     bud_back = float(bud_back_frac) * float(bank_ref_budget)
                     bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                    # cap por sinal é fração do budget do jogo (no modo fixed). Em modos adaptativos, recalculamos por match.
                     cap_sig_back = float(bud_cap_sig_frac) * float(bud_back)
                     cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
                     spent_back: Dict[int, float] = {}
@@ -4774,6 +4942,9 @@ async def main() -> int:
                             return ts.timestamp()
                         return 0.0
                     test_elig.sort(key=_ts_ev)
+                    # concentração observada (risk-adaptive): usa a própria quantidade de sinais do match na janela de teste
+                    cnt_back = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") == "Back")
+                    cnt_lay = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") != "Back")
                     for ev in test_elig:
                         st_eq, exp = _sizing_for_event(ev)
                         if st_eq is None or exp is None:
@@ -4781,10 +4952,17 @@ async def main() -> int:
                         # aplica budget por jogo como padrão
                         mid = int(ev.get("match_id"))
                         if ev.get("side") == "Back":
-                            rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                            # budget por match (fixo ou adaptativo por concentração)
+                            bud_m = float(bud_back)
+                            if bud_risk_mode == "signals_sqrt":
+                                bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
+                            elif bud_risk_mode == "signals_linear":
+                                bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                            cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                            rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                             if rem <= 0:
                                 continue
-                            exp_use = min(float(exp), float(rem), float(cap_sig_back))
+                            exp_use = min(float(exp), float(rem), float(cap_sig_m))
                             if exp_use <= 0:
                                 continue
                             # proporcionalmente reduz stake_eq
@@ -4793,10 +4971,16 @@ async def main() -> int:
                             st_eq = float(st_eq) * float(ratio)
                             spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
                         else:
-                            rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                            bud_m = float(bud_lay)
+                            if bud_risk_mode == "signals_sqrt":
+                                bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
+                            elif bud_risk_mode == "signals_linear":
+                                bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                            cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                            rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                             if rem <= 0:
                                 continue
-                            exp_use = min(float(exp), float(rem), float(cap_sig_lay))
+                            exp_use = min(float(exp), float(rem), float(cap_sig_m))
                             if exp_use <= 0:
                                 continue
                             ratio = exp_use / max(1e-9, float(exp))
@@ -4961,7 +5145,10 @@ async def main() -> int:
                 ]
                 for st in steps[:10]:
                     lines.append(f"**Train {st['train']} → Test {st['test']}**\n\n")
-                    lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---|\n")
+                    if wf_use_shrink:
+                        lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI mean (shrunk) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---:|---|\n")
+                    else:
+                        lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---|\n")
                     diag = st.get("diag") or {}
                     for k in combos_all:
                         d = diag.get(k) or {}
@@ -4981,10 +5168,19 @@ async def main() -> int:
                         roi_val = "—"
                         if roi_mean is not None:
                             roi_val = f"{_fmt_pct(roi_mean,2)} {_fmt_ci(roi_ci,2)}"
+                        roi_mean_eff = _safe_float(d.get("roi_mean_eff"))
+                        roi_eff_val = "—"
+                        if roi_mean_eff is not None:
+                            roi_eff_val = f"{_fmt_pct(roi_mean_eff,2)}"
                         roi_q30 = _safe_float(d.get("roi_q30"))
-                        lines.append(
-                            f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {roi_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
-                        )
+                        if wf_use_shrink:
+                            lines.append(
+                                f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {roi_val} | {roi_eff_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
+                            )
+                        else:
+                            lines.append(
+                                f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {roi_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
+                            )
                     lines.append("\n")
 
                 lines.append(
@@ -5016,7 +5212,8 @@ async def main() -> int:
                 )
                 lines.append(
                     f"**Padrão de risco**: P&L aqui já é calculado com **budget por jogo (match_id)** consumido ao longo do tempo "
-                    f"(Back={bud_back_frac:.2%} da banca ref; Lay={bud_lay_frac:.2%} em liability; cap por sinal={bud_cap_sig_frac:.0%} do budget).\n\n"
+                    f"(Back={bud_back_frac:.2%} da banca ref; Lay={bud_lay_frac:.2%} em liability; cap por sinal={bud_cap_sig_frac:.0%} do budget; "
+                    f"mode={bud_risk_mode}).\n\n"
                 )
                 lines.append(
                     f"**Sizing FLAT (quando aplicável no WF)**: Back stake={_fmt_num(wf_flat_stake_back,2)} | Lay liability={_fmt_num(wf_flat_liab_lay,2)}.\n\n"
@@ -5134,6 +5331,7 @@ async def main() -> int:
                         bud_back_frac: float,
                         bud_lay_frac: float,
                         cap_signal_frac: float,
+                        risk_mode: str = "fixed",
                     ) -> Dict[str, Any]:
                         bud_back = float(bud_back_frac) * float(bank_ref_budget)
                         bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
@@ -5163,6 +5361,8 @@ async def main() -> int:
                                     return ts.timestamp()
                                 return 0.0
                             test_elig.sort(key=_ts_ev)
+                            cnt_back = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") == "Back")
+                            cnt_lay = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") != "Back")
 
                             spent_back: Dict[int, float] = {}
                             spent_lay: Dict[int, float] = {}
@@ -5183,10 +5383,16 @@ async def main() -> int:
                                     raw = _sizing_back(d0, sc)
                                     if raw is None or float(raw) <= 0:
                                         continue
-                                    rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                                    bud_m = float(bud_back)
+                                    if risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
+                                    elif risk_mode == "signals_linear":
+                                        bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                                    cap_sig_m = float(cap_signal_frac) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    use = min(float(raw), float(rem), float(cap_sig_back))
+                                    use = min(float(raw), float(rem), float(cap_sig_m))
                                     if use <= 0:
                                         continue
                                     spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(use)
@@ -5205,10 +5411,16 @@ async def main() -> int:
                                     liab_raw, lay_odd = sized
                                     if liab_raw is None or float(liab_raw) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
                                         continue
-                                    rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                                    bud_m = float(bud_lay)
+                                    if risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
+                                    elif risk_mode == "signals_linear":
+                                        bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                                    cap_sig_m = float(cap_signal_frac) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    liab_use = min(float(liab_raw), float(rem), float(cap_sig_lay))
+                                    liab_use = min(float(liab_raw), float(rem), float(cap_sig_m))
                                     if liab_use <= 0:
                                         continue
                                     spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(liab_use)
@@ -5277,6 +5489,10 @@ async def main() -> int:
                         ("BUDGET_4.00%/2.00% cap33%", 0.040, 0.0200, 0.33),
                         ("BUDGET_3.00%/1.50% cap50%", 0.030, 0.0150, 0.50),
                         ("BUDGET_4.00%/2.00% cap50%", 0.040, 0.0200, 0.50),
+                        # Sensibilidade: Lay budget = Back budget (não penaliza Lay por default)
+                        ("BUDGET_EQ_0.50%/0.50% cap25%", 0.005, 0.0050, 0.25),
+                        ("BUDGET_EQ_1.00%/1.00% cap33%", 0.010, 0.0100, 0.33),
+                        ("BUDGET_EQ_2.00%/2.00% cap50%", 0.020, 0.0200, 0.50),
                     ]
                     lines.append(
                         f"Referência de banca p/ budget: {_fmt_num(bank_ref_budget,2)} | "
@@ -5289,10 +5505,17 @@ async def main() -> int:
                         f"| BASELINE (sem budget) | {_fmt_num(turn_30d,2)} | {_fmt_num(profit_exp_30d,2)} | {_fmt_num(bank_eff,2)} | {_fmt_num(roi_bank_exp,2)}% | {_fmt_num(dd_exp_p95,2)} |\n"
                     )
                     for name, bbf, blf, csf in scenarios:
-                        r = _simulate_with_budget(bud_back_frac=bbf, bud_lay_frac=blf, cap_signal_frac=csf)
+                        r = _simulate_with_budget(bud_back_frac=bbf, bud_lay_frac=blf, cap_signal_frac=csf, risk_mode="fixed")
                         lines.append(
                             f"| {name} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                         )
+                    # Risk-adaptive: mesmo budget padrão, mas ajustando por concentração de sinais observada (por match_id)
+                    r_ra = _simulate_with_budget(bud_back_frac=float(bud_back_frac), bud_lay_frac=float(bud_lay_frac), cap_signal_frac=float(bud_cap_sig_frac), risk_mode="signals_sqrt")
+                    lines.append(
+                        f"| RISK(signals_sqrt) @ {bud_back_frac:.2%}/{bud_lay_frac:.2%} cap{bud_cap_sig_frac:.0%} | "
+                        f"{_fmt_num(r_ra.get('turn_30d'),2)} | {_fmt_num(r_ra.get('profit_30d_exp'),2)} | {_fmt_num(r_ra.get('bank_eff'),2)} | "
+                        f"{_fmt_num(r_ra.get('roi_bank_30d'),2)}% | {_fmt_num(r_ra.get('dd_p95'),2)} |\n"
+                    )
                     lines.append(
                         "\nLeitura:\n"
                         "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
