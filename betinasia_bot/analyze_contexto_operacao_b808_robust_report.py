@@ -5510,6 +5510,10 @@ async def main() -> int:
                         ("BUDGET_EQ_0.50%/0.50% cap25%", 0.005, 0.0050, 0.25),
                         ("BUDGET_EQ_1.00%/1.00% cap33%", 0.010, 0.0100, 0.33),
                         ("BUDGET_EQ_2.00%/2.00% cap50%", 0.020, 0.0200, 0.50),
+                        ("BUDGET_EQ_3.00%/3.00% cap33%", 0.030, 0.0300, 0.33),
+                        ("BUDGET_EQ_4.00%/4.00% cap33%", 0.040, 0.0400, 0.33),
+                        ("BUDGET_EQ_3.00%/3.00% cap50%", 0.030, 0.0300, 0.50),
+                        ("BUDGET_EQ_4.00%/4.00% cap50%", 0.040, 0.0400, 0.50),
                     ]
                     lines.append(
                         f"Referência de banca p/ budget: {_fmt_num(bank_ref_budget,2)} | "
