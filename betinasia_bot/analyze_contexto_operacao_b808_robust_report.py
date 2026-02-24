@@ -722,6 +722,13 @@ async def main() -> int:
         help="Se definido, inclui `league` na chave de combinação do OOS (combinação×liga). Isso incorpora liga no modelo de seleção/ativação.",
     )
     parser.add_argument(
+        "--wf-key-by-league-scope",
+        choices=["pre", "all"],
+        default=os.getenv("WF_KEY_BY_LEAGUE_SCOPE", "pre").strip() or "pre",
+        help="Escopo de `--wf-key-by-league`: 'pre' inclui liga somente no pre-match (recomendado, menos ruído); "
+        "'all' inclui liga também no in-match.",
+    )
+    parser.add_argument(
         "--wf-scheme-pre",
         default=os.getenv("WF_SCHEME_PRE", "KELLY_0.25"),
         help="Scheme de sizing para OOS pre-match (default KELLY_0.25). Ex.: PROXY, FLAT, KELLY_0.10",
@@ -4495,6 +4502,12 @@ async def main() -> int:
                         rev = "Any"
                     base = f"{side}_{regime}_{rev}"
                     if bool(getattr(args, "wf_key_by_league", False)):
+                        scope = str(getattr(args, "wf_key_by_league_scope", "pre") or "pre").strip().lower()
+                        if scope not in ("pre", "all"):
+                            scope = "pre"
+                        # default recomendado: liga influencia mais o pre-match; evita ruído no in-match.
+                        if scope == "pre" and regime != "Pre":
+                            return base
                         lg = str(e.get("league") or "—").strip() or "—"
                         # normaliza para evitar quebrar tabelas/markdown
                         lg = lg.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
@@ -5161,7 +5174,7 @@ async def main() -> int:
                 wf_key_by_league2 = bool(getattr(args, "wf_key_by_league", False))
                 if wf_key_by_league2:
                     lines.append(
-                        "| Train window | Test window | #ativas (comb×liga) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n"
+                        "| Train window | Test window | #ativas (keys) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n"
                         "|---|---|---:|---:|---:|---:|---:|---:|\n"
                     )
                 else:
@@ -5177,6 +5190,12 @@ async def main() -> int:
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
                             f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                         )
+                if wf_key_by_league2:
+                    scope = str(getattr(args, "wf_key_by_league_scope", "pre") or "pre").strip().lower()
+                    lines.append(
+                        f"\n_Neste modo, '#ativas (keys)' conta chaves por liga quando aplicável (scope='{scope}'); "
+                        f"'#ativas (comb)' agrega ignorando liga._\n\n"
+                    )
                 if len(steps) > 20:
                     lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
 
@@ -5923,6 +5942,28 @@ async def main() -> int:
                                 bud_back_frac_use=0.04,
                                 bud_lay_frac_use=0.04,
                                 cap_signal_frac_use=0.50,
+                                risk_mode="signals_sqrt",
+                            )
+                            lines.append(
+                                f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
+                                f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                            )
+                        lines.append("\n")
+
+                        # sensibilidade adicional: Risk(signals_sqrt) + EQ 2%/2% cap33%
+                        lines.append("### 12.2d Sensibilidade por banca — RISK(signals_sqrt) + BUDGET_EQ_2.00%/2.00% cap33%\n")
+                        lines.append(
+                            "Aqui repetimos a sensibilidade por banca usando **risk_mode=signals_sqrt** e budgets **EQ** "
+                            "(Back=2%, Lay=2%) com **cap por sinal=33%** do budget do jogo.\n\n"
+                        )
+                        lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                        lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        for b in grid:
+                            r = _simulate_with_bankroll(
+                                bank_ref=float(b),
+                                bud_back_frac_use=0.02,
+                                bud_lay_frac_use=0.02,
+                                cap_signal_frac_use=0.33,
                                 risk_mode="signals_sqrt",
                             )
                             lines.append(
