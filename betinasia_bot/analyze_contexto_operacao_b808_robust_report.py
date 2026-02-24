@@ -630,6 +630,12 @@ async def main() -> int:
         action="store_true",
         help="Habilita estudo OOS rolling-forward (walk-forward) por dia, com seleção de estratégias por IC90/p90.",
     )
+    parser.add_argument(
+        "--report-mode",
+        choices=["full", "oos_first"],
+        default=os.getenv("REPORT_MODE", "full").strip() or "full",
+        help="Formato do documento. 'full' mantém o relatório completo; 'oos_first' move o bloco OOS para o topo (leitura OOS-first).",
+    )
     parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "2")), help="Dias de treino por passo (default 2).")
     parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
     parser.add_argument(
@@ -648,7 +654,7 @@ async def main() -> int:
         "--wf-bankroll-grid",
         default=os.getenv("WF_BANKROLL_GRID", "").strip(),
         help="CSV de bancas para sensibilidade no OOS mantendo budgets/caps (ex.: '1659,5000,10000,25000'). "
-        "Se vazio, não roda a análise de sensibilidade por banca.",
+        "Se vazio e `--kelly-bankroll` estiver setado, usa o default: 10k,20k,30k,50k,100k.",
     )
     parser.add_argument(
         "--wf-flat-stake-back",
@@ -708,6 +714,12 @@ async def main() -> int:
         type=int,
         default=int(os.getenv("WF_MIN_MATCHES", "20")),
         help="Mínimo de jogos por combinação para ser elegível (default 20). Use 0 para desabilitar o mínimo.",
+    )
+    parser.add_argument(
+        "--wf-key-by-league",
+        action="store_true",
+        default=(os.getenv("WF_KEY_BY_LEAGUE", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Se definido, inclui `league` na chave de combinação do OOS (combinação×liga). Isso incorpora liga no modelo de seleção/ativação.",
     )
     parser.add_argument(
         "--wf-scheme-pre",
@@ -4481,7 +4493,16 @@ async def main() -> int:
                     rev = str(e.get("reversal"))
                     if side == "Back":
                         rev = "Any"
-                    return f"{side}_{regime}_{rev}"
+                    base = f"{side}_{regime}_{rev}"
+                    if bool(getattr(args, "wf_key_by_league", False)):
+                        lg = str(e.get("league") or "—").strip() or "—"
+                        # normaliza para evitar quebrar tabelas/markdown
+                        lg = lg.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+                        # limita tamanho para manter legibilidade
+                        if len(lg) > 48:
+                            lg = lg[:48].rstrip() + "…"
+                        return f"{base}__{lg}"
+                    return base
 
                 def _bym(sub: List[dict], key: str) -> Dict[int, List[float]]:
                     bym: Dict[int, List[float]] = {}
@@ -4943,6 +4964,13 @@ async def main() -> int:
                     lay_liab_all = lay_liab_roi = 0.0
                     turn_all = turn_roi = 0.0
                     pnl_obs = 0.0
+                    # breakdown Pre/In (com budget efetivamente aplicado)
+                    turn_pre = turn_in = 0.0
+                    pnl_obs_pre = pnl_obs_in = 0.0
+                    back_pre_all = back_pre_roi = 0.0
+                    lay_pre_all = lay_pre_roi = 0.0
+                    back_in_all = back_in_roi = 0.0
+                    lay_in_all = lay_in_roi = 0.0
                     # budget por jogo (padrão)
                     bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
                     if bank_ref_budget is None or float(bank_ref_budget) <= 0:
@@ -5014,6 +5042,19 @@ async def main() -> int:
                         else:
                             lay_liab_all += float(exp)
                         _append_job(ev, float(exp))
+                        # breakdown Pre/In (turnover + exposição)
+                        if ev.get("regime") == "Pre":
+                            turn_pre += float(st_eq)
+                            if ev.get("side") == "Back":
+                                back_pre_all += float(exp)
+                            else:
+                                lay_pre_all += float(exp)
+                        else:
+                            turn_in += float(st_eq)
+                            if ev.get("side") == "Back":
+                                back_in_all += float(exp)
+                            else:
+                                lay_in_all += float(exp)
                         # lucro observado se ROI existe
                         if ev.get("roi") is None:
                             continue
@@ -5025,8 +5066,23 @@ async def main() -> int:
                         else:
                             lay_liab_roi += float(exp)
                             pnl_obs += float(exp) * roi_pct / 100.0
+                        # breakdown Pre/In (lucro + exposições com ROI)
+                        if ev.get("regime") == "Pre":
+                            pnl_obs_pre += float(exp) * roi_pct / 100.0
+                            if ev.get("side") == "Back":
+                                back_pre_roi += float(exp)
+                            else:
+                                lay_pre_roi += float(exp)
+                        else:
+                            pnl_obs_in += float(exp) * roi_pct / 100.0
+                            if ev.get("side") == "Back":
+                                back_in_roi += float(exp)
+                            else:
+                                lay_in_roi += float(exp)
 
                     pnl_exp = pnl_obs
+                    pnl_exp_pre = pnl_obs_pre
+                    pnl_exp_in = pnl_obs_in
                     if wf_expand:
                         # expande separadamente por tipo de exposição (stake Back, liability Lay)
                         scale_back = (back_st_all / back_st_roi) if back_st_roi > 0 else 1.0
@@ -5044,69 +5100,27 @@ async def main() -> int:
                             pnl_exp = float(pnl_obs) * float(scale_lay)
                         else:
                             pnl_exp = float(pnl_obs)
+                        # expande por regime (Pre/In) com exposições observadas (já com budget aplicado)
+                        if (back_pre_roi + lay_pre_roi) > 0:
+                            wbp = back_pre_roi / max(1e-9, (back_pre_roi + lay_pre_roi))
+                            wlp = 1.0 - wbp
+                            pnl_exp_pre = float(pnl_obs_pre) * (
+                                wbp * ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0)
+                                + wlp * ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0)
+                            )
+                        if (back_in_roi + lay_in_roi) > 0:
+                            wbi = back_in_roi / max(1e-9, (back_in_roi + lay_in_roi))
+                            wli = 1.0 - wbi
+                            pnl_exp_in = float(pnl_obs_in) * (
+                                wbi * ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0)
+                                + wli * ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0)
+                            )
 
                     # acumula séries diárias (test pode ter vários dias)
                     for dday in test_days:
                         daily_turn[dday] = daily_turn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
                         daily_pnl_obs[dday] = daily_pnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
                         daily_pnl_exp[dday] = daily_pnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
-                        # breakdown Pre/In
-                        if any(ev.get("regime") == "Pre" for ev in test_elig):
-                            pass
-                    # breakdown por regime (usando o mesmo loop, mas recontando por ev)
-                    turn_pre = turn_in = 0.0
-                    pnl_obs_pre = pnl_obs_in = 0.0
-                    pnl_exp_pre = pnl_exp_in = 0.0  # preenchido depois
-                    back_pre_all = back_pre_roi = 0.0
-                    lay_pre_all = lay_pre_roi = 0.0
-                    back_in_all = back_in_roi = 0.0
-                    lay_in_all = lay_in_roi = 0.0
-                    for ev in test_elig:
-                        st_eq, exp = _sizing_for_event(ev)
-                        if st_eq is None or exp is None:
-                            continue
-                        if ev.get("regime") == "Pre":
-                            turn_pre += float(st_eq)
-                            if ev.get("side") == "Back":
-                                back_pre_all += float(exp)
-                            else:
-                                lay_pre_all += float(exp)
-                        else:
-                            turn_in += float(st_eq)
-                            if ev.get("side") == "Back":
-                                back_in_all += float(exp)
-                            else:
-                                lay_in_all += float(exp)
-                        if ev.get("roi") is None:
-                            continue
-                        roi_pct = float(ev.get("roi"))
-                        if ev.get("regime") == "Pre":
-                            if ev.get("side") == "Back":
-                                back_pre_roi += float(exp)
-                            else:
-                                lay_pre_roi += float(exp)
-                            pnl_obs_pre += float(exp) * roi_pct / 100.0
-                        else:
-                            if ev.get("side") == "Back":
-                                back_in_roi += float(exp)
-                            else:
-                                lay_in_roi += float(exp)
-                            pnl_obs_in += float(exp) * roi_pct / 100.0
-                    # expande por regime
-                    pnl_exp_pre = pnl_obs_pre
-                    pnl_exp_in = pnl_obs_in
-                    if wf_expand:
-                        scale_pre = ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0) * 0.5 + ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0) * 0.5
-                        scale_in = ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0) * 0.5 + ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0) * 0.5
-                        if (back_pre_roi + lay_pre_roi) > 0:
-                            wbp = back_pre_roi / max(1e-9, (back_pre_roi + lay_pre_roi))
-                            wlp = 1.0 - wbp
-                            pnl_exp_pre = float(pnl_obs_pre) * (wbp * ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0) + wlp * ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0))
-                        if (back_in_roi + lay_in_roi) > 0:
-                            wbi = back_in_roi / max(1e-9, (back_in_roi + lay_in_roi))
-                            wli = 1.0 - wbi
-                            pnl_exp_in = float(pnl_obs_in) * (wbi * ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0) + wli * ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0))
-                    for dday in test_days:
                         daily_turn_pre[dday] = daily_turn_pre.get(dday, 0.0) + float(turn_pre) / max(1, len(test_days))
                         daily_turn_in[dday] = daily_turn_in.get(dday, 0.0) + float(turn_in) / max(1, len(test_days))
                         daily_pnl_obs_pre[dday] = daily_pnl_obs_pre.get(dday, 0.0) + float(pnl_obs_pre) / max(1, len(test_days))
@@ -5160,18 +5174,33 @@ async def main() -> int:
                 lines.append(f"**Regra de elegibilidade (todas as combinações):** exige `N_ROI >= wf_min_matches` (aqui: {wf_min_m}).\n\n")
             else:
                 lines.append("**Regra de elegibilidade (todas as combinações):** `wf_min_matches=0` ⇒ mínimo de N **desligado**.\n\n")
+                wf_key_by_league = bool(getattr(args, "wf_key_by_league", False))
                 combos_all = [
                     "Back_Pre_Any", "Back_In_Any",
                     "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
-                ]
+                ] if not wf_key_by_league else []
                 for st in steps[:10]:
                     lines.append(f"**Train {st['train']} → Test {st['test']}**\n\n")
+                    hdr_key = "Chave (combinação×liga)" if wf_key_by_league else "Combinação"
                     if wf_use_shrink:
-                        lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI mean (shrunk) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---:|---|\n")
+                        lines.append(
+                            f"| {hdr_key} | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI mean (shrunk) | ROI q30 | Motivo |\n"
+                            "|---|---|---:|---:|---:|---:|---:|---|\n"
+                        )
                     else:
-                        lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---:|---|\n")
+                        lines.append(
+                            f"| {hdr_key} | Ativa? | Jogos treino (tot/CLV/ROI) | CLV mean (IC90) | ROI mean (IC90) | ROI q30 | Motivo |\n"
+                            "|---|---|---:|---:|---:|---:|---|\n"
+                        )
                     diag = st.get("diag") or {}
-                    for k in combos_all:
+                    keys_tbl = combos_all
+                    if wf_key_by_league:
+                        keys_tbl = sorted(
+                            list(diag.keys()),
+                            key=lambda kk: int((diag.get(kk) or {}).get("train_matches_total") or 0),
+                            reverse=True,
+                        )[:20]
+                    for k in keys_tbl:
                         d = diag.get(k) or {}
                         ok = bool(d.get("ok"))
                         tm = int(d.get("train_matches_total") or 0)
@@ -5324,6 +5353,16 @@ async def main() -> int:
                 lines.append(f"| DD 30d p95 (obs., cond OK) | {_fmt_num(dd_obs_p95_ok,2)} |\n")
                 lines.append(f"| DD 30d p95 (exp., calendário) | {_fmt_num(dd_exp_p95,2)} |\n")
                 lines.append(f"| DD 30d p95 (exp., cond OK) | {_fmt_num(dd_exp_p95_ok,2)} |\n")
+                lines.append("\n")
+
+                # Diagnóstico rápido: de onde vem o P&L (Pre vs In)
+                roi_turn_pre = (float(profit_exp_pre_30d) / float(turn_pre_30d) * 100.0) if (profit_exp_pre_30d is not None and turn_pre_30d and float(turn_pre_30d) > 0) else None
+                roi_turn_in = (float(profit_exp_in_30d) / float(turn_in_30d) * 100.0) if (profit_exp_in_30d is not None and turn_in_30d and float(turn_in_30d) > 0) else None
+                lines.append("**Ablation (OOS): operar só Pre vs só In (com o MESMO budget/sizing)**\n\n")
+                lines.append("| Universo | Turnover 30d | Lucro 30d (exp.) | ROI/turnover 30d (exp.) |\n")
+                lines.append("|---|---:|---:|---:|\n")
+                lines.append(f"| Só Pre | {_fmt_num(turn_pre_30d,2)} | {_fmt_num(profit_exp_pre_30d,2)} | {_fmt_num(roi_turn_pre,2)}% |\n")
+                lines.append(f"| Só In | {_fmt_num(turn_in_30d,2)} | {_fmt_num(profit_exp_in_30d,2)} | {_fmt_num(roi_turn_in,2)}% |\n")
                 lines.append("\n")
 
                 # ------------------------------------------------------------
@@ -5530,13 +5569,15 @@ async def main() -> int:
                         lines.append(
                             f"| {name} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                         )
-                    # Risk-adaptive: mesmo budget padrão, mas ajustando por concentração de sinais observada (por match_id)
-                    r_ra = _simulate_with_budget(bud_back_frac=float(bud_back_frac), bud_lay_frac=float(bud_lay_frac), cap_signal_frac=float(bud_cap_sig_frac), risk_mode="signals_sqrt")
-                    lines.append(
-                        f"| RISK(signals_sqrt) @ {bud_back_frac:.2%}/{bud_lay_frac:.2%} cap{bud_cap_sig_frac:.0%} | "
-                        f"{_fmt_num(r_ra.get('turn_30d'),2)} | {_fmt_num(r_ra.get('profit_30d_exp'),2)} | {_fmt_num(r_ra.get('bank_eff'),2)} | "
-                        f"{_fmt_num(r_ra.get('roi_bank_30d'),2)}% | {_fmt_num(r_ra.get('dd_p95'),2)} |\n"
-                    )
+                    lines.append("\n**Risk-adaptive (signals_sqrt): sensibilidade variando budgets/caps**\n\n")
+                    lines.append("| Cenário (risk) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                    lines.append("|---|---:|---:|---:|---:|---:|\n")
+                    for name, bbf, blf, csf in scenarios:
+                        r_ra = _simulate_with_budget(bud_back_frac=bbf, bud_lay_frac=blf, cap_signal_frac=csf, risk_mode="signals_sqrt")
+                        lines.append(
+                            f"| RISK(signals_sqrt) {name} | {_fmt_num(r_ra.get('turn_30d'),2)} | {_fmt_num(r_ra.get('profit_30d_exp'),2)} | "
+                            f"{_fmt_num(r_ra.get('bank_eff'),2)} | {_fmt_num(r_ra.get('roi_bank_30d'),2)}% | {_fmt_num(r_ra.get('dd_p95'),2)} |\n"
+                        )
                     lines.append(
                         "\nLeitura:\n"
                         "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
@@ -5548,6 +5589,10 @@ async def main() -> int:
                     # ------------------------------------------------------------
                     raw_grid = str(getattr(args, "wf_bankroll_grid", "") or "").strip()
                     grid: List[float] = []
+                    # Default solicitado: se usuário setou `--kelly-bankroll` mas não passou grid,
+                    # roda uma sensibilidade padrão de banca (OOS).
+                    if (not raw_grid) and (_safe_float(getattr(args, "kelly_bankroll", None)) or 0.0) > 0:
+                        raw_grid = "10000,20000,30000,50000,100000"
                     if raw_grid:
                         for part in raw_grid.replace(";", ",").split(","):
                             p = part.strip()
@@ -6017,6 +6062,55 @@ async def main() -> int:
         lines.append("  --out betinasia_bot/docs/analise_contexto_operacao_b808_robusta.md \\\n")
         lines.append("  --pdf betinasia_bot/docs/analise_contexto_operacao_b808_robusta.pdf\n")
         lines.append("```\n")
+
+        # ============================================================
+        # Pós-processamento do documento (ex.: OOS-first)
+        # ============================================================
+        report_mode = str(getattr(args, "report_mode", "full") or "full").strip().lower()
+        if report_mode == "oos_first":
+            def _reorder_oos_first(doc_lines: List[str]) -> List[str]:
+                def _find_in(lines_list: List[str], prefix: str, start: int = 0) -> Optional[int]:
+                    for ii in range(start, len(lines_list)):
+                        if str(lines_list[ii] or "").startswith(prefix):
+                            return ii
+                    return None
+
+                i_oos = _find_in(doc_lines, "## 12) OOS walk-forward", 0)
+                if i_oos is None:
+                    return doc_lines
+                j_oos = _find_in(doc_lines, "## 10) Diagnóstico", i_oos + 1)
+                if j_oos is None:
+                    j_oos = len(doc_lines)
+                oos_block = doc_lines[i_oos:j_oos]
+                rest = doc_lines[:i_oos] + doc_lines[j_oos:]
+
+                # transforma headings para leitura OOS-first
+                oos2: List[str] = []
+                for ln in oos_block:
+                    if "Até aqui o relatório é **in-sample**" in ln:
+                        ln = (
+                            "Este relatório é **OOS-first**: começamos pelo walk-forward (OOS) e deixamos as análises in-sample/diagnósticos no apêndice.\n\n"
+                        )
+                    if ln.startswith("## 12) OOS walk-forward"):
+                        ln = ln.replace("## 12)", "## 1)", 1)
+                    if ln.startswith("### 12."):
+                        ln = ln.replace("### 12.", "### 1.", 1)
+                    if ln.startswith("### 12.A"):
+                        ln = ln.replace("### 12.A", "### 1.A", 1)
+                    oos2.append(ln)
+
+                ins = _find_in(rest, "## 1) ", 0)
+                if ins is None:
+                    ins = 0
+
+                appendix_hdr = [
+                    "\n---\n\n",
+                    "## Apêndice — Diagnósticos e in-sample\n\n",
+                    "_Nota: as seções abaixo mantêm a numeração original do relatório completo._\n\n",
+                ]
+                return rest[:ins] + oos2 + appendix_hdr + rest[ins:]
+
+            lines = _reorder_oos_first(lines)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("".join(lines), encoding="utf-8")
