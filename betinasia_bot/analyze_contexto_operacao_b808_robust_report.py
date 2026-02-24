@@ -5731,15 +5731,23 @@ async def main() -> int:
                         stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
                         return (float(stake_eq), float(liab))
 
-                    def _simulate_with_bankroll(*, bank_ref: float) -> Dict[str, Any]:
+                    def _simulate_with_bankroll(
+                        *,
+                        bank_ref: float,
+                        bud_back_frac_use: Optional[float] = None,
+                        bud_lay_frac_use: Optional[float] = None,
+                        cap_signal_frac_use: Optional[float] = None,
+                        risk_mode: str = "fixed",
+                    ) -> Dict[str, Any]:
                         """
                         Simula todo o OOS (nos steps já selecionados) variando somente a referência de banca.
                         Mantém budgets/caps (frações) constantes.
                         """
-                        bud_back = float(bud_back_frac) * float(bank_ref)
-                        bud_lay = float(bud_lay_frac) * float(bank_ref)
-                        cap_sig_back = float(bud_cap_sig_frac) * float(bud_back)
-                        cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
+                        bbf = float(bud_back_frac if bud_back_frac_use is None else bud_back_frac_use)
+                        blf = float(bud_lay_frac if bud_lay_frac_use is None else bud_lay_frac_use)
+                        csf = float(bud_cap_sig_frac if cap_signal_frac_use is None else cap_signal_frac_use)
+                        bud_back = float(bbf) * float(bank_ref)
+                        bud_lay = float(blf) * float(bank_ref)
 
                         dturn: Dict[str, float] = {}
                         dpnl_exp: Dict[str, float] = {}
@@ -5766,6 +5774,8 @@ async def main() -> int:
                                 return 0.0
 
                             test_elig.sort(key=_ts_ev)
+                            cnt_back = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") == "Back")
+                            cnt_lay = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") != "Back")
 
                             turn_all = 0.0
                             pnl_obs = 0.0
@@ -5785,10 +5795,16 @@ async def main() -> int:
 
                                 mid = int(ev.get("match_id"))
                                 if ev.get("side") == "Back":
-                                    rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                                    bud_m = float(bud_back)
+                                    if risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
+                                    elif risk_mode == "signals_linear":
+                                        bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                                    cap_sig_m = float(csf) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    exp_use = min(float(exp), float(rem), float(cap_sig_back))
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
                                     if exp_use <= 0:
                                         continue
                                     ratio = exp_use / max(1e-9, float(exp))
@@ -5799,10 +5815,16 @@ async def main() -> int:
                                     if ev.get("roi") is not None:
                                         back_roi += float(exp)
                                 else:
-                                    rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                                    bud_m = float(bud_lay)
+                                    if risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
+                                    elif risk_mode == "signals_linear":
+                                        bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                                    cap_sig_m = float(csf) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                                     if rem <= 0:
                                         continue
-                                    exp_use = min(float(exp), float(rem), float(cap_sig_lay))
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
                                     if exp_use <= 0:
                                         continue
                                     ratio = exp_use / max(1e-9, float(exp))
@@ -5881,6 +5903,28 @@ async def main() -> int:
                         lines.append("|---:|---:|---:|---:|---:|---:|\n")
                         for b in grid:
                             r = _simulate_with_bankroll(bank_ref=float(b))
+                            lines.append(
+                                f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
+                                f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                            )
+                        lines.append("\n")
+
+                        # cenário solicitado: Risk(signals_sqrt) + EQ 4%/4% cap50%
+                        lines.append("### 12.2c Sensibilidade por banca — RISK(signals_sqrt) + BUDGET_EQ_4.00%/4.00% cap50%\n")
+                        lines.append(
+                            "Aqui repetimos a sensibilidade por banca usando **risk_mode=signals_sqrt** e budgets **EQ** "
+                            "(Back=4%, Lay=4%) com **cap por sinal=50%** do budget do jogo.\n\n"
+                        )
+                        lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                        lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        for b in grid:
+                            r = _simulate_with_bankroll(
+                                bank_ref=float(b),
+                                bud_back_frac_use=0.04,
+                                bud_lay_frac_use=0.04,
+                                cap_signal_frac_use=0.50,
+                                risk_mode="signals_sqrt",
+                            )
                             lines.append(
                                 f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
