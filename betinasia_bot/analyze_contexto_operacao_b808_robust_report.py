@@ -4772,6 +4772,7 @@ async def main() -> int:
                     # seleção por combinação
                     active: List[str] = []
                     diag = {}
+                    wf_key_by_league = bool(getattr(args, "wf_key_by_league", False))
                     # pré-calcula shrinkage de ROI por combinação neste step
                     shrink_map: Dict[str, Optional[float]] = {}
                     if wf_use_shrink:
@@ -5133,6 +5134,12 @@ async def main() -> int:
                     if lay_liab_all > 0:
                         oos_lay_liab_all.append(float(lay_liab_all))
 
+                    # número de combinações "base" (sem a liga, quando wf_key_by_league=1)
+                    active_base = set()
+                    for k in active:
+                        kb = str(k).split("__", 1)[0] if wf_key_by_league else str(k)
+                        active_base.add(kb)
+
                     steps.append(
                         {
                             "train": f"{min(train_days)}→{max(train_days)}",
@@ -5140,6 +5147,7 @@ async def main() -> int:
                             "test_days": sorted(test_days),
                             "active_keys": list(active),
                             "active_n": len(active),
+                            "active_n_base": len(active_base),
                             "oos_matches": len(bym_roi),
                             "oos_mean": oos_mean,
                             "oos_ci": oos_ci,
@@ -5150,12 +5158,25 @@ async def main() -> int:
                         }
                     )
 
-                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|\n")
-                for s in steps[:20]:
+                wf_key_by_league2 = bool(getattr(args, "wf_key_by_league", False))
+                if wf_key_by_league2:
                     lines.append(
-                        f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                        f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                        "| Train window | Test window | #ativas (comb×liga) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n"
+                        "|---|---|---:|---:|---:|---:|---:|---:|\n"
                     )
+                else:
+                    lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|\n")
+                for s in steps[:20]:
+                    if wf_key_by_league2:
+                        lines.append(
+                            f"| {s['train']} | {s['test']} | {s['active_n']} | {int(s.get('active_n_base') or 0)} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                        )
+                    else:
+                        lines.append(
+                            f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                        )
                 if len(steps) > 20:
                     lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
 
