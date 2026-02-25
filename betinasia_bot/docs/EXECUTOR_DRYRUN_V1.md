@@ -89,3 +89,16 @@ curl -sS http://127.0.0.1:8089/health
 - JSONL padrão: `logs/executor_dryrun.jsonl` (config: `EXECUTOR_JSONL`)
 - Opcional: gravar no Postgres com `--save-to-db` (ou `EXECUTOR_SAVE_TO_DB=1`).
 
+## Descoberta do endpoint de "place/confirm" (aposta real)
+
+Para implementarmos o "place bet" via API interna, rode a captura e faça **1 aposta manual de ~$3**:
+
+```bash
+cd /home/betbot/Bets/betinasia_bot
+source venv/bin/activate
+
+python3 betinasia_bot/executor/capture_place_confirm.py --out logs/place_confirm_capture.jsonl
+```
+
+O script vai abrir o browser, fazer login e gravar requests/responses/WS relevantes (com redaction).
+
