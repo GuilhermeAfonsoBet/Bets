@@ -4878,8 +4878,11 @@ async def main() -> int:
                         daily_pnl_exp_pre.setdefault(dday, 0.0)
                         daily_pnl_exp_in.setdefault(dday, 0.0)
 
-                    train = [e for e in combo_events if e["day"] in train_days]
-                    test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None]
+                    # Aplica políticas operacionais determinísticas também no treino/teste (sem lookahead):
+                    # - filtro por linha AH (|line|)
+                    # Observação: gates baseados em percentil de limit (p50/p75) são aplicados no teste com limiar do treino.
+                    train = [e for e in combo_events if e["day"] in train_days and _ah_ok(e)]
+                    test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None and _ah_ok(e)]
 
                     # thresholds de liquidez estimados na janela de treino (sem lookahead)
                     thr_p50_pre = thr_p75_pre = None
