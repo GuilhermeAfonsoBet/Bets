@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,12 +60,14 @@ class ExecutorWorker:
     _api_backoff_until_ts: float = 0.0
     _cap_lock: asyncio.Lock = None
     _cap_open_times: Any = None  # deque[float]
+    _betslip_cache: Dict[str, str] = None  # key -> betslip_id
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
         from collections import deque
 
         self._cap_open_times = deque()
+        self._betslip_cache = {}
         self._scraper = BetinAsiaScraper()
         await self._scraper.start()
         ok_login = await self._scraper.login()
@@ -73,6 +76,17 @@ class ExecutorWorker:
         page = self._scraper._page
         self._api = ApiBetslipClient(page)
         self._api.setup_listener()
+
+        # FAST mode: reduzir esperas por PMM (trade-off: menos bookies/menos "best odd")
+        if os.getenv("EXECUTOR_FAST_PMM", "1").strip() in ("1", "true", "True", "yes", "YES"):
+            self._api.PMM_TIMEOUT = float(os.getenv("EXECUTOR_PMM_TIMEOUT_SEC", "0.8"))
+            self._api.PMM_MIN_WAIT = float(os.getenv("EXECUTOR_PMM_MIN_WAIT_SEC", "0.0"))
+            self._api.PMM_IDLE_TIMEOUT = float(os.getenv("EXECUTOR_PMM_IDLE_TIMEOUT_SEC", "0.12"))
+            logger.info(
+                f"[executor:{self.name}] FAST_PMM on: timeout={self._api.PMM_TIMEOUT}s "
+                f"min_wait={self._api.PMM_MIN_WAIT}s idle={self._api.PMM_IDLE_TIMEOUT}s"
+            )
+
         await page.goto(self.football_url)
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(4000)
@@ -185,9 +199,16 @@ class ExecutorWorker:
         else:
             bet_type = ApiBetslipClient.build_bet_type(req.market_type.value, req.side, req.line)
 
+        cache_key = f"{req.event_id}|{betslip_type}|{bet_type}"
         api_result: Optional[BetslipApiResult] = None
         try:
-            api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+            cached_id = (self._betslip_cache or {}).get(cache_key)
+            if cached_id:
+                api_result = await self._api.refresh_betslip(cached_id)
+            else:
+                api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+                if api_result and api_result.success and getattr(api_result, "betslip_id", ""):
+                    self._betslip_cache[cache_key] = str(api_result.betslip_id)
         except Exception as e:
             return ExecutionResult(
                 execution_id=req.execution_id,
@@ -258,6 +279,7 @@ class ExecutorWorker:
             error=err,
             raw={
                 "betslip_id": getattr(api_result, "betslip_id", ""),
+                "cache_hit": bool((self._betslip_cache or {}).get(cache_key)),
                 "cap": cap_meta,
                 "bet_type": bet_type,
                 "betslip_type": betslip_type,

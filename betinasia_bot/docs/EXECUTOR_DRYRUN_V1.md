@@ -24,6 +24,23 @@ python3 run_executor_dryrun.py --host 127.0.0.1 --port 8089 --workers 1
 python3 run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers 1
 ```
 
+## Modo ultra-rápido (recomendado para aproximar do real)
+
+O fluxo "abrir betslip e esperar todos PMMs" pode levar 2–3s. Para reduzir:
+- o executor ativa **FAST_PMM** por padrão (usa timeouts menores e para assim que existe preço utilizável);
+- usa **cache de betslip_id** por (event_id, bet_type, betslip_type) e passa a usar `/refresh/` nas execuções seguintes.
+
+Variáveis:
+
+```bash
+export EXECUTOR_FAST_PMM=1
+export EXECUTOR_PMM_TIMEOUT_SEC=0.8
+export EXECUTOR_PMM_MIN_WAIT_SEC=0.0
+export EXECUTOR_PMM_IDLE_TIMEOUT_SEC=0.12
+```
+
+Isso troca um pouco de "best odd" por velocidade (o que é desejável quando tempo destrói edge).
+
 ## API
 
 ### `POST /execute`
