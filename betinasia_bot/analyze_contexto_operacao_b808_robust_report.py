@@ -374,6 +374,18 @@ def line_bucket(line_str: str) -> str:
     return "AH 2+ (extrema)"
 
 
+def line_abs(line_str: Any) -> Optional[float]:
+    try:
+        if line_str is None:
+            return None
+        x = abs(float(str(line_str).replace(",", ".")))
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
 def lag_bucket(ms: Optional[int]) -> str:
     if not ms or ms <= 0:
         return "Desconhecido"
@@ -778,6 +790,19 @@ async def main() -> int:
         default=os.getenv("WF_BUDGET_RISK_MODE", "fixed").strip() or "fixed",
         choices=["fixed", "signals_sqrt", "signals_linear"],
         help="Modo de budget por match_id no OOS: fixed (constante), ou adaptativo por concentração de sinais observada (signals_sqrt/signals_linear).",
+    )
+    parser.add_argument(
+        "--wf-ah-max-abs-line",
+        type=float,
+        default=float(os.getenv("WF_AH_MAX_ABS_LINE", "0")),
+        help="Política OOS por linha AH (proxy de liquidez): se >0, filtra eventos com |line| > este valor "
+        "(ex.: 2.0 para excluir AH 2+). Default 0 (sem filtro).",
+    )
+    parser.add_argument(
+        "--wf-ah-scope",
+        choices=["pre", "all"],
+        default=os.getenv("WF_AH_SCOPE", "all").strip() or "all",
+        help="Escopo do filtro por linha AH no OOS: 'pre' aplica só no pre-match; 'all' aplica também no in-match. Default: all.",
     )
     args = parser.parse_args()
 
@@ -4268,6 +4293,10 @@ async def main() -> int:
             if wf_liq_scope not in ("pre", "all"):
                 wf_liq_scope = "pre"
             wf_liq_min = float(max(0.0, _safe_float(getattr(args, "wf_liquidity_min_limit", 0.0)) or 0.0))
+            wf_ah_max_abs = float(max(0.0, _safe_float(getattr(args, "wf_ah_max_abs_line", 0.0)) or 0.0))
+            wf_ah_scope = str(getattr(args, "wf_ah_scope", "all") or "all").strip().lower()
+            if wf_ah_scope not in ("pre", "all"):
+                wf_ah_scope = "all"
 
             def _liq_ok(ev: dict, *, thr: Optional[float]) -> bool:
                 if wf_liq_mode == "none":
@@ -4283,6 +4312,16 @@ async def main() -> int:
                     # sem limiar estimável => não filtra
                     return True
                 return float(lim) >= float(thr)
+
+            def _ah_ok(ev: dict) -> bool:
+                if wf_ah_max_abs <= 0:
+                    return True
+                if wf_ah_scope == "pre" and str(ev.get("regime")) != "Pre":
+                    return True
+                a = _safe_float(ev.get("ah_abs"))
+                if a is None or not math.isfinite(float(a)):
+                    return False
+                return float(a) <= float(wf_ah_max_abs)
 
             # Para scheme in-match "ROI_TRAIN": usamos ROI médio no treino por combinação como proxy de EV.
             # Mapeamento preenchido por step (train window) e usado no loop de sizing do test.
@@ -4304,6 +4343,10 @@ async def main() -> int:
                     f"**Política de liquidez (OOS)**: mode=`{wf_liq_mode}`, scope=`{wf_liq_scope}`"
                     + (f", min_limit={_fmt_num(wf_liq_min,2)}" if wf_liq_mode == "gate_min" else "")
                     + ".\n\n"
+                )
+            if wf_ah_max_abs and float(wf_ah_max_abs) > 0:
+                lines.append(
+                    f"**Política por linha AH (OOS)**: max_abs_line={_fmt_num(wf_ah_max_abs,2)} (scope=`{wf_ah_scope}`).\n\n"
                 )
             def _ws_proxy_odd(d0: dict) -> Optional[Tuple[float, float]]:
                 """
@@ -4406,6 +4449,7 @@ async def main() -> int:
                         "reversal": "Any",
                         "match_id": int(d0.get("match_id")),
                         "league": str(d0.get("league") or ""),
+                        "ah_abs": line_abs(d0.get("line")),
                         "liq_limit": (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None),
                         "clv_back": clv_entry,
                         "clv_lay_conv": None,
@@ -4438,6 +4482,7 @@ async def main() -> int:
                         "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
                         "match_id": int(r.get("match_id")),
                         "league": str((d0 or {}).get("league") or ""),
+                        "ah_abs": line_abs((d0 or {}).get("line")),
                         "liq_limit": (
                             _safe_float(_get_path((d0 or {}).get("hypothesis_details") or {}, ["lay", "available_limit"]))
                             if (_safe_float(_get_path((d0 or {}).get("hypothesis_details") or {}, ["lay", "available_limit"])) or 0.0) > 0
@@ -5046,7 +5091,7 @@ async def main() -> int:
                         roi_train_by_key[str(k)] = float(rm)
 
                     # avaliação OOS: ROI agregado nas combinações ativas
-                    test_active = [e for e in test if _key(e) in set(active) and _liq_ok(e, thr=thr_use)]
+                    test_active = [e for e in test if _key(e) in set(active) and _liq_ok(e, thr=thr_use) and _ah_ok(e)]
                     bym_roi: Dict[int, List[float]] = {}
                     for e in test_active:
                         bym_roi.setdefault(int(e["match_id"]), []).append(float(e["roi"]))
@@ -5054,7 +5099,7 @@ async def main() -> int:
 
                     # sizing + P&L no período de teste
                     # Conjunto elegível no teste (inclui sem ROI para turnover)
-                    test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active) and _liq_ok(e, thr=thr_use)]
+                    test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active) and _liq_ok(e, thr=thr_use) and _ah_ok(e)]
                     back_st_all = back_st_roi = 0.0
                     lay_liab_all = lay_liab_roi = 0.0
                     turn_all = turn_roi = 0.0
@@ -5516,6 +5561,9 @@ async def main() -> int:
                     bank_ref_budget = float(bank_ref_budget or 1.0)
 
                     def _liq_ok_policy(ev: dict, st: dict) -> bool:
+                        # política adicional: linha AH (proxy de liquidez por mercado)
+                        if not _ah_ok(ev):
+                            return False
                         if wf_liq_mode == "none":
                             return True
                         if wf_liq_scope == "pre" and str(ev.get("regime")) != "Pre":
@@ -6077,12 +6125,175 @@ async def main() -> int:
                         lines.append("\n")
 
                     # ------------------------------------------------------------
-                    # 12.3 Liquidez (limit) — sensibilidade OOS (sem lookahead)
+                    # 12.3 Liquidez por linha AH — sensibilidade OOS e política
                     # ------------------------------------------------------------
-                    lines.append("### 12.3 Liquidez (AH) no OOS — sensibilidade e política\n")
+                    lines.append("### 12.3 Linha AH (0–1, 1–2, 2+) no OOS — sensibilidade e política\n")
                     lines.append(
-                        "Proxy de **liquidez**: `betslip_limit` (Back) e `lay.available_limit` (Lay, quando disponível; fallback `betslip_limit`).\n\n"
-                        "Testamos um **gate por liquidez** (filtra baixo limit) usando limiares estimados na janela de treino (sem lookahead).\n\n"
+                        "Interpretação operacional (proxy de liquidez do **mercado AH**): linhas extremas (ex.: **AH 2+**) tendem a ser menos líquidas e "
+                        "podem sofrer mais com slippage/execução. Aqui testamos políticas de filtro por `|line|` no OOS.\n\n"
+                        "Buckets usados: **0–1**, **1–2**, **2+** (por `abs(line)`).\n\n"
+                    )
+
+                    def _ah_bucket(abs_line: Optional[float]) -> Optional[str]:
+                        if abs_line is None or not math.isfinite(float(abs_line)):
+                            return None
+                        x = float(abs_line)
+                        if x <= 1.0:
+                            return "AH 0-1"
+                        if x <= 2.0:
+                            return "AH 1-2"
+                        return "AH 2+"
+
+                    def _simulate_oos_filtered(*, filt_fn) -> Dict[str, Any]:
+                        dturn: Dict[str, float] = {}
+                        dpnl: Dict[str, float] = {}
+                        for st in steps:
+                            test_days = set(st.get("test_days") or [])
+                            active_keys = set(st.get("active_keys") or [])
+                            if not test_days or not active_keys:
+                                continue
+                            test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in active_keys and filt_fn(e, st)]
+                            if not test_elig:
+                                continue
+                            # budget/sizing padrão (mesmo da 12.1)
+                            bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
+                            if bank_ref_budget is None or float(bank_ref_budget) <= 0:
+                                bank_ref_budget = bank_eff
+                            bank_ref_budget = float(bank_ref_budget or 1.0)
+                            bud_back = float(bud_back_frac) * float(bank_ref_budget)
+                            bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                            spent_back: Dict[int, float] = {}
+                            spent_lay: Dict[int, float] = {}
+                            # ordem temporal
+                            def _ts_ev(ev: dict) -> float:
+                                d0 = audit_by_id.get(int(ev.get("audit_id")))
+                                ts = d0.get("audited_at") if d0 else None
+                                if isinstance(ts, datetime):
+                                    return ts.timestamp()
+                                return 0.0
+                            test_elig.sort(key=_ts_ev)
+                            cnt_back = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") == "Back")
+                            cnt_lay = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") != "Back")
+                            turn_all = 0.0
+                            pnl_obs = 0.0
+                            back_all = back_roi = 0.0
+                            lay_all = lay_roi = 0.0
+                            for ev in test_elig:
+                                st_eq, exp = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                if st_eq is None or exp is None:
+                                    continue
+                                mid = int(ev.get("match_id"))
+                                if ev.get("side") == "Back":
+                                    bud_m = float(bud_back)
+                                    if bud_risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
+                                    elif bud_risk_mode == "signals_linear":
+                                        bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                                    cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                                    if exp_use <= 0:
+                                        continue
+                                    ratio = exp_use / max(1e-9, float(exp))
+                                    exp = exp_use
+                                    st_eq = float(st_eq) * float(ratio)
+                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
+                                    back_all += float(exp)
+                                    if ev.get("roi") is not None:
+                                        back_roi += float(exp)
+                                else:
+                                    bud_m = float(bud_lay)
+                                    if bud_risk_mode == "signals_sqrt":
+                                        bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
+                                    elif bud_risk_mode == "signals_linear":
+                                        bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                                    cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                                    rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                                    if exp_use <= 0:
+                                        continue
+                                    ratio = exp_use / max(1e-9, float(exp))
+                                    exp = exp_use
+                                    st_eq = float(st_eq) * float(ratio)
+                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
+                                    lay_all += float(exp)
+                                    if ev.get("roi") is not None:
+                                        lay_roi += float(exp)
+                                turn_all += float(st_eq)
+                                if ev.get("roi") is None:
+                                    continue
+                                pnl_obs += float(exp) * float(ev.get("roi")) / 100.0
+                            pnl_exp = float(pnl_obs)
+                            if wf_expand:
+                                scale_back = (back_all / back_roi) if back_roi > 0 else 1.0
+                                scale_lay = (lay_all / lay_roi) if lay_roi > 0 else 1.0
+                                if back_roi > 0 and lay_roi > 0:
+                                    w_back = back_roi / max(1e-9, (back_roi + lay_roi))
+                                    w_lay = 1.0 - w_back
+                                    pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                                elif back_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_back)
+                                elif lay_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_lay)
+                            for dday in test_days:
+                                dturn[dday] = dturn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                                dpnl[dday] = dpnl.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+                        oos_days2 = sorted(dturn.keys())
+                        n_days2 = len(oos_days2) if oos_days2 else 0
+                        scale = (30.0 / float(n_days2)) if n_days2 > 0 else None
+                        turn_30 = float(sum(dturn.values())) * float(scale) if scale is not None else None
+                        prof_30 = float(sum(dpnl.values())) * float(scale) if scale is not None else None
+                        _, dd_p95 = _bootstrap_dd(list(dpnl.values()), horizon_days=30, n_boot=2000)
+                        roi_turn = (float(prof_30) / float(turn_30) * 100.0) if (prof_30 is not None and turn_30 and float(turn_30) > 0) else None
+                        return {"turn_30d": turn_30, "profit_30d_exp": prof_30, "roi_turn": roi_turn, "dd_p95": dd_p95}
+
+                    def _filt_gate(max_abs: float, scope: str):
+                        scope = str(scope or "all").strip().lower()
+                        if scope not in ("pre", "all"):
+                            scope = "all"
+                        def _f(ev: dict, st: dict) -> bool:
+                            if scope == "pre" and str(ev.get("regime")) != "Pre":
+                                return True
+                            a = _safe_float(ev.get("ah_abs"))
+                            if a is None or not math.isfinite(float(a)):
+                                return False
+                            return float(a) <= float(max_abs)
+                        return _f
+
+                    def _filt_only_bucket(bucket: str):
+                        def _f(ev: dict, st: dict) -> bool:
+                            a = _safe_float(ev.get("ah_abs"))
+                            return _ah_bucket(a) == bucket
+                        return _f
+
+                    lines.append("| Cenário | Scope | Turnover 30d | Lucro 30d (exp.) | ROI/turnover 30d | DD 30d p95 |\n")
+                    lines.append("|---|---|---:|---:|---:|---:|\n")
+                    r0 = _simulate_oos_filtered(filt_fn=lambda ev, st: True)
+                    lines.append(f"| BASELINE (sem filtro) | — | {_fmt_num(r0.get('turn_30d'),2)} | {_fmt_num(r0.get('profit_30d_exp'),2)} | {_fmt_num(r0.get('roi_turn'),2)}% | {_fmt_num(r0.get('dd_p95'),2)} |\n")
+                    for scope in ("pre", "all"):
+                        r2 = _simulate_oos_filtered(filt_fn=_filt_gate(2.0, scope))
+                        lines.append(f"| GATE abs<=2.0 | {scope} | {_fmt_num(r2.get('turn_30d'),2)} | {_fmt_num(r2.get('profit_30d_exp'),2)} | {_fmt_num(r2.get('roi_turn'),2)}% | {_fmt_num(r2.get('dd_p95'),2)} |\n")
+                    for scope in ("pre", "all"):
+                        r1 = _simulate_oos_filtered(filt_fn=_filt_gate(1.0, scope))
+                        lines.append(f"| GATE abs<=1.0 | {scope} | {_fmt_num(r1.get('turn_30d'),2)} | {_fmt_num(r1.get('profit_30d_exp'),2)} | {_fmt_num(r1.get('roi_turn'),2)}% | {_fmt_num(r1.get('dd_p95'),2)} |\n")
+                    lines.append("\n**Ablation (diagnóstico)**: operar apenas em um bucket de linha (budget reinicia por step; serve como diagnóstico, não como decomposição exata do baseline).\n\n")
+                    lines.append("| Bucket | Turnover 30d | Lucro 30d (exp.) | ROI/turnover 30d |\n")
+                    lines.append("|---|---:|---:|---:|\n")
+                    for bkt in ("AH 0-1", "AH 1-2", "AH 2+"):
+                        r = _simulate_oos_filtered(filt_fn=_filt_only_bucket(bkt))
+                        lines.append(f"| {bkt} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('roi_turn'),2)}% |\n")
+                    lines.append("\n**Política sugerida (OOS)**: se `AH 2+` degradar ROI/turnover, começar com `--wf-ah-max-abs-line 2 --wf-ah-scope all` (ou `pre`).\n\n")
+
+                    # ------------------------------------------------------------
+                    # 12.4 Liquidez por limit (betslip_limit) — sensibilidade OOS
+                    # ------------------------------------------------------------
+                    lines.append("### 12.4 Liquidez por limit (betslip_limit) no OOS — sensibilidade (opcional)\n")
+                    lines.append(
+                        "Este bloco é **opcional** e usa o proxy `betslip_limit`/`lay.available_limit` (capacidade por aposta) como outra visão de liquidez.\n\n"
                     )
 
                     def _simulate_liq_sensitivity(*, mode: str, scope: str) -> Dict[str, Any]:
@@ -6226,7 +6437,7 @@ async def main() -> int:
                     for md, sc in [("gate_p50", "pre"), ("gate_p75", "pre"), ("gate_p50", "all")]:
                         r = _simulate_liq_sensitivity(mode=md, scope=sc)
                         lines.append(f"| LIQ_{md.upper()} | {sc} | {_fmt_num(r.get('thr_med'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('roi_turn'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n")
-                    lines.append("\n**Política sugerida (OOS)**: começar com `--wf-liquidity-mode gate_p50 --wf-liquidity-scope pre`.\n\n")
+                    lines.append("\nPolítica sugerida (opcional): `--wf-liquidity-mode gate_p50 --wf-liquidity-scope pre`.\n\n")
 
                     # Breakdown de volume por combinação (para explicar queda de turnover/lucro)
                     lines.append("**Volume e stake médio por combinação (janela OOS, com budget padrão)**\n\n")
