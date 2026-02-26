@@ -10,9 +10,10 @@ import asyncio
 import re
 import os
 import json
+import hashlib
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from loguru import logger
 from dateutil import parser as date_parser
 
@@ -385,6 +386,64 @@ class BetinAsiaScraper:
             await password_input.fill(password)
             await self._page.wait_for_timeout(500)
             
+            async def _root_session_fingerprint() -> str:
+                try:
+                    cookies = await self._context.cookies()
+                    for c in (cookies or []):
+                        if c.get("name") == "root-session" and c.get("value"):
+                            v = str(c.get("value"))
+                            h = hashlib.sha256(v.encode("utf-8")).hexdigest()[:12]
+                            return f"len={len(v)} sha256_12={h}"
+                except Exception:
+                    return ""
+                return ""
+
+            async def _api_auth_check() -> Dict[str, Any]:
+                """
+                Verifica se o header `session` (root-session) está aceitando chamadas autenticadas.
+                """
+                try:
+                    # token root-session
+                    session_token = ""
+                    cookies = await self._context.cookies()
+                    for c in (cookies or []):
+                        if c.get("name") == "root-session" and c.get("value"):
+                            session_token = str(c.get("value"))
+                            break
+                    if not session_token:
+                        return {"ok": False, "status": 0, "prefix": "NO_ROOT_SESSION"}
+
+                    resp = await self._page.evaluate(
+                        """
+                        async (params) => {
+                            try {
+                                const u = '/v1/orders/?placer=' + encodeURIComponent(params.username) + '&page_size=1';
+                                const r = await fetch(u, {
+                                    method: 'GET',
+                                    credentials: 'same-origin',
+                                    headers: {
+                                        'Accept': 'application/json, text/plain, */*',
+                                        'session': params.sessionToken,
+                                        'x-molly-client-name': 'sonic',
+                                        'x-molly-client-version': '2.5.54'
+                                    }
+                                });
+                                let text = '';
+                                try { text = await r.text(); } catch(e) { text = ''; }
+                                return {ok: r.ok, status: r.status, prefix: (text || '').slice(0, 220)};
+                            } catch(e) {
+                                return {ok: false, status: 0, prefix: String(e && e.message ? e.message : e)};
+                            }
+                        }
+                        """,
+                        {"username": str(username), "sessionToken": session_token},
+                    )
+                    if isinstance(resp, dict):
+                        return resp
+                except Exception as e:
+                    return {"ok": False, "status": 0, "prefix": str(e)[:220]}
+                return {"ok": False, "status": 0, "prefix": "UNKNOWN"}
+
             # Clica no botão de login (texto "Log In")
             login_button = await self._page.query_selector(
                 "button:has-text('Log In'), button:has-text('Iniciar'), "
@@ -408,6 +467,7 @@ class BetinAsiaScraper:
             start_ts = datetime.now(timezone.utc).timestamp()
             current_url = self._page.url
             has_root = False
+            auth_check: Dict[str, Any] = {}
             while (datetime.now(timezone.utc).timestamp() - start_ts) < max_wait_sec:
                 current_url = self._page.url
                 try:
@@ -416,11 +476,22 @@ class BetinAsiaScraper:
                 except Exception:
                     has_root = False
 
+                if has_root:
+                    # se a API já aceita o session token, consideramos login ok mesmo se ficar em /login (proxy/CDN)
+                    auth_check = await _api_auth_check()
+                    if bool(auth_check.get("ok")) and int(auth_check.get("status") or 0) == 200:
+                        break
                 if ("login" not in (current_url or "").lower()) and has_root:
                     break
                 await self._page.wait_for_timeout(500)
 
-            if ("login" not in (current_url or "").lower()) and has_root:
+            if has_root:
+                # log fingerprint (sem expor token)
+                fp = await _root_session_fingerprint()
+                if fp:
+                    logger.info(f"[login] root-session {fp}")
+
+            if (("login" not in (current_url or "").lower()) and has_root) or (bool(auth_check.get("ok")) and int(auth_check.get("status") or 0) == 200):
                 self._logged_in = True
                 logger.success("Login realizado com sucesso!")
                 
@@ -463,7 +534,13 @@ class BetinAsiaScraper:
                     except Exception:
                         hint = ""
                     extra = f" hint={hint!r}" if hint else ""
-                    logger.error(f"Login falhou (url={current_url} has_root={has_root}){extra}")
+                    ac = ""
+                    try:
+                        if auth_check:
+                            ac = f" api_status={auth_check.get('status')} api_ok={auth_check.get('ok')} api_prefix={str(auth_check.get('prefix') or '')[:140]!r}"
+                    except Exception:
+                        ac = ""
+                    logger.error(f"Login falhou (url={current_url} has_root={has_root}){extra}{ac}")
                     
                 await _dump_login_debug("login_failed")
                 return False
