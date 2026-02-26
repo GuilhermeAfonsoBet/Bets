@@ -394,25 +394,29 @@ class BetinAsiaScraper:
                 # Tenta pressionar Enter
                 await password_input.press("Enter")
                 
-            # Aguarda redirecionamento
+            # Aguarda pós-submit. Em proxy/latência, o cookie/root-session pode demorar.
             try:
                 await self._page.wait_for_load_state("domcontentloaded", timeout=self.DEFAULT_NAV_TIMEOUT_MS)
             except Exception:
                 pass
-            await self._page.wait_for_timeout(2500)
-            
-            # Verifica se logou (URL mudou ou apareceu elemento de usuário logado)
-            current_url = self._page.url
-            
-            # Além de sair do /login, validamos que root-session exista
-            has_root = False
-            try:
-                cookies = await self._context.cookies()
-                has_root = any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
-            except Exception:
-                has_root = False
 
-            if ("login" not in current_url.lower()) and has_root:
+            max_wait_sec = float(os.getenv("BETINASIA_LOGIN_POST_WAIT_SEC", "12"))
+            start_ts = datetime.now(timezone.utc).timestamp()
+            current_url = self._page.url
+            has_root = False
+            while (datetime.now(timezone.utc).timestamp() - start_ts) < max_wait_sec:
+                current_url = self._page.url
+                try:
+                    cookies = await self._context.cookies()
+                    has_root = any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
+                except Exception:
+                    has_root = False
+
+                if ("login" not in (current_url or "").lower()) and has_root:
+                    break
+                await self._page.wait_for_timeout(500)
+
+            if ("login" not in (current_url or "").lower()) and has_root:
                 self._logged_in = True
                 logger.success("Login realizado com sucesso!")
                 
@@ -429,7 +433,7 @@ class BetinAsiaScraper:
                     error_text = await error_el.inner_text()
                     logger.error(f"Erro no login: {error_text}")
                 else:
-                    logger.error("Login falhou (ainda em /login ou sem root-session)")
+                    logger.error(f"Login falhou (url={current_url} has_root={has_root})")
                     
                 await _dump_login_debug("login_failed")
                 return False
