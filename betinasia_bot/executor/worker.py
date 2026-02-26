@@ -49,7 +49,12 @@ def _is_auth_error(api_result: Optional[BetslipApiResult]) -> bool:
         if hs == 401:
             return True
         err = str(getattr(api_result, "error", "") or "").lower()
-        return ("auth_error" in err) or ("authentication credentials were not provided" in err) or ("http_401" in err)
+        return (
+            ("auth_error" in err)
+            or ("authentication credentials were not provided" in err)
+            or ("http_401" in err)
+            or ("no_root_session_cookie" in err)
+        )
     except Exception:
         return False
 
@@ -407,7 +412,11 @@ class ExecutorWorker:
         )
         post_ms = _ms(max(0.0, time.time() - t_place0))
 
-        if (not place.success) and (int(place.http_status or 0) == 401 or "HTTP_401" in str(place.error or "")):
+        if (not place.success) and (
+            int(place.http_status or 0) == 401
+            or "HTTP_401" in str(place.error or "")
+            or "NO_ROOT_SESSION_COOKIE" in str(place.error or "")
+        ):
             ok = await self._relogin()
             if ok:
                 t_place1 = time.time()
