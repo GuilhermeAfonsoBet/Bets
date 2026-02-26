@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from loguru import logger
 
 from scraper.betinasia import BetinAsiaScraper
-from scraper.api_betslip import ApiBetslipClient, BetslipApiResult
+from scraper.api_betslip import ApiBetslipClient, BetslipApiResult, PlaceOrderResult
 
 from .contracts import ExecutionRequest, ExecutionResult, ExecStatus, ExecSide, ExecutionTiming
 
@@ -285,4 +285,134 @@ class ExecutorWorker:
                 "betslip_type": betslip_type,
             },
         )
+
+    async def _relogin(self) -> bool:
+        """
+        Revalida login e força novo login se necessário.
+        """
+        try:
+            assert self._scraper is not None
+            ok = await self._scraper.is_session_valid()
+            if ok:
+                return True
+        except Exception:
+            pass
+        try:
+            assert self._scraper is not None
+            ok = await self._scraper.login(force=True)
+            if ok:
+                try:
+                    page = self._scraper._page
+                    await page.goto(self.football_url)
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+            return bool(ok)
+        except Exception:
+            return False
+
+    async def execute(self, req: ExecutionRequest, received_ts: float) -> ExecutionResult:
+        """
+        Dispatcher: dryrun por padrão; LIVE quando req.is_live=True (com gate ENV).
+        """
+        if not bool(req.is_live):
+            return await self.execute_dryrun(req, received_ts)
+
+        if os.getenv("EXECUTOR_ALLOW_LIVE", "0").strip() not in ("1", "true", "True", "yes", "YES"):
+            r = await self.execute_dryrun(req, received_ts)
+            r.error = "LIVE_DISABLED (set EXECUTOR_ALLOW_LIVE=1)"
+            return r
+
+        if req.exec_side != ExecSide.BACK:
+            r = await self.execute_dryrun(req, received_ts)
+            r.error = "LIVE_V0 supports BACK only (need capture for LAY payload)"
+            return r
+
+        # 1) Obter snapshot + betslip_id (reutiliza lógica de odds)
+        dry = await self.execute_dryrun(req, received_ts)
+        betslip_id = str((dry.raw or {}).get("betslip_id") or "")
+        if dry.status != ExecStatus.DRY_OK or not betslip_id:
+            dry.error = (dry.error or "") + " | LIVE_PRECHECK_FAILED"
+            return dry
+
+        # 2) Definir stake e preço a enviar
+        stake = None
+        try:
+            if req.policy and req.policy.stake_requested is not None:
+                stake = float(req.policy.stake_requested)
+        except Exception:
+            stake = None
+        if stake is None:
+            stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "3.0"))
+
+        stake_ccy = str(os.getenv("EXECUTOR_LIVE_CCY", "USD"))
+        max_stake = float(os.getenv("EXECUTOR_LIVE_MAX_STAKE", "5.0"))
+        if stake > max_stake:
+            dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
+            return dry
+
+        price = dry.odd_final or req.odd_at_decision
+        if not price or float(price) <= 1.0:
+            dry.error = f"BAD_PRICE price={price}"
+            return dry
+
+        # 3) Place order (com 1 retry via relogin se 401)
+        assert self._api is not None
+        t_place0 = time.time()
+        place: PlaceOrderResult = await self._api.place_order(
+            betslip_id=betslip_id,
+            price=float(price),
+            stake_ccy=stake_ccy,
+            stake=float(stake),
+            exchange_mode=str(os.getenv("EXECUTOR_LIVE_EXCHANGE_MODE", "make_and_take")),
+        )
+        post_ms = _ms(max(0.0, time.time() - t_place0))
+
+        if (not place.success) and (int(place.http_status or 0) == 401 or "HTTP_401" in str(place.error or "")):
+            ok = await self._relogin()
+            if ok:
+                t_place1 = time.time()
+                place = await self._api.place_order(
+                    betslip_id=betslip_id,
+                    price=float(price),
+                    stake_ccy=stake_ccy,
+                    stake=float(stake),
+                    exchange_mode=str(os.getenv("EXECUTOR_LIVE_EXCHANGE_MODE", "make_and_take")),
+                )
+                post_ms = _ms(max(0.0, time.time() - t_place1))
+
+        # 4) Montar resultado LIVE
+        if place.success:
+            dry.status = ExecStatus.LIVE_OK
+            dry.http_status = int(place.http_status or 0) or 200
+            dry.timing.post_ms = post_ms
+            dry.raw = dict(dry.raw or {})
+            dry.raw.update(
+                {
+                    "live": True,
+                    "order_resp": place.response,
+                    "order_http": int(place.http_status or 0),
+                    "order_ms": int(place.request_time_ms or 0),
+                    "order_text_prefix": (place.text_prefix or "")[:300],
+                    "sent": {"stake_ccy": stake_ccy, "stake": float(stake), "price": float(price)},
+                }
+            )
+            return dry
+
+        dry.status = ExecStatus.API_FAILED
+        dry.http_status = int(place.http_status or 0) or None
+        dry.error = f"LIVE_PLACE_FAILED: {place.error or 'unknown'}"
+        dry.timing.post_ms = post_ms
+        dry.raw = dict(dry.raw or {})
+        dry.raw.update(
+            {
+                "live": True,
+                "order_http": int(place.http_status or 0),
+                "order_ms": int(place.request_time_ms or 0),
+                "order_text_prefix": (place.text_prefix or "")[:300],
+                "sent": {"stake_ccy": stake_ccy, "stake": float(stake), "price": float(price)},
+            }
+        )
+        return dry
 

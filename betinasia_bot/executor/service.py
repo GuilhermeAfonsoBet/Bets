@@ -75,7 +75,7 @@ class ExecutorService:
             try:
                 req = item["req"]
                 received_ts = item["received_ts"]
-                res = await worker.execute_dryrun(req, received_ts)
+                res = await worker.execute(req, received_ts)
                 payload = {
                     "request": req.model_dump(mode="json"),
                     "result": res.model_dump(mode="json"),

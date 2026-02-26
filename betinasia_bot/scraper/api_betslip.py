@@ -22,6 +22,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
+from uuid import uuid4
 from loguru import logger
 from playwright.async_api import Page
 
@@ -72,6 +73,22 @@ class BetslipApiResult:
     rate_limit_retry_after_sec: int = 0
 
 
+@dataclass
+class PlaceOrderResult:
+    betslip_id: str
+    want_price: float
+    want_stake_ccy: str
+    want_stake: float
+    exchange_mode: str = "make_and_take"
+
+    success: bool = False
+    http_status: int = 0
+    error: str = ""
+    response: Optional[Dict[str, Any]] = None
+    text_prefix: str = ""
+    request_time_ms: int = 0
+
+
 class ApiBetslipClient:
     """
     Cliente que extrai odds do betslip via API (sem DOM).
@@ -97,6 +114,8 @@ class ApiBetslipClient:
         self._pmm_messages: Dict[str, List[dict]] = {}  # betslip_id -> [pmm_data]
         self._betslip_info: Dict[str, dict] = {}  # betslip_id -> betslip creation data
         self._listening = False
+        self.MOLLY_CLIENT_NAME = "sonic"
+        self.MOLLY_CLIENT_VERSION = os.getenv("BETINASIA_MOLLY_CLIENT_VERSION", "2.5.54")
 
     async def _get_root_session_token(self) -> str:
         """
@@ -231,8 +250,8 @@ class ApiBetslipClient:
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json, text/plain, */*',
                                 'session': params.sessionToken,
-                                'x-molly-client-name': 'sonic',
-                                'x-molly-client-version': '2.5.34'
+                                'x-molly-client-name': params.clientName,
+                                'x-molly-client-version': params.clientVersion
                             },
                             body: JSON.stringify({
                                 sport: 'fb',
@@ -252,7 +271,7 @@ class ApiBetslipClient:
                         return {ok: false, error: e.message};
                     }
                 }
-            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type, "sessionToken": session_token})
+            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type, "sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION})
             
             result.request_time_ms = int((time.time() - t_post) * 1000)
             result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
@@ -482,8 +501,8 @@ class ApiBetslipClient:
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json',
                                 'session': params.sessionToken,
-                                'x-molly-client-name': 'sonic',
-                                'x-molly-client-version': '2.5.35'
+                                'x-molly-client-name': params.clientName,
+                                'x-molly-client-version': params.clientVersion
                             },
                             body: JSON.stringify({betslipId: params.betslip_id})
                         });
@@ -495,7 +514,7 @@ class ApiBetslipClient:
                         return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                     } catch(e) { return {ok: false, error: e.message}; }
                 }
-            """, {"betslip_id": betslip_id, "sessionToken": session_token})
+            """, {"betslip_id": betslip_id, "sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION})
             
             result.request_time_ms = int((time.time() - t0) * 1000)
             result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
@@ -588,6 +607,102 @@ class ApiBetslipClient:
             result.error = str(e)
             result.total_time_ms = int((time.time() - t0) * 1000)
             return result
+
+    async def place_order(
+        self,
+        *,
+        betslip_id: str,
+        price: float,
+        stake_ccy: str,
+        stake: float,
+        duration_sec: int = 259200,
+        keep_open_ir: bool = False,
+        exchange_mode: str = "make_and_take",
+    ) -> PlaceOrderResult:
+        """
+        Coloca ordem (confirma aposta) via POST /v1/orders/.
+        Requer cookie root-session presente (usado como header `session`).
+        """
+        res = PlaceOrderResult(
+            betslip_id=str(betslip_id),
+            want_price=float(price),
+            want_stake_ccy=str(stake_ccy),
+            want_stake=float(stake),
+            exchange_mode=str(exchange_mode),
+        )
+        t0 = time.time()
+        try:
+            session_token = await self._get_root_session_token()
+            if not session_token:
+                res.error = "NO_ROOT_SESSION_COOKIE"
+                return res
+
+            req_uuid = str(uuid4())
+            payload = {
+                "betslip_id": str(betslip_id),
+                "price": float(price),
+                "stake": [str(stake_ccy), float(stake)],
+                "duration": int(duration_sec),
+                "keep_open_ir": bool(keep_open_ir),
+                "adaptive_bookies": [],
+                "accounts": [],
+                "exchange_mode": str(exchange_mode),
+                "request_uuid": req_uuid,
+            }
+
+            response = await self.page.evaluate(
+                """
+                async (params) => {
+                    try {
+                        const resp = await fetch('/v1/orders/', {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json, text/plain, */*',
+                                'session': params.sessionToken,
+                                'x-molly-client-name': params.clientName,
+                                'x-molly-client-version': params.clientVersion
+                            },
+                            body: JSON.stringify(params.payload)
+                        });
+                        let text = '';
+                        let data = null;
+                        try { text = await resp.text(); } catch(e) { text = ''; }
+                        try { data = JSON.parse(text); } catch(e) { data = null; }
+                        const prefix = (text || '').slice(0, 1200);
+                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
+                    } catch(e) {
+                        return {ok: false, error: e.message};
+                    }
+                }
+                """,
+                {"sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION, "payload": payload},
+            )
+            res.request_time_ms = int((time.time() - t0) * 1000)
+
+            if not response or not isinstance(response, dict):
+                res.error = "NO_RESPONSE"
+                return res
+
+            res.http_status = int(response.get("status") or 0)
+            res.text_prefix = str(response.get("text_prefix") or "")
+            data = response.get("data")
+            res.response = data if isinstance(data, dict) else None
+
+            if not bool(response.get("ok")):
+                err = response.get("error") or f"HTTP_{res.http_status}"
+                if res.text_prefix:
+                    err = f"{err} | resp_prefix={res.text_prefix[:220]}"
+                res.error = str(err)
+                return res
+
+            res.success = True
+            return res
+        except Exception as e:
+            res.request_time_ms = int((time.time() - t0) * 1000)
+            res.error = str(e)
+            return res
     
     @staticmethod
     def build_bet_type(market_type: str, side: str, line: str = None) -> str:

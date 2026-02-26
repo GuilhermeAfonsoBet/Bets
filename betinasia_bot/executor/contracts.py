@@ -19,6 +19,7 @@ class MarketType(str, Enum):
 
 class ExecStatus(str, Enum):
     DRY_OK = "DRY_OK"
+    LIVE_OK = "LIVE_OK"
     STALE = "STALE"
     API_BACKOFF = "API_BACKOFF"
     CAP_BLOCKED = "CAP_BLOCKED"
