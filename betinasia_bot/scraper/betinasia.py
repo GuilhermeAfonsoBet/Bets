@@ -321,6 +321,10 @@ class BetinAsiaScraper:
                     txt = await self.get_page_text()
                     with open(f"logs/{tag}_{ts}.txt", "w", encoding="utf-8") as fh:
                         fh.write(txt or "")
+                    # Log de diagnóstico rápido no stdout (sem segredos)
+                    preview = " ".join((txt or "").split())[:280]
+                    if preview:
+                        logger.error(f"[login_debug] body_preview={preview}")
                 except Exception:
                     pass
 
@@ -433,7 +437,33 @@ class BetinAsiaScraper:
                     error_text = await error_el.inner_text()
                     logger.error(f"Erro no login: {error_text}")
                 else:
-                    logger.error(f"Login falhou (url={current_url} has_root={has_root})")
+                    # tenta extrair hints do texto renderizado
+                    hint = ""
+                    try:
+                        body = await self.get_page_text()
+                        body_lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
+                        needles = (
+                            "invalid",
+                            "incorrect",
+                            "blocked",
+                            "forbidden",
+                            "not allowed",
+                            "verify",
+                            "captcha",
+                            "challenge",
+                            "try again",
+                            "error",
+                            "denied",
+                        )
+                        for ln in body_lines:
+                            l = ln.lower()
+                            if any(k in l for k in needles):
+                                hint = ln[:200]
+                                break
+                    except Exception:
+                        hint = ""
+                    extra = f" hint={hint!r}" if hint else ""
+                    logger.error(f"Login falhou (url={current_url} has_root={has_root}){extra}")
                     
                 await _dump_login_debug("login_failed")
                 return False
