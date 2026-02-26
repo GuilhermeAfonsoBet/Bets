@@ -353,11 +353,6 @@ class ExecutorWorker:
             r.error = "LIVE_DISABLED (set EXECUTOR_ALLOW_LIVE=1)"
             return r
 
-        if req.exec_side != ExecSide.BACK:
-            r = await self.execute_dryrun(req, received_ts)
-            r.error = "LIVE_V0 supports BACK only (need capture for LAY payload)"
-            return r
-
         # 1) Obter snapshot + betslip_id (reutiliza lógica de odds)
         dry = await self.execute_dryrun(req, received_ts)
         betslip_id = str((dry.raw or {}).get("betslip_id") or "")
@@ -372,18 +367,29 @@ class ExecutorWorker:
                 stake = float(req.policy.stake_requested)
         except Exception:
             stake = None
-        if stake is None:
-            stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "3.0"))
 
         stake_ccy = str(os.getenv("EXECUTOR_LIVE_CCY", "USD"))
         max_stake = float(os.getenv("EXECUTOR_LIVE_MAX_STAKE", "5.0"))
-        if stake > max_stake:
-            dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
-            return dry
 
         price = dry.odd_final or req.odd_at_decision
         if not price or float(price) <= 1.0:
             dry.error = f"BAD_PRICE price={price}"
+            return dry
+
+        if req.exec_side == ExecSide.LAY and stake is None:
+            try:
+                if req.policy and req.policy.liability_requested is not None:
+                    liab = float(req.policy.liability_requested)
+                    if liab > 0 and float(price) > 1.0:
+                        stake = liab / (float(price) - 1.0)
+            except Exception:
+                stake = None
+
+        if stake is None:
+            stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "3.0"))
+
+        if stake > max_stake:
+            dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
             return dry
 
         # 3) Place order (com 1 retry via relogin se 401)

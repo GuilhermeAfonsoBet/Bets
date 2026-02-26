@@ -30,6 +30,7 @@ python3 run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers 
 
 - Para habilitar no executor: `EXECUTOR_ALLOW_LIVE=1`
 - No request: `is_live=true`
+- Suporta **Back e Lay** (Lay usa `betslip_type=lay` + `bet_type=against,...`).
 
 Variáveis úteis:
 
