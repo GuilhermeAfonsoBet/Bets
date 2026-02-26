@@ -82,7 +82,39 @@ class ExecutorService:
                 }
                 await self._store.put(req.execution_id, payload)
             except Exception as e:
-                logger.exception(f"[executor:{worker.name}] erro: {e}")
+                try:
+                    logger.exception(f"[executor:{worker.name}] erro: {e}")
+                except Exception:
+                    pass
+                # Evita `not_found`: sempre grava um resultado, mesmo em erro inesperado.
+                try:
+                    req = item.get("req")
+                    if req:
+                        res = ExecutionResult(
+                            execution_id=req.execution_id,
+                            status=ExecStatus.INTERNAL_ERROR,
+                            created_at=req.created_at,
+                            finished_at=_now_utc(),
+                            audit_id=req.audit_id,
+                            match_id=req.match_id,
+                            event_id=req.event_id,
+                            market_type=req.market_type,
+                            side=req.side,
+                            line=req.line,
+                            exec_side=req.exec_side,
+                            is_live=bool(req.is_live),
+                            odd_at_decision=req.odd_at_decision,
+                            policy=req.policy,
+                            error=str(e)[:500],
+                            raw={"where": "_run_worker_loop"},
+                        )
+                        payload = {
+                            "request": req.model_dump(mode="json"),
+                            "result": res.model_dump(mode="json"),
+                        }
+                        await self._store.put(req.execution_id, payload)
+                except Exception:
+                    pass
             finally:
                 self._queue.task_done()
 

@@ -321,9 +321,12 @@ class ExecutorWorker:
         """
         try:
             assert self._scraper is not None
-            ok = await self._scraper.is_session_valid()
-            if ok:
-                return True
+            try:
+                ok = await asyncio.wait_for(self._scraper.is_session_valid(), timeout=float(os.getenv("EXECUTOR_RELOGIN_CHECK_TIMEOUT_SEC", "8")))
+                if ok:
+                    return True
+            except Exception:
+                pass
         except Exception:
             pass
         try:
