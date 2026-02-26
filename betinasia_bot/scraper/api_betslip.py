@@ -718,10 +718,47 @@ class ApiBetslipClient:
         Returns:
             bet_type string (ex: "for,ah,h,-1")
         """
+        def _parse_ah_line_to_float(x: Optional[str]) -> Optional[float]:
+            if x is None:
+                return None
+            s = str(x).strip()
+            if not s:
+                return None
+            s = s.replace(",", ".").replace("−", "-")
+            # quarter split "0.5/1" => 0.75
+            if "/" in s:
+                parts = [p.strip() for p in s.split("/") if p.strip()]
+                if len(parts) == 2:
+                    try:
+                        a = float(parts[0])
+                        b = float(parts[1])
+                        return 0.5 * (a + b)
+                    except Exception:
+                        return None
+            try:
+                return float(s)
+            except Exception:
+                return None
+
+        def _ah_code_quarters(*, side: str, line: str) -> str:
+            """
+            A API /v1/betslips/ usa a linha em 'quarters' (int),
+            representando o handicap do HOME.
+              - home: code = round(line * 4)
+              - away: code = round((-line) * 4)   (inverte para home-handicap)
+            Ex.: away +0.75 => home -0.75 => -3  (capturado no place/confirm)
+            """
+            v = _parse_ah_line_to_float(line)
+            if v is None:
+                return str(line)
+            home_handicap = float(v) if str(side) == "home" else -float(v)
+            code = int(round(home_handicap * 4.0))
+            return str(code)
+
         if market_type == "AH":
             h_or_a = "h" if side == "home" else "a"
             if line is not None:
-                return f"for,ah,{h_or_a},{line}"
+                return f"for,ah,{h_or_a},{_ah_code_quarters(side=side, line=line)}"
             else:
                 return f"for,{h_or_a}"
         elif market_type == "OU":
@@ -746,7 +783,9 @@ class ApiBetslipClient:
         if market_type == "AH":
             h_or_a = "h" if side == "home" else "a"
             if line is not None:
-                return f"against,ah,{h_or_a},{line}"
+                # mesma codificação de quarters do build_bet_type
+                v = str(ApiBetslipClient.build_bet_type("AH", side, line)).split(",")[-1]
+                return f"against,ah,{h_or_a},{v}"
             else:
                 return f"against,{h_or_a}"
         elif market_type == "OU":
