@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,7 @@ def _utc_now_iso() -> str:
 
 SENSITIVE_HEADER_KEYS = {
     "cookie",
+    "set-cookie",
     "authorization",
     "proxy-authorization",
     "session",
@@ -35,12 +37,18 @@ SENSITIVE_HEADER_KEYS = {
 }
 
 
+def _redacted_hash(v: Any) -> Dict[str, Any]:
+    s = "" if v is None else str(v)
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+    return {"redacted": True, "len": len(s), "sha256_12": h}
+
+
 def _redact_headers(h: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in (h or {}).items():
         lk = str(k).lower()
         if lk in SENSITIVE_HEADER_KEYS:
-            out[k] = "***"
+            out[k] = _redacted_hash(v)
         else:
             out[k] = v
     return out
@@ -139,9 +147,34 @@ async def capture_place_confirm(*, out_jsonl: Path, headless: bool, capture_all:
         return 2
 
     page = scraper._page
+
+    async def snapshot_cookies(tag: str):
+        try:
+            ctx = page.context
+            cookies = await ctx.cookies()
+            red = []
+            for c in (cookies or []):
+                v = c.get("value", "")
+                red.append(
+                    {
+                        "name": c.get("name"),
+                        "domain": c.get("domain"),
+                        "path": c.get("path"),
+                        "expires": c.get("expires"),
+                        "httpOnly": c.get("httpOnly"),
+                        "secure": c.get("secure"),
+                        "sameSite": c.get("sameSite"),
+                        "value": _redacted_hash(v),
+                    }
+                )
+            await w.write({"type": "cookies", "ts": _utc_now_iso(), "tag": tag, "cookies": red})
+        except Exception:
+            return
+
     await page.goto(BetinAsiaScraper.FOOTBALL_URL)
     await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(3500)
+    await snapshot_cookies("after_login")
 
     pending_tasks: List[asyncio.Task] = []
 
@@ -192,6 +225,8 @@ async def capture_place_confirm(*, out_jsonl: Path, headless: bool, capture_all:
             }
             resp_cnt[(status, _mask_url(url).split("?", 1)[0])] += 1
             await w.write(item)
+            if status == 401 and "/v1/" in (url or "").lower():
+                await snapshot_cookies(f"401::{_mask_url(url).split('?', 1)[0]}")
         except Exception:
             return
 
@@ -272,6 +307,7 @@ async def capture_place_confirm(*, out_jsonl: Path, headless: bool, capture_all:
             "ws_top": ws_cnt.most_common(30),
         }
     )
+    await snapshot_cookies("end")
 
     await scraper.close()
     await w.close()
