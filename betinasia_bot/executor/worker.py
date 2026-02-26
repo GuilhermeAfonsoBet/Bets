@@ -41,6 +41,19 @@ def _extract_snapshot(side: ExecSide, api_result: Optional[BetslipApiResult]) ->
     return float(api_result.best_odd), str(api_result.best_bookie), float(api_result.best_limit), int(api_result.num_bookmakers), None
 
 
+def _is_auth_error(api_result: Optional[BetslipApiResult]) -> bool:
+    try:
+        if not api_result:
+            return False
+        hs = int(getattr(api_result, "http_status", 0) or 0)
+        if hs == 401:
+            return True
+        err = str(getattr(api_result, "error", "") or "").lower()
+        return ("auth_error" in err) or ("authentication credentials were not provided" in err) or ("http_401" in err)
+    except Exception:
+        return False
+
+
 @dataclass
 class ExecutorWorker:
     """
@@ -209,6 +222,20 @@ class ExecutorWorker:
                 api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
                 if api_result and api_result.success and getattr(api_result, "betslip_id", ""):
                     self._betslip_cache[cache_key] = str(api_result.betslip_id)
+
+            # Se der 401/auth na fase de betslip, a causa mais comum é cache de betslip
+            # de uma sessão anterior. Faz relogin + força criar betslip novo (sem refresh).
+            if _is_auth_error(api_result):
+                try:
+                    if cache_key in (self._betslip_cache or {}):
+                        self._betslip_cache.pop(cache_key, None)
+                except Exception:
+                    pass
+                ok = await self._relogin()
+                if ok:
+                    api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+                    if api_result and api_result.success and getattr(api_result, "betslip_id", ""):
+                        self._betslip_cache[cache_key] = str(api_result.betslip_id)
         except Exception as e:
             return ExecutionResult(
                 execution_id=req.execution_id,
@@ -248,6 +275,8 @@ class ExecutorWorker:
         err = None
         if status != ExecStatus.DRY_OK:
             err = snap_err or (api_result.error if api_result else "API_FAILED")
+            if _is_auth_error(api_result):
+                status = ExecStatus.NO_SESSION
         if retry_after > 0:
             status = ExecStatus.RATE_LIMIT
             err = f"RATE_LIMIT retry_after={retry_after}s"
