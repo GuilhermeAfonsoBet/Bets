@@ -24,6 +24,22 @@ python3 run_executor_dryrun.py --host 127.0.0.1 --port 8089 --workers 1
 python3 run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers 1
 ```
 
+### Modo LIVE (aposta real) — v0
+
+**Atenção**: isso confirma aposta via `POST /v1/orders/`. Use stake pequeno e caps conservadores.
+
+- Para habilitar no executor: `EXECUTOR_ALLOW_LIVE=1`
+- No request: `is_live=true`
+
+Variáveis úteis:
+
+```bash
+export EXECUTOR_ALLOW_LIVE=1
+export EXECUTOR_LIVE_CCY=USD
+export EXECUTOR_LIVE_STAKE=3.0
+export EXECUTOR_LIVE_MAX_STAKE=3.0
+```
+
 ## Modo ultra-rápido (recomendado para aproximar do real)
 
 O fluxo "abrir betslip e esperar todos PMMs" pode levar 2–3s. Para reduzir:
@@ -83,6 +99,20 @@ curl -sS http://127.0.0.1:8089/result/<execution_id>
 
 ```bash
 curl -sS http://127.0.0.1:8089/health
+```
+
+## Client CLI (exemplo)
+
+Dentro de `betinasia_bot/`:
+
+```bash
+python -m executor.client \
+  --event-id 2026-02-28,23624,173 \
+  --side away \
+  --line -0.25 \
+  --exec-side Back \
+  --live \
+  --stake 3
 ```
 
 ## Logs e DB
