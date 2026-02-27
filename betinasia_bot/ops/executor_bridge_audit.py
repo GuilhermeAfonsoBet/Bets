@@ -476,7 +476,10 @@ def main() -> int:
     )
 
     logger.remove()
-    logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
+    # stdout vai para logs/executor_bridge.log (systemd StandardOutput)
+    logger.add(sys.stdout, level=os.getenv("LOG_LEVEL", "INFO"))
+    # erros em stderr vão para logs/executor_bridge_error.log (systemd StandardError)
+    logger.add(sys.stderr, level="ERROR")
     try:
         asyncio.run(run_bridge(cfg))
     except KeyboardInterrupt:
