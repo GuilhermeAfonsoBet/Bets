@@ -5322,7 +5322,7 @@ async def main() -> int:
                         payload = {
                             "generated_at": datetime.now(timezone.utc).isoformat(),
                             "report_out": str(out_path),
-                            "lookback_days": int(args.lookback_days),
+                            "lookback_days": (int(args.lookback_days) if args.lookback_days is not None else None),
                             "versions": versions,
                             "walkforward": True,
                             "wf": {
@@ -5354,6 +5354,10 @@ async def main() -> int:
                         }
                         outp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                         lines.append(f"\n[INFO] WF policy exportado: `{wf_export}`\n\n")
+                        try:
+                            print(f"[INFO] WF policy exportado: {wf_export}", flush=True)
+                        except Exception:
+                            pass
                     except Exception as e:
                         lines.append(f"\n[WARN] Falha ao exportar WF policy JSON ({wf_export}): {e}\n\n")
 
