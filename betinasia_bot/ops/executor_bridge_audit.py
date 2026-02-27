@@ -8,6 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -55,6 +56,12 @@ class BridgeConfig:
     http_url: Optional[str] = None
     only_hypothesis: str = "H3B"
     only_prematch: bool = True
+    # Policy OOS (export do report walk-forward)
+    policy_json: Optional[str] = None
+    policy_reload_sec: float = 5.0
+    policy_use_base: bool = False
+    # Guardrails simples
+    min_limit: float = 0.0
 
 
 DDL_SEEN = """
@@ -70,10 +77,134 @@ CREATE TABLE IF NOT EXISTS executor_bridge_seen (
 );
 """
 
+DDL_SEEN_KEYS = """
+CREATE TABLE IF NOT EXISTS executor_bridge_seen_keys (
+  id BIGSERIAL PRIMARY KEY,
+  src_table TEXT NOT NULL,
+  src_key TEXT NOT NULL,
+  action TEXT NOT NULL,
+  execution_id UUID NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  meta JSONB NULL,
+  UNIQUE (src_table, src_key, action)
+);
+"""
+
 
 async def _ensure_seen_table(db: Database) -> None:
     async with db.engine.begin() as conn:
         await conn.execute(text(DDL_SEEN))
+        await conn.execute(text(DDL_SEEN_KEYS))
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _event_key(row: Dict[str, Any], cfg: BridgeConfig) -> str:
+    event_id = str(row.get("event_id") or "").strip()
+    market = str(row.get("market_type") or "AH").strip().upper()
+    line = _norm_line(str(row.get("line") or ""))
+    side = str(row.get("side") or "").strip().lower()
+    is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+    hyp = str(row.get("hypothesis_type") or "").strip().upper()
+    regime = "in" if is_live else "pre"
+    return f"{event_id}|{market}|{line}|{side}|{cfg.exec_side.value}|{cfg.mode}|{regime}|{hyp}"
+
+
+async def _reserve_seen_key(
+    db: Database,
+    *,
+    src_key: str,
+    action: str,
+    meta: Dict[str, Any],
+) -> bool:
+    q = """
+    INSERT INTO executor_bridge_seen_keys (src_table, src_key, action, execution_id, meta)
+    VALUES ('betslip_audit_results', :src_key, :action, NULL, (:meta)::jsonb)
+    ON CONFLICT (src_table, src_key, action) DO NOTHING
+    RETURNING id
+    """
+    async with db.async_session() as session:
+        r = await session.execute(
+            text(q),
+            {"src_key": str(src_key), "action": str(action), "meta": json.dumps(meta, ensure_ascii=False)},
+        )
+        row = r.fetchone()
+        await session.commit()
+        return bool(row and row[0])
+
+
+async def _finalize_seen_key(
+    db: Database,
+    *,
+    src_key: str,
+    action: str,
+    execution_id: Optional[str],
+) -> None:
+    if not execution_id:
+        return
+    q = """
+    UPDATE executor_bridge_seen_keys
+    SET execution_id = :execution_id
+    WHERE src_table='betslip_audit_results' AND src_key=:src_key AND action=:action
+    """
+    async with db.async_session() as session:
+        await session.execute(
+            text(q),
+            {"execution_id": str(execution_id), "src_key": str(src_key), "action": str(action)},
+        )
+        await session.commit()
+
+
+def _load_policy_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _combo_key_from_row(row: Dict[str, Any], cfg: BridgeConfig, policy: Dict[str, Any]) -> str:
+    is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+    regime = "In" if is_live else "Pre"
+
+    if cfg.exec_side == ExecSide.BACK:
+        comb = f"Back_{regime}_Any"
+    else:
+        hyp = str(row.get("hypothesis_type") or "").strip().upper()
+        details = row.get("hypothesis_details")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = None
+        had_rev: Optional[bool] = None
+        if hyp == "H3B":
+            had_rev = True
+        elif isinstance(details, dict) and "had_reversal" in details:
+            had_rev = bool(details.get("had_reversal"))
+        else:
+            had_rev = bool(str(row.get("reversal_direction") or "").strip())
+        rev = "Yes" if had_rev else "No"
+        comb = f"Lay_{regime}_{rev}"
+
+    wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
+    key_by_league = bool(wf.get("key_by_league"))
+    scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
+    if key_by_league and (scope == "all" or regime == "Pre"):
+        league = str(row.get("league") or "").strip()
+        if league:
+            comb = f"{comb}__{league}"
+    return comb
 
 
 async def _fetch_candidates(
@@ -95,6 +226,8 @@ async def _fetch_candidates(
       r.websocket_odd,
       r.betslip_odd,
       r.betslip_limit,
+      r.league,
+      r.reversal_direction,
       r.hypothesis_details,
       r.audited_at
     FROM betslip_audit_results r
@@ -173,10 +306,7 @@ def _build_request(row: Dict[str, Any], cfg: BridgeConfig) -> ExecutionRequest:
         odd_at_decision=odd_dec,
     )
     req.policy.policy_version = f"bridge_{cfg.only_hypothesis.lower()}_{cfg.mode}_v0"
-    if cfg.exec_side == ExecSide.LAY:
-        req.policy.stake_requested = float(cfg.stake)
-    else:
-        req.policy.stake_requested = float(cfg.stake)
+    req.policy.stake_requested = float(cfg.stake)
     # meta útil para auditoria
     req.meta["bridge"] = {
         "src": "betslip_audit_results",
@@ -193,14 +323,44 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     await db.connect()
     await _ensure_seen_table(db)
 
+    policy: Optional[Dict[str, Any]] = None
+    policy_mtime: Optional[float] = None
+    policy_last_check = 0.0
+    active_keys: Optional[set] = None
+    active_keys_base: Optional[set] = None
+
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
-        f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch}"
+        f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
+        f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} min_limit={cfg.min_limit}"
     )
 
     while True:
         t0 = time.time()
+        # reload policy (se configurado)
+        if cfg.policy_json and (time.time() - policy_last_check) >= float(cfg.policy_reload_sec):
+            policy_last_check = time.time()
+            try:
+                p = Path(cfg.policy_json)
+                mtime = p.stat().st_mtime if p.exists() else None
+                if mtime and (policy_mtime is None or float(mtime) > float(policy_mtime)):
+                    pol = _load_policy_json(cfg.policy_json)
+                    if pol:
+                        policy = pol
+                        policy_mtime = float(mtime)
+                        steps = pol.get("steps") if isinstance(pol.get("steps"), list) else []
+                        last = steps[-1] if steps else None
+                        if isinstance(last, dict):
+                            active_keys = set(last.get("active_keys") or [])
+                            active_keys_base = set(last.get("active_keys_base") or [])
+                            logger.info(
+                                f"[bridge] policy reloaded mtime={policy_mtime:.0f} "
+                                f"active_keys={len(active_keys)} active_base={len(active_keys_base)}"
+                            )
+            except Exception as e:
+                logger.warning(f"[bridge] policy reload failed: {e}")
+
         since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
         rows = await _fetch_candidates(db, since=since, cfg=cfg)
         if not rows:
@@ -211,11 +371,60 @@ async def run_bridge(cfg: BridgeConfig) -> int:
             src_id = int(row.get("id") or 0)
             action = f"{cfg.mode}:{cfg.exec_side.value}"
             try:
+                # guardrail: limit mínimo
+                lim = _safe_float(row.get("betslip_limit"))
+                if cfg.min_limit and lim is not None and float(lim) < float(cfg.min_limit):
+                    await _mark_seen(
+                        db,
+                        src_id=src_id,
+                        action=action,
+                        execution_id=None,
+                        meta={"skipped": True, "reason": "min_limit", "betslip_limit": lim, "min_limit": cfg.min_limit},
+                    )
+                    continue
+
+                # policy OOS: só executa se combinação estiver ativa
+                if policy and active_keys is not None:
+                    comb = _combo_key_from_row(row, cfg, policy)
+                    ok = False
+                    if cfg.policy_use_base and active_keys_base is not None and active_keys_base:
+                        ok = str(comb).split("__", 1)[0] in active_keys_base
+                    else:
+                        ok = comb in active_keys
+                    if not ok:
+                        await _mark_seen(
+                            db,
+                            src_id=src_id,
+                            action=action,
+                            execution_id=None,
+                            meta={"skipped": True, "reason": "not_active", "combo": comb},
+                        )
+                        continue
+
+                # dedupe por chave operacional
+                skey = _event_key(row, cfg)
+                reserved = await _reserve_seen_key(
+                    db,
+                    src_key=skey,
+                    action=action,
+                    meta={"src_id": src_id, "audited_at": str(row.get("audited_at") or ""), "event_id": row.get("event_id")},
+                )
+                if not reserved:
+                    await _mark_seen(
+                        db,
+                        src_id=src_id,
+                        action=action,
+                        execution_id=None,
+                        meta={"skipped": True, "reason": "dup_key", "src_key": skey},
+                    )
+                    continue
+
                 req = _build_request(row, cfg)
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
                 eid = str(res.get("execution_id") or "")
                 accepted = bool(res.get("accepted"))
                 logger.info(f"[bridge] submit src_id={src_id} accepted={accepted} execution_id={eid}")
+                await _finalize_seen_key(db, src_key=skey, action=action, execution_id=(eid or None))
                 await _mark_seen(db, src_id=src_id, action=action, execution_id=(eid or None), meta={"accepted": accepted, "resp": res})
             except Exception as e:
                 logger.exception(f"[bridge] failed src_id={src_id}: {e}")
@@ -238,6 +447,15 @@ def main() -> int:
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
     ap.add_argument("--prematch-only", action="store_true", default=(os.getenv("BRIDGE_PREMATCH_ONLY", "1").strip() not in ("0", "false", "False", "no", "NO")))
+    ap.add_argument("--policy-json", default=os.getenv("BRIDGE_POLICY_JSON", "").strip() or None, help="Path para WF policy exportado (JSON).")
+    ap.add_argument("--policy-reload-sec", type=float, default=float(os.getenv("BRIDGE_POLICY_RELOAD_SEC", "5.0")))
+    ap.add_argument(
+        "--policy-use-base",
+        action="store_true",
+        default=(os.getenv("BRIDGE_POLICY_USE_BASE", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Se true, usa active_keys_base (ignora sufixo de liga).",
+    )
+    ap.add_argument("--min-limit", type=float, default=float(os.getenv("BRIDGE_MIN_LIMIT", "0.0")), help="Se >0, exige betslip_limit >= este mínimo.")
     args = ap.parse_args()
 
     cfg = BridgeConfig(
@@ -251,6 +469,10 @@ def main() -> int:
         http_url=(str(args.http_url) if args.http_url else None),
         only_hypothesis=str(args.hypothesis),
         only_prematch=bool(args.prematch_only),
+        policy_json=(str(args.policy_json) if args.policy_json else None),
+        policy_reload_sec=float(args.policy_reload_sec),
+        policy_use_base=bool(args.policy_use_base),
+        min_limit=float(args.min_limit),
     )
 
     logger.remove()

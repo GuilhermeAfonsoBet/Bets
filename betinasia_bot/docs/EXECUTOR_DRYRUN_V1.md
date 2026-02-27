@@ -116,6 +116,38 @@ python -m executor.client \
   --stake 3
 ```
 
+## Bridge / Decision Engine v0 (DB audit -> Executor)
+
+O bridge (`ops/executor_bridge_audit.py`) faz polling da tabela `betslip_audit_results` e dispara `POST /execute` no executor.
+
+### Rodar (shadow ou live)
+
+```bash
+cd /home/betbot/Bets/betinasia_bot
+source venv/bin/activate
+
+# shadow (não aposta de verdade)
+BRIDGE_MODE=shadow BRIDGE_EXEC_SIDE=Back BRIDGE_STAKE=3 python3 ops/executor_bridge_audit.py
+
+# live (aposta real) — requer EXECUTOR_ALLOW_LIVE=1 no serviço do executor
+BRIDGE_MODE=live BRIDGE_EXEC_SIDE=Lay BRIDGE_STAKE=3 python3 ops/executor_bridge_audit.py
+```
+
+### Gate por OOS (policy export do walk-forward)
+
+O relatório (`analyze_contexto_operacao_b808_robust_report.py`) pode exportar um JSON com `active_keys` do walk-forward.
+O bridge pode carregar esse JSON e **só executar quando a combinação estiver ativa**.
+
+```bash
+# 1) gerar/exportar policy (exemplo)
+python3 analyze_contexto_operacao_b808_robust_report.py --walkforward \
+  --wf-export-policy-json logs/wf_policy.json \
+  --out logs/relatorio.md
+
+# 2) ligar o bridge com policy
+BRIDGE_POLICY_JSON=logs/wf_policy.json BRIDGE_POLICY_RELOAD_SEC=5 python3 ops/executor_bridge_audit.py
+```
+
 ## Logs e DB
 - JSONL padrão: `logs/executor_dryrun.jsonl` (config: `EXECUTOR_JSONL`)
 - Opcional: gravar no Postgres com `--save-to-db` (ou `EXECUTOR_SAVE_TO_DB=1`).
