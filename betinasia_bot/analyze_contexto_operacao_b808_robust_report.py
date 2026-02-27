@@ -804,6 +804,11 @@ async def main() -> int:
         default=os.getenv("WF_AH_SCOPE", "all").strip() or "all",
         help="Escopo do filtro por linha AH no OOS: 'pre' aplica só no pre-match; 'all' aplica também no in-match. Default: all.",
     )
+    parser.add_argument(
+        "--wf-export-policy-json",
+        default=os.getenv("WF_EXPORT_POLICY_JSON", "").strip(),
+        help="Se definido (path), exporta um JSON com os steps do walk-forward (inclui active_keys/diag) para uso operacional (Decision Engine).",
+    )
     args = parser.parse_args()
 
     # seed global para reprodutibilidade do bootstrap
@@ -5291,6 +5296,7 @@ async def main() -> int:
                             "active_keys": list(active),
                             "active_n": len(active),
                             "active_n_base": len(active_base),
+                            "active_keys_base": sorted(list(active_base)),
                             "oos_matches": len(bym_roi),
                             "oos_mean": oos_mean,
                             "oos_ci": oos_ci,
@@ -5307,6 +5313,49 @@ async def main() -> int:
                             "liq_thr_use": thr_use,
                         }
                     )
+
+                wf_export = str(getattr(args, "wf_export_policy_json", "") or "").strip()
+                if wf_export:
+                    try:
+                        outp = Path(wf_export)
+                        outp.parent.mkdir(parents=True, exist_ok=True)
+                        payload = {
+                            "generated_at": datetime.now(timezone.utc).isoformat(),
+                            "report_out": str(out_path),
+                            "lookback_days": int(args.lookback_days),
+                            "versions": versions,
+                            "walkforward": True,
+                            "wf": {
+                                "train_days": int(getattr(args, "wf_train_days", 2)),
+                                "test_days": int(getattr(args, "wf_test_days", 1)),
+                                "step_days": int(getattr(args, "wf_step_days", 1)),
+                                "min_matches": int(getattr(args, "wf_min_matches", 0)),
+                                "key_by_league": bool(getattr(args, "wf_key_by_league", False)),
+                                "key_by_league_scope": str(getattr(args, "wf_key_by_league_scope", "pre") or "pre"),
+                                "liquidity_mode": str(getattr(args, "wf_liquidity_mode", "none") or "none"),
+                                "liquidity_scope": str(getattr(args, "wf_liquidity_scope", "pre") or "pre"),
+                                "liquidity_min_limit": float(getattr(args, "wf_liquidity_min_limit", 0.0) or 0.0),
+                                "ah_max_abs_line": float(getattr(args, "wf_ah_max_abs_line", 0.0) or 0.0),
+                                "ah_scope": str(getattr(args, "wf_ah_scope", "all") or "all"),
+                                "scheme_pre": str(getattr(args, "wf_scheme_pre", "") or ""),
+                                "scheme_in": str(getattr(args, "wf_scheme_in", "") or ""),
+                                "match_budget": bool(getattr(args, "wf_match_budget", False)),
+                                "budget_back_frac": float(getattr(args, "wf_budget_back_frac", 0.0) or 0.0),
+                                "budget_lay_frac": float(getattr(args, "wf_budget_lay_frac", 0.0) or 0.0),
+                                "budget_cap_signal_frac": float(getattr(args, "wf_budget_cap_signal_frac", 0.0) or 0.0),
+                                "budget_risk_mode": str(getattr(args, "wf_budget_risk_mode", "fixed") or "fixed"),
+                                "shrinkage": bool(getattr(args, "wf_shrinkage", False)),
+                                "exclude_exec_buckets": str(getattr(args, "wf_exclude_exec_buckets", "") or ""),
+                                "exclude_exec_buckets_back": str(getattr(args, "wf_exclude_exec_buckets_back", "") or ""),
+                                "exclude_exec_buckets_lay": str(getattr(args, "wf_exclude_exec_buckets_lay", "") or ""),
+                            },
+                            "steps": steps,
+                            "active_counts": active_counts,
+                        }
+                        outp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                        lines.append(f"\n[INFO] WF policy exportado: `{wf_export}`\n\n")
+                    except Exception as e:
+                        lines.append(f"\n[WARN] Falha ao exportar WF policy JSON ({wf_export}): {e}\n\n")
 
                 wf_key_by_league2 = bool(getattr(args, "wf_key_by_league", False))
                 if wf_key_by_league2:
