@@ -95,12 +95,17 @@ async def _download_from_accounting_page(
     selectors = [
         "a:has-text('CSV')",
         "button:has-text('CSV')",
+        "[role='button']:has-text('CSV')",
+        "text=/^CSV$/",
         "a:has-text('Export')",
         "button:has-text('Export')",
+        "[role='button']:has-text('Export')",
         "a:has-text('Download')",
         "button:has-text('Download')",
+        "[role='button']:has-text('Download')",
         "a:has-text('Baixar')",
         "button:has-text('Baixar')",
+        "[role='button']:has-text('Baixar')",
     ]
 
     for sel in selectors:
