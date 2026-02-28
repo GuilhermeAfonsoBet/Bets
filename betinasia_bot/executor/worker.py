@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from loguru import logger
 
 from scraper.betinasia import BetinAsiaScraper
-from scraper.api_betslip import ApiBetslipClient, BetslipApiResult, PlaceOrderResult
+from scraper.api_betslip import ApiBetslipClient, BetslipApiResult, PlaceOrderResult, ApiGetResult
 
 from .contracts import ExecutionRequest, ExecutionResult, ExecStatus, ExecSide, ExecutionTiming
 
@@ -79,9 +79,11 @@ class ExecutorWorker:
     _cap_lock: asyncio.Lock = None
     _cap_open_times: Any = None  # deque[float]
     _betslip_cache: Dict[str, str] = None  # key -> betslip_id
+    _op_lock: asyncio.Lock = None
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
+        self._op_lock = asyncio.Lock()
         from collections import deque
 
         self._cap_open_times = deque()
@@ -349,9 +351,125 @@ class ExecutorWorker:
         except Exception:
             return False
 
-    async def execute(self, req: ExecutionRequest, received_ts: float) -> ExecutionResult:
+    async def get_account_snapshot(self, *, page_size: int = 50) -> Dict[str, Any]:
         """
-        Dispatcher: dryrun por padrão; LIVE quando req.is_live=True (com gate ENV).
+        Snapshot operacional (best-effort):
+        - tenta descobrir saldo (endpoint variável)
+        - busca últimas ordens (/v1/orders/) e resume P&L/exposição quando disponível
+        """
+        assert self._api is not None
+        assert self._scraper is not None
+        async with (self._op_lock or asyncio.Lock()):
+            placer = os.getenv("BETINASIA_USERNAME", "").strip()
+
+            bal: ApiGetResult = await self._api.get_balance_any()
+            if (not bal.ok) and (
+                int(bal.http_status or 0) == 401
+                or "NO_ROOT_SESSION_COOKIE" in str(bal.error or "")
+                or "HTTP_401" in str(bal.error or "")
+            ):
+                ok = await self._relogin()
+                if ok:
+                    bal = await self._api.get_balance_any()
+
+            orders: Optional[ApiGetResult] = None
+            if placer:
+                orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
+                if (not orders.ok) and (
+                    int(orders.http_status or 0) == 401
+                    or "NO_ROOT_SESSION_COOKIE" in str(orders.error or "")
+                    or "HTTP_401" in str(orders.error or "")
+                ):
+                    ok = await self._relogin()
+                    if ok:
+                        orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
+
+            def _extract_orders_list(x: Any) -> list:
+                if isinstance(x, list):
+                    return x
+                if not isinstance(x, dict):
+                    return []
+                for k in ("orders", "results", "data"):
+                    v = x.get(k)
+                    if isinstance(v, list):
+                        return v
+                    if isinstance(v, dict):
+                        for kk in ("orders", "results", "data"):
+                            vv = v.get(kk)
+                            if isinstance(vv, list):
+                                return vv
+                return []
+
+            pnl = {
+                "orders_ok": bool(orders.ok) if orders else False,
+                "orders_http": int(orders.http_status or 0) if orders else 0,
+                "orders_error": (str(orders.error)[:220] if orders and orders.error else None),
+                "n": 0,
+                "n_open": 0,
+                "n_closed": 0,
+                "pnl_realized_sum": None,
+                "stake_open_sum": None,
+                "stake_total_sum": None,
+            }
+            if orders and orders.data is not None:
+                raw = orders.data
+                if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+                    raw = raw.get("data")
+                lst = _extract_orders_list(raw)
+                pnl["n"] = int(len(lst))
+                pnl_real = 0.0
+                pnl_have = 0
+                stake_open = 0.0
+                stake_tot = 0.0
+                n_open = 0
+                n_closed = 0
+                for o in lst:
+                    if not isinstance(o, dict):
+                        continue
+                    closed = bool(o.get("closed")) if o.get("closed") is not None else (str(o.get("status") or "").lower() in ("closed", "settled"))
+                    if closed:
+                        n_closed += 1
+                    else:
+                        n_open += 1
+                    ws = o.get("want_stake")
+                    if isinstance(ws, list) and len(ws) >= 2:
+                        try:
+                            st = float(ws[1])
+                            stake_tot += st
+                            if not closed:
+                                stake_open += st
+                        except Exception:
+                            pass
+                    pl = o.get("profit_loss")
+                    if pl is not None:
+                        try:
+                            pnl_real += float(pl)
+                            pnl_have += 1
+                        except Exception:
+                            pass
+                pnl["n_open"] = n_open
+                pnl["n_closed"] = n_closed
+                pnl["stake_open_sum"] = float(stake_open)
+                pnl["stake_total_sum"] = float(stake_tot)
+                pnl["pnl_realized_sum"] = (float(pnl_real) if pnl_have > 0 else None)
+
+            return {
+                "ts": _now_utc().isoformat(),
+                "placer": placer or None,
+                "balance_ok": bool(bal.ok),
+                "balance_http": int(bal.http_status or 0),
+                "balance_error": (str(bal.error)[:220] if bal.error else None),
+                "balance": bal.data,
+                "pnl": pnl,
+            }
+
+    async def execute(self, req: ExecutionRequest, received_ts: float) -> ExecutionResult:
+        async with (self._op_lock or asyncio.Lock()):
+            return await self._execute_unlocked(req, received_ts)
+
+    async def _execute_unlocked(self, req: ExecutionRequest, received_ts: float) -> ExecutionResult:
+        """
+        Implementação real do dispatcher (assume lock externo).
         """
         if not bool(req.is_live):
             return await self.execute_dryrun(req, received_ts)

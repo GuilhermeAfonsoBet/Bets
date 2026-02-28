@@ -90,6 +90,16 @@ class PlaceOrderResult:
     request_time_ms: int = 0
 
 
+@dataclass
+class ApiGetResult:
+    ok: bool
+    http_status: int
+    data: Optional[Any] = None
+    text_prefix: str = ""
+    error: str = ""
+    request_time_ms: int = 0
+
+
 class ApiBetslipClient:
     """
     Cliente que extrai odds do betslip via API (sem DOM).
@@ -705,6 +715,156 @@ class ApiBetslipClient:
             res.error = str(e)
             return res
     
+    async def get_orders(
+        self,
+        *,
+        placer: str,
+        page_size: int = 50,
+        page: int = 1,
+    ) -> ApiGetResult:
+        """
+        Busca ordens do usuário via GET /v1/orders/.
+        Útil para monitorar P&L (quando a API preencher profit_loss) e exposição.
+        """
+        t0 = time.time()
+        session_token = await self._get_root_session_token()
+        if not session_token:
+            return ApiGetResult(ok=False, http_status=0, error="NO_ROOT_SESSION_COOKIE", request_time_ms=0)
+        try:
+            response = await self.page.evaluate(
+                """
+                async (params) => {
+                    try {
+                        const u = '/v1/orders/?placer=' + encodeURIComponent(params.placer)
+                                  + '&page_size=' + encodeURIComponent(String(params.pageSize))
+                                  + '&page=' + encodeURIComponent(String(params.page));
+                        const resp = await fetch(u, {
+                            method: 'GET',
+                            credentials: 'same-origin',
+                            headers: {
+                                'Accept': 'application/json, text/plain, */*',
+                                'session': params.sessionToken,
+                                'x-molly-client-name': params.clientName,
+                                'x-molly-client-version': params.clientVersion
+                            }
+                        });
+                        let text = '';
+                        let data = null;
+                        try { text = await resp.text(); } catch(e) { text = ''; }
+                        try { data = JSON.parse(text); } catch(e) { data = null; }
+                        const prefix = (text || '').slice(0, 1200);
+                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
+                    } catch(e) {
+                        return {ok: false, status: 0, error: e.message};
+                    }
+                }
+                """,
+                {
+                    "placer": str(placer),
+                    "pageSize": int(page_size),
+                    "page": int(page),
+                    "sessionToken": session_token,
+                    "clientName": self.MOLLY_CLIENT_NAME,
+                    "clientVersion": self.MOLLY_CLIENT_VERSION,
+                },
+            )
+            dt_ms = int((time.time() - t0) * 1000)
+            if not response or not isinstance(response, dict):
+                return ApiGetResult(ok=False, http_status=0, error="NO_RESPONSE", request_time_ms=dt_ms)
+            ok = bool(response.get("ok"))
+            st = int(response.get("status") or 0)
+            data = response.get("data")
+            prefix = str(response.get("text_prefix") or "")
+            if not ok:
+                err = response.get("error") or f"HTTP_{st}"
+                if prefix:
+                    err = f"{err} | resp_prefix={prefix[:220]}"
+                return ApiGetResult(ok=False, http_status=st, data=(data if isinstance(data, (dict, list)) else None), text_prefix=prefix, error=str(err), request_time_ms=dt_ms)
+            return ApiGetResult(ok=True, http_status=st, data=(data if isinstance(data, (dict, list)) else None), text_prefix=prefix, request_time_ms=dt_ms)
+        except Exception as e:
+            dt_ms = int((time.time() - t0) * 1000)
+            return ApiGetResult(ok=False, http_status=0, error=str(e), request_time_ms=dt_ms)
+
+    async def get_balance_any(self) -> ApiGetResult:
+        """
+        Tenta descobrir um endpoint de saldo/conta.
+        Como o endpoint pode variar, tentamos uma lista de paths e retornamos o primeiro 200.
+        """
+        t0 = time.time()
+        session_token = await self._get_root_session_token()
+        if not session_token:
+            return ApiGetResult(ok=False, http_status=0, error="NO_ROOT_SESSION_COOKIE", request_time_ms=0)
+
+        candidates = [
+            "/v1/accounts/",
+            "/v1/accounts",
+            "/v1/account/",
+            "/v1/account",
+            "/v1/balance/",
+            "/v1/balance",
+            "/v1/wallet/",
+            "/v1/wallet",
+            "/v1/profile/",
+            "/v1/profile",
+            "/v1/users/me/",
+            "/v1/users/me",
+            "/v1/user/",
+            "/v1/user",
+        ]
+        attempts = []
+        for path in candidates:
+            try:
+                resp = await self.page.evaluate(
+                    """
+                    async (params) => {
+                        try {
+                            const resp = await fetch(params.path, {
+                                method: 'GET',
+                                credentials: 'same-origin',
+                                headers: {
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'session': params.sessionToken,
+                                    'x-molly-client-name': params.clientName,
+                                    'x-molly-client-version': params.clientVersion
+                                }
+                            });
+                            let text = '';
+                            let data = null;
+                            try { text = await resp.text(); } catch(e) { text = ''; }
+                            try { data = JSON.parse(text); } catch(e) { data = null; }
+                            const prefix = (text || '').slice(0, 300);
+                            return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
+                        } catch(e) {
+                            return {ok: false, status: 0, error: e.message};
+                        }
+                    }
+                    """,
+                    {
+                        "path": str(path),
+                        "sessionToken": session_token,
+                        "clientName": self.MOLLY_CLIENT_NAME,
+                        "clientVersion": self.MOLLY_CLIENT_VERSION,
+                    },
+                )
+                ok = bool(resp.get("ok")) if isinstance(resp, dict) else False
+                st = int(resp.get("status") or 0) if isinstance(resp, dict) else 0
+                attempts.append({"path": path, "status": st, "ok": ok})
+                if ok and st == 200:
+                    dt_ms = int((time.time() - t0) * 1000)
+                    return ApiGetResult(
+                        ok=True,
+                        http_status=st,
+                        data={"path": path, "resp": resp.get("data"), "attempts": attempts},
+                        text_prefix=str(resp.get("text_prefix") or ""),
+                        request_time_ms=dt_ms,
+                    )
+            except Exception:
+                attempts.append({"path": path, "status": 0, "ok": False})
+                continue
+
+        dt_ms = int((time.time() - t0) * 1000)
+        return ApiGetResult(ok=False, http_status=0, data={"attempts": attempts}, error="NO_BALANCE_ENDPOINT_FOUND", request_time_ms=dt_ms)
+
     @staticmethod
     def build_bet_type(market_type: str, side: str, line: str = None) -> str:
         """

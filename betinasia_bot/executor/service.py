@@ -179,9 +179,23 @@ def create_app(svc: ExecutorService) -> web.Application:
             return web.json_response({"error": "not_found"}, status=404)
         return web.json_response(payload)
 
+    async def account(req: web.Request) -> web.Response:
+        try:
+            page_size = int(req.query.get("page_size") or "50")
+        except Exception:
+            page_size = 50
+        if not svc._workers:
+            return web.json_response({"error": "no_workers"}, status=503)
+        try:
+            snap = await svc._workers[0].get_account_snapshot(page_size=page_size)
+            return web.json_response(snap)
+        except Exception as e:
+            return web.json_response({"error": "account_failed", "detail": str(e)[:300]}, status=500)
+
     app.router.add_get("/health", health)
     app.router.add_post("/execute", execute)
     app.router.add_get("/result/{execution_id}", result)
+    app.router.add_get("/account", account)
 
     async def on_startup(_app: web.Application):
         await svc.start()

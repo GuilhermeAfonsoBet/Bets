@@ -102,6 +102,22 @@ curl -sS http://127.0.0.1:8089/result/<execution_id>
 curl -sS http://127.0.0.1:8089/health
 ```
 
+### `GET /account` (saldo + P&L best-effort)
+
+Retorna um snapshot operacional:
+- tenta descobrir um endpoint de saldo/conta (varia)
+- puxa as últimas ordens de `GET /v1/orders/` e resume P&L quando houver `profit_loss`
+
+```bash
+curl -sS http://127.0.0.1:8089/account?page_size=50
+```
+
+Via unix socket:
+
+```bash
+curl -sS --unix-socket /tmp/betinasia-exec.sock "http://localhost/account?page_size=50"
+```
+
 ## Client CLI (exemplo)
 
 Dentro de `betinasia_bot/`:
