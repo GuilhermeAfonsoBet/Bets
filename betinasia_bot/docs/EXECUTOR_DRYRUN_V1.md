@@ -149,6 +149,14 @@ BRIDGE_MODE=shadow BRIDGE_EXEC_SIDE=Back BRIDGE_STAKE=3 python3 ops/executor_bri
 BRIDGE_MODE=live BRIDGE_EXEC_SIDE=Lay BRIDGE_STAKE=3 python3 ops/executor_bridge_audit.py
 ```
 
+### Produção (todas combinações): bridge Back + bridge Lay em paralelo
+
+Para operar Back e Lay ao mesmo tempo, rode **dois serviços** (um para cada lado):
+- `betinasia-executor-bridge-back.service`
+- `betinasia-executor-bridge-lay.service`
+
+Eles leem o mesmo `.env` e sobrescrevem `BRIDGE_EXEC_SIDE` no unit.
+
 ### Gate por OOS (policy export do walk-forward)
 
 O relatório (`analyze_contexto_operacao_b808_robust_report.py`) pode exportar um JSON com `active_keys` do walk-forward.

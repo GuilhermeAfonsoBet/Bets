@@ -28,10 +28,25 @@ Instalar/rodar:
 
 ```bash
 sudo cp -v "$(git ls-files | grep -m1 'betinasia-accounting-monitor.service')" /etc/systemd/system/
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-accounting-daily.service')" /etc/systemd/system/
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-accounting-daily.timer')" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now betinasia-accounting-monitor
+sudo systemctl enable --now betinasia-accounting-daily.timer
 sudo systemctl status --no-pager -n 80 betinasia-accounting-monitor
 tail -n 50 logs/accounting_monitor.log
+```
+
+Rodar manual “snapshot do momento”:
+
+```bash
+python3 -m ops.accounting_monitor --once
+```
+
+Resumo de P&L (best-effort) a partir de um CSV exportado:
+
+```bash
+python3 -m ops.accounting_report --csv logs/accounting/<arquivo.csv>
 ```
 
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
