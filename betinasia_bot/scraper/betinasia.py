@@ -187,6 +187,8 @@ class BetinAsiaScraper:
             "locale": "pt-BR",
             "timezone_id": "America/Sao_Paulo",
             "ignore_https_errors": True,
+            # necessário para monitor baixar CSVs (accounting)
+            "accept_downloads": True,
         }
         
         # Carrega sessão salva se existir

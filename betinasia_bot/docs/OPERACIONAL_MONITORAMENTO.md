@@ -14,6 +14,26 @@
 sudo systemctl status --no-pager -n 80 betinasia-collector betinasia-audit-api
 ```
 
+### Saldo + P&L (Accounting)
+
+Há um monitor paralelo que baixa os CSVs de:
+- `https://black.betinasia.com/accounting/balance`
+- `https://black.betinasia.com/accounting/open-stakes`
+
+Ele grava:
+- CSVs em `logs/accounting/`
+- snapshots em `logs/accounting_snapshots.jsonl`
+
+Instalar/rodar:
+
+```bash
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-accounting-monitor.service')" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-accounting-monitor
+sudo systemctl status --no-pager -n 80 betinasia-accounting-monitor
+tail -n 50 logs/accounting_monitor.log
+```
+
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
 
