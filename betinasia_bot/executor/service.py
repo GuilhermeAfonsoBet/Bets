@@ -31,8 +31,13 @@ class ExecutorService:
     _worker_tasks: list = None
     _workers: list = None
     _store: ResultStore = None
+    _start_task: Optional[asyncio.Task] = None
+    _ready: bool = False
+    _start_error: Optional[str] = None
 
     async def start(self):
+        self._start_error = None
+        self._ready = False
         self._queue = asyncio.Queue(maxsize=int(os.getenv("EXECUTOR_QUEUE_MAX", "200")))
         self._worker_tasks = []
         self._workers = []
@@ -56,6 +61,7 @@ class ExecutorService:
             self._workers.append(w)
             t = asyncio.create_task(self._run_worker_loop(w))
             self._worker_tasks.append(t)
+        self._ready = True
         logger.info(f"[executor] service started workers={len(self._workers)}")
 
     async def close(self):
@@ -153,9 +159,19 @@ def create_app(svc: ExecutorService) -> web.Application:
     app = web.Application(client_max_size=1_000_000)
 
     async def health(_req: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "workers": len(svc._workers or []), "queue": (svc._queue.qsize() if svc._queue else 0)})
+        return web.json_response(
+            {
+                "ok": True,
+                "ready": bool(getattr(svc, "_ready", False)),
+                "start_error": getattr(svc, "_start_error", None),
+                "workers": len(svc._workers or []),
+                "queue": (svc._queue.qsize() if svc._queue else 0),
+            }
+        )
 
     async def execute(req: web.Request) -> web.Response:
+        if not bool(getattr(svc, "_ready", False)):
+            return web.json_response({"error": "not_ready", "detail": getattr(svc, "_start_error", None)}, status=503)
         try:
             data = await req.json()
         except Exception:
@@ -180,6 +196,8 @@ def create_app(svc: ExecutorService) -> web.Application:
         return web.json_response(payload)
 
     async def account(req: web.Request) -> web.Response:
+        if not bool(getattr(svc, "_ready", False)):
+            return web.json_response({"error": "not_ready", "detail": getattr(svc, "_start_error", None)}, status=503)
         try:
             page_size = int(req.query.get("page_size") or "50")
         except Exception:
@@ -198,7 +216,18 @@ def create_app(svc: ExecutorService) -> web.Application:
     app.router.add_get("/account", account)
 
     async def on_startup(_app: web.Application):
-        await svc.start()
+        # Não bloquear o bind do socket: aquecer workers em background
+        async def _bg_start():
+            try:
+                await svc.start()
+            except Exception as e:
+                try:
+                    svc._start_error = str(e)[:300]
+                except Exception:
+                    pass
+                raise
+
+        svc._start_task = asyncio.create_task(_bg_start())
 
     async def on_cleanup(_app: web.Application):
         await svc.close()

@@ -37,16 +37,19 @@ def main():
     runner = web.AppRunner(app)
 
     async def _run():
-        await runner.setup()
+        sock_path = None
         if args.unix_socket:
             sock_path = Path(args.unix_socket)
             sock_path.parent.mkdir(parents=True, exist_ok=True)
-            # remove socket antigo
+            # remove socket antigo ANTES do startup (startup pode demorar por login)
             try:
                 if sock_path.exists():
                     sock_path.unlink()
             except Exception:
                 pass
+
+        await runner.setup()
+        if sock_path is not None:
             site = web.UnixSite(runner, str(sock_path))
             await site.start()
             logger.info(f"[executor] listening unix={sock_path}")
