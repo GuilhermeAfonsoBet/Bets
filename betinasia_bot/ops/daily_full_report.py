@@ -43,11 +43,20 @@ class DailyReportCfg:
     report_tz: str = "America/Sao_Paulo"
     versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.0-ws-only,v1.0,v1.0-recovered")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
-    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "")
+    # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
+    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
     report_mode: str = os.getenv("DAILY_REPORT_MODE", "oos_first")
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
+    # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
+    wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
+    wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
+    wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
+    wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "2.0")
+    wf_ah_scope: str = os.getenv("DAILY_WF_AH_SCOPE", "pre")
+    wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
+    wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
     executor_jsonl: Path = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))
@@ -102,6 +111,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     ]
     if str(cfg.lookback_days).strip():
         args += ["--lookback-days", str(cfg.lookback_days).strip()]
+    if str(cfg.wf_train_mode).strip():
+        args += ["--wf-train-mode", str(cfg.wf_train_mode).strip()]
+    if bool(cfg.wf_key_by_league):
+        args += ["--wf-key-by-league"]
+        if str(cfg.wf_key_by_league_scope).strip():
+            args += ["--wf-key-by-league-scope", str(cfg.wf_key_by_league_scope).strip()]
+    if str(cfg.wf_ah_max_abs_line).strip():
+        args += ["--wf-ah-max-abs-line", str(cfg.wf_ah_max_abs_line).strip()]
+        if str(cfg.wf_ah_scope).strip():
+            args += ["--wf-ah-scope", str(cfg.wf_ah_scope).strip()]
+    if str(cfg.wf_liquidity_mode).strip():
+        args += ["--wf-liquidity-mode", str(cfg.wf_liquidity_mode).strip()]
+        if str(cfg.wf_liquidity_scope).strip():
+            args += ["--wf-liquidity-scope", str(cfg.wf_liquidity_scope).strip()]
 
     subprocess.run(args, check=True, cwd=str(Path(__file__).resolve().parent.parent))
 
