@@ -46,6 +46,7 @@ class DailyReportCfg:
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
     lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
+    no_auto_exclude_days: bool = (os.getenv("DAILY_NO_AUTO_EXCLUDE_DAYS", "0").strip() in ("1", "true", "True", "yes", "YES"))
     report_mode: str = os.getenv("DAILY_REPORT_MODE", "oos_first")
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
@@ -119,6 +120,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "--wf-export-policy-json",
         str(policy_hist),
     ]
+    if bool(cfg.no_auto_exclude_days):
+        args += ["--no-auto-exclude-days"]
     if str(cfg.lookback_days).strip():
         args += ["--lookback-days", str(cfg.lookback_days).strip()]
     if str(cfg.kelly_bankroll).strip():
