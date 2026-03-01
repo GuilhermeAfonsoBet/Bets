@@ -52,6 +52,9 @@ class DailyReportCfg:
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
+    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
+    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "2")
+    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
     wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "2.0")
@@ -124,6 +127,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-bankroll-grid", str(cfg.wf_bankroll_grid).strip()]
     if str(cfg.wf_train_mode).strip():
         args += ["--wf-train-mode", str(cfg.wf_train_mode).strip()]
+    if str(cfg.wf_train_days).strip():
+        args += ["--wf-train-days", str(cfg.wf_train_days).strip()]
+    if str(cfg.wf_test_days).strip():
+        args += ["--wf-test-days", str(cfg.wf_test_days).strip()]
+    if str(cfg.wf_step_days).strip():
+        args += ["--wf-step-days", str(cfg.wf_step_days).strip()]
     if bool(cfg.wf_key_by_league):
         args += ["--wf-key-by-league"]
         if str(cfg.wf_key_by_league_scope).strip():
@@ -196,12 +205,39 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     extra.append("\n### 99.2 Execução (KPIs)\n\n")
     extra.append(f"- Fonte: `{cfg.executor_jsonl}`\n\n")
-    extra.append("**Status (all):**\n\n")
-    extra.append("```json\n" + json.dumps(kpi_all.get("status_counts", {}), ensure_ascii=False, indent=2) + "\n```\n\n")
-    extra.append("**Latência (somente LIVE_OK/DRY_OK):**\n\n")
-    extra.append("```json\n" + json.dumps((kpi_ok.get("timing_ms") or {}), ensure_ascii=False, indent=2) + "\n```\n\n")
-    extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision):**\n\n")
-    extra.append("```json\n" + json.dumps((kpi_ok.get("slippage") or {}), ensure_ascii=False, indent=2) + "\n```\n\n")
+
+    # Status table
+    extra.append("**Status (all)**\n\n")
+    extra.append("| Status | N |\n|---|---:|\n")
+    for k, v in (kpi_all.get("status_counts") or {}).items():
+        extra.append(f"| {k} | {int(v)} |\n")
+    extra.append("\n")
+
+    def _timing_table(title: str, obj: Dict[str, Any]) -> str:
+        def _row(name: str, a: dict) -> str:
+            return (
+                f"| {name} | {a.get('n')} | {a.get('p50')} | {a.get('p90')} | {a.get('p99')} | {a.get('mean')} |\n"
+            )
+
+        s = []
+        s.append(f"**{title}**\n\n")
+        s.append("| Métrica | n | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|---:|\n")
+        for nm in ("queue_delay", "call_to_done", "post"):
+            a = ((obj.get(nm) or {}) if isinstance(obj, dict) else {})
+            s.append(_row(nm, a if isinstance(a, dict) else {}))
+        s.append("\n")
+        return "".join(s)
+
+    timing_ok = (kpi_ok.get("timing_ms") or {}) if isinstance(kpi_ok, dict) else {}
+    extra.append(_timing_table("Latência (somente LIVE_OK/DRY_OK) — ms", timing_ok))
+
+    slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
+    extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
+    extra.append("| Tipo | n | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|---:|\n")
+    for nm in ("abs", "pct"):
+        a = (slip_ok.get(nm) or {}) if isinstance(slip_ok, dict) else {}
+        extra.append(f"| {nm} | {a.get('n')} | {a.get('p50')} | {a.get('p90')} | {a.get('p99')} | {a.get('mean')} |\n")
+    extra.append("\n")
     extra.append(
         "_Nota: o p90/p99 de `call_to_done_ms` explode quando inclui `NO_SESSION/API_FAILED` (timeouts/relogin). "
         "Por isso reportamos também o recorte apenas de sucessos._\n\n"
