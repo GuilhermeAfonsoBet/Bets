@@ -61,6 +61,12 @@ KPIs de execução (lag/slippage/status) a partir do JSONL do executor:
 python3 -m ops.execution_kpis --jsonl logs/executor_live.jsonl --last 5000
 ```
 
+Relatório diário completo (OOS + execução + accounting + PDF + Telegram):
+
+```bash
+python3 -m ops.daily_full_report
+```
+
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
 

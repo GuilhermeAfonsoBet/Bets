@@ -1,0 +1,20 @@
+[Unit]
+Description=BetinAsia Daily Full Report (OOS + execution + accounting + PDF + Telegram)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PYTHONUNBUFFERED=1"
+Environment="DISPLAY=:99"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs/daily_reports
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python -m ops.daily_full_report; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec /home/betbot/Bets/venv/bin/python -m ops.daily_full_report; else exec /usr/bin/python3 -m ops.daily_full_report; fi'
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/daily_full_report.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/daily_full_report_error.log
+

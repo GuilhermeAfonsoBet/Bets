@@ -7,7 +7,7 @@ import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -73,21 +73,15 @@ def _agg(xs: List[float]) -> Agg:
     )
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="KPIs de execução (lag/slippage/status) a partir do JSONL do executor.")
-    ap.add_argument("--jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
-    ap.add_argument("--last", type=int, default=int(os.getenv("EXEC_KPI_LAST", "5000")), help="Ler apenas os últimos N registros (0=all).")
-    args = ap.parse_args()
-
-    path = Path(str(args.jsonl))
-    if not path.exists():
-        print(json.dumps({"error": "jsonl_not_found", "path": str(path)}, ensure_ascii=False))
-        return 2
-
-    # read lines (best-effort; para N pequeno não é caro)
-    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    if int(args.last) > 0 and len(lines) > int(args.last):
-        lines = lines[-int(args.last) :]
+def compute_kpis_from_lines(
+    lines: List[str],
+    *,
+    path: str = "",
+    only_status: Optional[Iterable[str]] = None,
+    exclude_status: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    only_set = set([str(s).strip() for s in (only_status or []) if str(s).strip()])
+    excl_set = set([str(s).strip() for s in (exclude_status or []) if str(s).strip()])
 
     status_counts: Dict[str, int] = {}
     t_call: List[float] = []
@@ -109,9 +103,16 @@ def main() -> int:
             continue
 
         st = str(res.get("status") or "")
+        if only_set and st not in only_set:
+            continue
+        if excl_set and st in excl_set:
+            continue
+
         status_counts[st] = int(status_counts.get(st, 0)) + 1
 
-        created_at = _parse_iso(str(res.get("created_at") or "")) or _parse_iso(str(req.get("created_at") or "")) if isinstance(req, dict) else None
+        created_at = _parse_iso(str(res.get("created_at") or ""))
+        if created_at is None and isinstance(req, dict):
+            created_at = _parse_iso(str(req.get("created_at") or ""))
         finished_at = _parse_iso(str(res.get("finished_at") or ""))
         if created_at and (first_ts is None or created_at.isoformat() < first_ts):
             first_ts = created_at.isoformat()
@@ -130,6 +131,8 @@ def main() -> int:
             t_post.append(float(p))
 
         odd_dec = _safe_float(res.get("odd_at_decision"))
+        if odd_dec is None and isinstance(req, dict):
+            odd_dec = _safe_float(req.get("odd_at_decision"))
         odd_fin = _safe_float(res.get("odd_final"))
         if odd_dec and odd_fin and odd_dec > 0:
             da = float(odd_fin) - float(odd_dec)
@@ -137,11 +140,12 @@ def main() -> int:
             slip_abs.append(da)
             slip_pct.append(dp)
 
-    out = {
+    return {
         "path": str(path),
         "n_lines": len(lines),
         "first_ts": first_ts,
         "last_ts": last_ts,
+        "filter": {"only_status": sorted(list(only_set)), "exclude_status": sorted(list(excl_set))},
         "status_counts": dict(sorted(status_counts.items(), key=lambda x: x[1], reverse=True)),
         "timing_ms": {
             "queue_delay": _agg(t_queue).__dict__,
@@ -157,6 +161,28 @@ def main() -> int:
             "ROI/Lucro real depende de settlement; aqui só KPIs de execução",
         ],
     }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="KPIs de execução (lag/slippage/status) a partir do JSONL do executor.")
+    ap.add_argument("--jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
+    ap.add_argument("--last", type=int, default=int(os.getenv("EXEC_KPI_LAST", "5000")), help="Ler apenas os últimos N registros (0=all).")
+    ap.add_argument("--only-status", default=os.getenv("EXEC_KPI_ONLY_STATUS", "").strip(), help="CSV de status para incluir (ex.: LIVE_OK,DRY_OK).")
+    ap.add_argument("--exclude-status", default=os.getenv("EXEC_KPI_EXCLUDE_STATUS", "").strip(), help="CSV de status para excluir.")
+    args = ap.parse_args()
+
+    path = Path(str(args.jsonl))
+    if not path.exists():
+        print(json.dumps({"error": "jsonl_not_found", "path": str(path)}, ensure_ascii=False))
+        return 2
+
+    # read lines (best-effort; para N pequeno não é caro)
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if int(args.last) > 0 and len(lines) > int(args.last):
+        lines = lines[-int(args.last) :]
+    only = [s.strip() for s in str(args.only_status).split(",") if s.strip()]
+    excl = [s.strip() for s in str(args.exclude_status).split(",") if s.strip()]
+    out = compute_kpis_from_lines(lines, path=str(path), only_status=only, exclude_status=excl)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
