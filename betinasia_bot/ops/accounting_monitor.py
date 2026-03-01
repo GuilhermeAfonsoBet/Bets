@@ -115,12 +115,37 @@ async def _download_from_accounting_page(
             if cnt <= 0:
                 continue
             meta["clicked_selector"] = sel
-            async with page.expect_download(timeout=timeout_ms) as di:
-                await loc.first.click()
-            dl = await di.value
-            await dl.save_as(str(out_path))
-            meta["downloaded_via"] = "expect_download"
-            return out_path, meta
+            # 1) tentativa: download “real”
+            try:
+                async with page.expect_download(timeout=timeout_ms) as di:
+                    await loc.first.click(force=True)
+                dl = await di.value
+                await dl.save_as(str(out_path))
+                meta["downloaded_via"] = "expect_download"
+                return out_path, meta
+            except Exception as e1:
+                meta.setdefault("attempt_errors", []).append({f"{sel}:download": str(e1)[:160]})
+            # 2) tentativa: XHR/response com CSV/attachment
+            try:
+                def _is_csv_response(r):
+                    try:
+                        u = (r.url or "").lower()
+                        ct = (r.headers.get("content-type", "") or "").lower()
+                        cd = (r.headers.get("content-disposition", "") or "").lower()
+                        return ("text/csv" in ct) or ("application/csv" in ct) or ("attachment" in cd and "csv" in cd) or ("csv" in u and ("export" in u or "download" in u))
+                    except Exception:
+                        return False
+                async with page.expect_response(_is_csv_response, timeout=timeout_ms) as ri:
+                    await loc.first.click(force=True)
+                r = await ri.value
+                body = await r.body()
+                out_path.write_bytes(body)
+                meta["downloaded_via"] = "expect_response_csv"
+                meta["csv_resp_url"] = getattr(r, "url", None)
+                meta["csv_resp_status"] = getattr(r, "status", None)
+                return out_path, meta
+            except Exception as e2:
+                meta.setdefault("attempt_errors", []).append({f"{sel}:response": str(e2)[:160]})
         except Exception as e:
             meta.setdefault("attempt_errors", []).append({sel: str(e)[:160]})
             continue
@@ -193,6 +218,11 @@ async def run_monitor(cfg: AccountingConfig) -> int:
     await scraper.start()
     ok = await scraper.login()
     if not ok:
+        # não explode sem registrar: grava snapshot de falha e sai
+        fail = {"ts": _utcnow(), "error": "LOGIN_FAILED", "files": {"balance": None, "open_stakes": None}, "meta": {}}
+        cfg.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with cfg.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(fail, ensure_ascii=False) + "\n")
         raise RuntimeError("LOGIN_FAILED")
 
     logger.info(f"[acct] started poll_sec={cfg.poll_sec} out_dir={cfg.out_dir} jsonl={cfg.jsonl_path}")
