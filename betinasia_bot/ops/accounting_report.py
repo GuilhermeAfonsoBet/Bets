@@ -77,21 +77,43 @@ def _pick_col(cols: List[str], needles: Iterable[str]) -> Optional[str]:
 class Report:
     tz: timezone
     rows: int
+    kind: str
     dt_col: Optional[str]
     pnl_col: Optional[str]
     pnl_by_day: Dict[str, float]
     pnl_by_month: Dict[str, float]
+    # extras (balance ledger)
+    balance_current: Optional[float] = None
+    type_col: Optional[str] = None
+    by_type: Optional[Dict[str, float]] = None
+    pnl_by_day_filtered: Optional[Dict[str, float]] = None
+    pnl_by_month_filtered: Optional[Dict[str, float]] = None
 
 
 def compute_pnl_report(csv_path: Path, *, tz: timezone) -> Report:
     with csv_path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.DictReader(f)
         cols = list(reader.fieldnames or [])
-        dt_col = _pick_col(cols, ("settled", "settle", "closed", "date", "time", "placement"))
+        cols_l = [c.lower() for c in cols]
+        is_balance_ledger = ("amount" in cols_l) and ("balance" in cols_l) and (("post date" in cols_l) or ("post_date" in cols_l))
+
+        kind = "generic"
+        dt_col = _pick_col(cols, ("post date", "post_date", "settled", "settle", "closed", "date", "time", "placement"))
         pnl_col = _pick_col(cols, ("profit_loss", "profit", "p&l", "pnl", "net", "pl"))
+        type_col = _pick_col(cols, ("type",))
+        balance_col = _pick_col(cols, ("balance",))
+
+        if is_balance_ledger:
+            kind = "balance_ledger"
+            dt_col = _pick_col(cols, ("post date", "post_date", "date", "time"))
+            pnl_col = _pick_col(cols, ("amount",)) or pnl_col
 
         pnl_by_day: Dict[str, float] = defaultdict(float)
         pnl_by_month: Dict[str, float] = defaultdict(float)
+        pnl_by_day_f: Dict[str, float] = defaultdict(float)
+        pnl_by_month_f: Dict[str, float] = defaultdict(float)
+        by_type: Dict[str, float] = defaultdict(float)
+        balance_current: Optional[float] = None
         n = 0
         for row in reader:
             n += 1
@@ -110,13 +132,35 @@ def compute_pnl_report(csv_path: Path, *, tz: timezone) -> Report:
             pnl_by_day[dayk] += float(pnl)
             pnl_by_month[monthk] += float(pnl)
 
+            if kind == "balance_ledger":
+                typ = str(row.get(type_col) or "").strip() if type_col else ""
+                if typ:
+                    by_type[typ] += float(pnl)
+                if balance_col:
+                    b = _safe_float(row.get(balance_col))
+                    if b is not None:
+                        balance_current = float(b)
+
+                # filtro “P&L-like”: exclui movimentações que não são resultado de aposta
+                tl = typ.lower()
+                exclude = any(k in tl for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+                if not exclude:
+                    pnl_by_day_f[dayk] += float(pnl)
+                    pnl_by_month_f[monthk] += float(pnl)
+
         return Report(
             tz=tz,
             rows=int(n),
+            kind=str(kind),
             dt_col=dt_col,
             pnl_col=pnl_col,
             pnl_by_day=dict(pnl_by_day),
             pnl_by_month=dict(pnl_by_month),
+            balance_current=balance_current,
+            type_col=type_col,
+            by_type=dict(by_type) if by_type else None,
+            pnl_by_day_filtered=(dict(pnl_by_day_f) if pnl_by_day_f else None),
+            pnl_by_month_filtered=(dict(pnl_by_month_f) if pnl_by_month_f else None),
         )
 
 
@@ -154,9 +198,20 @@ def main() -> int:
     # meses anteriores fechados
     closed = {k: float(v) for k, v in sorted(rep.pnl_by_month.items()) if k < monthk}
 
+    pnl_today_f = None
+    pnl_week_f = None
+    pnl_month_f = None
+    closed_f = None
+    if rep.pnl_by_day_filtered and rep.pnl_by_month_filtered:
+        pnl_today_f = float(rep.pnl_by_day_filtered.get(today.isoformat(), 0.0))
+        pnl_week_f = float(sum(v for k, v in rep.pnl_by_day_filtered.items() if week0.isoformat() <= k <= today.isoformat()))
+        pnl_month_f = float(rep.pnl_by_month_filtered.get(monthk, 0.0))
+        closed_f = {k: float(v) for k, v in sorted(rep.pnl_by_month_filtered.items()) if k < monthk}
+
     out = {
         "csv": str(p),
         "rows": rep.rows,
+        "kind": rep.kind,
         "dt_col": rep.dt_col,
         "pnl_col": rep.pnl_col,
         "tz": str(args.tz),
@@ -164,6 +219,13 @@ def main() -> int:
         "pnl_week": pnl_week,
         "pnl_month": pnl_month,
         "closed_months": closed,
+        "balance_current": rep.balance_current,
+        "type_col": rep.type_col,
+        "by_type": rep.by_type,
+        "pnl_filtered_today": pnl_today_f,
+        "pnl_filtered_week": pnl_week_f,
+        "pnl_filtered_month": pnl_month_f,
+        "closed_months_filtered": closed_f,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
