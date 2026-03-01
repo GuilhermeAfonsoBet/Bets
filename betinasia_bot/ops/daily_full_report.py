@@ -41,7 +41,8 @@ def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, captio
 class DailyReportCfg:
     out_dir: Path = Path("logs/daily_reports")
     report_tz: str = "America/Sao_Paulo"
-    versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.0-ws-only,v1.0,v1.0-recovered")
+    # Alinhar com o relatório “v38” por default
+    versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.0-ws-only,v5.1-ws-gate-lay")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
     lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
@@ -57,6 +58,12 @@ class DailyReportCfg:
     wf_ah_scope: str = os.getenv("DAILY_WF_AH_SCOPE", "pre")
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
     wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
+    wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
+    wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
+    wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
+    # Escala de banca/sizing (manter “10k etc.”)
+    kelly_bankroll: str = os.getenv("DAILY_KELLY_BANKROLL", "10000")
+    wf_bankroll_grid: str = os.getenv("DAILY_WF_BANKROLL_GRID", "").strip()
     executor_jsonl: Path = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))
@@ -111,6 +118,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     ]
     if str(cfg.lookback_days).strip():
         args += ["--lookback-days", str(cfg.lookback_days).strip()]
+    if str(cfg.kelly_bankroll).strip():
+        args += ["--kelly-bankroll", str(cfg.kelly_bankroll).strip()]
+    if str(cfg.wf_bankroll_grid).strip():
+        args += ["--wf-bankroll-grid", str(cfg.wf_bankroll_grid).strip()]
     if str(cfg.wf_train_mode).strip():
         args += ["--wf-train-mode", str(cfg.wf_train_mode).strip()]
     if bool(cfg.wf_key_by_league):
@@ -125,6 +136,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-liquidity-mode", str(cfg.wf_liquidity_mode).strip()]
         if str(cfg.wf_liquidity_scope).strip():
             args += ["--wf-liquidity-scope", str(cfg.wf_liquidity_scope).strip()]
+    if str(cfg.wf_min_matches).strip():
+        args += ["--wf-min-matches", str(cfg.wf_min_matches).strip()]
+    if bool(cfg.wf_shrinkage):
+        args += ["--wf-shrinkage"]
+    if str(cfg.wf_exclude_exec_buckets_back).strip():
+        args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
 
     subprocess.run(args, check=True, cwd=str(Path(__file__).resolve().parent.parent))
 
@@ -134,20 +151,34 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
     tmp.replace(cfg.wf_policy_current)
 
+    active_keys = None
+    active_keys_base = None
     try:
         pol = json.loads(policy_hist.read_text(encoding="utf-8"))
         steps = pol.get("steps") if isinstance(pol, dict) else []
         last = steps[-1] if isinstance(steps, list) and steps else {}
+        if isinstance(last, dict):
+            active_keys = last.get("active_keys")
+            active_keys_base = last.get("active_keys_base")
         rec = {
             "ts": ts.isoformat(),
             "policy_path": str(policy_hist),
             "policy_current": str(cfg.wf_policy_current),
-            "active_keys": last.get("active_keys") if isinstance(last, dict) else None,
-            "active_keys_base": last.get("active_keys_base") if isinstance(last, dict) else None,
+            "active_keys": active_keys,
+            "active_keys_base": active_keys_base,
         }
         cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
         with cfg.wf_policy_history_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    # v38: renomeia apenas o header do bloco OOS para "## 1) OOS ..." (o resto pode manter numbering interno)
+    try:
+        txt = base_md.read_text(encoding="utf-8")
+        txt2 = txt.replace("## 12) OOS walk-forward", "## 1) OOS walk-forward")
+        if txt2 != txt:
+            base_md.write_text(txt2, encoding="utf-8")
     except Exception:
         pass
 
@@ -169,10 +200,17 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     extra.append("```json\n" + json.dumps(kpi_all.get("status_counts", {}), ensure_ascii=False, indent=2) + "\n```\n\n")
     extra.append("**Latência (somente LIVE_OK/DRY_OK):**\n\n")
     extra.append("```json\n" + json.dumps((kpi_ok.get("timing_ms") or {}), ensure_ascii=False, indent=2) + "\n```\n\n")
+    extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision):**\n\n")
+    extra.append("```json\n" + json.dumps((kpi_ok.get("slippage") or {}), ensure_ascii=False, indent=2) + "\n```\n\n")
     extra.append(
         "_Nota: o p90/p99 de `call_to_done_ms` explode quando inclui `NO_SESSION/API_FAILED` (timeouts/relogin). "
         "Por isso reportamos também o recorte apenas de sucessos._\n\n"
     )
+
+    if active_keys:
+        extra.append("\n### 99.3 Regras OOS ativas (último step)\n\n")
+        extra.append(f"- active_keys: {len(active_keys) if isinstance(active_keys, list) else '—'}\n")
+        extra.append("```json\n" + json.dumps(active_keys, ensure_ascii=False, indent=2) + "\n```\n\n")
 
     combined_md = day_dir / "report_daily.md"
     combined_md.write_text(base_md.read_text(encoding="utf-8") + "".join(extra), encoding="utf-8")
