@@ -65,11 +65,24 @@ def _parse_dt_any(s: str) -> Optional[datetime]:
 
 
 def _pick_col(cols: List[str], needles: Iterable[str]) -> Optional[str]:
-    cols_l = {c.lower(): c for c in cols}
+    """
+    Seleciona uma coluna por heurística, mas preferindo:
+    1) match exato (case-insensitive)
+    2) prefix (ex.: 'post date' vs 'post date (utc)')
+    3) contains (fallback)
+    """
+    cols_map = {c.lower(): c for c in cols}
+    cols_l = list(cols_map.keys())
     for n in needles:
-        for cl, orig in cols_l.items():
+        n = str(n).lower()
+        if n in cols_map:
+            return cols_map[n]
+        for cl in cols_l:
+            if cl.startswith(n):
+                return cols_map[cl]
+        for cl in cols_l:
             if n in cl:
-                return orig
+                return cols_map[cl]
     return None
 
 
