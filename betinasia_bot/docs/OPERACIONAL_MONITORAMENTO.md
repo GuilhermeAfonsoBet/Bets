@@ -49,6 +49,18 @@ Resumo de P&L (best-effort) a partir de um CSV exportado:
 python3 -m ops.accounting_report --csv logs/accounting/<arquivo.csv>
 ```
 
+Comando único (snapshot + relatório):
+
+```bash
+python3 -m ops.accounting_daily_report
+```
+
+KPIs de execução (lag/slippage/status) a partir do JSONL do executor:
+
+```bash
+python3 -m ops.execution_kpis --jsonl logs/executor_live.jsonl --last 5000
+```
+
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
 
