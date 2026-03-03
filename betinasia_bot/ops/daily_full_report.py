@@ -21,6 +21,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _load_env_file(path: Path) -> None:
+    """
+    Carrega variáveis de um arquivo .env simples (KEY=VALUE), sem sobrescrever env já definido.
+    Ajuda quando rodando manualmente fora do systemd (que usa EnvironmentFile=...).
+    """
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if not k or k in os.environ:
+                continue
+            os.environ[k] = v.strip()
+    except Exception:
+        return
+
+
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
         if not path.exists():
@@ -294,7 +315,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "--executor-jsonl",
                 str(cfg.executor_jsonl),
                 "--tz",
-                str(os.getenv("REPORT_TZ", cfg.report_tz)),
+                "UTC",
                 "--days",
                 str(os.getenv("DAILY_ADHERENCE_DAYS", "7")),
                 "--out",
@@ -425,6 +446,9 @@ def main() -> int:
 
     logger.remove()
     logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
+
+    # Se rodando manualmente, garante que .env seja carregado antes do cfg.
+    _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
 
     cfg = DailyReportCfg(out_dir=Path(str(args.out_dir)))
     import asyncio

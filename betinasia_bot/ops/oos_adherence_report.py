@@ -291,13 +291,27 @@ def _active_keys_by_day_from_policy(policy: Dict[str, Any], *, tz_name: str) -> 
     for st in steps:
         if not isinstance(st, dict):
             continue
+        active = st.get("active_keys") if isinstance(st.get("active_keys"), list) else None
+        # Formato atual do export do WF (b808): train_days/test_days como lista de YYYY-MM-DD (UTC).
+        test_days = st.get("test_days") if isinstance(st.get("test_days"), list) else None
+        if test_days:
+            for ds in [str(x) for x in test_days if str(x)]:
+                out["days"][ds] = {
+                    "active_keys": active or [],
+                    "n_active_keys": len(active or []),
+                    "train": st.get("train"),
+                    "test": st.get("test"),
+                    "train_days": st.get("train_days"),
+                    "test_days": test_days,
+                }
+            continue
+
+        # Fallback: formato antigo com test_window.start/end (ISO)
         test = st.get("test_window") if isinstance(st.get("test_window"), dict) else {}
         t0 = _parse_iso(str(test.get("start") or "")) if isinstance(test, dict) else None
         t1 = _parse_iso(str(test.get("end") or "")) if isinstance(test, dict) else None
         if not t0 or not t1:
             continue
-        active = st.get("active_keys") if isinstance(st.get("active_keys"), list) else None
-        # inclui dias do intervalo [t0, t1] (end inclusive no relatório, mas aqui usamos date local)
         d0 = t0.astimezone(tz).date()
         d1 = t1.astimezone(tz).date()
         for d in _iter_dates(d0, d1):
