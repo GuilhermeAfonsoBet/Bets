@@ -1915,9 +1915,31 @@ class H3bApiAudit:
                 status = "OK" if r.get("success") else "API_FAILED"
 
             bs_odd = r.get("bs_odd", None)
+            bs_limit = r.get("bs_limit", None)
             has_bs = isinstance(bs_odd, (int, float)) and float(bs_odd) > 0
+
+            # Compatibilidade: em ws_gate_lay, podemos ter snapshot em lay_odd/lay_limit
+            # mesmo quando bs_odd não foi preenchida por algum caminho.
+            if not has_bs:
+                try:
+                    lay_odd = r.get("lay_odd", None)
+                    lay_limit = r.get("lay_limit", None)
+                    if isinstance(lay_odd, (int, float)) and float(lay_odd) > 1.0:
+                        bs_odd = float(lay_odd)
+                        bs_limit = float(lay_limit) if isinstance(lay_limit, (int, float)) else 0.0
+                        has_bs = True
+                except Exception:
+                    pass
             diff_pct = r.get("diff_pct") if has_bs else None
-            diff_abs = (float(bs_odd) - float(r.get("ws_odd") or 0.0)) if has_bs else None
+            diff_abs = None
+            try:
+                ws = float(r.get("ws_odd") or 0.0)
+                if has_bs and ws > 0:
+                    diff_abs = float(bs_odd) - ws
+                    if diff_pct is None:
+                        diff_pct = diff_abs / ws * 100.0
+            except Exception:
+                diff_abs = None
             is_valid = r.get("is_valid_opportunity")
             if is_valid is None:
                 try:
@@ -1934,6 +1956,14 @@ class H3bApiAudit:
                     )
                 except Exception:
                     is_valid = bool(has_bs)
+
+            # ws_gate_lay: se abriu ticket com sucesso (status OK) e temos lay_odd,
+            # tratamos como oportunidade executável mesmo que diff_pct esteja ausente.
+            try:
+                if str(r.get("audit_version") or "") == "v5.1-ws-gate-lay" and str(status) == "OK" and has_bs:
+                    is_valid = True
+            except Exception:
+                pass
 
             record = BetslipAuditResult(
                 hypothesis_type="H3B",
@@ -1953,7 +1983,7 @@ class H3bApiAudit:
                 betslip_odd=float(bs_odd) if has_bs else None,
                 difference_pct=float(diff_pct) if isinstance(diff_pct, (int, float)) else None,
                 difference_absolute=float(diff_abs) if isinstance(diff_abs, (int, float)) else None,
-                betslip_limit=r.get('bs_limit', 0) if has_bs else 0,
+                betslip_limit=float(bs_limit) if (has_bs and isinstance(bs_limit, (int, float))) else (r.get('bs_limit', 0) if has_bs else 0),
                 status=status,
                 is_valid_opportunity=bool(is_valid),
                 is_live=r.get('is_live'),
