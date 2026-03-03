@@ -326,6 +326,59 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # 99.5 Auditoria (DB): motivos de no-OK por versão + qualidade dos OK
+    try:
+        audit_json = day_dir / "audit_status_kpis.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.audit_status_kpis",
+                "--hours",
+                str(os.getenv("DAILY_AUDIT_KPI_HOURS", "24")),
+                "--direction",
+                str(cfg.direction),
+                "--out",
+                str(audit_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        rep = _read_json(audit_json)
+        if isinstance(rep, dict) and isinstance(rep.get("by_version"), list) and rep.get("by_version"):
+            extra.append("\n### 99.5 Auditoria (DB) — motivos de no-OK (por versão)\n\n")
+            extra.append(f"- Arquivo: `{audit_json}`\n")
+            extra.append(f"- Janela: últimas **{rep.get('hours')}h** (desde `{rep.get('since_utc')}`)\n\n")
+            extra.append("| audit_version | total | OK | OK com betslip_odd | OK valid | top no-OK |\n")
+            extra.append("|---|---:|---:|---:|---:|---|\n")
+            for v in rep.get("by_version") or []:
+                if not isinstance(v, dict):
+                    continue
+                sc = v.get("status_counts") if isinstance(v.get("status_counts"), dict) else {}
+                total = int(v.get("total") or 0)
+                nok = 0
+                try:
+                    nok = int(sc.get("OK") or 0)
+                except Exception:
+                    nok = 0
+                # top no-OK
+                pairs = []
+                for k, cnt in sc.items():
+                    if str(k) == "OK":
+                        continue
+                    try:
+                        pairs.append((str(k), int(cnt)))
+                    except Exception:
+                        continue
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                top = ", ".join([f"{k}={c}" for k, c in pairs[:4]]) if pairs else "—"
+                extra.append(
+                    f"| {v.get('audit_version')} | {total} | {nok} | {int(v.get('ok_with_bs') or 0)} | {int(v.get('ok_valid') or 0)} | {top} |\n"
+                )
+            extra.append("\n")
+    except Exception:
+        pass
+
     combined_md = day_dir / "report_daily.md"
     combined_md.write_text(base_md.read_text(encoding="utf-8") + "".join(extra), encoding="utf-8")
 
