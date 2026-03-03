@@ -19,7 +19,7 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="AUDIT_EXECUTOR_WORKERS=1"
 Environment="AUDIT_TEMPORAL_WORKERS=0"
 Environment="AUDIT_MAX_QUEUE_DEPTH=20"
-Environment="AUDIT_MAX_QUEUE_WAIT_MS=2500"
+Environment="AUDIT_MAX_QUEUE_WAIT_MS=20000"
 Environment="AUDIT_API_SIDES=back"
 
 ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs

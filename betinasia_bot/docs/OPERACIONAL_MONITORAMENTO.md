@@ -86,6 +86,10 @@ Como ler as tabelas:
   - `NO_SESSION`: sem sessão/logado (ou sessão expirada)
   - `API_FAILED`: falha de API/timeout/erro ao abrir betslip ou confirmar
   - `RATE_LIMIT`: rate limit/backoff
+- **Erros típicos (quando `API_FAILED`)**:
+  - `HTTP_403 ... code=too_many_open_betslips`: a conta/sessão acumulou **betslips abertos demais**. Mitigação: reduzir cache + fechar betslips no executor/audit.
+    - Ajustes recomendados no `.env`: `EXECUTOR_BETSLIP_CACHE_MAX_KEYS=0` (shadow) e reiniciar executor.
+  - `No PMMs received`: betslip abriu, mas não chegaram mensagens PMM no WS dentro do timeout. Mitigação: aumentar timeouts (`EXECUTOR_PMM_TIMEOUT_SEC`) e reduzir saturação (menos abertura concorrente/menos filas velhas).
 - **Latência (somente LIVE_OK/DRY_OK)**:
   - `queue_delay_ms`: tempo na fila do executor antes do worker iniciar
   - `call_to_done_ms`: tempo total observado desde `created_at` até o resultado (wall clock)
