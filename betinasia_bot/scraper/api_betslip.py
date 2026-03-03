@@ -128,6 +128,109 @@ class ApiBetslipClient:
         self.MOLLY_CLIENT_NAME = "sonic"
         self.MOLLY_CLIENT_VERSION = os.getenv("BETINASIA_MOLLY_CLIENT_VERSION", "2.5.54")
 
+    async def close_visible_betslip_ui(self) -> bool:
+        """
+        Best-effort: fecha o betslip no UI (quando o site renderiza o aside).
+        Útil como fallback quando não conhecemos o endpoint de close do /v1/betslips/.
+        """
+        try:
+            closed = await self.page.evaluate(
+                """
+                () => {
+                  const asides = document.querySelectorAll('aside');
+                  for (const aside of asides) {
+                    const text = (aside.innerText || '');
+                    if (!text.includes('Betslip')) continue;
+                    const closeButtons = aside.querySelectorAll('button, [role="button"], span');
+                    for (const btn of closeButtons) {
+                      const t = (btn.innerText || '').trim();
+                      if (t === '×' || t === 'X' || t === '✕') { btn.click(); return true; }
+                    }
+                    const svgButtons = aside.querySelectorAll('svg, [class*="close"], [class*="remove"]');
+                    for (const btn of svgButtons) {
+                      try { btn.click(); return true; } catch(e) {}
+                      try { btn.parentElement && btn.parentElement.click(); return true; } catch(e) {}
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+            if not closed:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            return bool(closed)
+        except Exception:
+            return False
+
+    async def close_betslip(self, betslip_id: str) -> bool:
+        """
+        Best-effort: tenta fechar/remover o betslip no servidor.
+        A API pública não é documentada no repo, então tentamos alguns endpoints comuns
+        e caímos no fechamento via UI.
+        """
+        bid = str(betslip_id or "").strip()
+        if not bid:
+            return False
+        try:
+            session_token = await self._get_root_session_token()
+            if not session_token:
+                # ainda tenta UI close
+                return await self.close_visible_betslip_ui()
+
+            resp = await self.page.evaluate(
+                """
+                async (params) => {
+                  const headers = {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Content-Type': 'application/json',
+                    'session': params.sessionToken,
+                    'x-molly-client-name': params.clientName,
+                    'x-molly-client-version': params.clientVersion
+                  };
+                  const endpoints = [
+                    {method: 'DELETE', url: '/v1/betslips/' + params.betslip_id + '/'},
+                    {method: 'POST', url: '/v1/betslips/' + params.betslip_id + '/close/'},
+                    {method: 'POST', url: '/v1/betslips/' + params.betslip_id + '/delete/'},
+                    {method: 'POST', url: '/v1/betslips/' + params.betslip_id + '/remove/'},
+                  ];
+                  for (const ep of endpoints) {
+                    try {
+                      const opts = {method: ep.method, credentials: 'same-origin', headers};
+                      if (ep.method === 'POST') {
+                        opts.body = JSON.stringify({betslip_id: params.betslip_id, betslipId: params.betslip_id});
+                      }
+                      const r = await fetch(ep.url, opts);
+                      const ok = r.ok;
+                      const st = r.status;
+                      if (ok) return {ok: true, status: st, url: ep.url};
+                      // 404: pode já ter expirado/ter sido fechado. Trata como sucesso para cleanup.
+                      if (st === 404) return {ok: true, status: st, url: ep.url};
+                    } catch(e) {}
+                  }
+                  return {ok: false, status: 0};
+                }
+                """,
+                {
+                    "betslip_id": bid,
+                    "sessionToken": session_token,
+                    "clientName": self.MOLLY_CLIENT_NAME,
+                    "clientVersion": self.MOLLY_CLIENT_VERSION,
+                },
+            )
+            ok = bool(resp.get("ok")) if isinstance(resp, dict) else False
+            if ok:
+                return True
+        except Exception:
+            pass
+        # fallback UI
+        try:
+            return await self.close_visible_betslip_ui()
+        except Exception:
+            return False
+
     async def _get_root_session_token(self) -> str:
         """
         Obtém o cookie `root-session` via Playwright (inclui HttpOnly).
@@ -312,6 +415,12 @@ class ApiBetslipClient:
             if (not ok) or (status_code and status_code != 200):
                 # Status != 200 pode ocorrer como 401/403/429 etc. (resp.ok=False)
                 result.error = response.get("error") or f"HTTP_{status_code}"
+                # tenta extrair code (ex.: too_many_open_betslips)
+                try:
+                    if isinstance(data, dict) and data.get("code"):
+                        result.error = f"{result.error} | code={data.get('code')}"
+                except Exception:
+                    pass
                 if status_code:
                     result.error = f"HTTP_{status_code}: {result.error}"
                 if prefix:

@@ -78,24 +78,32 @@ class ExecutorWorker:
     _api_backoff_until_ts: float = 0.0
     _cap_lock: asyncio.Lock = None
     _cap_open_times: Any = None  # deque[float]
-    _betslip_cache: Dict[str, str] = None  # key -> betslip_id
+    _betslip_cache: Any = None  # OrderedDict[str, str] | None
+    _betslip_cache_max_keys: int = 0
     _op_lock: asyncio.Lock = None
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
         self._op_lock = asyncio.Lock()
-        from collections import deque
+        from collections import deque, OrderedDict
 
         self._cap_open_times = deque()
-        self._betslip_cache = {}
         self._scraper = BetinAsiaScraper()
         await self._scraper.start()
+        page = self._scraper._page
+        self._api = ApiBetslipClient(page)
+        # listener deve ser registrado ANTES de navegações que possam abrir WS
+        self._api.setup_listener()
+
         ok_login = await self._scraper.login()
         if not ok_login:
             raise RuntimeError("LOGIN_FAILED")
-        page = self._scraper._page
-        self._api = ApiBetslipClient(page)
-        self._api.setup_listener()
+
+        try:
+            self._betslip_cache_max_keys = int(os.getenv("EXECUTOR_BETSLIP_CACHE_MAX_KEYS", "0"))
+        except Exception:
+            self._betslip_cache_max_keys = 0
+        self._betslip_cache = OrderedDict() if self._betslip_cache_max_keys > 0 else None
 
         # FAST mode: reduzir esperas por PMM (trade-off: menos bookies/menos "best odd")
         if os.getenv("EXECUTOR_FAST_PMM", "1").strip() in ("1", "true", "True", "yes", "YES"):
@@ -111,7 +119,9 @@ class ExecutorWorker:
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(4000)
         self._running = True
-        logger.info(f"[executor:{self.name}] started (WS warm)")
+        logger.info(
+            f"[executor:{self.name}] started (WS warm) betslip_cache_max_keys={self._betslip_cache_max_keys}"
+        )
 
     async def close(self) -> None:
         self._running = False
@@ -221,28 +231,70 @@ class ExecutorWorker:
 
         cache_key = f"{req.event_id}|{betslip_type}|{bet_type}"
         api_result: Optional[BetslipApiResult] = None
+        cache_hit = False
+
+        def _is_too_many_open(res: Optional[BetslipApiResult]) -> bool:
+            try:
+                if not res:
+                    return False
+                if int(getattr(res, "http_status", 0) or 0) != 403:
+                    return False
+                return "too_many_open_betslips" in str(getattr(res, "error", "") or "")
+            except Exception:
+                return False
+
         try:
-            cached_id = (self._betslip_cache or {}).get(cache_key)
+            cached_id = None
+            if self._betslip_cache is not None:
+                cached_id = self._betslip_cache.get(cache_key)
+                if cached_id:
+                    cache_hit = True
+                    try:
+                        self._betslip_cache.move_to_end(cache_key)
+                    except Exception:
+                        pass
             if cached_id:
                 api_result = await self._api.refresh_betslip(cached_id)
             else:
                 api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
-                if api_result and api_result.success and getattr(api_result, "betslip_id", ""):
+                if self._betslip_cache is not None and api_result and api_result.success and getattr(api_result, "betslip_id", ""):
                     self._betslip_cache[cache_key] = str(api_result.betslip_id)
+                    try:
+                        self._betslip_cache.move_to_end(cache_key)
+                    except Exception:
+                        pass
+
+            # 403 too_many_open_betslips: tenta fechar UI e re-tenta 1 vez (sem usar cache).
+            if _is_too_many_open(api_result):
+                try:
+                    if self._betslip_cache is not None:
+                        self._betslip_cache.clear()
+                except Exception:
+                    pass
+                try:
+                    await self._api.close_visible_betslip_ui()
+                except Exception:
+                    pass
+                await asyncio.sleep(float(os.getenv("EXECUTOR_TOO_MANY_OPEN_RETRY_SLEEP_SEC", "0.6")))
+                api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
 
             # Se der 401/auth na fase de betslip, a causa mais comum é cache de betslip
             # de uma sessão anterior. Faz relogin + força criar betslip novo (sem refresh).
             if _is_auth_error(api_result):
                 try:
-                    if cache_key in (self._betslip_cache or {}):
+                    if self._betslip_cache is not None:
                         self._betslip_cache.pop(cache_key, None)
                 except Exception:
                     pass
                 ok = await self._relogin()
                 if ok:
                     api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
-                    if api_result and api_result.success and getattr(api_result, "betslip_id", ""):
+                    if self._betslip_cache is not None and api_result and api_result.success and getattr(api_result, "betslip_id", ""):
                         self._betslip_cache[cache_key] = str(api_result.betslip_id)
+                        try:
+                            self._betslip_cache.move_to_end(cache_key)
+                        except Exception:
+                            pass
         except Exception as e:
             return ExecutionResult(
                 execution_id=req.execution_id,
@@ -288,6 +340,24 @@ class ExecutorWorker:
             status = ExecStatus.RATE_LIMIT
             err = f"RATE_LIMIT retry_after={retry_after}s"
 
+        # Cleanup: no shadow/dryrun, tenta reduzir "open betslips" no servidor.
+        # Em LIVE, precisamos manter o betslip aberto para o place_order().
+        try:
+            bid = str(getattr(api_result, "betslip_id", "") or "")
+            if bid and (not bool(req.is_live)):
+                if self._betslip_cache is None:
+                    await self._api.close_betslip(bid)
+                else:
+                    # eviction LRU: fecha os expulsos
+                    while self._betslip_cache_max_keys > 0 and len(self._betslip_cache) > self._betslip_cache_max_keys:
+                        _, old_bid = self._betslip_cache.popitem(last=False)
+                        try:
+                            await self._api.close_betslip(str(old_bid))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         return ExecutionResult(
             execution_id=req.execution_id,
             status=status,
@@ -315,7 +385,7 @@ class ExecutorWorker:
             error=err,
             raw={
                 "betslip_id": getattr(api_result, "betslip_id", ""),
-                "cache_hit": bool((self._betslip_cache or {}).get(cache_key)),
+                "cache_hit": bool(cache_hit),
                 "cap": cap_meta,
                 "bet_type": bet_type,
                 "betslip_type": betslip_type,

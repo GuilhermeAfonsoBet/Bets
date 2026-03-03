@@ -1012,6 +1012,17 @@ class H3bApiAudit:
             'temporal_points': temporal_points,
             'temporal_deferred': False,
         }
+        # Cleanup: após finalizar refreshes, fecha betslips para evitar "too_many_open_betslips".
+        try:
+            close_calls = []
+            if back_betslip_id:
+                close_calls.append(asyncio.wait_for(self.api_client.close_betslip(back_betslip_id), timeout=1.2))
+            if lay_betslip_id:
+                close_calls.append(asyncio.wait_for(self.api_client.close_betslip(lay_betslip_id), timeout=1.2))
+            if close_calls:
+                await asyncio.gather(*close_calls, return_exceptions=True)
+        except Exception:
+            pass
         return back_temporal, lay_temporal, telemetry_patch
 
     async def _collect_ws_series(
@@ -1485,17 +1496,31 @@ class H3bApiAudit:
             telemetry['temporal_points'] = []
             telemetry['temporal_deferred'] = has_temporal_refs and (not run_temporal)
             if has_temporal_refs and (not run_temporal):
-                rt = None
-                if self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
-                    rt = [x for x in (self.ws_sample_offsets_sec or []) if float(x) > 0.0]
-                base['_temporal_refs'] = {
-                    'ws_odd': ws_odd,
-                    'back_betslip_id': back_betslip_id,
-                    'lay_betslip_id': lay_betslip_id,
-                    'ws_state_key': h3b.get("ws_state_key"),
-                    'ws_side': str(h3b.get("side") or ""),
-                    'refresh_times': rt,
-                }
+                # Se não há temporal workers, não adianta deferir — fecha para evitar acúmulo de betslips abertos.
+                if int(getattr(self, "temporal_workers", 0) or 0) <= 0:
+                    telemetry['temporal_deferred'] = False
+                    try:
+                        close_calls = []
+                        if back_betslip_id:
+                            close_calls.append(asyncio.wait_for(self.api_client.close_betslip(back_betslip_id), timeout=1.2))
+                        if lay_betslip_id:
+                            close_calls.append(asyncio.wait_for(self.api_client.close_betslip(lay_betslip_id), timeout=1.2))
+                        if close_calls:
+                            await asyncio.gather(*close_calls, return_exceptions=True)
+                    except Exception:
+                        pass
+                else:
+                    rt = None
+                    if self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+                        rt = [x for x in (self.ws_sample_offsets_sec or []) if float(x) > 0.0]
+                    base['_temporal_refs'] = {
+                        'ws_odd': ws_odd,
+                        'back_betslip_id': back_betslip_id,
+                        'lay_betslip_id': lay_betslip_id,
+                        'ws_state_key': h3b.get("ws_state_key"),
+                        'ws_side': str(h3b.get("side") or ""),
+                        'refresh_times': rt,
+                    }
 
         end_to_end_ms = int((time.time() - detected_at) * 1000)
         telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
@@ -1876,6 +1901,12 @@ class H3bApiAudit:
 
         self.gate_open_success += 1
         lay_betslip_id = lay_result.betslip_id if lay_result and lay_result.success else ""
+        # Se não vamos fazer refresh temporal, fecha o betslip já para reduzir "open betslips".
+        if (not self.gate_lay_refresh) and lay_betslip_id:
+            try:
+                await asyncio.wait_for(self.api_client.close_betslip(lay_betslip_id), timeout=1.2)
+            except Exception:
+                pass
         # Opcional: coletar temporal Lay via refresh (deferred no temporal worker)
         if self.gate_lay_refresh and lay_betslip_id:
             base["_temporal_refs"] = {
