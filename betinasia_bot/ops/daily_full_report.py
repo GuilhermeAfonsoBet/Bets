@@ -21,6 +21,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _fmt_pct(x: Any, nd: int = 2) -> str:
+    try:
+        if x is None:
+            return "—"
+        return f"{float(x):.{nd}f}%"
+    except Exception:
+        return "—"
+
+
 def _read_jsonl_last(path: Path, last: int) -> list[str]:
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     if last > 0 and len(lines) > last:
@@ -250,6 +269,62 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append("\n### 99.3 Regras OOS ativas (último step)\n\n")
         extra.append(f"- active_keys: {len(active_keys) if isinstance(active_keys, list) else '—'}\n")
         extra.append("```json\n" + json.dumps(active_keys, ensure_ascii=False, indent=2) + "\n```\n\n")
+
+    # 99.4 Aderência OOS (policy por dia × execução)
+    try:
+        adh_json = day_dir / "oos_adherence.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.oos_adherence_report",
+                "--policy-json",
+                str(cfg.wf_policy_current),
+                "--executor-jsonl",
+                str(cfg.executor_jsonl),
+                "--tz",
+                str(os.getenv("REPORT_TZ", cfg.report_tz)),
+                "--days",
+                str(os.getenv("DAILY_ADHERENCE_DAYS", "7")),
+                "--out",
+                str(adh_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        adh = _read_json(adh_json)
+        if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
+            extra.append("\n### 99.4 Aderência OOS (portfolio por dia × execução)\n\n")
+            extra.append(f"- Arquivo: `{adh_json}`\n")
+            extra.append(f"- Policy current: `{cfg.wf_policy_current}`\n\n")
+
+            extra.append("**Resumo (últimos dias)**\n\n")
+            extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | ROI Back (stake) | ROI Lay (liability) |\n")
+            extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for it in adh.get("per_day") or []:
+                if not isinstance(it, dict):
+                    continue
+                pol = it.get("policy") if isinstance(it.get("policy"), dict) else {}
+                nkeys = pol.get("n_active_keys")
+                bridge_rows = 0
+                skipped_na = 0
+                for b in (it.get("bridge") or []):
+                    if isinstance(b, dict):
+                        bridge_rows += int(b.get("n_rows") or 0)
+                        skipped_na += int(b.get("n_not_active") or 0)
+                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                sc = ex.get("status_counts") if isinstance(ex.get("status_counts"), dict) else {}
+                live_ok = int(sc.get("LIVE_OK") or 0)
+                dry_ok = int(sc.get("DRY_OK") or 0)
+                back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+                lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+                extra.append(
+                    f"| {it.get('day')} | {nkeys if nkeys is not None else '—'} | {bridge_rows} | {skipped_na} | "
+                    f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {_fmt_pct(back.get('roi_pct'))} | {_fmt_pct(lay.get('roi_pct_per_liability'))} |\n"
+                )
+            extra.append("\n")
+    except Exception:
+        pass
 
     combined_md = day_dir / "report_daily.md"
     combined_md.write_text(base_md.read_text(encoding="utf-8") + "".join(extra), encoding="utf-8")

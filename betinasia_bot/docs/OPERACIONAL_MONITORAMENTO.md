@@ -61,11 +61,40 @@ KPIs de execução (lag/slippage/status) a partir do JSONL do executor:
 python3 -m ops.execution_kpis --jsonl logs/executor_live.jsonl --last 5000
 ```
 
+Como ler as tabelas:
+- **Status (all)**: contagem por `result.status` em `logs/executor_live.jsonl`.
+  - `LIVE_OK`: aposta real enviada/confirmada (`EXECUTOR_ALLOW_LIVE=1` + request `is_live=true`)
+  - `DRY_OK`: abriu betslip e capturou odd final, **sem** apostar (dry-run)
+  - `NO_SESSION`: sem sessão/logado (ou sessão expirada)
+  - `API_FAILED`: falha de API/timeout/erro ao abrir betslip ou confirmar
+  - `RATE_LIMIT`: rate limit/backoff
+- **Latência (somente LIVE_OK/DRY_OK)**:
+  - `queue_delay_ms`: tempo na fila do executor antes do worker iniciar
+  - `call_to_done_ms`: tempo total observado desde `created_at` até o resultado (wall clock)
+  - `post_ms`: tempo do request principal (ex.: abrir betslip / place order)
+- **Slippage** só aparece quando o JSONL tem `odd_at_decision` **e** `odd_final` na mesma linha.
+
 Relatório diário completo (OOS + execução + accounting + PDF + Telegram):
 
 ```bash
 python3 -m ops.daily_full_report
 ```
+
+Saídas importantes do daily:
+- `logs/daily_reports/YYYYMMDD/report_daily.pdf`: relatório completo (inclui seção 99)
+- `logs/wf_policy_current.json`: policy “corrente” (export do walk-forward, usado pelo bridge)
+- `logs/policy_history/wf_policy_YYYYMMDD.json`: histórico diário do export
+- `logs/daily_reports/YYYYMMDD/oos_adherence.json`: aderência (portfolio por dia × execução × ROI por placar)
+
+### Policy OOS ativa (mecânica de atualização)
+O `ops.daily_full_report` roda o walk-forward e faz:
+- export diário da policy (JSON) em `logs/policy_history/`
+- atualização **atômica** do “ponteiro” `logs/wf_policy_current.json`
+
+O bridge (`ops/executor_bridge_audit.py`) aplica essa policy quando você setar:
+- `BRIDGE_POLICY_JSON=logs/wf_policy_current.json`
+- `BRIDGE_POLICY_RELOAD_SEC=5` (recarrega automaticamente quando o arquivo muda)
+- `BRIDGE_POLICY_USE_BASE=1` (opcional: ignora sufixo de liga, usa `active_keys_base`)
 
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
