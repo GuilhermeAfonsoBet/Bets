@@ -65,6 +65,7 @@ class H3bApiAudit:
         gate_max_late_sec: float = 2.5,
         gate_lay_refresh: bool = False,
         gate_lay_refresh_times_sec: Optional[List[float]] = None,
+        api_sides: str = "both",
     ):
         self.num_audits = num_audits
         self.direction = direction
@@ -136,6 +137,9 @@ class H3bApiAudit:
             if (gate_lay_refresh_times_sec is None)
             else [float(x) for x in gate_lay_refresh_times_sec if x is not None and float(x) >= 0.0]
         )
+        self.api_sides = (str(api_sides or "both").strip().lower() or "both")
+        if self.api_sides not in ("back", "lay", "both"):
+            self.api_sides = "both"
 
         # Contadores (observabilidade)
         self.gate_seen = 0
@@ -1215,6 +1219,13 @@ class H3bApiAudit:
             'post_ms': 0,
             'pmm_ms': 0,
         }
+        # Versionamento: evita misturar "api back-only" com o legado v4.0-api.
+        if self.api_sides == "back":
+            base["audit_version"] = "v5.2-api-back"
+        elif self.api_sides == "lay":
+            base["audit_version"] = "v5.2-api-lay"
+        else:
+            base["audit_version"] = "v4.0-api"
 
         # Backoff global: não chama API enquanto bloqueado (rate limit / instabilidade),
         # preserva a operação e reduz STALE por fila acumulada.
@@ -1263,33 +1274,44 @@ class H3bApiAudit:
             })
             return base
 
-        # Constrói bet_types
+        # Constrói bet_types (somente os necessários)
         t_build = time.time()
-        back_bet_type = ApiBetslipClient.build_bet_type(
-            market_type=h3b['market_type'],
-            side=h3b['side'],
-            line=h3b['line'],
-        )
-        lay_bet_type = ApiBetslipClient.build_lay_bet_type(
-            market_type=h3b['market_type'],
-            side=h3b['side'],
-            line=h3b['line'],
-        )
+        back_bet_type = None
+        lay_bet_type = None
+        if self.api_sides in ("back", "both"):
+            back_bet_type = ApiBetslipClient.build_bet_type(
+                market_type=h3b['market_type'],
+                side=h3b['side'],
+                line=h3b['line'],
+            )
+        if self.api_sides in ("lay", "both"):
+            lay_bet_type = ApiBetslipClient.build_lay_bet_type(
+                market_type=h3b['market_type'],
+                side=h3b['side'],
+                line=h3b['line'],
+            )
         build_bet_type_ms = int((time.time() - t_build) * 1000)
 
-        # === T+0: BACK + LAY SIMULTÂNEOS ===
+        # === T+0: BACK e/ou LAY ===
         t_parallel = time.time()
-        back_task = self.api_client.get_betslip_odds(
-            event_id=h3b['event_id'],
-            bet_type=back_bet_type,
-        )
-        lay_task = self.api_client.get_betslip_odds(
-            event_id=h3b['event_id'],
-            bet_type=lay_bet_type,
-            betslip_type="lay",
-        )
-        
-        back_result, lay_result = await asyncio.gather(back_task, lay_task, return_exceptions=True)
+        back_result = None
+        lay_result = None
+        if self.api_sides == "back":
+            back_result = await self.api_client.get_betslip_odds(event_id=h3b['event_id'], bet_type=str(back_bet_type))
+        elif self.api_sides == "lay":
+            lay_result = await self.api_client.get_betslip_odds(
+                event_id=h3b['event_id'],
+                bet_type=str(lay_bet_type),
+                betslip_type="lay",
+            )
+        else:
+            back_task = self.api_client.get_betslip_odds(event_id=h3b['event_id'], bet_type=str(back_bet_type))
+            lay_task = self.api_client.get_betslip_odds(
+                event_id=h3b['event_id'],
+                bet_type=str(lay_bet_type),
+                betslip_type="lay",
+            )
+            back_result, lay_result = await asyncio.gather(back_task, lay_task, return_exceptions=True)
         parallel_fetch_ms = int((time.time() - t_parallel) * 1000)
         
         # Trata exceções
@@ -1320,10 +1342,13 @@ class H3bApiAudit:
             'back_error': back_result.error if (back_result and not back_result.success and back_result.error) else '',
             'lay_error': lay_result.error if (lay_result and not lay_result.success and lay_result.error) else '',
         })
-        base['post_ms'] = back_post_ms
-        base['pmm_ms'] = back_pmm_ms
+        # Mantém compatibilidade: post_ms/pmm_ms refletem BACK quando existir, senão LAY.
+        base['post_ms'] = back_post_ms if back_post_ms > 0 else lay_post_ms
+        base['pmm_ms'] = back_pmm_ms if back_pmm_ms > 0 else lay_pmm_ms
 
-        if not back_result or not back_result.success:
+        # Critério de sucesso depende do lado primário escolhido
+        primary = back_result if (self.api_sides in ("back", "both")) else lay_result
+        if not primary or not primary.success:
             lay_snapshot = _extract_lay_snapshot(lay_result)
             if lay_snapshot:
                 base.update({
@@ -1333,7 +1358,7 @@ class H3bApiAudit:
                     'lay_num_bk': lay_snapshot['num_bk'],
                 })
 
-            back_err = back_result.error if back_result else 'Back failed'
+            back_err = primary.error if primary else ('Back failed' if self.api_sides != "lay" else 'Lay failed')
             if lay_result and not lay_result.success and lay_result.error:
                 back_err = f"{back_err} | lay={lay_result.error}"
 
@@ -1381,29 +1406,50 @@ class H3bApiAudit:
             return base
 
         ws_odd = h3b['websocket_odd']
-        diff = ((back_result.best_odd - ws_odd) / ws_odd) * 100 if ws_odd else 0
+        if self.api_sides == "lay":
+            # Em lay-only, persistimos "bs_*" como snapshot do ticket LAY (para compatibilidade com bridge)
+            lay_snapshot = _extract_lay_snapshot(lay_result)
+            if not lay_snapshot:
+                base.update({'success': False, 'status': 'API_FAILED', 'bs_odd': 0, 'bs_limit': 0, 'num_bk': 0, 'diff_pct': 0, 'error': 'Lay snapshot missing'})
+                return base
+            diff = ((float(lay_snapshot['odd']) - ws_odd) / ws_odd) * 100 if ws_odd else 0
+            base.update({
+                'success': True,
+                'status': 'OK',
+                'bs_odd': float(lay_snapshot['odd']),
+                'bs_bookie': lay_snapshot['bookie'],
+                'bs_limit': float(lay_snapshot['limit']),
+                'num_bk': int(lay_snapshot['num_bk']),
+                'diff_pct': diff,
+                'lay_odd': lay_snapshot['odd'],
+                'lay_bookie': lay_snapshot['bookie'],
+                'lay_limit': lay_snapshot['limit'],
+                'lay_num_bk': lay_snapshot['num_bk'],
+            })
+        else:
+            diff = ((back_result.best_odd - ws_odd) / ws_odd) * 100 if ws_odd else 0
 
-        base.update({
-            'success': True,
-            'status': 'OK',
-            'bs_odd': back_result.best_odd,
-            'bs_bookie': back_result.best_bookie,
-            'bs_limit': back_result.best_limit,
-            'second_odd': back_result.second_odd,
-            'second_bookie': back_result.second_bookie,
-            'highest_limit': back_result.highest_limit,
-            'highest_limit_bookie': back_result.highest_limit_bookie,
-            'num_bk': back_result.num_bookmakers,
-            'diff_pct': diff,
-        })
+            base.update({
+                'success': True,
+                'status': 'OK',
+                'bs_odd': back_result.best_odd,
+                'bs_bookie': back_result.best_bookie,
+                'bs_limit': back_result.best_limit,
+                'second_odd': back_result.second_odd,
+                'second_bookie': back_result.second_bookie,
+                'highest_limit': back_result.highest_limit,
+                'highest_limit_bookie': back_result.highest_limit_bookie,
+                'num_bk': back_result.num_bookmakers,
+                'diff_pct': diff,
+            })
 
-        # Lay (capturado simultaneamente ao back)
-        lay_snapshot = _extract_lay_snapshot(lay_result)
-        if lay_snapshot:
-            base['lay_odd'] = lay_snapshot['odd']
-            base['lay_bookie'] = lay_snapshot['bookie']
-            base['lay_limit'] = lay_snapshot['limit']
-            base['lay_num_bk'] = lay_snapshot['num_bk']
+            # Lay (capturado simultaneamente ao back)
+            lay_snapshot = _extract_lay_snapshot(lay_result)
+            if lay_snapshot:
+                base['lay_odd'] = lay_snapshot['odd']
+                base['lay_bookie'] = lay_snapshot['bookie']
+                base['lay_limit'] = lay_snapshot['limit']
+                base['lay_num_bk'] = lay_snapshot['num_bk']
 
         back_betslip_id = back_result.betslip_id if back_result and back_result.success else ""
         lay_betslip_id = lay_result.betslip_id if lay_result and lay_result.success else ""
@@ -2135,6 +2181,12 @@ async def main():
         default=str(default_offsets),
         help="Offsets (segundos) para amostragem WS (ex: '0,3,6,...,30').",
     )
+    parser.add_argument(
+        "--api-sides",
+        default=(os.getenv("AUDIT_API_SIDES", "both") or "both").strip(),
+        choices=["back", "lay", "both"],
+        help="Somente para --mode api: quais lados chamar (back, lay, both). Default: both.",
+    )
     # Gate: H3B UP + queda em 5s -> abre ticket LAY
     parser.add_argument("--gate-drop-offset-sec", type=float, default=float(os.getenv("GATE_DROP_OFFSET_SEC", "5")), help="Gate: offset (s) para comparar WS(t+offset) vs WS(t0). Default=5.")
     parser.add_argument("--gate-drop-ratio", type=float, default=float(os.getenv("GATE_DROP_RATIO", "0.98")), help="Gate: condição WS(t+offset) < ratio * WS(t0). Default=0.98 (queda >2%).")
@@ -2203,6 +2255,7 @@ async def main():
         gate_max_late_sec=float(getattr(args, "gate_max_late_sec", 2.5)),
         gate_lay_refresh=bool(getattr(args, "gate_lay_refresh", False)),
         gate_lay_refresh_times_sec=gate_refresh_times,
+        api_sides=str(getattr(args, "api_sides", "both")),
     )
 
     # SIGTERM/SIGINT: encerra gracioso (evita chrome órfão e stop timeout)

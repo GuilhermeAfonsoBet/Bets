@@ -14,6 +14,24 @@
 sudo systemctl status --no-pager -n 80 betinasia-collector betinasia-audit-api
 ```
 
+### Auditoria Back + Lay em paralelo (2 audits)
+Para executar **Back e Lay** sob policy OOS, você precisa gerar oportunidades executáveis para ambos:
+- `betinasia-audit-api` (já existente): `--mode ws_gate_lay` (Lay via gate)
+- `betinasia-audit-api-back` (novo): `--mode api --api-sides back` (Back via API, back-only)
+
+Instalar o unit do Back:
+
+```bash
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-audit-api-back.service')" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-audit-api-back
+sudo systemctl status --no-pager -n 80 betinasia-audit-api-back
+```
+
+Notas:
+- O Back-only grava como `audit_version=v5.2-api-back` (não mistura com `v4.0-api` antigo).
+- Inclua `v5.2-api-back` em `DAILY_OOS_VERSIONS` para aparecer nos relatórios e no OOS.
+
 ### Saldo + P&L (Accounting)
 
 Há um monitor paralelo que baixa os CSVs de:
