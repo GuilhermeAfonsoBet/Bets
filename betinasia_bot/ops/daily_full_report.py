@@ -112,6 +112,21 @@ class DailyReportCfg:
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))
 
+    def __post_init__(self) -> None:
+        # Releitura de env em runtime (importante quando rodando manualmente e carregando .env em main()).
+        self.versions = os.getenv("DAILY_OOS_VERSIONS", self.versions)
+        self.direction = os.getenv("DAILY_OOS_DIRECTION", self.direction)
+        self.lookback_days = os.getenv("DAILY_OOS_LOOKBACK_DAYS", self.lookback_days)
+        self.report_mode = os.getenv("DAILY_REPORT_MODE", self.report_mode)
+        self.wf_policy_current = Path(os.getenv("DAILY_WF_POLICY_CURRENT", str(self.wf_policy_current)))
+        self.wf_policy_history_dir = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", str(self.wf_policy_history_dir)))
+        self.wf_policy_history_jsonl = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", str(self.wf_policy_history_jsonl)))
+        self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
+        try:
+            self.exec_kpi_last = int(os.getenv("DAILY_EXEC_KPI_LAST", str(self.exec_kpi_last)))
+        except Exception:
+            pass
+
 
 async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     ts = _utcnow()
