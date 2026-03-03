@@ -1779,6 +1779,21 @@ class H3bApiAudit:
                 'lay_limit': lay_snapshot['limit'],
                 'lay_num_bk': lay_snapshot['num_bk'],
             })
+            # Para compatibilizar com análises e bridge:
+            # - registramos a odd/limit do ticket LAY como "bs_*" (odd efetiva no betslip)
+            # - diff_pct passa a ser comparável ao WS(t0): (ticket - ws0) / ws0
+            try:
+                base['bs_odd'] = float(lay_snapshot['odd'])
+                base['bs_limit'] = float(lay_snapshot['limit'])
+                base['num_bk'] = int(lay_snapshot['num_bk'])
+                if ws0 and float(ws0) > 0:
+                    base['diff_pct'] = (float(base['bs_odd']) - float(ws0)) / float(ws0) * 100.0
+                else:
+                    base['diff_pct'] = None
+                # Marca explicitamente como oportunidade executável quando o gate abriu ticket com sucesso
+                base['is_valid_opportunity'] = True
+            except Exception:
+                pass
 
         retry_after = int(getattr(lay_result, "rate_limit_retry_after_sec", 0) or 0) if lay_result else 0
         if retry_after > 0:
@@ -1843,10 +1858,11 @@ class H3bApiAudit:
         base.update({
             'success': True,
             'status': 'OK',
-            'bs_odd': None,
-            'bs_limit': 0,
-            'num_bk': 0,
-            'diff_pct': None,
+            # preserva o snapshot do ticket (se houver)
+            'bs_odd': base.get('bs_odd'),
+            'bs_limit': base.get('bs_limit', 0),
+            'num_bk': base.get('num_bk', 0),
+            'diff_pct': base.get('diff_pct'),
             'error': '',
             'total_ms': end_to_end_ms,
             'telemetry': telemetry,
@@ -1905,7 +1921,17 @@ class H3bApiAudit:
             is_valid = r.get("is_valid_opportunity")
             if is_valid is None:
                 try:
-                    is_valid = bool(has_bs and (diff_pct is not None) and abs(float(diff_pct)) < 2.0)
+                    # "Oportunidade válida" deve significar:
+                    # - existe snapshot do ticket (bs_odd)
+                    # - diferença BS vs WS está dentro de um range confiável (evita parse/mismatch)
+                    # - e há edge mínimo (compatível com buckets do relatório)
+                    dp = float(diff_pct) if (diff_pct is not None) else None
+                    is_valid = bool(
+                        has_bs
+                        and (dp is not None)
+                        and (-10.0 <= float(dp) <= 10.0)
+                        and (abs(float(dp)) >= 2.0)
+                    )
                 except Exception:
                     is_valid = bool(has_bs)
 
