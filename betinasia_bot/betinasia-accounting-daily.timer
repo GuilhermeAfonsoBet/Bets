@@ -1,9 +1,8 @@
 [Unit]
-Description=Run BetinAsia Accounting snapshot daily 19:00 BRT
+Description=Run BetinAsia Accounting snapshot daily 19:00 BRT (22:00 UTC)
 
 [Timer]
-OnCalendar=*-*-* 19:00:00
-TimeZone=America/Sao_Paulo
+OnCalendar=*-*-* 22:00:00 UTC
 Persistent=true
 RandomizedDelaySec=120
 Unit=betinasia-accounting-daily.service
