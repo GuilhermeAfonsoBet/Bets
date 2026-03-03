@@ -73,6 +73,39 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         for x in r.fetchall() or []:
             rows.append(_json_safe(dict(x._mapping)))
 
+    # Top erros (api_error) por versão/status para entender "por que não-OK"
+    q_err = text(
+        """
+        SELECT
+          audit_version,
+          status,
+          COALESCE(hypothesis_details->>'api_error', '') AS api_error,
+          COUNT(*)::bigint AS n
+        FROM betslip_audit_results
+        WHERE hypothesis_type = :hyp
+          AND reversal_direction = :direction
+          AND audited_at >= :since
+          AND status <> 'OK'
+          AND hypothesis_details IS NOT NULL
+          AND (hypothesis_details::jsonb ? 'api_error')
+        GROUP BY 1,2,3
+        ORDER BY n DESC;
+        """
+    )
+    err_rows: List[Dict[str, Any]] = []
+    async with db.async_session() as session:
+        r = await session.execute(q_err, {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since})
+        for x in r.fetchall() or []:
+            err_rows.append(_json_safe(dict(x._mapping)))
+
+    top_errors_by_version: Dict[str, List[Dict[str, Any]]] = {}
+    for it in err_rows:
+        ver = str(it.get("audit_version") or "NA")
+        top_errors_by_version.setdefault(ver, []).append(it)
+    # keep only top 8 per version
+    for ver, xs in list(top_errors_by_version.items()):
+        top_errors_by_version[ver] = xs[:8]
+
     # pivot leve: por version
     by_version: Dict[str, Dict[str, Any]] = {}
     for it in rows:
@@ -115,6 +148,8 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         "direction": cfg.direction,
         "hypothesis_type": cfg.hypothesis_type,
         "rows": rows,
+        "error_rows": err_rows,
+        "top_errors_by_version": top_errors_by_version,
         "by_version": sorted(by_version.values(), key=lambda x: int(x.get("total") or 0), reverse=True),
     }
     out = _json_safe(out)

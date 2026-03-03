@@ -423,6 +423,25 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"| {v.get('audit_version')} | {total} | {nok} | {int(v.get('ok_with_bs') or 0)} | {int(v.get('ok_valid') or 0)} | {top} |\n"
                 )
             extra.append("\n")
+
+            # Top api_error (quando houver) para explicar API_FAILED/NO_SESSION/etc.
+            tev = rep.get("top_errors_by_version") if isinstance(rep.get("top_errors_by_version"), dict) else {}
+            if tev:
+                extra.append("**Top erros (api_error) por versão**\n\n")
+                for ver, xs in tev.items():
+                    if not isinstance(xs, list) or not xs:
+                        continue
+                    extra.append(f"- `{ver}`:\n")
+                    for it in xs[:5]:
+                        if not isinstance(it, dict):
+                            continue
+                        st = str(it.get("status") or "NA")
+                        err = str(it.get("api_error") or "").strip()
+                        n = int(it.get("n") or 0)
+                        if err:
+                            err = (err[:180] + "…") if len(err) > 180 else err
+                            extra.append(f"  - {st} ×{n}: `{err}`\n")
+                    extra.append("\n")
     except Exception:
         pass
 
