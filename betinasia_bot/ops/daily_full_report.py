@@ -100,15 +100,24 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # 1) Accounting snapshot + report
     acct_out = day_dir / "accounting_daily_report.json"
-    acct = await run_acct_daily(
-        AcctDailyCfg(
-            out_dir=Path(os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting")),
-            jsonl=Path(os.getenv("ACCOUNTING_JSONL", "logs/accounting_snapshots.jsonl")),
-            tz_name=str(os.getenv("REPORT_TZ", cfg.report_tz)),
-            report_out=acct_out,
-            print_json=False,
+    acct: Dict[str, Any] = {}
+    try:
+        acct = await run_acct_daily(
+            AcctDailyCfg(
+                out_dir=Path(os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting")),
+                jsonl=Path(os.getenv("ACCOUNTING_JSONL", "logs/accounting_snapshots.jsonl")),
+                tz_name=str(os.getenv("REPORT_TZ", cfg.report_tz)),
+                report_out=acct_out,
+                print_json=False,
+            )
         )
-    )
+    except Exception as e:
+        # Não aborta o daily: ainda queremos OOS + KPIs + aderência mesmo sem login no accounting.
+        acct = {"ts": ts.isoformat(), "error": f"ACCOUNTING_FAILED: {str(e)[:200]}"}
+        try:
+            acct_out.write_text(json.dumps(acct, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     # 2) Execution KPIs (all + success-only)
     exec_lines = []
@@ -218,6 +227,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     extra.append("\n\n## 99) Operacional — saldo, P&L e execução\n\n")
     extra.append("### 99.1 Accounting (saldo + P&L)\n\n")
     extra.append(f"- Arquivo: `{acct_out}`\n")
+    if acct.get("error"):
+        extra.append(f"- **Erro**: **{acct.get('error')}**\n")
     extra.append(f"- Saldo atual: **{acct.get('balance_current')}**\n")
     extra.append(f"- P&L hoje/semana/mês: **{acct.get('pnl_today')} / {acct.get('pnl_week')} / {acct.get('pnl_month')}**\n")
     extra.append("\nMeses fechados:\n\n")
