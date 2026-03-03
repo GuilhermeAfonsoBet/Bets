@@ -49,6 +49,20 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _json_safe(x: Any) -> Any:
+    if isinstance(x, datetime):
+        return x.isoformat()
+    if isinstance(x, date):
+        return x.isoformat()
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_json_safe(v) for v in list(x)]
+    return x
+
+
 def _iter_dates(d0: date, d1: date) -> Iterable[date]:
     cur = d0
     while cur <= d1:
@@ -428,6 +442,7 @@ async def run_report(
         "policy_days": active_by_day,
         "per_day": per_day,
     }
+    out = _json_safe(out)
     if out_json:
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")

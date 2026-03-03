@@ -17,6 +17,18 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _json_safe(x: Any) -> Any:
+    if isinstance(x, datetime):
+        return x.isoformat()
+    if isinstance(x, timedelta):
+        return x.total_seconds()
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+    return x
+
+
 @dataclass
 class AuditStatusCfg:
     hours: float = 24.0
@@ -59,7 +71,7 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
     async with db.async_session() as session:
         r = await session.execute(q, {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since})
         for x in r.fetchall() or []:
-            rows.append(dict(x._mapping))
+            rows.append(_json_safe(dict(x._mapping)))
 
     # pivot leve: por version
     by_version: Dict[str, Dict[str, Any]] = {}
@@ -105,6 +117,7 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         "rows": rows,
         "by_version": sorted(by_version.values(), key=lambda x: int(x.get("total") or 0), reverse=True),
     }
+    out = _json_safe(out)
     try:
         await db.close()
     except Exception:
