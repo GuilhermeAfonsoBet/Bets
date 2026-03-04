@@ -3578,7 +3578,7 @@ async def main() -> int:
                 lay_lim = _safe_float(d.get("limit"))
             return _max_stake_from_limit(float(lay_lim or 0.0))
 
-        def _sizing_back(d: dict, scheme: str) -> Optional[float]:
+        def _sizing_back(d: dict, scheme: str, *, bank_ref: float) -> Optional[float]:
             """
             Retorna stake (em unidade monetária proxy).
             """
@@ -3597,14 +3597,14 @@ async def main() -> int:
                 if f is None:
                     return None
                 f = max(0.0, f) * frac
-                cap = BACK_CAP_FRAC * max(1e-9, back_bank_ref)
-                st = min(f * back_bank_ref, cap)
+                cap = BACK_CAP_FRAC * max(1e-9, float(bank_ref))
+                st = min(f * float(bank_ref), cap)
                 # cap adicional por evento (limit)
                 st = min(float(st), float(_max_back_stake_event(d)))
                 return float(st)
             return None
 
-        def _sizing_lay_liab(d: dict, scheme: str) -> Optional[Tuple[float, float]]:
+        def _sizing_lay_liab(d: dict, scheme: str, *, bank_ref: float) -> Optional[Tuple[float, float]]:
             """
             Retorna (liability, lay_odd) em unidade monetária proxy.
             Para Lay, o sizing governado por liability.
@@ -3629,8 +3629,8 @@ async def main() -> int:
                 if f is None:
                     return None
                 f = max(0.0, f) * frac
-                cap = LAY_CAP_FRAC * max(1e-9, lay_bank_ref)
-                liab = min(f * lay_bank_ref, cap)
+                cap = LAY_CAP_FRAC * max(1e-9, float(bank_ref))
+                liab = min(f * float(bank_ref), cap)
                 # cap adicional por evento (limit): converte stake max -> liab max
                 max_st = _max_lay_stake_event(d)
                 liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
@@ -3648,7 +3648,7 @@ async def main() -> int:
 
         schemes = ["FLAT", "PROXY"] + [f"KELLY_{f:.2f}" for f in frac_list]
 
-        def _eval_back(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+        def _eval_back(rows_in: List[dict], scheme: str, *, bank_ref: float) -> Dict[str, Any]:
             pnls = []
             stakes = []
             mids = []
@@ -3657,7 +3657,7 @@ async def main() -> int:
                 roi = _safe_float(d.get("roi_bs"))
                 if roi is None:
                     continue
-                st = _sizing_back(d, scheme)
+                st = _sizing_back(d, scheme, bank_ref=float(bank_ref))
                 if st is None or st <= 0:
                     continue
                 pnl = _pnl_back(roi, st)
@@ -3685,7 +3685,7 @@ async def main() -> int:
                 "dd_p95": dd_p95,
             }
 
-        def _eval_lay(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+        def _eval_lay(rows_in: List[dict], scheme: str, *, bank_ref: float) -> Dict[str, Any]:
             pnls = []
             liabs = []
             stakes = []
@@ -3694,7 +3694,7 @@ async def main() -> int:
                 mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
                 if mult is None:
                     continue
-                sized = _sizing_lay_liab(d, scheme)
+                sized = _sizing_lay_liab(d, scheme, bank_ref=float(bank_ref))
                 if not sized:
                     continue
                 liab, lay_odd = sized
@@ -3736,8 +3736,8 @@ async def main() -> int:
         lines.append("**Backtest de sizing (apenas eventos com placar; valores em unidade monetária *proxy*)**\n\n")
         lines.append("| Lado | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover | p99 exposição | ES95 exposição | DD 30d (média) | DD 30d (p95) |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for sc in schemes:
-            eb = _eval_back(back_finished, sc)
-            el = _eval_lay(lay_finished, sc)
+            eb = _eval_back(back_finished, sc, bank_ref=float(back_bank_ref))
+            el = _eval_lay(lay_finished, sc, bank_ref=float(lay_bank_ref))
             lines.append(
                 f"| Back | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | "
                 f"{_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['es95_stake'],2)} | {_fmt_num(eb['dd_mean'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
@@ -3746,6 +3746,29 @@ async def main() -> int:
                 f"| Lay | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | "
                 f"{_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['es95_liab'],2)} | {_fmt_num(el['dd_mean'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
             )
+
+        # Requisito (relatório): repetir o backtest para 4 bancas explícitas.
+        # Observação: FLAT/PROXY não dependem de banca; o impacto aparece principalmente nos KELLY_*.
+        kelly_default = "KELLY_0.25" if "KELLY_0.25" in schemes else next((s for s in schemes if s.startswith("KELLY_")), None)
+        schemes_4bank = [s for s in ["FLAT", "PROXY", kelly_default] if s]
+        if kelly_default:
+            lines.append("\n**Backtest de sizing por banca (10k/50k/100k/500k; foco em FLAT/PROXY/KELLY)**\n\n")
+            for bank_ref_use in [10000, 50000, 100000, 500000]:
+                lines.append(f"**Banca (ref) = {bank_ref_use:,}**\n\n".replace(",", "."))
+                lines.append("| Lado | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover | p99 exposição | ES95 exposição | DD 30d (média) | DD 30d (p95) |\n")
+                lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                for sc in schemes_4bank:
+                    eb = _eval_back(back_finished, sc, bank_ref=float(bank_ref_use))
+                    el = _eval_lay(lay_finished, sc, bank_ref=float(bank_ref_use))
+                    lines.append(
+                        f"| Back | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | "
+                        f"{_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['es95_stake'],2)} | {_fmt_num(eb['dd_mean'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
+                    )
+                    lines.append(
+                        f"| Lay | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | "
+                        f"{_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['es95_liab'],2)} | {_fmt_num(el['dd_mean'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
+                    )
+                lines.append("\n")
         lines.append(
             "\nLeitura:\n"
             "- Se `PROXY` piora ROI/turnover vs `FLAT`, isso indica que a política de stake atual está concentrando exposição em pontos com pior performance.\n"
@@ -3792,14 +3815,14 @@ async def main() -> int:
                     if side == "Back":
                         rows_fin = [d for d in rows_combo if d.get("roi_bs") is not None]
                         for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
-                            eb = _eval_back(rows_fin, sc)
+                            eb = _eval_back(rows_fin, sc, bank_ref=float(back_bank_ref))
                             lines.append(
                                 f"| {side} | {regime_label} | {rev_label} | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | {_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
                             )
                     else:
                         rows_fin = [d for d in rows_combo if d.get("home_score") is not None and d.get("away_score") is not None]
                         for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
-                            el = _eval_lay(rows_fin, sc)
+                            el = _eval_lay(rows_fin, sc, bank_ref=float(lay_bank_ref))
                             lines.append(
                                 f"| {side} | {regime_label} | {rev_label} | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | {_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
                             )
@@ -3851,7 +3874,7 @@ async def main() -> int:
 
         FX = float(args.fx_usdbrl or 5.20)
 
-        def _liq_bank_from_sized(rows_b_all: List[dict], rows_l_all: List[dict], scheme: str) -> Optional[float]:
+        def _liq_bank_from_sized(rows_b_all: List[dict], rows_l_all: List[dict], scheme: str, *, bank_ref_use: float) -> Optional[float]:
             """Banca por liquidez: p99 do capital simultaneamente travado (com buffer)."""
             # Reusa premissas de liquidez do 7.3 (defaults/env)
             settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
@@ -3869,7 +3892,7 @@ async def main() -> int:
                 t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
                 if t1 <= t0:
                     t1 = t0 + timedelta(hours=(dur_h + settle_h))
-                st = _sizing_back(d, scheme)
+                st = _sizing_back(d, scheme, bank_ref=float(bank_ref_use))
                 if st is None or float(st) <= 0:
                     continue
                 jobs.append((t0, t1, float(st)))
@@ -3882,7 +3905,7 @@ async def main() -> int:
                 t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
                 if t1 <= t0:
                     t1 = t0 + timedelta(hours=(dur_h + settle_h))
-                sized = _sizing_lay_liab(d, scheme)
+                sized = _sizing_lay_liab(d, scheme, bank_ref=float(bank_ref_use))
                 if not sized:
                     continue
                 liab, _ = sized
@@ -3912,8 +3935,8 @@ async def main() -> int:
             return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
 
         def _summ_strategy(name: str, rows_b: List[dict], rows_l: List[dict], scheme: str):
-            eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme)
-            el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme)
+            eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme, bank_ref=float(back_bank_ref))
+            el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme, bank_ref=float(lay_bank_ref))
 
             back_n = int(eb["n"] or 0)
             lay_n = int(el["n"] or 0)
@@ -3937,12 +3960,12 @@ async def main() -> int:
             # Banca por risco (unitária) deve vir do sizing (não só do subconjunto com ROI).
             risk_back = []
             for d in rows_b:
-                st = _sizing_back(d, scheme)
+                st = _sizing_back(d, scheme, bank_ref=float(back_bank_ref))
                 if st is not None and float(st) > 0:
                     risk_back.append(float(st))
             risk_lay = []
             for d in rows_l:
-                sized = _sizing_lay_liab(d, scheme)
+                sized = _sizing_lay_liab(d, scheme, bank_ref=float(lay_bank_ref))
                 if sized and sized[0] is not None and float(sized[0]) > 0:
                     risk_lay.append(float(sized[0]))
             bank_back_p99 = _pctl(risk_back, 99) if risk_back else None
@@ -3951,7 +3974,8 @@ async def main() -> int:
             if bank_back_p99 is not None or bank_lay_p99 is not None:
                 bank_risk_total = float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)
 
-            bank_liq_total = _liq_bank_from_sized(rows_b, rows_l, scheme)
+            bank_ref_liq = float(kelly_bankroll) if use_bankroll else float(max(float(back_bank_ref), float(lay_bank_ref)))
+            bank_liq_total = _liq_bank_from_sized(rows_b, rows_l, scheme, bank_ref_use=bank_ref_liq)
             bank_eff = None
             if bank_risk_total is not None or bank_liq_total is not None:
                 bank_eff = max(float(bank_risk_total or 0.0), float(bank_liq_total or 0.0))
@@ -4744,7 +4768,7 @@ async def main() -> int:
                         if sc == "FLAT":
                             st = float(wf_flat_stake_back)
                         elif sc == "PROXY":
-                            st = _sizing_back(d0, "PROXY")
+                            st = _sizing_back(d0, "PROXY", bank_ref=float(back_bank_ref))
                         elif str(sc).startswith("KELLY"):
                             # Kelly no WF deve usar a odd de entrada do evento (pode vir de WS proxy em ws-only)
                             if d0.get("is_live") is True:
@@ -5877,7 +5901,7 @@ async def main() -> int:
                             if sc == "FLAT":
                                 st = float(wf_flat_stake_back)
                             elif sc == "PROXY":
-                                st = _sizing_back(d0, "PROXY")
+                                st = _sizing_back(d0, "PROXY", bank_ref=float(back_bank_ref))
                             elif str(sc).upper() == "ROI_TRAIN":
                                 k = _key(ev)
                                 roi_hat = _safe_float((roi_train_map or {}).get(k))
@@ -5922,7 +5946,7 @@ async def main() -> int:
                         if sc == "FLAT":
                             liab = float(wf_flat_liab_lay)
                         elif sc == "PROXY":
-                            sized = _sizing_lay_liab(d0, "PROXY")
+                            sized = _sizing_lay_liab(d0, "PROXY", bank_ref=float(lay_bank_ref))
                             if not sized:
                                 return (None, None)
                             liab = float(sized[0])
