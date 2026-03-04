@@ -131,6 +131,36 @@ def _week_start_iso(day_iso: str) -> Optional[str]:
         return None
 
 
+def _month_key(day_iso: str) -> Optional[str]:
+    try:
+        from datetime import date as _date
+
+        d = _date.fromisoformat(str(day_iso))
+        return f"{d.year:04d}-{d.month:02d}"
+    except Exception:
+        return None
+
+
+def _agg_by_week(pnls_by_day: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for d, v in pnls_by_day.items():
+        ws = _week_start_iso(d)
+        if not ws:
+            continue
+        out[ws] = float(out.get(ws, 0.0)) + float(v or 0.0)
+    return dict(sorted(out.items()))
+
+
+def _agg_by_month(pnls_by_day: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for d, v in pnls_by_day.items():
+        mk = _month_key(d)
+        if not mk:
+            continue
+        out[mk] = float(out.get(mk, 0.0)) + float(v or 0.0)
+    return dict(sorted(out.items()))
+
+
 def _max_drawdown(pnls_by_day: Dict[str, float]) -> Dict[str, Any]:
     """
     Max drawdown em unidade monetária, usando curva de equity = cumsum(P&L diário).
@@ -508,6 +538,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
         # drawdown e sharpe (curto, usando a própria janela da série)
         dd = _max_drawdown({k: float(v) for k, v in pnls.items()})
+        dd_w = _max_drawdown(_agg_by_week({k: float(v) for k, v in pnls.items()}))
+        dd_m = _max_drawdown(_agg_by_month({k: float(v) for k, v in pnls.items()}))
         br_real = None
         try:
             br_real = float(acct.get("balance_current")) if isinstance(acct, dict) and acct.get("balance_current") is not None else None
@@ -521,16 +553,52 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
         s1.append("**Risco/consistência (a partir do P&L diário)**\n\n")
         s1.append("| Métrica | Valor |\n|---|---:|\n")
-        s1.append(f"| Max drawdown (monetário) | {_fmt_num(dd.get('mdd'), 2)} |\n")
+        s1.append(f"| Max drawdown (diário, monetário) | {_fmt_num(dd.get('mdd'), 2)} |\n")
+        s1.append(f"| Max drawdown (semanal, monetário) | {_fmt_num(dd_w.get('mdd'), 2)} |\n")
+        s1.append(f"| Max drawdown (mensal, monetário) | {_fmt_num(dd_m.get('mdd'), 2)} |\n")
         if dd.get("from_day") and dd.get("to_day"):
             s1.append(f"| Janela do DD | {dd.get('from_day')} → {dd.get('to_day')} |\n")
         if br_real:
             sh = _sharpe_annualized(pnls, bankroll_ref=float(br_real))
             s1.append(f"| Sharpe anualizado (vs banca real) | {_fmt_num(sh, 2)} |\n")
+            # ROI por banca (recortes simples)
+            try:
+                pnl_week = float(acct.get("pnl_filtered_week") if acct.get("pnl_filtered_week") is not None else acct.get("pnl_week") or 0.0)
+                pnl_month = float(acct.get("pnl_filtered_month") if acct.get("pnl_filtered_month") is not None else acct.get("pnl_month") or 0.0)
+                s1.append(f"| ROI/banca real (semana) | {_fmt_num((pnl_week/float(br_real))*100.0, 2)}% |\n")
+                s1.append(f"| ROI/banca real (mês) | {_fmt_num((pnl_month/float(br_real))*100.0, 2)}% |\n")
+            except Exception:
+                pass
         if br_theo:
             sh2 = _sharpe_annualized(pnls, bankroll_ref=float(br_theo))
             s1.append(f"| Sharpe anualizado (vs banca teórica) | {_fmt_num(sh2, 2)} |\n")
+            try:
+                pnl_week = float(acct.get("pnl_filtered_week") if acct.get("pnl_filtered_week") is not None else acct.get("pnl_week") or 0.0)
+                pnl_month = float(acct.get("pnl_filtered_month") if acct.get("pnl_filtered_month") is not None else acct.get("pnl_month") or 0.0)
+                s1.append(f"| ROI/banca teórica (semana; ref={_fmt_num(br_theo,0)}) | {_fmt_num((pnl_week/float(br_theo))*100.0, 2)}% |\n")
+                s1.append(f"| ROI/banca teórica (mês; ref={_fmt_num(br_theo,0)}) | {_fmt_num((pnl_month/float(br_theo))*100.0, 2)}% |\n")
+            except Exception:
+                pass
         s1.append("\n")
+
+        # semanas fechadas do mês corrente (visão executiva)
+        try:
+            weeks = _agg_by_week({k: float(v) for k, v in pnls.items()})
+            # identifica mês corrente pelo último dia do dataset
+            days_sorted = sorted(pnls.keys())
+            if days_sorted:
+                mk_cur = _month_key(days_sorted[-1])
+                # semanas cujo week_start está no mesmo mês e não é a semana corrente
+                ws_cur = _week_start_iso(days_sorted[-1])
+                rows = [(ws, val) for ws, val in weeks.items() if _month_key(ws) == mk_cur and ws != ws_cur]
+                if rows:
+                    s1.append("**Semanas anteriores fechadas (mês corrente)**\n\n")
+                    s1.append("| Semana (start) | P&L |\n|---|---:|\n")
+                    for ws, val in rows[-6:]:
+                        s1.append(f"| {ws} | {_fmt_num(val, 2)} |\n")
+                    s1.append("\n")
+        except Exception:
+            pass
     else:
         s1.append("_Sem série de accounting disponível para métricas diárias/Sharpe/DD (ver 99.1)._ \n\n")
 
