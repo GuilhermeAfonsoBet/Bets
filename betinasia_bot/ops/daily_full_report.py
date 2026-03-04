@@ -341,6 +341,8 @@ class DailyReportCfg:
     executor_jsonl: Path = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))
+    skip_accounting: bool = (os.getenv("DAILY_SKIP_ACCOUNTING", "0").strip() in ("1", "true", "True", "yes", "YES"))
+    skip_oos: bool = (os.getenv("DAILY_SKIP_OOS", "0").strip() in ("1", "true", "True", "yes", "YES"))
 
     def __post_init__(self) -> None:
         # Releitura de env em runtime (importante quando rodando manualmente e carregando .env em main()).
@@ -356,6 +358,8 @@ class DailyReportCfg:
             self.exec_kpi_last = int(os.getenv("DAILY_EXEC_KPI_LAST", str(self.exec_kpi_last)))
         except Exception:
             pass
+        self.skip_accounting = (os.getenv("DAILY_SKIP_ACCOUNTING", "1" if self.skip_accounting else "0").strip() in ("1", "true", "True", "yes", "YES"))
+        self.skip_oos = (os.getenv("DAILY_SKIP_OOS", "1" if self.skip_oos else "0").strip() in ("1", "true", "True", "yes", "YES"))
 
 
 async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
@@ -367,23 +371,30 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # 1) Accounting snapshot + report
     acct_out = day_dir / "accounting_daily_report.json"
     acct: Dict[str, Any] = {}
-    try:
-        acct = await run_acct_daily(
-            AcctDailyCfg(
-                out_dir=Path(os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting")),
-                jsonl=Path(os.getenv("ACCOUNTING_JSONL", "logs/accounting_snapshots.jsonl")),
-                tz_name=str(os.getenv("REPORT_TZ", cfg.report_tz)),
-                report_out=acct_out,
-                print_json=False,
-            )
-        )
-    except Exception as e:
-        # Não aborta o daily: ainda queremos OOS + KPIs + aderência mesmo sem login no accounting.
-        acct = {"ts": ts.isoformat(), "error": f"ACCOUNTING_FAILED: {str(e)[:200]}"}
+    if cfg.skip_accounting:
+        acct = {"ts": ts.isoformat(), "skipped": True, "error": "ACCOUNTING_SKIPPED (DAILY_SKIP_ACCOUNTING=1)"}
         try:
             acct_out.write_text(json.dumps(acct, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+    else:
+        try:
+            acct = await run_acct_daily(
+                AcctDailyCfg(
+                    out_dir=Path(os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting")),
+                    jsonl=Path(os.getenv("ACCOUNTING_JSONL", "logs/accounting_snapshots.jsonl")),
+                    tz_name=str(os.getenv("REPORT_TZ", cfg.report_tz)),
+                    report_out=acct_out,
+                    print_json=False,
+                )
+            )
+        except Exception as e:
+            # Não aborta o daily: ainda queremos OOS + KPIs + aderência mesmo sem login no accounting.
+            acct = {"ts": ts.isoformat(), "error": f"ACCOUNTING_FAILED: {str(e)[:200]}"}
+            try:
+                acct_out.write_text(json.dumps(acct, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     # 2) Execution KPIs (all + success-only)
     exec_lines = []
@@ -449,35 +460,55 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     if str(cfg.wf_exclude_exec_buckets_back).strip():
         args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
 
-    subprocess.run(args, check=True, cwd=str(Path(__file__).resolve().parent.parent))
+    oos_run = {"skipped": False, "ok": True, "returncode": 0, "error": None, "log": str(day_dir / "oos_run.log")}
+    if cfg.skip_oos:
+        oos_run = {"skipped": True, "ok": False, "returncode": None, "error": "OOS_SKIPPED (DAILY_SKIP_OOS=1)", "log": None}
+    else:
+        try:
+            log_path = Path(str(oos_run["log"]))
+            proc = subprocess.run(args, check=False, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
+            oos_run["returncode"] = int(proc.returncode)
+            if proc.returncode != 0:
+                oos_run["ok"] = False
+                oos_run["error"] = f"OOS_FAILED: returncode={proc.returncode}"
+            # sempre grava log (stdout+stderr) para debug no VPS
+            try:
+                log_path.write_text((proc.stdout or "") + "\n\n--- STDERR ---\n\n" + (proc.stderr or ""), encoding="utf-8")
+            except Exception:
+                pass
+        except Exception as e:
+            oos_run["ok"] = False
+            oos_run["error"] = f"OOS_EXCEPTION: {str(e)[:200]}"
 
-    # Atualiza policy_current (atomic replace) e registra histórico (jsonl)
-    cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cfg.wf_policy_current.with_suffix(".tmp")
-    tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
-    tmp.replace(cfg.wf_policy_current)
+    # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
+    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg.wf_policy_current.with_suffix(".tmp")
+        tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
+        tmp.replace(cfg.wf_policy_current)
 
     active_keys = None
     active_keys_base = None
-    try:
-        pol = json.loads(policy_hist.read_text(encoding="utf-8"))
-        steps = pol.get("steps") if isinstance(pol, dict) else []
-        last = steps[-1] if isinstance(steps, list) and steps else {}
-        if isinstance(last, dict):
-            active_keys = last.get("active_keys")
-            active_keys_base = last.get("active_keys_base")
-        rec = {
-            "ts": ts.isoformat(),
-            "policy_path": str(policy_hist),
-            "policy_current": str(cfg.wf_policy_current),
-            "active_keys": active_keys,
-            "active_keys_base": active_keys_base,
-        }
-        cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
-        with cfg.wf_policy_history_jsonl.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        try:
+            pol = json.loads(policy_hist.read_text(encoding="utf-8"))
+            steps = pol.get("steps") if isinstance(pol, dict) else []
+            last = steps[-1] if isinstance(steps, list) and steps else {}
+            if isinstance(last, dict):
+                active_keys = last.get("active_keys")
+                active_keys_base = last.get("active_keys_base")
+            rec = {
+                "ts": ts.isoformat(),
+                "policy_path": str(policy_hist),
+                "policy_current": str(cfg.wf_policy_current),
+                "active_keys": active_keys,
+                "active_keys_base": active_keys_base,
+            }
+            cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            with cfg.wf_policy_history_jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     # 4) Relatórios auxiliares para seção 0/1 e apêndices (99.x)
     adh_json = day_dir / "oos_adherence.json"
@@ -531,10 +562,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # 5) Montagem do relatório final:
     # Ordem pedida: 0 (Resumo) -> 1 (Resultados reais) -> 2 (OOS) -> 3 (In-sample) -> 99 (apêndices operacionais)
     base_txt = ""
-    try:
-        base_txt = base_md.read_text(encoding="utf-8")
-    except Exception:
-        base_txt = ""
+    if base_md.exists():
+        try:
+            base_txt = base_md.read_text(encoding="utf-8")
+        except Exception:
+            base_txt = ""
     insample_txt, oos_txt = _split_base_into_insample_and_oos(base_txt)
     if oos_txt:
         oos_txt = (
@@ -561,6 +593,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # --- Seção 0: Resumo / conclusões (executivo) ---
     s0 = []
     s0.append("## 0) Resumo e conclusões (executivo)\n\n")
+    if cfg.skip_oos or (isinstance(oos_run, dict) and not bool(oos_run.get("ok"))):
+        s0.append("**Status do OOS (walk-forward)**\n\n")
+        if cfg.skip_oos:
+            s0.append("- **OOS**: **SKIPPED** (`DAILY_SKIP_OOS=1`).\n\n")
+        else:
+            s0.append(f"- **OOS**: **FAILED** — `{oos_run.get('error')}`\n")
+            if oos_run.get("log"):
+                s0.append(f"- Log: `{oos_run.get('log')}`\n\n")
 
     # performance “real” (accounting) quando houver
     if isinstance(acct, dict) and not acct.get("error"):
