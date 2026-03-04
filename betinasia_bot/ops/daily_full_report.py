@@ -214,6 +214,53 @@ def _read_jsonl_last(path: Path, last: int) -> list[str]:
     return lines
 
 
+def _parse_iso_dt(s: str) -> Optional[datetime]:
+    try:
+        t = str(s or "").strip()
+        if not t:
+            return None
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _executor_gaps_summary(lines: list[str]) -> Dict[str, Any]:
+    """
+    Sumário simples de "downtime" por gaps no JSONL do executor.
+    Interpretação: gaps grandes sugerem paradas/restarts ou ausência de tráfego.
+    """
+    ts = []
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        dt = _parse_iso_dt(str(res.get("created_at") or req.get("created_at") or ""))
+        if dt:
+            ts.append(dt)
+    ts.sort()
+    if len(ts) < 2:
+        return {"n": len(ts), "max_gap_s": None, "gaps_gt_300s": 0, "gaps_gt_900s": 0}
+    gaps = [(ts[i] - ts[i - 1]).total_seconds() for i in range(1, len(ts))]
+    return {
+        "n": int(len(ts)),
+        "first_ts": ts[0].isoformat(),
+        "last_ts": ts[-1].isoformat(),
+        "max_gap_s": float(max(gaps)) if gaps else None,
+        "gaps_gt_300s": int(sum(1 for g in gaps if g > 300.0)),
+        "gaps_gt_900s": int(sum(1 for g in gaps if g > 900.0)),
+    }
+
+
 def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     with file_path.open("rb") as f:
@@ -501,6 +548,34 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             err2 = (err[:160] + "…") if len(err) > 160 else err
             s0.append(f"- `{ver}`: **{st} ×{n}** — `{err2}`\n")
 
+    # conversão (audit) e saúde do executor (gaps)
+    try:
+        if isinstance(audit_rep, dict) and isinstance(audit_rep.get("by_version"), list):
+            tot = ok = valid = 0
+            for v in audit_rep.get("by_version") or []:
+                if not isinstance(v, dict):
+                    continue
+                sc = v.get("status_counts") if isinstance(v.get("status_counts"), dict) else {}
+                tot += int(v.get("total") or 0)
+                ok += int(sc.get("OK") or 0)
+                valid += int(v.get("ok_valid") or 0)
+            if tot > 0:
+                s0.append("\n**Conversão (últimas 24h; auditoria DB)**\n\n")
+                s0.append(f"- OK/total: **{ok}/{tot}** ({(ok/tot)*100.0:.1f}%)\n")
+                s0.append(f"- OK_valid/total: **{valid}/{tot}** ({(valid/tot)*100.0:.1f}%)\n")
+    except Exception:
+        pass
+    try:
+        gaps = _executor_gaps_summary(exec_lines)
+        if gaps.get("n") and gaps.get("max_gap_s") is not None:
+            s0.append("\n**Saúde do executor (proxy por gaps no JSONL)**\n\n")
+            s0.append(f"- Janela: `{gaps.get('first_ts')}` → `{gaps.get('last_ts')}` (n={gaps.get('n')})\n")
+            s0.append(
+                f"- Maior gap: `{_fmt_num(gaps.get('max_gap_s'),1)}s` | gaps>5min: `{gaps.get('gaps_gt_300s')}` | gaps>15min: `{gaps.get('gaps_gt_900s')}`\n"
+            )
+    except Exception:
+        pass
+
     # leitura executiva (heurística): onde atacar primeiro
     s0.append(
         "\n**Conclusões operacionais (prioridades)**\n\n"
@@ -751,6 +826,21 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Stake sizing operacional (real)**: hoje é **FLAT** via `BRIDGE_STAKE` (ver `99.3` e `99.6`).\n"
         "- **Parâmetros técnicos efetivos** (executor/audit/bridge): ver `99.6 Filtros ativos`.\n\n"
     )
+
+    # aspectos técnicos (latência/gaps/restarts proxy)
+    try:
+        gaps = _executor_gaps_summary(exec_lines)
+        s1.append("**Aspectos técnicos (latência/estabilidade)**\n\n")
+        s1.append("- Latência detalhada: ver `99.2` (p50/p90/p99 por etapa).\n")
+        if gaps.get("max_gap_s") is not None:
+            s1.append(
+                f"- Gaps no `executor_jsonl` (proxy de downtime/restart/sem tráfego): max `{_fmt_num(gaps.get('max_gap_s'),1)}s`, "
+                f"gaps>5min `{gaps.get('gaps_gt_300s')}`, gaps>15min `{gaps.get('gaps_gt_900s')}`.\n\n"
+            )
+        else:
+            s1.append("- Gaps no `executor_jsonl`: amostra insuficiente.\n\n")
+    except Exception:
+        pass
 
     # 6) Combinar markdown (base reordenado + blocos operacionais 99.x)
     extra = []
