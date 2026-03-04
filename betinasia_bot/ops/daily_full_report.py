@@ -84,16 +84,19 @@ def _demote_h2_to_h3(md: str) -> str:
 
 def _split_base_into_insample_and_oos(md: str) -> tuple[str, str]:
     """
-    O relatório robusto escreve o bloco OOS no topo-nível:
-      '## 12) OOS walk-forward ...'
+    O relatório robusto pode escrever o bloco OOS no topo-nível como:
+      - '## 12) OOS walk-forward ...' (modo "full")
+      - '## 1) OOS walk-forward ...'  (modo "oos_first")
     Tudo antes disso é o bloco in-sample.
     """
-    key = "## 12) OOS walk-forward"
-    i = (md or "").find(key)
-    if i < 0:
+    txt = md or ""
+    keys = ["## 12) OOS walk-forward", "## 1) OOS walk-forward", "## 2) OOS walk-forward"]
+    hits = [(txt.find(k), k) for k in keys if txt.find(k) >= 0]
+    if not hits:
         # fallback: não encontrou; trata tudo como in-sample
-        return (md or ""), ""
-    return (md or "")[:i], (md or "")[i:]
+        return txt, ""
+    i, _ = sorted(hits, key=lambda x: x[0])[0]
+    return txt[:i], txt[i:]
 
 
 def _extract_md_block(md: str, *, start: str, until_any: list[str]) -> str:
@@ -112,6 +115,39 @@ def _extract_md_block(md: str, *, start: str, until_any: list[str]) -> str:
             j = k if j is None else min(j, k)
     return txt[i : (j if j is not None else len(txt))].strip() + "\n"
 
+
+def _extract_md_table(md: str, *, header_startswith: str) -> tuple[str, list[list[str]]]:
+    """
+    Extrai uma tabela markdown cujo header começa com `header_startswith` (linha iniciando com '| ...').
+    Retorna (table_md, rows) onde rows são as linhas de dados já separadas em colunas (sem pipes).
+    """
+    txt = md or ""
+    lines = txt.splitlines()
+    i = None
+    for idx, ln in enumerate(lines):
+        if ln.strip().startswith(header_startswith):
+            i = idx
+            break
+    if i is None:
+        return "", []
+    # coletar até a primeira linha vazia após começar
+    out_lines = []
+    rows: list[list[str]] = []
+    for ln in lines[i:]:
+        if not ln.strip():
+            break
+        if not ln.strip().startswith("|"):
+            break
+        out_lines.append(ln)
+        # data row (skip separator)
+        if ln.strip().startswith("|---"):
+            continue
+        cols = [c.strip() for c in ln.strip().strip("|").split("|")]
+        # pula header
+        if cols and cols[0].lower().startswith("train window"):
+            continue
+        rows.append(cols)
+    return "\n".join(out_lines).strip() + "\n", rows
 
 def _tail_lines(path: Path, n: int) -> list[str]:
     try:
@@ -300,7 +336,8 @@ class DailyReportCfg:
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     # Escala de banca/sizing (manter “10k etc.”)
     kelly_bankroll: str = os.getenv("DAILY_KELLY_BANKROLL", "10000")
-    wf_bankroll_grid: str = os.getenv("DAILY_WF_BANKROLL_GRID", "").strip()
+    # Grid default para sempre gerar sensibilidade (pequeno o bastante para ser barato).
+    wf_bankroll_grid: str = os.getenv("DAILY_WF_BANKROLL_GRID", "10000,50000,100000,500000").strip()
     executor_jsonl: Path = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))
@@ -500,7 +537,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         base_txt = ""
     insample_txt, oos_txt = _split_base_into_insample_and_oos(base_txt)
     if oos_txt:
-        oos_txt = oos_txt.replace("## 12) OOS walk-forward", "## 2) OOS walk-forward")
+        oos_txt = (
+            oos_txt.replace("## 12) OOS walk-forward", "## 2) OOS walk-forward")
+            .replace("## 1) OOS walk-forward", "## 2) OOS walk-forward")
+        )
 
     # Accounting: série por dia/mês a partir do CSV (quando disponível)
     acct_series = None
@@ -764,17 +804,84 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # Sensibilidade de banca (reusa tabela OOS existente)
     if oos_txt:
+        # OOS pode estar numerado como 12.x (full) ou 1.x (oos_first)
         sens = _extract_md_block(
             oos_txt,
             start="### 12.2b Sensibilidade por banca",
-            until_any=["### 12.2c Sensibilidade por banca", "### 12.3 "],
+            until_any=["### 12.2c Sensibilidade por banca", "### 12.3 ", "### 1.2c Sensibilidade por banca", "### 1.3 "],
         )
+        if not sens.strip():
+            sens = _extract_md_block(
+                oos_txt,
+                start="### 1.2b Sensibilidade por banca",
+                until_any=["### 1.2c Sensibilidade por banca", "### 1.3 ", "### 12.2c Sensibilidade por banca", "### 12.3 "],
+            )
         if sens.strip():
             s1.append("**Estudo de sensibilidade (banca × lucro)**\n\n")
             s1.append(
                 "_A tabela abaixo é reaproveitada do bloco OOS (mesmo layout). Ela responde “até onde a operação escala” antes de bater em caps/limites._\n\n"
             )
             s1.append(sens + "\n")
+
+        # Diagnóstico: por que turnover/jogos/lucro OOS podem cair nos steps recentes
+        try:
+            tbl_md, rows = _extract_md_table(oos_txt, header_startswith="| Train window")
+            if tbl_md.strip() and rows:
+                s1.append("**OOS recente: escala (turnover/jogos/lucro) por step**\n\n")
+                s1.append(
+                    "_Leitura: se `#ativas (keys)` e `Jogos OOS` caem, a causa típica é calendário/fragmentação (por liga) + filtros (AH/exec_bucket) + cobertura de placar. "
+                    "Se jogos não caem, mas turnover cai, o gargalo tende a ser budget/caps (governança) e sizing._\n\n"
+                )
+                # mostrar a tabela original e destacar os últimos 4 steps (no topo executivo)
+                s1.append(tbl_md + "\n")
+                last4 = rows[-4:]
+                def _g(cols, ix):
+                    try:
+                        return cols[ix]
+                    except Exception:
+                        return ""
+                # heurística: comparar último vs mediana
+                try:
+                    games = []
+                    turns = []
+                    profs = []
+                    for r in rows:
+                        try:
+                            games.append(float(_g(r, 2)) if _g(r, 2) else 0.0)
+                        except Exception:
+                            pass
+                        try:
+                            turns.append(float(str(_g(r, 5)).replace(",", ".")))
+                        except Exception:
+                            pass
+                        try:
+                            profs.append(float(str(_g(r, 6)).replace(",", ".")))
+                        except Exception:
+                            pass
+                    if games and turns:
+                        import statistics
+                        med_g = statistics.median(games)
+                        med_t = statistics.median(turns)
+                        s1.append("**Diagnóstico rápido (último step vs mediana histórica do WF)**\n\n")
+                        # último row
+                        lr = rows[-1]
+                        g_last = float(_g(lr, 2) or 0.0)
+                        t_last = None
+                        try:
+                            t_last = float(str(_g(lr, 5)).replace(",", "."))
+                        except Exception:
+                            t_last = None
+                        s1.append(f"- Jogos OOS (último): `{_fmt_num(g_last,0)}` vs mediana `{_fmt_num(med_g,0)}`\n")
+                        if t_last is not None:
+                            s1.append(f"- Turnover teste (último): `{_fmt_num(t_last,2)}` vs mediana `{_fmt_num(med_t,2)}`\n")
+                        s1.append(
+                            "- Se a queda é em **Jogos OOS**: problema é **volume/cobertura** (placar, calendário, fragmentação por liga, filtros como AH/exec_bucket).\n"
+                            "- Se Jogos OOS está ok mas turnover cai: **governança/sizing** (budgets/caps) está limitando escala.\n\n"
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # Histórico recente de policy (parâmetros “passados” do portfólio ativo)
     try:
@@ -826,6 +933,46 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Stake sizing operacional (real)**: hoje é **FLAT** via `BRIDGE_STAKE` (ver `99.3` e `99.6`).\n"
         "- **Parâmetros técnicos efetivos** (executor/audit/bridge): ver `99.6 Filtros ativos`.\n\n"
     )
+
+    # Critérios (OOS e real) + clareza do filtro de AH
+    try:
+        wf_ah = float(os.getenv("DAILY_WF_AH_MAX_ABS_LINE", str(cfg.wf_ah_max_abs_line)) or 0.0)
+    except Exception:
+        wf_ah = 0.0
+    wf_ah_scope = str(os.getenv("DAILY_WF_AH_SCOPE", str(cfg.wf_ah_scope)) or "").strip() or "pre"
+    wf_key_by_league = str(os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+    wf_key_scope = str(os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", str(cfg.wf_key_by_league_scope)) or "").strip() or "pre"
+    wf_min_matches = str(os.getenv("DAILY_WF_MIN_MATCHES", str(cfg.wf_min_matches)) or "").strip() or "0"
+    s1.append("**Critérios de seleção (OOS) e critérios do real (bridge/executor)**\n\n")
+    s1.append(
+        "- **OOS (walk-forward)** decide o portfólio `active_keys`.\n"
+        f"  - **Chave por liga**: `{wf_key_by_league}` (scope=`{wf_key_scope}`) ⇒ em pre-match a chave pode virar `...__<League>`.\n"
+        f"  - **Filtro de AH ativo?**: `{wf_ah > 0}` (max_abs_line=`{_fmt_num(wf_ah,2)}`; scope=`{wf_ah_scope}`) ⇒ remove eventos com `abs(line)` acima do limiar.\n"
+        f"  - **Mínimo de jogos no treino**: `wf_min_matches={wf_min_matches}` (0 = desligado).\n"
+        "  - **Regra de decisão (por combinação, no treino)**:\n"
+        "    - Se `ROI` for **significativamente negativo** (IC90 inteiro < 0): **bloqueia**.\n"
+        "    - Se `ROI` for **significativamente positivo** (IC90 inteiro > 0): **ativa**.\n"
+        "    - Se `ROI` > 0 mas **não significativo**:\n"
+        "      - **Pre-match**: ativa apenas se **CLV > 0** (CLV não precisa ser sig.).\n"
+        "      - **In-match**: ativa se **ROI > 0** (CLV não se aplica).\n"
+        "  - Operacionalmente, o OOS também pode excluir buckets de execução (ex.: `wf_exclude_exec_buckets_back`).\n"
+        "- **Real (shadow/live)**:\n"
+        "  - O bridge só envia oportunidades cuja chave esteja em `active_keys` (policy current).\n"
+        "  - `DRY_OK` = **shadow** (não apostou); `LIVE_OK` = **efetivo** (apostou).\n\n"
+    )
+    # explicitar shadow vs live na janela
+    try:
+        live_ok = int((kpi_all.get("status_counts") or {}).get("LIVE_OK") or 0)
+        dry_ok = int((kpi_all.get("status_counts") or {}).get("DRY_OK") or 0)
+        s1.append("**Este período está rodando shadow ou efetivo?**\n\n")
+        if live_ok > 0 and dry_ok > 0:
+            s1.append(f"- Misturado: `LIVE_OK={live_ok}` e `DRY_OK={dry_ok}`.\n\n")
+        elif live_ok > 0:
+            s1.append(f"- Predominantemente **efetivo**: `LIVE_OK={live_ok}` (e `DRY_OK={dry_ok}`).\n\n")
+        else:
+            s1.append(f"- Predominantemente **shadow**: `DRY_OK={dry_ok}` (e `LIVE_OK={live_ok}`).\n\n")
+    except Exception:
+        pass
 
     # aspectos técnicos (latência/gaps/restarts proxy)
     try:
@@ -1071,8 +1218,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 sens = _extract_md_block(
                     oos_txt,
                     start="### 12.2b Sensibilidade por banca",
-                    until_any=["### 12.2c Sensibilidade por banca", "### 12.3 "],
+                    until_any=["### 12.2c Sensibilidade por banca", "### 12.3 ", "### 1.2c Sensibilidade por banca", "### 1.3 "],
                 )
+                if not sens.strip():
+                    sens = _extract_md_block(
+                        oos_txt,
+                        start="### 1.2b Sensibilidade por banca",
+                        until_any=["### 1.2c Sensibilidade por banca", "### 1.3 ", "### 12.2c Sensibilidade por banca", "### 12.3 "],
+                    )
                 best = None
                 if sens:
                     for ln in sens.splitlines():
