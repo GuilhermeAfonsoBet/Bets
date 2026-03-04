@@ -2120,6 +2120,93 @@ async def main() -> int:
 
             return float(bs), float(bp), float(ls), float(ll)
 
+        # ------------------------------------------------------------
+        # Política inteligente de sizing (para P&L/ROI "realizado" no in-sample)
+        # ------------------------------------------------------------
+        # Reusa o mesmo par de schemes do WF, para consistência entre seções.
+        ins_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
+        ins_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
+        ins_bank_ref = _safe_float(getattr(args, "kelly_bankroll", None))
+        if ins_bank_ref is None or float(ins_bank_ref) <= 0:
+            # fallback: não ideal, mas evita dividir por zero; em produção o daily sempre passa kelly_bankroll
+            ins_bank_ref = 10000.0
+        # caps conservadores (alinhados ao bloco 9.3)
+        INS_BACK_CAP_FRAC = max(0.0, float(getattr(args, "kelly_back_cap_frac", 0.02)))
+        INS_LAY_CAP_FRAC = max(0.0, float(getattr(args, "kelly_lay_cap_frac", 0.01)))
+
+        def _ins_scheme_for_row(d: dict) -> str:
+            return ins_scheme_in if d.get("is_live") is True else ins_scheme_pre
+
+        def _kelly_back_frac_simple(entry_odd: Any, closing_odd: Any) -> Optional[float]:
+            o = _safe_float(entry_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            b = o - 1.0
+            ev = (o * p) - 1.0
+            f = ev / b
+            return float(f)
+
+        def _kelly_lay_liab_frac_simple(entry_lay_odd: Any, closing_odd: Any) -> Optional[float]:
+            o = _safe_float(entry_lay_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            f = 1.0 - (p * o)
+            return float(f)
+
+        def _ins_sizing_back(d: dict) -> Optional[float]:
+            sc = _ins_scheme_for_row(d)
+            if sc == "FLAT":
+                return 1.0
+            if sc == "PROXY":
+                bs, _, _, _ = finance_for_row(d)
+                return float(bs)
+            if sc.startswith("KELLY"):
+                if d.get("is_live") is True:
+                    return None
+                try:
+                    frac = float(sc.split("_")[1])
+                except Exception:
+                    return None
+                f0 = _kelly_back_frac_simple(d.get("bs_odd"), d.get("closing_odd"))
+                if f0 is None:
+                    return None
+                f = max(0.0, float(f0)) * float(frac)
+                cap = INS_BACK_CAP_FRAC * float(ins_bank_ref)
+                return float(min(f * float(ins_bank_ref), cap))
+            return None
+
+        def _ins_sizing_lay_liab(d: dict) -> Optional[Tuple[float, float]]:
+            sc = _ins_scheme_for_row(d)
+            h = d.get("hypothesis_details") or {}
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+            if lay_odd is None or lay_odd <= 0:
+                lay_odd = _safe_float(d.get("bs_odd"))
+            if lay_odd is None or lay_odd <= 1.0:
+                return None
+            if sc == "FLAT":
+                return (1.0, float(lay_odd))
+            if sc == "PROXY":
+                _, _, _, ll = finance_for_row(d)
+                return (float(ll), float(lay_odd))
+            if sc.startswith("KELLY"):
+                if d.get("is_live") is True:
+                    return None
+                try:
+                    frac = float(sc.split("_")[1])
+                except Exception:
+                    return None
+                f0 = _kelly_lay_liab_frac_simple(lay_odd, d.get("closing_odd"))
+                if f0 is None:
+                    return None
+                f = max(0.0, float(f0)) * float(frac)
+                cap = INS_LAY_CAP_FRAC * float(ins_bank_ref)
+                return (float(min(f * float(ins_bank_ref), cap)), float(lay_odd))
+            return None
+
         back_stakes = []
         back_profit_if_win = []
         lay_stakes = []
@@ -2151,6 +2238,8 @@ async def main() -> int:
         back_realized_stakes = []
         back_realized_roi = []
         back_realized_mids = []
+        back_realized_policy = []
+        back_realized_policy_stakes = []
         for d in back_edge:
             roi = _safe_float(d.get("roi_bs"))
             if roi is None:
@@ -2160,11 +2249,24 @@ async def main() -> int:
             back_realized_stakes.append(float(bs))
             back_realized_roi.append(float(roi))
             back_realized_mids.append(int(d.get("match_id")))
+            st_pol = _ins_sizing_back(d)
+            if st_pol is not None and float(st_pol) > 0:
+                back_realized_policy.append(float(st_pol) * float(roi) / 100.0)
+                back_realized_policy_stakes.append(float(st_pol))
         if back_realized:
             roi_weighted = (sum(back_realized) / sum(back_realized_stakes) * 100.0) if sum(back_realized_stakes) > 0 else None
             lines.append(f"| N com ROI realizado | {len(back_realized)} |\n")
-            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(back_realized), 2)} |\n")
-            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_weighted, 2)}% |\n")
+            # Política inteligente (principal)
+            if back_realized_policy and sum(back_realized_policy_stakes) > 0:
+                roi_pol = (sum(back_realized_policy) / sum(back_realized_policy_stakes) * 100.0)
+                lines.append(f"| P&L realizado total (**policy sizing**: Pre={ins_scheme_pre}, In={ins_scheme_in}, bank_ref={_fmt_num(ins_bank_ref,0)}) | {_fmt_num(sum(back_realized_policy), 2)} |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por stake) | {_fmt_num(roi_pol, 2)}% |\n")
+            else:
+                lines.append(f"| P&L realizado total (**policy sizing**) | — |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por stake) | — |\n")
+            # Proxy/legado (comparativo)
+            lines.append(f"| P&L realizado total (proxy finance/limit) | {_fmt_num(sum(back_realized), 2)} |\n")
+            lines.append(f"| ROI realizado (proxy, ponderado por stake) | {_fmt_num(roi_weighted, 2)}% |\n")
 
             roi_sum = summarize_metric(back_realized_roi, back_realized_mids, clip_low=-100, clip_high=500)
             lines.append(f"| ROI realizado (robusto por jogo, mean; IC90) | {_fmt_pct(roi_sum.mean_cluster,2)} {_fmt_ci(roi_sum.ci90_cluster,2)} |\n")
@@ -2249,6 +2351,9 @@ async def main() -> int:
         lay_realized_roi_liab = []
         lay_realized_roi_stake = []
         lay_realized_mids = []
+        lay_realized_policy_pnl = []
+        lay_realized_policy_liab = []
+        lay_realized_policy_stake = []
         for d in lay_edge:
             mult = _mult_back_from_row(d)
             if mult is None:
@@ -2277,14 +2382,36 @@ async def main() -> int:
             lay_realized_roi_liab.append(roi_liab)
             lay_realized_roi_stake.append(roi_stake)
             lay_realized_mids.append(int(d.get("match_id")))
+            sized_pol = _ins_sizing_lay_liab(d)
+            if sized_pol and sized_pol[0] is not None and float(sized_pol[0]) > 0:
+                liab_pol, odd_pol = sized_pol
+                roi_liab_pol = _roi_lay_pct_per_liability(float(odd_pol), float(mult))
+                if roi_liab_pol is not None:
+                    pnl_pol = float(liab_pol) * float(roi_liab_pol) / 100.0
+                    lay_realized_policy_pnl.append(float(pnl_pol))
+                    lay_realized_policy_liab.append(float(liab_pol))
+                    st_eq = float(liab_pol) / max(1e-9, (float(odd_pol) - 1.0))
+                    lay_realized_policy_stake.append(float(st_eq))
 
         if lay_realized_pnl:
             roi_liab_weighted = (sum(lay_realized_pnl) / sum(lay_realized_liab) * 100.0) if sum(lay_realized_liab) > 0 else None
             roi_stake_weighted = (sum(lay_realized_pnl) / sum(lay_realized_stake) * 100.0) if sum(lay_realized_stake) > 0 else None
             lines.append(f"| N com ROI realizado | {len(lay_realized_pnl)} |\n")
-            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(lay_realized_pnl), 2)} |\n")
-            lines.append(f"| ROI realizado (ponderado por liability) | {_fmt_num(roi_liab_weighted, 2)}% |\n")
-            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_stake_weighted, 2)}% |\n")
+            # Política inteligente (principal)
+            if lay_realized_policy_pnl and sum(lay_realized_policy_liab) > 0:
+                roi_liab_pol = (sum(lay_realized_policy_pnl) / sum(lay_realized_policy_liab) * 100.0)
+                roi_st_pol = (sum(lay_realized_policy_pnl) / sum(lay_realized_policy_stake) * 100.0) if sum(lay_realized_policy_stake) > 0 else None
+                lines.append(f"| P&L realizado total (**policy sizing**: Pre={ins_scheme_pre}, In={ins_scheme_in}, bank_ref={_fmt_num(ins_bank_ref,0)}) | {_fmt_num(sum(lay_realized_policy_pnl), 2)} |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por liability) | {_fmt_num(roi_liab_pol, 2)}% |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por stake eq.) | {_fmt_num(roi_st_pol, 2)}% |\n")
+            else:
+                lines.append(f"| P&L realizado total (**policy sizing**) | — |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por liability) | — |\n")
+                lines.append(f"| ROI realizado (**policy**, ponderado por stake eq.) | — |\n")
+            # Proxy/legado (comparativo)
+            lines.append(f"| P&L realizado total (proxy finance/limit) | {_fmt_num(sum(lay_realized_pnl), 2)} |\n")
+            lines.append(f"| ROI realizado (proxy, ponderado por liability) | {_fmt_num(roi_liab_weighted, 2)}% |\n")
+            lines.append(f"| ROI realizado (proxy, ponderado por stake) | {_fmt_num(roi_stake_weighted, 2)}% |\n")
 
             # robusto por jogo (não ponderado)
             roi_liab_sum = summarize_metric(lay_realized_roi_liab, lay_realized_mids, clip_low=-200, clip_high=5000)
