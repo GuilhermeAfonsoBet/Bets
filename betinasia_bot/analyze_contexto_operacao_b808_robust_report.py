@@ -3409,29 +3409,31 @@ async def main() -> int:
                     n_total = len(filt)
                     m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
 
-                    # Critérios do usuário (direcionamento):
-                    # Back Pre: CLV>0 significativo p90 (IC90 lb>0) e ROI>0 (não precisa ser sig)
-                    # Back In: apenas ROI com p30>0
-                    # Lay Pre: CLV_CONV>0 significativo p90 (IC90 lb>0) e ROI significativo p30 (p30>0)
-                    # Lay In: apenas ROI p30>0
+                    # Critérios alinhados ao OOS (walk-forward):
+                    # - Se ROI for sig<0 (IC90 ub<0): bloqueia
+                    # - Se ROI for sig>0 (IC90 lb>0): ativa
+                    # - Se ROI>0 mas não sig:
+                    #   - Pre: ativa se CLV>0 (não precisa ser sig)  [Lay usa CLV_CONV]
+                    #   - In : ativa se ROI>0
                     active = None
                     crit = ""
-                    if side == "Back" and regime_label == "Pre":
-                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
-                        roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
-                        active = clv_sig and roi_pos
-                        crit = "CLV p90>0 AND ROI>0"
-                    elif side == "Back" and regime_label == "In":
-                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
-                        crit = "ROI p30>0"
-                    elif side == "Lay" and regime_label == "Pre":
-                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
-                        roi_sig = bool(roi_q30 is not None and float(roi_q30) > 0)
-                        active = clv_sig and roi_sig
-                        crit = "CLV_CONV p90>0 AND ROI p30>0"
+                    roi_sig_pos = bool(roi_ci and float(roi_ci[0]) > 0) if roi_ci else False
+                    roi_sig_neg = bool(roi_ci and float(roi_ci[1]) < 0) if roi_ci else False
+                    roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
+                    clv_pos = bool(clv_mean is not None and float(clv_mean) > 0) if regime_label == "Pre" else False
+                    if roi_sig_neg:
+                        active = False
+                        crit = "ROI sig<0 bloqueia"
+                    elif roi_sig_pos:
+                        active = True
+                        crit = "ROI sig>0"
                     else:
-                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
-                        crit = "ROI p30>0"
+                        if regime_label == "Pre":
+                            active = bool(roi_pos and clv_pos)
+                            crit = "ROI>0 (NS) AND CLV>0"
+                        else:
+                            active = bool(roi_pos)
+                            crit = "ROI>0"
                     active_lbl = ("sim" if active else "não") if active is not None else "—"
 
                     clv_str = f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)}" if (is_live_val is False) else "—"
@@ -4144,14 +4146,9 @@ async def main() -> int:
                 "bank_eff_brl": (float(bank_eff) * FX) if bank_eff is not None else None,
             }
 
-        lines.append(
-            "| Estratégia | Scheme | N Back (janela) | N Lay (janela) | N Back 30d (proj.) | N Lay 30d (proj.) | "
-            "Stake médio Back | Stake médio Lay | Liability média Lay | "
-            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | ROI Lay/liability (janela) | ROI Lay/turnover (janela) | "
-            "Banca p99 (Back) | Banca p99 (Lay) | Banca risco p99 (soma) | Banca liquidez p99 (+buf) | Banca recomendada (max) | ROI/banca 30d | "
-            "Turnover 30d (R$) | Lucro 30d (R$) | Banca rec. (R$) | DD 30d p95 |\n"
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
-        )
+        lines.append("**Tabela política de sizing sugerida — resumo executivo (30d)**\n\n")
+        lines.append("| Estratégia | Scheme | Turnover 30d | Lucro 30d | Banca rec. (max) | ROI/banca 30d | DD 30d p95 |\n")
+        lines.append("|---|---|---:|---:|---:|---:|---:|\n")
         # Consolida estratégia pre-match como união das combinações ativas (8.3) — somente PRE (Kelly depende de closing).
         by_audit_id_94: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
 
@@ -4202,12 +4199,28 @@ async def main() -> int:
         for sc in base_schemes_94:
             s1 = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
             lines.append(
-                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
-                f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
-                f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | {_fmt_num(s1['lay_roi_liab_win'],2)}% | {_fmt_num(s1['lay_roi_turn_win'],2)}% | "
-                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_risk_p99'],2)} | {_fmt_num(s1['bank_liq_p99'],2)} | {_fmt_num(s1['bank_eff'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
-                f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_eff_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
+                f"| {s1['name']} | {sc} | {_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | "
+                f"{_fmt_num(s1['bank_eff'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | {_fmt_num(s1['dd_p95'],2)} |\n"
             )
+        lines.append("\n**Tabela política de sizing sugerida — detalhe (volume/sizing/risco)**\n\n")
+        lines.append("| Estratégia | Scheme | N Back | N Lay | N Back 30d | N Lay 30d | Stake méd Back | Stake méd Lay | Liab méd Lay |\n")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        for sc in base_schemes_94:
+            s1 = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
+            lines.append(
+                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
+                f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} |\n"
+            )
+        lines.append("\n")
+        lines.append("| Estratégia | Scheme | ROI/turnover (janela) | ROI Lay/liab (janela) | Banca risco p99 | Banca liq p99 | Banca rec. (max) |\n")
+        lines.append("|---|---|---:|---:|---:|---:|---:|\n")
+        for sc in base_schemes_94:
+            s1 = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
+            lines.append(
+                f"| {s1['name']} | {sc} | {_fmt_num(s1['roi_turn_win'],2)}% | {_fmt_num(s1['lay_roi_liab_win'],2)}% | "
+                f"{_fmt_num(s1['bank_risk_p99'],2)} | {_fmt_num(s1['bank_liq_p99'],2)} | {_fmt_num(s1['bank_eff'],2)} |\n"
+            )
+        lines.append("\n")
         lines.append(
             "\nNotas:\n"
             "- **N Back/Lay** na tabela é **na janela observada**. As colunas `N 30d (proj.)` são uma **escala linear** por dias observados.\n"
