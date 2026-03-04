@@ -165,6 +165,30 @@ def _slip_raw_pct(*, odd_dec: Optional[float], odd_fin: Optional[float]) -> Opti
     return float((float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0)
 
 
+def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
+    """
+    Bucketiza por slippage_raw_pct (com sinal), em 3 faixas:
+    - <= -2%
+    - (-2%, 2%]
+    - > 2%
+    Retorna média de ROI por bucket.
+    """
+    outb: List[Dict[str, Any]] = []
+    if not pairs:
+        return outb
+    buckets = [
+        ("<= -2%", lambda s: s <= -2.0),
+        ("(-2, 2]", lambda s: (s > -2.0) and (s <= 2.0)),
+        ("> 2%", lambda s: s > 2.0),
+    ]
+    for lab, fn in buckets:
+        ys = [roi for (slip, roi) in pairs if fn(float(slip))]
+        if not ys:
+            continue
+        outb.append({"bucket": lab, "n": int(len(ys)), "roi_mean": float(sum(ys) / len(ys))})
+    return outb
+
+
 def _slip_cost_pct(*, exec_side: str, odd_dec: Optional[float], odd_fin: Optional[float]) -> Optional[float]:
     """
     Slippage "custo" em % (sempre >=0), normalizado por lado:
@@ -428,6 +452,8 @@ async def run_report(
         slip_cost_lay: List[float] = []
         pairs_back: List[Tuple[float, float]] = []
         pairs_lay: List[Tuple[float, float]] = []
+        pairs_raw_back: List[Tuple[float, float]] = []
+        pairs_raw_lay: List[Tuple[float, float]] = []
 
         def _bucketize(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
             edges = [(0.0, 0.0), (0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 999.0)]
@@ -485,6 +511,8 @@ async def run_report(
                     slip_cost_back.append(float(cost_pct))
                 if cost_pct is not None:
                     pairs_back.append((float(cost_pct), float(roi)))
+                if raw_pct is not None:
+                    pairs_raw_back.append((float(raw_pct), float(roi)))
             elif side.lower() == "lay":
                 perf["lay"]["n"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
@@ -516,6 +544,8 @@ async def run_report(
                     slip_cost_lay.append(float(cost_pct))
                 if cost_pct is not None and roi_liab is not None:
                     pairs_lay.append((float(cost_pct), float(roi_liab)))
+                if raw_pct is not None and roi_liab is not None:
+                    pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
 
         # ROIs agregados
         back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum"]) * 100.0) if perf["back"]["stake_sum"] else None
@@ -539,6 +569,12 @@ async def run_report(
         if pairs_lay:
             perf["slippage_vs_roi"]["lay"]["corr_cost_pct_vs_roi"] = _pearson([c for c, _ in pairs_lay], [r for _, r in pairs_lay])
             perf["slippage_vs_roi"]["lay"]["buckets"] = _bucketize(pairs_lay)
+
+        # Buckets por slippage RAW (com sinal): <=-2%, -2..2, >2
+        perf["slippage_vs_roi_raw"] = {
+            "back": {"buckets": _bucketize_3way_raw(pairs_raw_back)},
+            "lay": {"buckets": _bucketize_3way_raw(pairs_raw_lay)},
+        }
 
         per_day.append(
             {

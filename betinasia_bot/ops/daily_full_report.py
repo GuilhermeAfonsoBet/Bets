@@ -14,6 +14,7 @@ import requests
 from loguru import logger
 
 from .accounting_daily_report import DailyCfg as AcctDailyCfg, run_daily as run_acct_daily
+from .accounting_report import compute_pnl_report
 from .execution_kpis import compute_kpis_from_lines
 
 
@@ -60,6 +61,121 @@ def _fmt_pct(x: Any, nd: int = 2) -> str:
     except Exception:
         return "—"
 
+
+def _fmt_num(x: Any, nd: int = 2) -> str:
+    try:
+        if x is None:
+            return "—"
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "—"
+
+
+def _demote_h2_to_h3(md: str) -> str:
+    # Usado para "embrulhar" o bloco in-sample sem reescrever o conteúdo.
+    out = []
+    for ln in (md or "").splitlines(True):
+        if ln.startswith("## "):
+            out.append("### " + ln[3:])
+        else:
+            out.append(ln)
+    return "".join(out)
+
+
+def _split_base_into_insample_and_oos(md: str) -> tuple[str, str]:
+    """
+    O relatório robusto escreve o bloco OOS no topo-nível:
+      '## 12) OOS walk-forward ...'
+    Tudo antes disso é o bloco in-sample.
+    """
+    key = "## 12) OOS walk-forward"
+    i = (md or "").find(key)
+    if i < 0:
+        # fallback: não encontrou; trata tudo como in-sample
+        return (md or ""), ""
+    return (md or "")[:i], (md or "")[i:]
+
+
+def _extract_md_block(md: str, *, start: str, until_any: list[str]) -> str:
+    """
+    Extrai um trecho de markdown começando em `start` até antes do primeiro marcador em `until_any`.
+    Best-effort: se não achar `start`, retorna "".
+    """
+    txt = md or ""
+    i = txt.find(start)
+    if i < 0:
+        return ""
+    j = None
+    for u in until_any:
+        k = txt.find(u, i + len(start))
+        if k >= 0:
+            j = k if j is None else min(j, k)
+    return txt[i : (j if j is not None else len(txt))].strip() + "\n"
+
+
+def _tail_lines(path: Path, n: int) -> list[str]:
+    try:
+        xs = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return xs[-n:] if n > 0 else xs
+    except Exception:
+        return []
+
+def _week_start_iso(day_iso: str) -> Optional[str]:
+    try:
+        from datetime import date as _date, timedelta as _td
+
+        d = _date.fromisoformat(str(day_iso))
+        ws = d - _td(days=int(d.weekday()))
+        return ws.isoformat()
+    except Exception:
+        return None
+
+
+def _max_drawdown(pnls_by_day: Dict[str, float]) -> Dict[str, Any]:
+    """
+    Max drawdown em unidade monetária, usando curva de equity = cumsum(P&L diário).
+    """
+    days = sorted([d for d in pnls_by_day.keys() if str(d)])
+    eq = 0.0
+    peak = 0.0
+    mdd = 0.0
+    mdd_from = None
+    mdd_to = None
+    peak_day = None
+    for d in days:
+        eq += float(pnls_by_day.get(d) or 0.0)
+        if eq >= peak:
+            peak = eq
+            peak_day = d
+        dd = peak - eq
+        if dd > mdd:
+            mdd = dd
+            mdd_from = peak_day
+            mdd_to = d
+    return {"mdd": float(mdd), "from_day": mdd_from, "to_day": mdd_to}
+
+
+def _sharpe_annualized(pnls_by_day: Dict[str, float], *, bankroll_ref: float) -> Optional[float]:
+    """
+    Sharpe anualizado (sqrt(252)) usando retornos diários r = pnl / bankroll_ref.
+    """
+    try:
+        br = float(bankroll_ref)
+        if br <= 0:
+            return None
+        rs = [float(v) / br for _, v in sorted(pnls_by_day.items())]
+        if len(rs) < 5:
+            return None
+        import statistics
+        import math
+
+        mu = statistics.fmean(rs)
+        sd = statistics.pstdev(rs)
+        if sd <= 0:
+            return None
+        return float((mu / sd) * math.sqrt(252.0))
+    except Exception:
+        return None
 
 def _read_jsonl_last(path: Path, last: int) -> list[str]:
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -249,16 +365,326 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # v38: renomeia apenas o header do bloco OOS para "## 1) OOS ..." (o resto pode manter numbering interno)
+    # 4) Relatórios auxiliares para seção 0/1 e apêndices (99.x)
+    adh_json = day_dir / "oos_adherence.json"
+    adh: Optional[Dict[str, Any]] = None
     try:
-        txt = base_md.read_text(encoding="utf-8")
-        txt2 = txt.replace("## 12) OOS walk-forward", "## 1) OOS walk-forward")
-        if txt2 != txt:
-            base_md.write_text(txt2, encoding="utf-8")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.oos_adherence_report",
+                "--policy-json",
+                str(cfg.wf_policy_current),
+                "--executor-jsonl",
+                str(cfg.executor_jsonl),
+                "--tz",
+                "UTC",
+                "--days",
+                str(os.getenv("DAILY_ADHERENCE_DAYS", "7")),
+                "--out",
+                str(adh_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        adh = _read_json(adh_json)
+    except Exception:
+        adh = None
+
+    audit_json = day_dir / "audit_status_kpis.json"
+    audit_rep: Optional[Dict[str, Any]] = None
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.audit_status_kpis",
+                "--hours",
+                str(os.getenv("DAILY_AUDIT_KPI_HOURS", "24")),
+                "--direction",
+                str(cfg.direction),
+                "--out",
+                str(audit_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        audit_rep = _read_json(audit_json)
+    except Exception:
+        audit_rep = None
+
+    # 5) Montagem do relatório final:
+    # Ordem pedida: 0 (Resumo) -> 1 (Resultados reais) -> 2 (OOS) -> 3 (In-sample) -> 99 (apêndices operacionais)
+    base_txt = ""
+    try:
+        base_txt = base_md.read_text(encoding="utf-8")
+    except Exception:
+        base_txt = ""
+    insample_txt, oos_txt = _split_base_into_insample_and_oos(base_txt)
+    if oos_txt:
+        oos_txt = oos_txt.replace("## 12) OOS walk-forward", "## 2) OOS walk-forward")
+
+    # Accounting: série por dia/mês a partir do CSV (quando disponível)
+    acct_series = None
+    try:
+        bal_csv = Path(str(acct.get("balance_csv") or "")).expanduser()
+        if bal_csv.exists():
+            tz = timezone.utc
+            try:
+                from zoneinfo import ZoneInfo  # type: ignore
+
+                tz = ZoneInfo(str(os.getenv("REPORT_TZ", cfg.report_tz)))
+            except Exception:
+                tz = timezone.utc
+            acct_series = compute_pnl_report(bal_csv, tz=tz)
+    except Exception:
+        acct_series = None
+
+    # --- Seção 0: Resumo / conclusões (executivo) ---
+    s0 = []
+    s0.append("## 0) Resumo e conclusões (executivo)\n\n")
+
+    # performance “real” (accounting) quando houver
+    if isinstance(acct, dict) and not acct.get("error"):
+        s0.append(f"- **Banca real (saldo atual)**: `{acct.get('balance_current')}`\n")
+        s0.append(f"- **P&L (hoje / semana / mês)**: `{acct.get('pnl_today')} / {acct.get('pnl_week')} / {acct.get('pnl_month')}`\n")
+    else:
+        s0.append("- **Accounting**: indisponível (ver apêndice 99.1)\n")
+
+    # risco/estabilidade operacional (últimas 24h) via audit_status_kpis
+    top_errs = []
+    try:
+        for it in (audit_rep or {}).get("error_rows") or []:
+            if not isinstance(it, dict):
+                continue
+            n = int(it.get("n") or 0)
+            if n <= 0:
+                continue
+            top_errs.append((n, str(it.get("audit_version") or ""), str(it.get("status") or ""), str(it.get("api_error") or "")))
+        top_errs.sort(key=lambda x: x[0], reverse=True)
+    except Exception:
+        top_errs = []
+    if top_errs:
+        s0.append("\n**Principais causas de perda de throughput (24h)**\n\n")
+        for n, ver, st, err in top_errs[:6]:
+            err2 = (err[:160] + "…") if len(err) > 160 else err
+            s0.append(f"- `{ver}`: **{st} ×{n}** — `{err2}`\n")
+
+    # leitura executiva (heurística): onde atacar primeiro
+    s0.append(
+        "\n**Conclusões operacionais (prioridades)**\n\n"
+        "- **Objetivo 1 (conversão)**: reduzir `API_FAILED` (especialmente `No PMMs received`) e `STALE_QUEUE_WAIT` para aumentar taxa de execução sem inflar risco.\n"
+        "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
+        "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
+    )
+
+    # --- Seção 1: Resultados reais (shadow/live) ---
+    s1 = []
+    s1.append("## 1) Resultados reais (shadow/live)\n\n")
+
+    # KPIs por recortes (diário/semana/mês) — quando há série
+    if acct_series is not None:
+        # preferir P&L filtrado (exclui depósitos/saques) quando existir
+        pnls = acct_series.pnl_by_day_filtered or acct_series.pnl_by_day
+        # semana corrente (por dia)
+        try:
+            now = _utcnow().astimezone(timezone.utc)
+            # usa o maior dia presente como "today" do dataset para evitar mismatch tz
+            days_sorted = sorted(pnls.keys())
+            today = days_sorted[-1] if days_sorted else now.date().isoformat()
+            ws = _week_start_iso(today) or today
+            cur_week_days = [d for d in days_sorted if ws <= d <= today]
+        except Exception:
+            cur_week_days = []
+            today = None
+            ws = None
+
+        s1.append("**P&L real por dia (semana corrente)**\n\n")
+        s1.append("| Dia | P&L |\n|---|---:|\n")
+        for d in (cur_week_days or [])[-14:]:
+            s1.append(f"| {d} | {_fmt_num(pnls.get(d), 2)} |\n")
+        s1.append("\n")
+
+        # drawdown e sharpe (curto, usando a própria janela da série)
+        dd = _max_drawdown({k: float(v) for k, v in pnls.items()})
+        br_real = None
+        try:
+            br_real = float(acct.get("balance_current")) if isinstance(acct, dict) and acct.get("balance_current") is not None else None
+        except Exception:
+            br_real = None
+        br_theo = None
+        try:
+            br_theo = float(cfg.kelly_bankroll) if str(cfg.kelly_bankroll).strip() else None
+        except Exception:
+            br_theo = None
+
+        s1.append("**Risco/consistência (a partir do P&L diário)**\n\n")
+        s1.append("| Métrica | Valor |\n|---|---:|\n")
+        s1.append(f"| Max drawdown (monetário) | {_fmt_num(dd.get('mdd'), 2)} |\n")
+        if dd.get("from_day") and dd.get("to_day"):
+            s1.append(f"| Janela do DD | {dd.get('from_day')} → {dd.get('to_day')} |\n")
+        if br_real:
+            sh = _sharpe_annualized(pnls, bankroll_ref=float(br_real))
+            s1.append(f"| Sharpe anualizado (vs banca real) | {_fmt_num(sh, 2)} |\n")
+        if br_theo:
+            sh2 = _sharpe_annualized(pnls, bankroll_ref=float(br_theo))
+            s1.append(f"| Sharpe anualizado (vs banca teórica) | {_fmt_num(sh2, 2)} |\n")
+        s1.append("\n")
+    else:
+        s1.append("_Sem série de accounting disponível para métricas diárias/Sharpe/DD (ver 99.1)._ \n\n")
+
+    # execução (contagens + stake médio) via aderência (7 dias)
+    if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
+        s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
+        s1.append("| Dia | Exec rows | LIVE_OK | DRY_OK | API_FAILED | P&L Back | ROI Back | P&L Lay | ROI Lay/liab |\n")
+        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for it in adh.get("per_day") or []:
+            if not isinstance(it, dict):
+                continue
+            ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+            sc = ex.get("status_counts") if isinstance(ex.get("status_counts"), dict) else {}
+            back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+            lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+            s1.append(
+                f"| {it.get('day')} | {int(ex.get('n_exec_rows') or 0)} | {int(sc.get('LIVE_OK') or 0)} | {int(sc.get('DRY_OK') or 0)} | "
+                f"{int(sc.get('API_FAILED') or 0)} | {_fmt_num(back.get('pnl_sum'),2)} | {_fmt_pct(back.get('roi_pct'))} | "
+                f"{_fmt_num(lay.get('pnl_sum'),2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} |\n"
+            )
+        s1.append("\n")
+
+        # slippage x ROI (3 buckets raw com sinal) — último dia com dados
+        last = None
+        try:
+            last = (adh.get("per_day") or [])[-1]
+        except Exception:
+            last = None
+        if isinstance(last, dict):
+            ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
+            rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
+            if rawblk:
+                s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — exemplo do dia `{last.get('day')}`**\n\n")
+                for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                    b = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
+                    buckets = b.get("buckets") if isinstance(b.get("buckets"), list) else []
+                    if not buckets:
+                        continue
+                    s1.append(f"- **{title}**\n\n")
+                    s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                    for row in buckets:
+                        if not isinstance(row, dict):
+                            continue
+                        s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
+                    s1.append("\n")
+
+    # Funil (24h) por auditoria: total → OK/valid → erros principais
+    if isinstance(audit_rep, dict) and isinstance(audit_rep.get("by_version"), list) and audit_rep.get("by_version"):
+        s1.append("**Funil de oportunidades (últimas 24h; auditoria DB)**\n\n")
+        s1.append("| audit_version | total | OK | OK_valid | GATE_NOT_ELIGIBLE | API_FAILED | STALE_QUEUE_WAIT |\n")
+        s1.append("|---|---:|---:|---:|---:|---:|---:|\n")
+        for v in audit_rep.get("by_version") or []:
+            if not isinstance(v, dict):
+                continue
+            sc = v.get("status_counts") if isinstance(v.get("status_counts"), dict) else {}
+            s1.append(
+                f"| {v.get('audit_version')} | {int(v.get('total') or 0)} | {int(sc.get('OK') or 0)} | {int(v.get('ok_valid') or 0)} | "
+                f"{int(sc.get('GATE_NOT_ELIGIBLE') or 0)} | {int(sc.get('API_FAILED') or 0)} | {int(sc.get('STALE_QUEUE_WAIT') or 0)} |\n"
+            )
+        s1.append("\n")
+
+        # motivos top (api_error) agregados
+        errs = []
+        try:
+            for it in (audit_rep.get("error_rows") or []):
+                if not isinstance(it, dict):
+                    continue
+                n = int(it.get("n") or 0)
+                if n <= 0:
+                    continue
+                errs.append((n, str(it.get("audit_version") or ""), str(it.get("status") or ""), str(it.get("api_error") or "")))
+            errs.sort(key=lambda x: x[0], reverse=True)
+        except Exception:
+            errs = []
+        if errs:
+            s1.append("**Motivos principais de não-execução / falha (top)**\n\n")
+            for n, ver, st, err in errs[:8]:
+                err2 = (err[:180] + "…") if len(err) > 180 else err
+                s1.append(f"- `{ver}`: {st} ×{n} — `{err2}`\n")
+            s1.append("\n")
+
+        s1.append("**Oportunidades identificadas / melhorias propostas (curto prazo)**\n\n")
+        s1.append(
+            "- **PMM/timeout**: se `No PMMs received` dominar, aumentar timeout efetivo e reduzir bursts (workers/queue) tende a elevar conversão sem mexer na estratégia.\n"
+            "- **Betslips abertos**: `too_many_open_betslips` é um gargalo de throughput; manter caps/janelas e garantir cleanup rápido evita bloqueio global.\n"
+            "- **Fila**: `STALE_QUEUE_WAIT` indica atraso interno; atacar latência/concorrência antes de aumentar volume/seleção.\n\n"
+        )
+
+    # Sensibilidade de banca (reusa tabela OOS existente)
+    if oos_txt:
+        sens = _extract_md_block(
+            oos_txt,
+            start="### 12.2b Sensibilidade por banca",
+            until_any=["### 12.2c Sensibilidade por banca", "### 12.3 "],
+        )
+        if sens.strip():
+            s1.append("**Estudo de sensibilidade (banca × lucro)**\n\n")
+            s1.append(
+                "_A tabela abaixo é reaproveitada do bloco OOS (mesmo layout). Ela responde “até onde a operação escala” antes de bater em caps/limites._\n\n"
+            )
+            s1.append(sens + "\n")
+
+    # Histórico recente de policy (parâmetros “passados” do portfólio ativo)
+    try:
+        hist_lines = _tail_lines(cfg.wf_policy_history_jsonl, 12)
+        recs = []
+        for ln in hist_lines:
+            try:
+                recs.append(json.loads(ln))
+            except Exception:
+                continue
+        recs = [r for r in recs if isinstance(r, dict)]
+        if recs:
+            s1.append("**Portfólio OOS: vigente vs histórico recente**\n\n")
+            s1.append("| ts | n_active_keys |\n|---|---:|\n")
+            for r in recs[-8:]:
+                nkeys = None
+                try:
+                    ak = r.get("active_keys")
+                    nkeys = len(ak) if isinstance(ak, list) else None
+                except Exception:
+                    nkeys = None
+                s1.append(f"| {r.get('ts')} | {nkeys if nkeys is not None else '—'} |\n")
+            s1.append("\n")
     except Exception:
         pass
 
-    # 4) Combinar markdown (base + blocos operacionais)
+    # parâmetros de negócio e técnicos: manter 99.6 como fonte, mas resumir aqui
+    s1.append("**Parâmetros vigentes (visão executiva)**\n\n")
+    # decomposição de active_keys (negócio)
+    try:
+        if isinstance(active_keys, list) and active_keys:
+            def _cnt(prefix: str) -> int:
+                return sum(1 for k in active_keys if str(k).startswith(prefix))
+            by_league = sum(1 for k in active_keys if "__" in str(k))
+            s1.append("| Dimensão | Valor |\n|---|---:|\n")
+            s1.append(f"| active_keys (total) | {len(active_keys)} |\n")
+            s1.append(f"| chaves por liga (suFIXO `__<League>`) | {by_league} |\n")
+            s1.append(f"| Back_Pre | {_cnt('Back_Pre_')} |\n")
+            s1.append(f"| Back_In | {_cnt('Back_In_')} |\n")
+            s1.append(f"| Lay_Pre_Yes | {_cnt('Lay_Pre_Yes')} |\n")
+            s1.append(f"| Lay_Pre_No | {_cnt('Lay_Pre_No')} |\n")
+            s1.append(f"| Lay_In_Yes | {_cnt('Lay_In_Yes')} |\n")
+            s1.append(f"| Lay_In_No | {_cnt('Lay_In_No')} |\n")
+            s1.append("\n")
+    except Exception:
+        pass
+    s1.append(
+        "- **Combinações ativas (OOS)**: ver `99.3` (active_keys) e o bloco `2) OOS`.\n"
+        "- **Stake sizing operacional (real)**: hoje é **FLAT** via `BRIDGE_STAKE` (ver `99.3` e `99.6`).\n"
+        "- **Parâmetros técnicos efetivos** (executor/audit/bridge): ver `99.6 Filtros ativos`.\n\n"
+    )
+
+    # 6) Combinar markdown (base reordenado + blocos operacionais 99.x)
     extra = []
     extra.append("\n\n## 99) Operacional — saldo, P&L e execução\n\n")
     extra.append("### 99.1 Accounting (saldo + P&L)\n\n")
@@ -448,35 +874,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # 99.4 Aderência OOS (policy por dia × execução)
     try:
-        adh_json = day_dir / "oos_adherence.json"
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "ops.oos_adherence_report",
-                "--policy-json",
-                str(cfg.wf_policy_current),
-                "--executor-jsonl",
-                str(cfg.executor_jsonl),
-                "--tz",
-                "UTC",
-                "--days",
-                str(os.getenv("DAILY_ADHERENCE_DAYS", "7")),
-                "--out",
-                str(adh_json),
-            ],
-            check=False,
-            cwd=str(Path(__file__).resolve().parent.parent),
-        )
-        adh = _read_json(adh_json)
         if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
             extra.append("\n### 99.4 Aderência OOS (portfolio por dia × execução)\n\n")
             extra.append(f"- Arquivo: `{adh_json}`\n")
             extra.append(f"- Policy current: `{cfg.wf_policy_current}`\n\n")
 
             extra.append("**Resumo (últimos dias)**\n\n")
-            extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | ROI Back (stake) | ROI Lay (liability) |\n")
-            extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | P&L total |\n")
+            extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             for it in adh.get("per_day") or []:
                 if not isinstance(it, dict):
                     continue
@@ -494,32 +899,77 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 dry_ok = int(sc.get("DRY_OK") or 0)
                 back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
                 lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+                pnl_b = float(back.get("pnl_sum") or 0.0)
+                pnl_l = float(lay.get("pnl_sum") or 0.0)
                 extra.append(
                     f"| {it.get('day')} | {nkeys if nkeys is not None else '—'} | {bridge_rows} | {skipped_na} | "
-                    f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {_fmt_pct(back.get('roi_pct'))} | {_fmt_pct(lay.get('roi_pct_per_liability'))} |\n"
+                    f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {_fmt_num(pnl_b,2)} | {_fmt_pct(back.get('roi_pct'))} | "
+                    f"{_fmt_num(pnl_l,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_num(pnl_b + pnl_l,2)} |\n"
                 )
             extra.append("\n")
 
-            # Slippage vs ROI (normalizado por lado) — a partir do executor_jsonl + placares em matches
-            extra.append("**Slippage × ROI (normalizado por lado; onde há placar + odd_decision+odd_final)**\n\n")
-            extra.append(
-                "- Definição usada aqui: `custo_slippage_pct` é sempre \u2265 0 e mede movimento adverso.\n"
-                "  - Back: custo = max(0, -(odd_final-odd_decision)/odd_decision)\n"
-                "  - Lay : custo = max(0, +(odd_final-odd_decision)/odd_decision)\n\n"
-            )
-            extra.append("| Dia | Back: n_slip | Back: custo_slip_pct mean | Lay: n_slip | Lay: custo_slip_pct mean |\n")
-            extra.append("|---|---:|---:|---:|---:|\n")
-            for it in adh.get("per_day") or []:
-                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
-                sl = ex.get("slippage") if isinstance(ex.get("slippage"), dict) else {}
-                sb = sl.get("back") if isinstance(sl.get("back"), dict) else {}
-                slay = sl.get("lay") if isinstance(sl.get("lay"), dict) else {}
-                extra.append(
-                    f"| {it.get('day')} | {int(sb.get('n') or 0)} | {_fmt_pct(sb.get('cost_pct_mean'))} | {int(slay.get('n') or 0)} | {_fmt_pct(slay.get('cost_pct_mean'))} |\n"
+            # Potencial (30d) pela banca que maximiza lucro na sensibilidade OOS (se disponível)
+            try:
+                sens = _extract_md_block(
+                    oos_txt,
+                    start="### 12.2b Sensibilidade por banca",
+                    until_any=["### 12.2c Sensibilidade por banca", "### 12.3 "],
                 )
-            extra.append("\n")
+                best = None
+                if sens:
+                    for ln in sens.splitlines():
+                        if not ln.startswith("|") or ln.strip().startswith("|---"):
+                            continue
+                        cols = [c.strip() for c in ln.strip().strip("|").split("|")]
+                        if len(cols) < 6 or cols[0].lower().startswith("banca"):
+                            continue
+                        def _f(s: str) -> Optional[float]:
+                            try:
+                                t = str(s).strip().replace(".", "").replace(",", ".")
+                                t = t.replace("%", "")
+                                return float(t)
+                            except Exception:
+                                return None
+                        bank_ref = _f(cols[0])
+                        turn_30 = _f(cols[1])
+                        prof_30 = _f(cols[2])
+                        bank_eff = _f(cols[3])
+                        roi_bank = _f(cols[4])
+                        dd_p95 = _f(cols[5])
+                        if prof_30 is None:
+                            continue
+                        if best is None or float(prof_30) > float(best["profit_30d_exp"]):
+                            best = {
+                                "bank_ref": bank_ref,
+                                "turn_30d": turn_30,
+                                "profit_30d_exp": prof_30,
+                                "bank_eff": bank_eff,
+                                "roi_bank_30d": roi_bank,
+                                "dd_p95": dd_p95,
+                            }
+                if best:
+                    # share observado (últimos dias) para decompor back/lay como estimativa
+                    pnl_b = pnl_l = 0.0
+                    for it in adh.get("per_day") or []:
+                        ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                        back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+                        lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+                        pnl_b += float(back.get("pnl_sum") or 0.0)
+                        pnl_l += float(lay.get("pnl_sum") or 0.0)
+                    tot = pnl_b + pnl_l
+                    w_b = (pnl_b / tot) if tot else 0.5
+                    w_l = 1.0 - w_b
+                    extra.append("**Potencial de lucro (30d) pela banca ótima (sensibilidade OOS)**\n\n")
+                    extra.append(f"- Banca ref (grid): `{_fmt_num(best.get('bank_ref'),2)}` | banca rec. (max): `{_fmt_num(best.get('bank_eff'),2)}`\n")
+                    extra.append(f"- Lucro 30d (exp.): `{_fmt_num(best.get('profit_30d_exp'),2)}` | ROI/banca 30d (exp.): `{_fmt_num(best.get('roi_bank_30d'),2)}%` | DD p95 (30d): `{_fmt_num(best.get('dd_p95'),2)}`\n")
+                    extra.append(
+                        f"- Decomposição *estimada* por lado (proporcional ao P&L observado na janela): total `{_fmt_num(best.get('profit_30d_exp'),2)}` → "
+                        f"Back `{_fmt_num(float(best.get('profit_30d_exp'))*w_b,2)}` | Lay `{_fmt_num(float(best.get('profit_30d_exp'))*w_l,2)}`\n\n"
+                    )
+            except Exception:
+                pass
 
-            # buckets (último dia com dados)
+            # Slippage × ROI (com sinal): 3 buckets por lado (<=-2%, -2..2, >2)
             last = None
             try:
                 last = (adh.get("per_day") or [])[-1]
@@ -527,44 +977,27 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 last = None
             if isinstance(last, dict):
                 ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
-                svr = ex.get("slippage_vs_roi") if isinstance(ex.get("slippage_vs_roi"), dict) else {}
-                if svr:
-                    extra.append(f"**Buckets (slippage_custo_pct → ROI) — exemplo do dia `{last.get('day')}`**\n\n")
+                rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
+                if rawblk:
+                    extra.append(f"**Slippage × ROI (raw, com sinal; 3 buckets) — exemplo do dia `{last.get('day')}`**\n\n")
                     for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
-                        blk = svr.get(side_key) if isinstance(svr.get(side_key), dict) else {}
+                        blk = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
                         buckets = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
-                        corr = blk.get("corr_cost_pct_vs_roi")
                         if not buckets:
                             continue
-                        extra.append(f"- **{title}**: corr(cost_slip_pct, ROI) = `{_fmt_num(corr)}`\n")
-                        extra.append("  - buckets:\n")
-                        for b in buckets[:6]:
+                        extra.append(f"- **{title}**\n\n")
+                        extra.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                        for b in buckets:
                             if not isinstance(b, dict):
                                 continue
-                            extra.append(f"    - `{b.get('bucket')}` n={int(b.get('n') or 0)} roi_mean={_fmt_pct(b.get('roi_mean'))}\n")
-                    extra.append("\n")
+                            extra.append(f"| {b.get('bucket')} | {int(b.get('n') or 0)} | {_fmt_pct(b.get('roi_mean'))} |\n")
+                        extra.append("\n")
     except Exception:
         pass
 
     # 99.5 Auditoria (DB): motivos de no-OK por versão + qualidade dos OK
     try:
-        audit_json = day_dir / "audit_status_kpis.json"
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "ops.audit_status_kpis",
-                "--hours",
-                str(os.getenv("DAILY_AUDIT_KPI_HOURS", "24")),
-                "--direction",
-                str(cfg.direction),
-                "--out",
-                str(audit_json),
-            ],
-            check=False,
-            cwd=str(Path(__file__).resolve().parent.parent),
-        )
-        rep = _read_json(audit_json)
+        rep = audit_rep
         if isinstance(rep, dict) and isinstance(rep.get("by_version"), list) and rep.get("by_version"):
             extra.append("\n### 99.5 Auditoria (DB) — motivos de no-OK (por versão)\n\n")
             extra.append(f"- Arquivo: `{audit_json}`\n")
@@ -641,7 +1074,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         pass
 
     combined_md = day_dir / "report_daily.md"
-    combined_md.write_text(base_md.read_text(encoding="utf-8") + "".join(extra), encoding="utf-8")
+    insample_wrapped = ""
+    if insample_txt.strip():
+        insample_wrapped = "## 3) In-sample (detalhe)\n\n" + _demote_h2_to_h3(insample_txt.strip() + "\n")
+
+    combined_core = "".join(s0) + "".join(s1) + (oos_txt.strip() + "\n\n" if oos_txt.strip() else "") + insample_wrapped
+    combined_md.write_text(combined_core + "".join(extra), encoding="utf-8")
 
     # 5) PDF
     pdf = day_dir / "report_daily.pdf"
