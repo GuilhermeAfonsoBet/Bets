@@ -302,11 +302,35 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
+    extra.append(
+        "- Definição: `slippage = odd_final - odd_at_decision` (em odds decimais) e `slippage_pct = slippage/odd_at_decision`.\n"
+        "- Interpretação depende do lado:\n"
+        "  - **Back**: slippage_pct **negativo** = piorou (odd caiu); **positivo** = melhorou.\n"
+        "  - **Lay**: slippage_pct **positivo** = piorou (odd subiu); **negativo** = melhorou.\n\n"
+    )
     extra.append("| Tipo | n | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|---:|\n")
     for nm in ("abs", "pct"):
         a = (slip_ok.get(nm) or {}) if isinstance(slip_ok, dict) else {}
         extra.append(f"| {nm} | {a.get('n')} | {a.get('p50')} | {a.get('p90')} | {a.get('p99')} | {a.get('mean')} |\n")
     extra.append("\n")
+
+    # Slippage por lado (Back vs Lay)
+    slip_by_side = (kpi_ok.get("slippage_by_side") or {}) if isinstance(kpi_ok, dict) else {}
+    if isinstance(slip_by_side, dict) and slip_by_side:
+        extra.append("**Slippage por lado (Back vs Lay)**\n\n")
+        extra.append("| Lado | Métrica | n | p50 | p90 | p99 | mean |\n|---|---|---:|---:|---:|---:|---:|\n")
+        for side, obj in slip_by_side.items():
+            if not isinstance(obj, dict):
+                continue
+            for nm, label in (
+                ("raw_pct", "slippage_pct (raw)"),
+                ("cost_pct", "slippage_pct (custo, >=0)"),
+            ):
+                a = obj.get(nm) if isinstance(obj.get(nm), dict) else {}
+                extra.append(
+                    f"| {side} | {label} | {a.get('n')} | {a.get('p50')} | {a.get('p90')} | {a.get('p99')} | {a.get('mean')} |\n"
+                )
+        extra.append("\n")
     extra.append(
         "_Nota: o p90/p99 de `call_to_done_ms` explode quando inclui `NO_SESSION/API_FAILED` (timeouts/relogin). "
         "Por isso reportamos também o recorte apenas de sucessos._\n\n"
@@ -316,6 +340,26 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append("\n### 99.3 Regras OOS ativas (último step)\n\n")
         extra.append(f"- active_keys: {len(active_keys) if isinstance(active_keys, list) else '—'}\n")
         extra.append("```json\n" + json.dumps(active_keys, ensure_ascii=False, indent=2) + "\n```\n\n")
+        extra.append("**Como ler `active_keys` (regra de aprovação)**\n\n")
+        extra.append(
+            "- `active_keys` é o **portfólio aprovado** pelo walk-forward (OOS) no **último step** exportado.\n"
+            "- O bridge (`ops.executor_bridge_audit`) só envia para o executor oportunidades cuja **chave operacional** (combinação) esteja ativa.\n"
+            "- Mapeamento de chaves (simplificado):\n"
+            "  - **Back**: `Back_Pre_Any` (pre) ou `Back_In_Any` (in). Se o walk-forward estiver com `key_by_league`, a chave pode ter sufixo `__<League>`.\n"
+            "  - **Lay**: `Lay_Pre_Yes/No` (pre) ou `Lay_In_Yes/No` (in). Para **H3B**, `Yes` indica que o sinal envolve reversão (por definição da hipótese).\n\n"
+        )
+        extra.append("**Regras de execução atuais (stake sizing)**\n\n")
+        extra.append(
+            "- No operacional (shadow/live), o tamanho enviado pelo bridge é **FLAT** via `BRIDGE_STAKE`.\n"
+            "- Em **Back**: stake = `BRIDGE_STAKE`.\n"
+            "- Em **Lay**: o executor recebe stake, mas o risco relevante é a **liability**, aproximadamente `liability ≈ stake × (odd - 1)`.\n"
+            "- Importante: o Kelly/caps que aparece no relatório OOS é **simulação/diagnóstico** do walk-forward; ele não está sendo aplicado no executor/bridge neste momento.\n\n"
+        )
+        extra.append("**Lay em `ws_gate_lay`: é só pós-reversão?**\n\n")
+        extra.append(
+            "- Sim: o audit `v5.1-ws-gate-lay` só abre ticket Lay quando passa pelo gate de **queda** (ex.: >2% em 5s): `WS(t+offset) < ratio × WS(t0)`.\n"
+            "- Isso significa que, mesmo em shadow, a amostra Lay desse audit representa apenas casos em que houve a movimentação (reversão/queda) definida pela estratégia.\n\n"
+        )
 
     # 99.4 Aderência OOS (policy por dia × execução)
     try:
@@ -370,6 +414,50 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {_fmt_pct(back.get('roi_pct'))} | {_fmt_pct(lay.get('roi_pct_per_liability'))} |\n"
                 )
             extra.append("\n")
+
+            # Slippage vs ROI (normalizado por lado) — a partir do executor_jsonl + placares em matches
+            extra.append("**Slippage × ROI (normalizado por lado; onde há placar + odd_decision+odd_final)**\n\n")
+            extra.append(
+                "- Definição usada aqui: `custo_slippage_pct` é sempre \u2265 0 e mede movimento adverso.\n"
+                "  - Back: custo = max(0, -(odd_final-odd_decision)/odd_decision)\n"
+                "  - Lay : custo = max(0, +(odd_final-odd_decision)/odd_decision)\n\n"
+            )
+            extra.append("| Dia | Back: n_slip | Back: custo_slip_pct mean | Lay: n_slip | Lay: custo_slip_pct mean |\n")
+            extra.append("|---|---:|---:|---:|---:|\n")
+            for it in adh.get("per_day") or []:
+                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                sl = ex.get("slippage") if isinstance(ex.get("slippage"), dict) else {}
+                sb = sl.get("back") if isinstance(sl.get("back"), dict) else {}
+                slay = sl.get("lay") if isinstance(sl.get("lay"), dict) else {}
+                extra.append(
+                    f"| {it.get('day')} | {int(sb.get('n') or 0)} | {_fmt_pct(sb.get('cost_pct_mean'))} | {int(slay.get('n') or 0)} | {_fmt_pct(slay.get('cost_pct_mean'))} |\n"
+                )
+            extra.append("\n")
+
+            # buckets (último dia com dados)
+            last = None
+            try:
+                last = (adh.get("per_day") or [])[-1]
+            except Exception:
+                last = None
+            if isinstance(last, dict):
+                ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
+                svr = ex.get("slippage_vs_roi") if isinstance(ex.get("slippage_vs_roi"), dict) else {}
+                if svr:
+                    extra.append(f"**Buckets (slippage_custo_pct → ROI) — exemplo do dia `{last.get('day')}`**\n\n")
+                    for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                        blk = svr.get(side_key) if isinstance(svr.get(side_key), dict) else {}
+                        buckets = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
+                        corr = blk.get("corr_cost_pct_vs_roi")
+                        if not buckets:
+                            continue
+                        extra.append(f"- **{title}**: corr(cost_slip_pct, ROI) = `{_fmt_num(corr)}`\n")
+                        extra.append("  - buckets:\n")
+                        for b in buckets[:6]:
+                            if not isinstance(b, dict):
+                                continue
+                            extra.append(f"    - `{b.get('bucket')}` n={int(b.get('n') or 0)} roi_mean={_fmt_pct(b.get('roi_mean'))}\n")
+                    extra.append("\n")
     except Exception:
         pass
 
@@ -396,6 +484,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             extra.append("\n### 99.5 Auditoria (DB) — motivos de no-OK (por versão)\n\n")
             extra.append(f"- Arquivo: `{audit_json}`\n")
             extra.append(f"- Janela: últimas **{rep.get('hours')}h** (desde `{rep.get('since_utc')}`)\n\n")
+            extra.append("**Definições (colunas)**\n\n")
+            extra.append(
+                "- **OK**: `status='OK'` no `betslip_audit_results` (a auditoria concluiu com sucesso).\n"
+                "- **OK com betslip_odd**: subset de OK em que `betslip_odd` está preenchido (houve snapshot do ticket/odds).\n"
+                "- **OK valid**: subset de OK em que `is_valid_opportunity=true` (passou o critério operacional de “oportunidade executável”).\n"
+                "  - Na prática, o `is_valid_opportunity` tende a cair quando `difference_pct` está fora do range aceito (edge muito pequeno <2% ou mismatch >10%) ou quando campos essenciais do ticket estão ausentes.\n\n"
+            )
             extra.append("| audit_version | total | OK | OK com betslip_odd | OK valid | top no-OK |\n")
             extra.append("|---|---:|---:|---:|---:|---|\n")
             for v in rep.get("by_version") or []:
@@ -421,6 +516,21 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 top = ", ".join([f"{k}={c}" for k, c in pairs[:4]]) if pairs else "—"
                 extra.append(
                     f"| {v.get('audit_version')} | {total} | {nok} | {int(v.get('ok_with_bs') or 0)} | {int(v.get('ok_valid') or 0)} | {top} |\n"
+                )
+            extra.append("\n")
+
+            # Diagnóstico (OK): por que OK_with_bs >> OK_valid?
+            extra.append("**Diagnóstico dos OK (por versão): buckets de |difference_pct|**\n\n")
+            extra.append(
+                "_Leitura: `OK valid` tende a ser aproximadamente o bucket `2% ≤ |difference_pct| ≤ 10%` (dependendo da regra vigente)._\n\n"
+            )
+            extra.append("| audit_version | OK diff nulo | OK |diff|<2% | OK 2–10% | OK |diff|>10% |\n")
+            extra.append("|---|---:|---:|---:|---:|\n")
+            for v in rep.get("by_version") or []:
+                if not isinstance(v, dict):
+                    continue
+                extra.append(
+                    f"| {v.get('audit_version')} | {int(v.get('ok_diff_null') or 0)} | {int(v.get('ok_absdiff_lt2') or 0)} | {int(v.get('ok_absdiff_2_10') or 0)} | {int(v.get('ok_absdiff_gt10') or 0)} |\n"
                 )
             extra.append("\n")
 

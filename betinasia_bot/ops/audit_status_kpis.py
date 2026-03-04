@@ -73,6 +73,29 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         for x in r.fetchall() or []:
             rows.append(_json_safe(dict(x._mapping)))
 
+    # Diagnóstico dos OK por versão: buckets de |difference_pct| para explicar queda OK_with_bs -> OK_valid
+    q_okdiff = text(
+        """
+        SELECT
+          audit_version,
+          SUM(CASE WHEN status='OK' AND difference_pct IS NULL THEN 1 ELSE 0 END)::bigint AS ok_diff_null,
+          SUM(CASE WHEN status='OK' AND difference_pct IS NOT NULL AND abs(difference_pct) < 2.0 THEN 1 ELSE 0 END)::bigint AS ok_absdiff_lt2,
+          SUM(CASE WHEN status='OK' AND difference_pct IS NOT NULL AND abs(difference_pct) >= 2.0 AND abs(difference_pct) <= 10.0 THEN 1 ELSE 0 END)::bigint AS ok_absdiff_2_10,
+          SUM(CASE WHEN status='OK' AND difference_pct IS NOT NULL AND abs(difference_pct) > 10.0 THEN 1 ELSE 0 END)::bigint AS ok_absdiff_gt10
+        FROM betslip_audit_results
+        WHERE hypothesis_type = :hyp
+          AND reversal_direction = :direction
+          AND audited_at >= :since
+        GROUP BY 1
+        """
+    )
+    okdiff_map: Dict[str, Dict[str, Any]] = {}
+    async with db.async_session() as session:
+        r = await session.execute(q_okdiff, {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since})
+        for x in r.fetchall() or []:
+            d = _json_safe(dict(x._mapping))
+            okdiff_map[str(d.get("audit_version") or "NA")] = d
+
     # Top erros (api_error) por versão/status para entender "por que não-OK"
     q_err = text(
         """
@@ -140,6 +163,14 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
             ls = str(l)
             if v["last_ts"] is None or ls > str(v["last_ts"]):
                 v["last_ts"] = l
+
+    # merge okdiff diagnostics
+    for ver, v in by_version.items():
+        d = okdiff_map.get(ver) or {}
+        v["ok_diff_null"] = int(d.get("ok_diff_null") or 0)
+        v["ok_absdiff_lt2"] = int(d.get("ok_absdiff_lt2") or 0)
+        v["ok_absdiff_2_10"] = int(d.get("ok_absdiff_2_10") or 0)
+        v["ok_absdiff_gt10"] = int(d.get("ok_absdiff_gt10") or 0)
 
     out = {
         "ts_utc": _utcnow().isoformat(),

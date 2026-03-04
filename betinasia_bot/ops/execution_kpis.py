@@ -89,6 +89,7 @@ def compute_kpis_from_lines(
     t_queue: List[float] = []
     slip_abs: List[float] = []
     slip_pct: List[float] = []
+    slip_by_side: Dict[str, Dict[str, List[float]]] = {}
     first_ts: Optional[str] = None
     last_ts: Optional[str] = None
 
@@ -140,6 +141,26 @@ def compute_kpis_from_lines(
             slip_abs.append(da)
             slip_pct.append(dp)
 
+            side = str(res.get("exec_side") or (req.get("exec_side") if isinstance(req, dict) else "") or "").strip()
+            side_norm = side.capitalize() if side else "NA"
+            slot = slip_by_side.setdefault(side_norm, {"raw_abs": [], "raw_pct": [], "cost_abs": [], "cost_pct": []})
+            slot["raw_abs"].append(float(da))
+            slot["raw_pct"].append(float(dp))
+
+            # "cost" = movimento adverso ao operador (>=0):
+            # - Back: odds caíram (da<0 / dp<0) é pior
+            # - Lay: odds subiram (da>0 / dp>0) é pior
+            if side_norm.lower() == "back":
+                slot["cost_abs"].append(float(max(0.0, -da)))
+                slot["cost_pct"].append(float(max(0.0, -dp)))
+            elif side_norm.lower() == "lay":
+                slot["cost_abs"].append(float(max(0.0, da)))
+                slot["cost_pct"].append(float(max(0.0, dp)))
+            else:
+                # desconhecido: usa abs como "custo" neutro
+                slot["cost_abs"].append(float(abs(da)))
+                slot["cost_pct"].append(float(abs(dp)))
+
     return {
         "path": str(path),
         "n_lines": len(lines),
@@ -156,8 +177,19 @@ def compute_kpis_from_lines(
             "abs": _agg(slip_abs).__dict__,
             "pct": _agg(slip_pct).__dict__,
         },
+        "slippage_by_side": {
+            k: {
+                "raw_abs": _agg(v.get("raw_abs") or []).__dict__,
+                "raw_pct": _agg(v.get("raw_pct") or []).__dict__,
+                "cost_abs": _agg(v.get("cost_abs") or []).__dict__,
+                "cost_pct": _agg(v.get("cost_pct") or []).__dict__,
+            }
+            for k, v in sorted(slip_by_side.items(), key=lambda x: x[0])
+        },
         "notes": [
             "slippage usa apenas linhas com odd_at_decision e odd_final presentes",
+            "slippage.abs/pct são (odd_final - odd_at_decision); sinal não é comparável entre Back e Lay",
+            "slippage_by_side.cost_* sempre representa movimento adverso (>=0) por lado",
             "ROI/Lucro real depende de settlement; aqui só KPIs de execução",
         ],
     }

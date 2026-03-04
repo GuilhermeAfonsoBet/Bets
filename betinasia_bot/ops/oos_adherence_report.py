@@ -143,6 +143,45 @@ def _roi_lay_pct_per_liability(lay_odd: float, mult_back: float) -> Optional[flo
     return 0.0
 
 
+def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+    try:
+        if len(xs) != len(ys) or len(xs) < 3:
+            return None
+        mx = sum(xs) / len(xs)
+        my = sum(ys) / len(ys)
+        vx = sum((x - mx) ** 2 for x in xs)
+        vy = sum((y - my) ** 2 for y in ys)
+        if vx <= 0 or vy <= 0:
+            return None
+        cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        return float(cov / (vx**0.5) / (vy**0.5))
+    except Exception:
+        return None
+
+
+def _slip_raw_pct(*, odd_dec: Optional[float], odd_fin: Optional[float]) -> Optional[float]:
+    if odd_dec is None or odd_fin is None or float(odd_dec) <= 0:
+        return None
+    return float((float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0)
+
+
+def _slip_cost_pct(*, exec_side: str, odd_dec: Optional[float], odd_fin: Optional[float]) -> Optional[float]:
+    """
+    Slippage "custo" em % (sempre >=0), normalizado por lado:
+    - Back: custo quando a odd caiu (piorou).
+    - Lay : custo quando a odd subiu (piorou).
+    """
+    raw = _slip_raw_pct(odd_dec=odd_dec, odd_fin=odd_fin)
+    if raw is None:
+        return None
+    s = str(exec_side or "").strip().lower()
+    if s == "back":
+        return float(max(0.0, -raw))
+    if s == "lay":
+        return float(max(0.0, raw))
+    return float(abs(raw))
+
+
 @dataclass
 class ExecRow:
     created_at: datetime
@@ -348,6 +387,8 @@ async def run_report(
 
     policy = _load_json(policy_json) or {}
     active_by_day = _active_keys_by_day_from_policy(policy, tz_name=tz_name)
+    steps = policy.get("steps") if isinstance(policy.get("steps"), list) else []
+    last_step = steps[-1] if steps and isinstance(steps[-1], dict) else None
 
     exec_rows = _parse_executor_jsonl(executor_jsonl)
     db = Database()
@@ -371,7 +412,37 @@ async def run_report(
             "status_counts": {},
             "back": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "stake_sum": 0.0, "pnl_sum": 0.0},
             "lay": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "liability_sum": 0.0, "pnl_sum": 0.0},
+            "slippage": {
+                "back": {"n": 0, "raw_pct_mean": None, "cost_pct_mean": None},
+                "lay": {"n": 0, "raw_pct_mean": None, "cost_pct_mean": None},
+            },
+            "slippage_vs_roi": {
+                "back": {"corr_cost_pct_vs_roi": None, "buckets": []},
+                "lay": {"corr_cost_pct_vs_roi": None, "buckets": []},
+            },
         }
+
+        slip_raw_back: List[float] = []
+        slip_cost_back: List[float] = []
+        slip_raw_lay: List[float] = []
+        slip_cost_lay: List[float] = []
+        pairs_back: List[Tuple[float, float]] = []
+        pairs_lay: List[Tuple[float, float]] = []
+
+        def _bucketize(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
+            edges = [(0.0, 0.0), (0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 999.0)]
+            outb = []
+            for a, b in edges:
+                if a == b:
+                    ys = [roi for (c, roi) in pairs if c == 0.0]
+                    lab = "0"
+                else:
+                    ys = [roi for (c, roi) in pairs if (c > a and c <= b)]
+                    lab = f"({a},{b}]"
+                if not ys:
+                    continue
+                outb.append({"bucket": lab, "n": int(len(ys)), "roi_mean": float(sum(ys) / len(ys))})
+            return outb
         for e in xs:
             perf["status_counts"][e.status] = int(perf["status_counts"].get(e.status, 0)) + 1
 
@@ -406,6 +477,14 @@ async def run_report(
                         perf["back"]["losses"] += 1
                 else:
                     perf["back"]["push"] += 1
+
+                raw_pct = _slip_raw_pct(odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                cost_pct = _slip_cost_pct(exec_side="back", odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                if raw_pct is not None and cost_pct is not None:
+                    slip_raw_back.append(float(raw_pct))
+                    slip_cost_back.append(float(cost_pct))
+                if cost_pct is not None:
+                    pairs_back.append((float(cost_pct), float(roi)))
             elif side.lower() == "lay":
                 perf["lay"]["n"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
@@ -430,11 +509,36 @@ async def run_report(
                 else:
                     perf["lay"]["push"] += 1
 
+                raw_pct = _slip_raw_pct(odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                cost_pct = _slip_cost_pct(exec_side="lay", odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                if raw_pct is not None and cost_pct is not None:
+                    slip_raw_lay.append(float(raw_pct))
+                    slip_cost_lay.append(float(cost_pct))
+                if cost_pct is not None and roi_liab is not None:
+                    pairs_lay.append((float(cost_pct), float(roi_liab)))
+
         # ROIs agregados
         back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum"]) * 100.0) if perf["back"]["stake_sum"] else None
         lay_roi = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["liability_sum"]) * 100.0) if perf["lay"]["liability_sum"] else None
         perf["back"]["roi_pct"] = back_roi
         perf["lay"]["roi_pct_per_liability"] = lay_roi
+
+        # slippage agregada
+        if slip_raw_back:
+            perf["slippage"]["back"]["n"] = int(len(slip_raw_back))
+            perf["slippage"]["back"]["raw_pct_mean"] = float(sum(slip_raw_back) / len(slip_raw_back))
+            perf["slippage"]["back"]["cost_pct_mean"] = float(sum(slip_cost_back) / len(slip_cost_back)) if slip_cost_back else None
+        if slip_raw_lay:
+            perf["slippage"]["lay"]["n"] = int(len(slip_raw_lay))
+            perf["slippage"]["lay"]["raw_pct_mean"] = float(sum(slip_raw_lay) / len(slip_raw_lay))
+            perf["slippage"]["lay"]["cost_pct_mean"] = float(sum(slip_cost_lay) / len(slip_cost_lay)) if slip_cost_lay else None
+
+        if pairs_back:
+            perf["slippage_vs_roi"]["back"]["corr_cost_pct_vs_roi"] = _pearson([c for c, _ in pairs_back], [r for _, r in pairs_back])
+            perf["slippage_vs_roi"]["back"]["buckets"] = _bucketize(pairs_back)
+        if pairs_lay:
+            perf["slippage_vs_roi"]["lay"]["corr_cost_pct_vs_roi"] = _pearson([c for c, _ in pairs_lay], [r for _, r in pairs_lay])
+            perf["slippage_vs_roi"]["lay"]["buckets"] = _bucketize(pairs_lay)
 
         per_day.append(
             {
@@ -446,6 +550,23 @@ async def run_report(
                 "execution": perf,
             }
         )
+
+    # Carry-forward do último step para dias sem mapeamento (test_days com gaps),
+    # refletindo a operação real (policy "corrente" vale até próxima atualização).
+    if last_step and isinstance(last_step, dict):
+        for it in per_day:
+            if not isinstance(it, dict):
+                continue
+            if it.get("policy") is None:
+                it["policy"] = {
+                    "active_keys": list(last_step.get("active_keys") or []),
+                    "n_active_keys": len(list(last_step.get("active_keys") or [])),
+                    "train": last_step.get("train"),
+                    "test": last_step.get("test"),
+                    "train_days": last_step.get("train_days"),
+                    "test_days": last_step.get("test_days"),
+                    "carried_forward": True,
+                }
 
     out = {
         "ts_utc": now_utc.isoformat(),
