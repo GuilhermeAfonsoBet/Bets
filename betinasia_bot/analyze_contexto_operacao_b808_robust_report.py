@@ -2207,6 +2207,20 @@ async def main() -> int:
                 return (float(min(f * float(ins_bank_ref), cap)), float(lay_odd))
             return None
 
+        def _roi_lay_pct_per_liability_policy(lay_odd: float, mult_back: float) -> Optional[float]:
+            """
+            ROI por liability para Lay (mesma convenção do relatório), usada aqui no bloco 7.x
+            antes do helper equivalente ser definido mais abaixo no arquivo.
+            """
+            liab = max(0.0, float(lay_odd) - 1.0)
+            if liab <= 0:
+                return None
+            if float(mult_back) < 0:
+                return (-float(mult_back)) / liab * 100.0
+            if float(mult_back) > 0:
+                return (-float(mult_back)) * 100.0
+            return 0.0
+
         back_stakes = []
         back_profit_if_win = []
         lay_stakes = []
@@ -2385,7 +2399,7 @@ async def main() -> int:
             sized_pol = _ins_sizing_lay_liab(d)
             if sized_pol and sized_pol[0] is not None and float(sized_pol[0]) > 0:
                 liab_pol, odd_pol = sized_pol
-                roi_liab_pol = _roi_lay_pct_per_liability(float(odd_pol), float(mult))
+                roi_liab_pol = _roi_lay_pct_per_liability_policy(float(odd_pol), float(mult))
                 if roi_liab_pol is not None:
                     pnl_pol = float(liab_pol) * float(roi_liab_pol) / 100.0
                     lay_realized_policy_pnl.append(float(pnl_pol))
