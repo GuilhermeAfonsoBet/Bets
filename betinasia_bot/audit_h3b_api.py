@@ -60,6 +60,8 @@ class H3bApiAudit:
         ws_sample_offsets_sec: Optional[List[float]] = None,
         gate_drop_offset_sec: float = 5.0,
         gate_drop_ratio: float = 0.98,
+        gate_rise_offset_sec: float = 5.0,
+        gate_rise_ratio: float = 1.02,
         gate_open_window_sec: int = 300,
         gate_open_max: int = 3,
         gate_max_late_sec: float = 2.5,
@@ -117,6 +119,7 @@ class H3bApiAudit:
         # - ws_only: coleta só WS (t0..t+30) e prepara dados para motor de decisão
         # - ws_vs_bs: auditoria comparativa (WS + BS no mesmo timestamp)
         # - ws_gate_lay: WS-only para gate (t0,t+5), abre ticket LAY só quando elegível
+        # - ws_gate_back: WS-only para gate (t0,t+5), marca oportunidade BACK quando elegível (sem abrir betslip)
         self.mode = str(mode or "api").strip().lower()
         self.ws_sample_offsets_sec = ws_sample_offsets_sec or [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]
 
@@ -126,6 +129,13 @@ class H3bApiAudit:
         if self.gate_drop_ratio <= 0 or self.gate_drop_ratio >= 1.0:
             # sane default: 0.98 (= queda >2%)
             self.gate_drop_ratio = 0.98
+
+        # Gate (H3B + subida em 5s) -> marca oportunidade BACK via WS (sem abrir betslip)
+        self.gate_rise_offset_sec = max(0.0, float(gate_rise_offset_sec))
+        self.gate_rise_ratio = float(gate_rise_ratio)
+        if self.gate_rise_ratio <= 1.0:
+            # sane default: 1.02 (= alta >=2%)
+            self.gate_rise_ratio = 1.02
         self.gate_open_window_sec = max(30, int(gate_open_window_sec))
         self.gate_open_max = max(0, int(gate_open_max))
         self.gate_max_late_sec = max(0.0, float(gate_max_late_sec))
@@ -151,6 +161,11 @@ class H3bApiAudit:
         self.gate_open_attempts = 0
         self.gate_open_success = 0
         self.gate_open_failed = 0
+
+        self.gate_back_seen = 0
+        self.gate_back_ws_missing = 0
+        self.gate_back_not_eligible = 0
+        self.gate_back_eligible = 0
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -453,6 +468,8 @@ class H3bApiAudit:
         logger.info("=" * 60)
         if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
             logger.info("MONITOR H3B (WS gate t0/t+5) + abre LAY (Exchange) sob cap")
+        elif self.mode in ("ws_gate_back", "gate_back"):
+            logger.info("MONITOR H3B (WS gate t0/t+5) + marca BACK válido (sem abrir betslip)")
         elif self.mode in ("ws_only", "ws"):
             logger.info("MONITOR H3B (WS-only) + série temporal (t0..t+30)")
         elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
@@ -465,6 +482,11 @@ class H3bApiAudit:
                 f"gate: offset={self.gate_drop_offset_sec:.1f}s ratio={self.gate_drop_ratio:.3f} | "
                 f"cap={self.gate_open_max}/{self.gate_open_window_sec}s | "
                 f"lay_refresh={self.gate_lay_refresh}"
+            )
+        if self.mode in ("ws_gate_back", "gate_back"):
+            logger.info(
+                f"gate_back: offset={self.gate_rise_offset_sec:.1f}s ratio={self.gate_rise_ratio:.3f} | "
+                f"max_late={self.gate_max_late_sec:.1f}s"
             )
         logger.info("=" * 60)
 
@@ -780,6 +802,9 @@ class H3bApiAudit:
             if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
                 # Gate precisa de WS(t0,t+5) inline para decidir; não pode ser deferred.
                 result = await self._execute_ws_gate_lay(h3b, defer_temporal=defer_temporal)
+            elif self.mode in ("ws_gate_back", "gate_back"):
+                # Gate Back decide via WS(t0,t+5) (sem abrir betslip).
+                result = await self._execute_ws_gate_back(h3b, defer_temporal=defer_temporal)
             elif self.mode in ("ws_only", "ws"):
                 result = await self._execute_ws_only(h3b, run_ws_series=not defer_temporal)
             elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
@@ -1645,6 +1670,8 @@ class H3bApiAudit:
             'post_ms': 0,
             'pmm_ms': 0,
             'audit_version': "v5.1-ws-gate-lay",
+            # evita que o bridge Back execute oportunidades Lay
+            'exec_side_hint': "Lay",
         }
 
         ws_state_key = h3b.get("ws_state_key")
@@ -1946,6 +1973,182 @@ class H3bApiAudit:
         })
         return base
 
+    async def _execute_ws_gate_back(self, h3b: dict, *, defer_temporal: bool = True) -> dict:
+        """
+        Gate Back (H3B UP + alta em 5s):
+          - mede WS(t0) e WS(t+offset) no timestamp alvo (detected_at + offset)
+          - se WS(t+offset) >= gate_rise_ratio * WS(t0): marca como oportunidade executável (Back)
+          - NÃO abre betslip (executor fará isso no momento da execução)
+        """
+        self.gate_back_seen += 1
+        detected_at = h3b['detected_at']
+        execution_start = time.time()
+        queue_wait_ms = int((execution_start - detected_at) * 1000)
+
+        telemetry: Dict[str, Any] = {
+            'queue_wait_ms': queue_wait_ms,
+            'queue_depth_at_enqueue': h3b.get('queue_depth_at_enqueue'),
+            'queue_depth_after_dequeue': h3b.get('queue_depth_after_dequeue'),
+            'gate_mode': 'ws_gate_back',
+            'gate_rise_offset_sec': float(self.gate_rise_offset_sec),
+            'gate_rise_ratio': float(self.gate_rise_ratio),
+        }
+
+        base: Dict[str, Any] = {
+            'event_id': h3b['event_id'],
+            'home_team': h3b['home_team'],
+            'away_team': h3b['away_team'],
+            'league': h3b.get('league', ''),
+            'kickoff': h3b.get('kickoff'),
+            'market_type': h3b['market_type'],
+            'market_period': h3b.get('market_period', 'full_time'),
+            'line': h3b['line'],
+            'side': h3b['side'],
+            'ws_odd': h3b['websocket_odd'],
+            'is_live': h3b.get('is_live'),
+            'direction': h3b.get('direction', 'up'),
+            'detected_at': detected_at,
+            'post_ms': 0,
+            'pmm_ms': 0,
+            'audit_version': "v5.3-ws-gate-back",
+            'exec_side_hint': "Back",
+        }
+
+        ws_state_key = h3b.get("ws_state_key")
+        ws_side = str(h3b.get("side") or "")
+
+        # WS(t0): valor capturado no instante da detecção
+        ws0 = None
+        try:
+            if isinstance(h3b.get("websocket_odd"), (int, float)) and float(h3b.get("websocket_odd")) > 0:
+                ws0 = float(h3b.get("websocket_odd"))
+        except Exception:
+            ws0 = None
+
+        # WS(t+offset) no timestamp alvo (detected_at + offset)
+        target_abs_ts = float(detected_at) + float(self.gate_rise_offset_sec)
+        now0 = time.time()
+        late_s = float(now0) - float(target_abs_ts)
+        telemetry["gate_target_abs_ts"] = float(target_abs_ts)
+        telemetry["gate_late_s_at_start"] = float(late_s)
+
+        if late_s > float(self.gate_max_late_sec):
+            base['ws_gate_series'] = [
+                {"t_target_s": 0.0, "t_actual_s": max(0.0, float(now0 - float(detected_at))), "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
+            ]
+            base.update({
+                'success': True,
+                'status': 'GATE_STALE',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': f"LATE>{float(self.gate_max_late_sec):.1f}s",
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        wait_s = max(0.0, float(target_abs_ts) - float(now0))
+        telemetry["gate_wait_s"] = float(wait_s)
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
+
+        ws5 = None
+        try:
+            if ws_state_key and ws_side:
+                cur = self._ws_get_side_odd(ws_state_key, ws_side)
+                if isinstance(cur, (int, float)) and float(cur) > 0:
+                    ws5 = float(cur)
+        except Exception:
+            ws5 = None
+
+        telemetry['gate_ws_t0'] = ws0
+        telemetry['gate_ws_t5'] = ws5
+        t_actual_5 = max(0.0, float(time.time() - float(detected_at)))
+        base['ws_gate_series'] = [
+            {"t_target_s": 0.0, "t_actual_s": 0.0, "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
+            {"t_target_s": float(self.gate_rise_offset_sec), "t_actual_s": t_actual_5, "ts": time.time(), "ws_side": ws_side, "ws_odd": ws5},
+        ]
+
+        if not ws_state_key or not ws_side:
+            self.gate_back_ws_missing += 1
+            base.update({
+                'success': True,
+                'status': 'GATE_WS_MISSING',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': 'WS_STATE_KEY_OR_SIDE_MISSING',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        if not ws0 or not ws5:
+            self.gate_back_ws_missing += 1
+            base.update({
+                'success': True,
+                'status': 'GATE_WS_POINT_MISSING',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': 'WS_POINT_MISSING',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+            })
+            return base
+
+        gate_ok = bool(float(ws5) >= float(self.gate_rise_ratio) * float(ws0))
+        telemetry['gate_eligible'] = gate_ok
+        telemetry['gate_rise_ratio_obs'] = float(ws5) / float(ws0) if ws0 else None
+        telemetry['gate_rise_pct_obs'] = ((float(ws5) - float(ws0)) / float(ws0) * 100.0) if ws0 else None
+
+        if not gate_ok:
+            self.gate_back_not_eligible += 1
+            if defer_temporal:
+                base["_ws_series_refs"] = {
+                    "ws_state_key": ws_state_key,
+                    "ws_side": ws_side,
+                    "offsets_sec": sorted({0.0, float(self.gate_rise_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+                }
+                telemetry["ws_series_deferred"] = True
+            base.update({
+                'success': True,
+                'status': 'GATE_NOT_ELIGIBLE',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': '',
+                'total_ms': int((time.time() - detected_at) * 1000),
+                'telemetry': telemetry,
+                'is_valid_opportunity': False,
+            })
+            return base
+
+        self.gate_back_eligible += 1
+        end_to_end_ms = int((time.time() - detected_at) * 1000)
+        telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
+        telemetry['end_to_end_ms'] = end_to_end_ms
+        telemetry['pipeline_overhead_ms'] = max(0, end_to_end_ms - telemetry.get('queue_wait_ms', 0))
+
+        base.update({
+            'success': True,
+            'status': 'OK',
+            'bs_odd': None,
+            'bs_limit': 0,
+            'num_bk': 0,
+            'diff_pct': None,
+            'error': '',
+            'total_ms': end_to_end_ms,
+            'telemetry': telemetry,
+            'is_valid_opportunity': True,
+        })
+        return base
+
     # ================================================================
     # SAVE
     # ================================================================
@@ -1979,6 +2182,9 @@ class H3bApiAudit:
             # Gate series/meta (t0,t+5) — usado para elegibilidade e debug
             if r.get('ws_gate_series'):
                 hypothesis_details['ws_gate_series'] = r.get('ws_gate_series')
+            # Hint para o bridge não misturar Back vs Lay
+            if r.get('exec_side_hint'):
+                hypothesis_details['exec_side_hint'] = str(r.get('exec_side_hint'))
             if (not r.get('success')) and r.get('error'):
                 hypothesis_details['api_error'] = r.get('error')
             finance_snapshot = self._build_finance_snapshot(r)
@@ -2203,9 +2409,9 @@ async def main():
     default_offsets = os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC") or getattr(settings, "audit_ws_sample_offsets_sec", None) or "0,3,6,9,12,15,18,21,24,27,30"
     parser.add_argument(
         "--mode",
-        choices=["api", "ws_only", "ws_vs_bs", "ws_gate_lay"],
+        choices=["api", "ws_only", "ws_vs_bs", "ws_gate_lay", "ws_gate_back"],
         default=default_mode,
-        help="Modo: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo), ws_gate_lay (WS gate + abre LAY sob cap).",
+        help="Modo: api (WS+BS), ws_only (só WS), ws_vs_bs (comparativo), ws_gate_lay (WS gate + abre LAY sob cap), ws_gate_back (WS gate + marca BACK válido).",
     )
     parser.add_argument(
         "--ws-sample-offsets-sec",
@@ -2221,6 +2427,9 @@ async def main():
     # Gate: H3B UP + queda em 5s -> abre ticket LAY
     parser.add_argument("--gate-drop-offset-sec", type=float, default=float(os.getenv("GATE_DROP_OFFSET_SEC", "5")), help="Gate: offset (s) para comparar WS(t+offset) vs WS(t0). Default=5.")
     parser.add_argument("--gate-drop-ratio", type=float, default=float(os.getenv("GATE_DROP_RATIO", "0.98")), help="Gate: condição WS(t+offset) < ratio * WS(t0). Default=0.98 (queda >2%).")
+    # Gate: H3B UP + alta em 5s -> oportunidade BACK via WS
+    parser.add_argument("--gate-rise-offset-sec", type=float, default=float(os.getenv("GATE_RISE_OFFSET_SEC", "5")), help="Gate Back: offset (s) para comparar WS(t+offset) vs WS(t0). Default=5.")
+    parser.add_argument("--gate-rise-ratio", type=float, default=float(os.getenv("GATE_RISE_RATIO", "1.02")), help="Gate Back: condição WS(t+offset) >= ratio * WS(t0). Default=1.02 (alta >=2%).")
     parser.add_argument("--gate-open-window-sec", type=int, default=int(os.getenv("GATE_OPEN_WINDOW_SEC", "300")), help="Cap: janela (s) para contar aberturas (POST /v1/betslips/). Default=300 (5 min).")
     parser.add_argument("--gate-open-max", type=int, default=int(os.getenv("GATE_OPEN_MAX", "3")), help="Cap: máximo de aberturas por janela. Default=3 por 5 min (conservador).")
     parser.add_argument("--gate-max-late-sec", type=float, default=float(os.getenv("GATE_MAX_LATE_SEC", "2.5")), help="Gate: tolerância de atraso (s). Se o worker começar >max_late após o t+offset, marca como stale e não abre ticket. Default=2.5.")
@@ -2281,6 +2490,8 @@ async def main():
         ws_sample_offsets_sec=ws_offsets,
         gate_drop_offset_sec=float(getattr(args, "gate_drop_offset_sec", 5.0)),
         gate_drop_ratio=float(getattr(args, "gate_drop_ratio", 0.98)),
+        gate_rise_offset_sec=float(getattr(args, "gate_rise_offset_sec", 5.0)),
+        gate_rise_ratio=float(getattr(args, "gate_rise_ratio", 1.02)),
         gate_open_window_sec=int(getattr(args, "gate_open_window_sec", 300)),
         gate_open_max=int(getattr(args, "gate_open_max", 3)),
         gate_max_late_sec=float(getattr(args, "gate_max_late_sec", 2.5)),

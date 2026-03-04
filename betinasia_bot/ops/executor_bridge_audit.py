@@ -236,6 +236,11 @@ async def _fetch_candidates(
     WHERE r.audited_at >= :since
       AND s.id IS NULL
       AND r.is_valid_opportunity = TRUE
+      AND (
+        r.hypothesis_details IS NULL
+        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
+        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+      )
       AND r.event_id IS NOT NULL AND r.event_id <> ''
       AND upper(r.market_type) = 'AH'
       AND r.hypothesis_type = :hyp
@@ -247,6 +252,7 @@ async def _fetch_candidates(
         "lim": int(cfg.max_per_cycle),
         "action": f"{cfg.mode}:{cfg.exec_side.value}",
         "hyp": str(cfg.only_hypothesis),
+        "exec_side_hint": str(cfg.exec_side.value),
     }
     if cfg.only_prematch:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
