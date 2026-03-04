@@ -4246,8 +4246,8 @@ async def main() -> int:
             "(ii) o sizing Kelly acima depende desse benchmark.\n\n"
         )
         strat_back_im = [d for d in back_edge if str(d.get("exec_bucket")) == "< 5s" and d.get("is_live") is True]
-        eb_flat_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "FLAT")
-        eb_proxy_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "PROXY")
+        eb_flat_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "FLAT", bank_ref=float(back_bank_ref))
+        eb_proxy_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "PROXY", bank_ref=float(back_bank_ref))
         lines.append("| Regime | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover |\n|---|---|---:|---:|---:|---:|\n")
         lines.append(f"| IN_MATCH BackFast (<5s) | FLAT | {eb_flat_im['n']} | {_fmt_num(eb_flat_im['turnover'],2)} | {_fmt_num(eb_flat_im['profit'],2)} | {_fmt_num(eb_flat_im['roi_turn'],2)}% |\n")
         lines.append(f"| IN_MATCH BackFast (<5s) | PROXY | {eb_proxy_im['n']} | {_fmt_num(eb_proxy_im['turnover'],2)} | {_fmt_num(eb_proxy_im['profit'],2)} | {_fmt_num(eb_proxy_im['roi_turn'],2)}% |\n")
