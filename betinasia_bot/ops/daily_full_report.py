@@ -361,6 +361,91 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- Isso significa que, mesmo em shadow, a amostra Lay desse audit representa apenas casos em que houve a movimentação (reversão/queda) definida pela estratégia.\n\n"
         )
 
+    # 99.6 Config efetiva (filtros ativos) — executor/audit/bridge/OOS
+    extra.append("\n### 99.6 Filtros ativos (config efetiva)\n\n")
+    extra.append(
+        "_Nota: esta seção reflete as variáveis carregadas pelo `daily_full_report` (via `.env`). "
+        "Services do systemd podem ter overrides (`Environment=`) que não aparecem aqui; use `systemctl show` para confirmar no VPS._\n\n"
+    )
+    def _env(k: str, default: str = "") -> str:
+        v = os.getenv(k, default)
+        return str(v) if v is not None else ""
+
+    extra.append("**Executor**\n\n")
+    extra.append("| chave | valor |\n|---|---|\n")
+    for k in [
+        "EXECUTOR_ALLOW_LIVE",
+        "EXECUTOR_WORKERS",
+        "EXECUTOR_QUEUE_MAX",
+        "EXECUTOR_CAP_WINDOW_SEC",
+        "EXECUTOR_CAP_MAX",
+        "EXECUTOR_FAST_PMM",
+        "EXECUTOR_PMM_TIMEOUT_SEC",
+        "EXECUTOR_PMM_MIN_WAIT_SEC",
+        "EXECUTOR_PMM_IDLE_TIMEOUT_SEC",
+        "EXECUTOR_BETSLIP_CACHE_MAX_KEYS",
+    ]:
+        extra.append(f"| {k} | `{_env(k)}` |\n")
+    extra.append("\n")
+
+    extra.append("**Audit H3B**\n\n")
+    extra.append("| chave | valor |\n|---|---|\n")
+    for k in [
+        "AUDIT_MODE",
+        "AUDIT_API_SIDES",
+        "AUDIT_EXECUTOR_WORKERS",
+        "AUDIT_TEMPORAL_WORKERS",
+        "AUDIT_MAX_QUEUE_DEPTH",
+        "AUDIT_MAX_QUEUE_WAIT_MS",
+        "GATE_DROP_OFFSET_SEC",
+        "GATE_DROP_RATIO",
+        "GATE_RISE_OFFSET_SEC",
+        "GATE_RISE_RATIO",
+        "GATE_OPEN_WINDOW_SEC",
+        "GATE_OPEN_MAX",
+        "GATE_MAX_LATE_SEC",
+        "GATE_LAY_REFRESH_TIMES_SEC",
+    ]:
+        extra.append(f"| {k} | `{_env(k)}` |\n")
+    extra.append("\n")
+
+    extra.append("**Bridge**\n\n")
+    extra.append("| chave | valor |\n|---|---|\n")
+    for k in [
+        "BRIDGE_MODE",
+        "BRIDGE_EXEC_SIDE",
+        "BRIDGE_STAKE",
+        "BRIDGE_POLL_SEC",
+        "BRIDGE_LOOKBACK_SEC",
+        "BRIDGE_MAX_PER_CYCLE",
+        "BRIDGE_PREMATCH_ONLY",
+        "BRIDGE_POLICY_JSON",
+        "BRIDGE_POLICY_RELOAD_SEC",
+        "BRIDGE_POLICY_USE_BASE",
+        "BRIDGE_MIN_LIMIT",
+    ]:
+        extra.append(f"| {k} | `{_env(k)}` |\n")
+    extra.append("\n")
+
+    extra.append("**OOS / Walk-forward (daily)**\n\n")
+    extra.append("| chave | valor |\n|---|---|\n")
+    for k in [
+        "DAILY_OOS_DIRECTION",
+        "DAILY_OOS_VERSIONS",
+        "DAILY_OOS_LOOKBACK_DAYS",
+        "DAILY_WF_TRAIN_MODE",
+        "DAILY_WF_TRAIN_DAYS",
+        "DAILY_WF_TEST_DAYS",
+        "DAILY_WF_STEP_DAYS",
+        "DAILY_WF_KEY_BY_LEAGUE",
+        "DAILY_WF_KEY_BY_LEAGUE_SCOPE",
+        "DAILY_WF_AH_MAX_ABS_LINE",
+        "DAILY_WF_AH_SCOPE",
+        "DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK",
+    ]:
+        extra.append(f"| {k} | `{_env(k)}` |\n")
+    extra.append("\n")
+
     # 99.4 Aderência OOS (policy por dia × execução)
     try:
         adh_json = day_dir / "oos_adherence.json"
