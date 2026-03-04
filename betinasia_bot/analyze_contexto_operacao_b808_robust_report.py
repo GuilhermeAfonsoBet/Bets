@@ -4533,28 +4533,56 @@ async def main() -> int:
                 )
             def _ws_proxy_odd(d0: dict) -> Optional[Tuple[float, float]]:
                 """
-                Retorna (odd, t_s) do ponto WS mais apropriado para o proxy de BS.
-                Preferimos o primeiro ponto com t>=offset (para simular "execução após lag"),
-                desde que a distância ao offset esteja <= max_gap; senão cai para o ponto mais próximo.
+                Retorna (odd, t_s) do ponto de entrada via WS para o proxy da execução.
+
+                Compatibilidade (migração BS -> WS):
+                - Preferimos `hypothesis_details.ws_series` quando existir.
+                - Se `ws_series` não existir, mas o pipeline salvou pontos WS em `hypothesis_details.temporal`,
+                  aceitamos `ws_odd` (fallback: `bs_odd`) com `t`.
+
+                Regra de seleção do ponto:
+                - Preferimos o primeiro ponto com t>=offset (simula "entrada após lag"),
+                  desde que |t-offset| <= max_gap; caso contrário usamos o ponto mais próximo
+                  (desde que também esteja dentro de max_gap).
                 """
                 h = d0.get("hypothesis_details") or {}
-                arr = h.get("ws_series") if isinstance(h, dict) else None
-                if not isinstance(arr, list) or not arr:
-                    return None
                 pts: List[Tuple[float, float]] = []
-                for e in arr:
-                    if not isinstance(e, dict):
-                        continue
-                    t = _safe_float(e.get("t_actual_s"))
-                    if t is None:
-                        t = _safe_float(e.get("t_target_s"))
-                    odd = _safe_float(e.get("ws_odd"))
-                    if t is None or odd is None or odd <= 0:
-                        continue
-                    pts.append((float(t), float(odd)))
+
+                # 1) ws_series (formato padrão)
+                arr = h.get("ws_series") if isinstance(h, dict) else None
+                if isinstance(arr, list) and arr:
+                    for e in arr:
+                        if not isinstance(e, dict):
+                            continue
+                        t = _safe_float(e.get("t_actual_s"))
+                        if t is None:
+                            t = _safe_float(e.get("t_target_s"))
+                        odd = _safe_float(e.get("ws_odd"))
+                        if t is None or odd is None or odd <= 0:
+                            continue
+                        pts.append((float(t), float(odd)))
+
+                # 2) temporal (fallback pós-mudança: alguns pipelines salvam ws_odd aqui)
+                if not pts:
+                    arr2 = h.get("temporal") if isinstance(h, dict) else None
+                    if isinstance(arr2, list) and arr2:
+                        for e in arr2:
+                            if not isinstance(e, dict):
+                                continue
+                            t = _safe_float(e.get("t"))
+                            odd = _safe_float(e.get("ws_odd"))
+                            if odd is None:
+                                odd = _safe_float(e.get("bs_odd"))
+                            if t is None or odd is None or odd <= 0:
+                                continue
+                            if float(t) <= 0.0005:
+                                continue
+                            pts.append((float(t), float(odd)))
+
                 if not pts:
                     return None
                 pts.sort(key=lambda x: x[0])
+
                 # preferir t>=offset (primeiro)
                 candidates = [(t, o) for (t, o) in pts if t >= float(wf_ws_proxy_offset)]
                 best = None
@@ -4643,18 +4671,34 @@ async def main() -> int:
                     }
                 )
 
-            # --- Lay: permanece baseado em betslip (não há lay no ws-only) ---
+            # --- Lay: entrada pós-reversal (ou último ponto). Alinha com operação WS (não depende de betslip). ---
             for r in lay_entries:
                 aid = r.get("audit_id")
                 if aid is None:
-                    continue
-                if int(aid) not in lay_edge_ids:
                     continue
                 d0 = audit_by_id.get(int(aid))
                 if d0 and wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
                     continue
                 ts = r.get("audited_at")
                 if not isinstance(ts, datetime):
+                    continue
+                ws0 = _safe_float((d0 or {}).get("ws_odd"))
+                if ws0 is None or ws0 <= 0:
+                    continue
+                entry = _safe_float(r.get("odd_entry"))
+                if entry is None or entry <= 0:
+                    # fallback: se odd_entry não vier, tentar WS proxy no offset (melhor que nada)
+                    ref = _ws_proxy_odd(d0 or {})
+                    if not ref:
+                        continue
+                    entry = float(ref[0])
+                diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
+                if diff is None:
+                    continue
+                if not (-10.0 <= float(diff) <= 10.0):
+                    continue
+                # edge Lay (mesmo corte antigo, mas agora usando WS-entry vs WS0)
+                if float(diff) > float(lay_cut):
                     continue
                 combo_events.append(
                     {
@@ -4675,6 +4719,8 @@ async def main() -> int:
                         "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False) else None,
                         "roi": r.get("roi_entry"),
                         "entry_odd": r.get("odd_entry"),
+                        "entry_source": str(r.get("entry_policy") or "WS_ENTRY"),
+                        "diff_pct": float(diff),
                     }
                 )
 
