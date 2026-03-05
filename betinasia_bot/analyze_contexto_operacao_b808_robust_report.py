@@ -5844,21 +5844,21 @@ async def main() -> int:
                 wf_key_by_league2 = bool(getattr(args, "wf_key_by_league", False))
                 if wf_key_by_league2:
                     lines.append(
-                        "| Train window | Test window | #ativas (keys) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n"
-                        "|---|---|---:|---:|---:|---:|---:|---:|\n"
+                        "| Train window | Test window | #ativas (keys) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Pre | Turnover In | Lucro (estratégia, budget) |\n"
+                        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
                     )
                 else:
-                    lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|\n")
+                    lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Pre | Turnover In | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
                 for s in steps[:20]:
                     if wf_key_by_league2:
                         lines.append(
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {int(s.get('active_n_base') or 0)} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                         )
                     else:
                         lines.append(
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                         )
                 # Transparência do turnover (diagnóstico de quedas bruscas)
                 lines.append(

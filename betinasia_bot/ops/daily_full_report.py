@@ -149,6 +149,24 @@ def _extract_md_table(md: str, *, header_startswith: str) -> tuple[str, list[lis
         rows.append(cols)
     return "\n".join(out_lines).strip() + "\n", rows
 
+
+def _md_table_header_cols(table_md: str) -> list[str]:
+    """
+    Retorna as colunas do header da tabela (linha 1) sem pipes.
+    """
+    try:
+        for ln in (table_md or "").splitlines():
+            s = ln.strip()
+            if not s.startswith("|"):
+                continue
+            if s.startswith("|---"):
+                continue
+            cols = [c.strip() for c in s.strip().strip("|").split("|")]
+            return cols
+    except Exception:
+        return []
+    return []
+
 def _tail_lines(path: Path, n: int) -> list[str]:
     try:
         xs = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1090,27 +1108,49 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 # mostrar a tabela original e destacar os últimos 4 steps (no topo executivo)
                 s1.append(tbl_md + "\n")
                 last4 = rows[-4:]
+                hdr = _md_table_header_cols(tbl_md)
+                hmap = {str(c).strip(): i for i, c in enumerate(hdr)}
+                # índices robustos (compatível com tabela antiga e nova)
+                ix_games = hmap.get("Jogos OOS")
+                ix_turn = hmap.get("Turnover (teste)")
+                ix_pnl = hmap.get("Lucro (estratégia, budget)")
+                ix_turn_pre = hmap.get("Turnover Pre")
+                ix_turn_in = hmap.get("Turnover In")
                 def _g(cols, ix):
                     try:
-                        return cols[ix]
+                        if ix is None:
+                            return ""
+                        return cols[int(ix)]
                     except Exception:
                         return ""
                 # heurística: comparar último vs mediana
                 try:
                     games = []
                     turns = []
+                    turns_pre = []
+                    turns_in = []
                     profs = []
                     for r in rows:
                         try:
-                            games.append(float(_g(r, 2)) if _g(r, 2) else 0.0)
+                            games.append(float(_g(r, ix_games)) if _g(r, ix_games) else 0.0)
                         except Exception:
                             pass
                         try:
-                            turns.append(float(str(_g(r, 5)).replace(",", ".")))
+                            turns.append(float(str(_g(r, ix_turn)).replace(",", ".")))
                         except Exception:
                             pass
                         try:
-                            profs.append(float(str(_g(r, 6)).replace(",", ".")))
+                            if _g(r, ix_turn_pre):
+                                turns_pre.append(float(str(_g(r, ix_turn_pre)).replace(",", ".")))
+                        except Exception:
+                            pass
+                        try:
+                            if _g(r, ix_turn_in):
+                                turns_in.append(float(str(_g(r, ix_turn_in)).replace(",", ".")))
+                        except Exception:
+                            pass
+                        try:
+                            profs.append(float(str(_g(r, ix_pnl)).replace(",", ".")))
                         except Exception:
                             pass
                     if games and turns:
@@ -1120,15 +1160,29 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         s1.append("**Diagnóstico rápido (último step vs mediana histórica do WF)**\n\n")
                         # último row
                         lr = rows[-1]
-                        g_last = float(_g(lr, 2) or 0.0)
+                        g_last = float(_g(lr, ix_games) or 0.0)
                         t_last = None
                         try:
-                            t_last = float(str(_g(lr, 5)).replace(",", "."))
+                            t_last = float(str(_g(lr, ix_turn)).replace(",", "."))
                         except Exception:
                             t_last = None
                         s1.append(f"- Jogos OOS (último): `{_fmt_num(g_last,0)}` vs mediana `{_fmt_num(med_g,0)}`\n")
                         if t_last is not None:
                             s1.append(f"- Turnover teste (último): `{_fmt_num(t_last,2)}` vs mediana `{_fmt_num(med_t,2)}`\n")
+                        # Pre/In (se houver)
+                        try:
+                            if ix_turn_pre is not None and turns_pre:
+                                med_tp = statistics.median(turns_pre)
+                                tp_last = float(str(_g(lr, ix_turn_pre)).replace(",", ".")) if _g(lr, ix_turn_pre) else None
+                                if tp_last is not None:
+                                    s1.append(f"- Turnover Pre (último): `{_fmt_num(tp_last,2)}` vs mediana `{_fmt_num(med_tp,2)}`\n")
+                            if ix_turn_in is not None and turns_in:
+                                med_ti = statistics.median(turns_in)
+                                ti_last = float(str(_g(lr, ix_turn_in)).replace(",", ".")) if _g(lr, ix_turn_in) else None
+                                if ti_last is not None:
+                                    s1.append(f"- Turnover In (último): `{_fmt_num(ti_last,2)}` vs mediana `{_fmt_num(med_ti,2)}`\n")
+                        except Exception:
+                            pass
                         s1.append(
                             "- Se a queda é em **Jogos OOS**: problema é **volume/cobertura** (placar, calendário, fragmentação por liga, filtros como AH/exec_bucket).\n"
                             "- Se Jogos OOS está ok mas turnover cai: **governança/sizing** (budgets/caps) está limitando escala.\n\n"
