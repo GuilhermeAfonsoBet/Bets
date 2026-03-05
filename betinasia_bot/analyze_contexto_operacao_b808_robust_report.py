@@ -2160,7 +2160,7 @@ async def main() -> int:
         def _ins_sizing_back(d: dict) -> Optional[float]:
             sc = _ins_scheme_for_row(d)
             if sc == "FLAT":
-                return 1.0
+                return float(os.getenv("WF_FLAT_STAKE_BACK", "1.0"))
             if sc == "PROXY":
                 bs, _, _, _ = finance_for_row(d)
                 return float(bs)
@@ -2173,7 +2173,11 @@ async def main() -> int:
                     return None
                 f0 = _kelly_back_frac_simple(d.get("bs_odd"), d.get("closing_odd"))
                 if f0 is None:
-                    return None
+                    # fallback: sem closing_odd não dá Kelly; cai para PROXY/FLAT para não “zerar” policy.
+                    bs, _, _, _ = finance_for_row(d)
+                    if bs is not None and float(bs) > 0:
+                        return float(bs)
+                    return float(os.getenv("WF_FLAT_STAKE_BACK", "1.0"))
                 f = max(0.0, float(f0)) * float(frac)
                 cap = INS_BACK_CAP_FRAC * float(ins_bank_ref)
                 return float(min(f * float(ins_bank_ref), cap))
@@ -2188,7 +2192,7 @@ async def main() -> int:
             if lay_odd is None or lay_odd <= 1.0:
                 return None
             if sc == "FLAT":
-                return (1.0, float(lay_odd))
+                return (float(os.getenv("WF_FLAT_LIAB_LAY", "1.0")), float(lay_odd))
             if sc == "PROXY":
                 _, _, _, ll = finance_for_row(d)
                 return (float(ll), float(lay_odd))
@@ -2201,7 +2205,11 @@ async def main() -> int:
                     return None
                 f0 = _kelly_lay_liab_frac_simple(lay_odd, d.get("closing_odd"))
                 if f0 is None:
-                    return None
+                    # fallback: sem closing_odd não dá Kelly; cai para PROXY/FLAT.
+                    _, _, _, ll = finance_for_row(d)
+                    if ll is not None and float(ll) > 0:
+                        return (float(ll), float(lay_odd))
+                    return (float(os.getenv("WF_FLAT_LIAB_LAY", "1.0")), float(lay_odd))
                 f = max(0.0, float(f0)) * float(frac)
                 cap = INS_LAY_CAP_FRAC * float(ins_bank_ref)
                 return (float(min(f * float(ins_bank_ref), cap)), float(lay_odd))
@@ -3150,15 +3158,49 @@ async def main() -> int:
             # define pontos
             p0 = series[0]  # t=0 incluído quando houver
             plast = series[-1]
+            # Entrada operacional (Back):
+            # - se há BS (execução), usamos BS como odd de entrada
+            # - senão (WS-only), usamos WS em t+offset como proxy de entrada (por padrão 5s)
+            ws0 = _safe_float(d.get("ws_odd"))
+            if (ws0 is None or ws0 <= 0) and len(series) > 0:
+                # fallback: ws0 como o primeiro ponto observado
+                ws0 = _safe_float(series[0].get("odd"))
+            tplus = _safe_float(os.getenv("WS_GATE_TPLUS_SEC", "5.0")) or 5.0
+            bs_exec = _safe_float(d.get("bs_odd"))
+            entry_odd = None
+            entry_t = None
+            entry_src = None
+            if bs_exec is not None and float(bs_exec) > 0:
+                entry_odd = float(bs_exec)
+                entry_t = 0.0
+                entry_src = "BS"
+            else:
+                # procura ponto mais próximo (>=tplus); se não houver, usa o último ponto
+                cand = [p for p in series if _safe_float(p.get("t")) is not None and float(p.get("t")) >= float(tplus) and _safe_float(p.get("odd"))]
+                if cand:
+                    # pega o mais perto do alvo
+                    cand.sort(key=lambda p: abs(float(p.get("t")) - float(tplus)))
+                    entry_odd = float(cand[0]["odd"])
+                    entry_t = float(cand[0]["t"])
+                    entry_src = f"WS@t+{entry_t:.1f}s"
+                else:
+                    entry_odd = float(plast["odd"])
+                    entry_t = float(plast.get("t") or 0.0)
+                    entry_src = f"WS@t+{entry_t:.1f}s"
+            diff_entry = None
+            if ws0 is not None and float(ws0) > 0 and entry_odd is not None and float(entry_odd) > 0:
+                diff_entry = (float(entry_odd) - float(ws0)) / float(ws0) * 100.0
             # ROI por ponto (se houver placar)
             mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
             roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
             roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
+            roi_entry = _roi_back_pct(float(entry_odd), mult) if (mult is not None and entry_odd is not None) else None
             # CLV só faz sentido pre-match (closing_odd é pré-jogo).
             clv0 = _clv_pct_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
             clve = _clv_pct_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
             clvl = _clv_pct_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
+            clv_entry = _clv_pct_from_odd(float(entry_odd), closing) if (d.get("is_live") is False and entry_odd is not None) else None
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
@@ -3171,13 +3213,19 @@ async def main() -> int:
                 "odd_t0": float(p0["odd"]),
                 "odd_ext": float(a["odd_ext"]),
                 "odd_last": float(plast["odd"]),
+                "odd_entry": float(entry_odd) if entry_odd is not None else None,
+                "t_entry": float(entry_t) if entry_t is not None else None,
+                "entry_source": str(entry_src or ""),
+                "diff_entry": diff_entry,
                 "closing_odd": _safe_float(closing),
                 "clv_t0": clv0,
                 "clv_ext": clve,
                 "clv_last": clvl,
+                "clv_entry": clv_entry,
                 "roi_t0": roi0,
                 "roi_ext": roipeak,
                 "roi_last": roilast,
+                "roi_entry": roi_entry,
             }
 
         def _entry_metrics_lay(d: dict) -> Optional[dict]:
@@ -3215,6 +3263,15 @@ async def main() -> int:
             roi_entry = roirev if has_rev else roilast
             clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
             clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
+            # diff no ponto de entrada vs ws_t0 (para coerência com OOS)
+            ws0 = _safe_float(d.get("ws_odd"))
+            if (ws0 is None or ws0 <= 0):
+                ws_series = _extract_ws_series(d)
+                if ws_series:
+                    ws0 = _safe_float(ws_series[0].get("odd"))
+            diff_entry = None
+            if ws0 is not None and float(ws0) > 0 and odd_entry is not None and float(odd_entry) > 0:
+                diff_entry = (float(odd_entry) - float(ws0)) / float(ws0) * 100.0
             return {
                 "audit_id": int(d.get("id")) if d.get("id") is not None else None,
                 "match_id": int(d.get("match_id")),
@@ -3239,6 +3296,7 @@ async def main() -> int:
                 "roi_entry": roi_entry,
                 "clv_entry": clv_entry,
                 "clv_conv_entry": clv_entry_conv,
+                "diff_entry": diff_entry,
             }
 
         def _summarize_entry(rows: List[dict], key: str, *, clip_low: Optional[float] = None, clip_high: Optional[float] = None) -> MetricSummary:
@@ -3931,6 +3989,58 @@ async def main() -> int:
         )
         lines.append("| Side | Pre/In | Reversal | Scheme | N (placar) | Turnover | Lucro | ROI/turnover | p99 exp | DD30 p95 |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
 
+        # Edge sets coerentes com a entrada operacional (entry_odd) + filtro AH (quando habilitado),
+        # para evitar incoerências entre esta tabela e a “política sugerida”.
+        ah_max_93 = _safe_float(getattr(args, "wf_ah_max_abs_line", 0.0)) or 0.0
+        ah_scope_93 = str(getattr(args, "wf_ah_scope", "all") or "all").strip().lower()
+        def _ah_ok_row_93(d0: dict) -> bool:
+            if ah_max_93 <= 0:
+                return True
+            abs_line = line_abs(d0.get("line"))
+            if abs_line is None:
+                return False
+            if ah_scope_93 == "pre":
+                # aplica só no pre-match
+                if d0.get("is_live") is True:
+                    return True
+            return bool(float(abs_line) <= float(ah_max_93) + 1e-12)
+
+        back_edge_ids_93 = set()
+        for r in back_entries:
+            aid = r.get("audit_id")
+            if aid is None:
+                continue
+            d0 = by_audit_id.get(int(aid))
+            if not d0 or str(d0.get("status", "")).upper() != "OK":
+                continue
+            if not _ah_ok_row_93(d0):
+                continue
+            diff = _safe_float(r.get("diff_entry"))
+            if diff is None:
+                continue
+            if not (-10.0 <= float(diff) <= 10.0):
+                continue
+            if float(diff) >= float(back_cut):
+                back_edge_ids_93.add(int(aid))
+
+        lay_edge_ids_93 = set()
+        for r in lay_entries:
+            aid = r.get("audit_id")
+            if aid is None:
+                continue
+            d0 = by_audit_id.get(int(aid))
+            if not d0 or str(d0.get("status", "")).upper() != "OK":
+                continue
+            if not _ah_ok_row_93(d0):
+                continue
+            diff = _safe_float(r.get("diff_entry"))
+            if diff is None:
+                continue
+            if not (-10.0 <= float(diff) <= 10.0):
+                continue
+            if float(diff) <= float(lay_cut):
+                lay_edge_ids_93.add(int(aid))
+
         def _rows_for_combo(side: str, is_live_val: bool, had_rev_val: bool) -> List[dict]:
             # usa entries para filtrar e volta para o d original (necessário para sizing)
             ent = back_entries if side == "Back" else lay_entries
@@ -3943,9 +4053,9 @@ async def main() -> int:
                 d0 = by_audit_id.get(int(aid))
                 if d0:
                     # filtra por coorte de edge (Back/Lay) para evitar misturar lados
-                    if side == "Back" and int(aid) not in back_edge_ids:
+                    if side == "Back" and int(aid) not in back_edge_ids_93:
                         continue
-                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                    if side == "Lay" and int(aid) not in lay_edge_ids_93:
                         continue
                     out.append(d0)
             return out
@@ -4172,11 +4282,31 @@ async def main() -> int:
             filt = [r for r in ent if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev)]
             if not filt:
                 return False
+            # Filtro AH (alinha com OOS quando configurado)
+            ah_max = _safe_float(getattr(args, "wf_ah_max_abs_line", 0.0)) or 0.0
+            ah_scope = str(getattr(args, "wf_ah_scope", "all") or "all").strip().lower()
+            if ah_max > 0:
+                # Para Back/Lay pre-match, aplicamos sempre no PRE; para IN só se scope=all (aqui é PRE apenas).
+                # As entradas não carregam a linha; então filtramos via lookup do audit.
+                filt2 = []
+                for r in filt:
+                    aid = r.get("audit_id")
+                    d0 = by_audit_id_94.get(int(aid)) if (aid is not None) else None
+                    if not d0:
+                        continue
+                    abs_line = line_abs(d0.get("line"))
+                    if abs_line is None:
+                        continue
+                    if float(abs_line) <= float(ah_max) + 1e-12:
+                        filt2.append(r)
+                filt = filt2
+                if not filt:
+                    return False
             # CLV
-            clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+            clv_key = "clv_entry" if side == "Back" else "clv_conv_entry"
             s_clv = summarize_metric([r.get(clv_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-50, clip_high=50)
             # ROI (entry)
-            roi_key = "roi_t0" if side == "Back" else "roi_entry"
+            roi_key = "roi_entry" if side == "Back" else "roi_entry"
             s_roi = summarize_metric([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-200, clip_high=(500.0 if side == "Back" else 5000.0))
             if side == "Back":
                 clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[0]) > 0)
@@ -4982,7 +5112,16 @@ async def main() -> int:
                                 entry_odd = _safe_float(d0.get("bs_odd"))
                             f0 = _kelly_back_frac(entry_odd, d0.get("closing_odd"))
                             if f0 is None:
-                                return (None, None)
+                                # fallback: quando não há closing_odd (ou cálculo falha), não podemos aplicar Kelly.
+                                # Para não “sumir” turnover/lucro em buckets recentes, caímos para PROXY/FLAT.
+                                st_fb = _sizing_back(d0, "PROXY", bank_ref=float(back_bank_ref))
+                                if st_fb is None or float(st_fb) <= 0:
+                                    st_fb = float(wf_flat_stake_back)
+                                st = float(st_fb)
+                                st = min(float(st), float(_max_back_stake_event(d0)))
+                                if st is None or float(st) <= 0:
+                                    return (None, None)
+                                return (float(st), float(st))
                             f = max(0.0, float(f0)) * float(frac)
                             bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
                             cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
@@ -5025,7 +5164,25 @@ async def main() -> int:
                         frac = float(sc.split("_")[1])
                         f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
                         if f0 is None:
-                            return (None, None)
+                            # fallback: sem closing_odd não dá para Kelly. Usa PROXY/FLAT para não distorcer turnover.
+                            h = d0.get("hypothesis_details") or {}
+                            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                            if lay_lim is None:
+                                lay_lim = _safe_float(d0.get("limit"))
+                            st_fb = stake_from_limit(float(lay_lim or 0.0))
+                            if st_fb is None or float(st_fb) <= 0:
+                                liab = float(wf_flat_liab_lay)
+                            else:
+                                liab = float(st_fb) * max(0.0, float(lay_odd) - 1.0)
+                            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                            liab = min(float(liab), float(cap))
+                            # cap por evento (limit)
+                            max_st = _max_lay_stake_event(d0)
+                            liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                            if liab is None or float(liab) <= 0:
+                                return (None, None)
+                            stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                            return (float(stake_eq), float(liab))
                         f = max(0.0, float(f0)) * float(frac)
                         cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
                         liab = min(f * float(lay_bank_ref), cap)
@@ -6349,6 +6506,14 @@ async def main() -> int:
                         lines.append(
                             "Aqui variamos a **banca de referência** usada tanto para o **sizing (Kelly/caps)** quanto para o **budget por jogo** "
                             f"(frações fixas: Back={bud_back_frac:.2%}, Lay={bud_lay_frac:.2%}, cap_sinal={bud_cap_sig_frac:.0%}).\n\n"
+                        )
+                        lines.append(
+                            "**Definições (importante):**\n"
+                            "- `Banca (ref)`: parâmetro de simulação que escala **budgets/caps** (e a fração de Kelly quando aplicável).\n"
+                            "- `Banca rec. (max)`: capital **recomendado** para suportar a operação no cenário simulado, calculado como:\n"
+                            "  `max( banca_risco_p99 ; banca_liq_p99 )`.\n"
+                            "- `ROI/banca`: por conservadorismo, usamos `Lucro 30d / Banca rec. (max)` (não `Lucro/Banca(ref)`), pois é o retorno sobre o capital que\n"
+                            "  de fato precisa estar alocado para rodar a estratégia sem estourar risco/liquidez.\n\n"
                         )
                         lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
                         lines.append("|---:|---:|---:|---:|---:|---:|\n")
