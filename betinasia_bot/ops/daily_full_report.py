@@ -296,6 +296,101 @@ def _executor_gaps_summary(lines: list[str]) -> Dict[str, Any]:
         "gaps_gt_900s": int(sum(1 for g in gaps if g > 900.0)),
     }
 
+def _env_bool(k: str, default: str = "0") -> bool:
+    v = str(os.getenv(k, default) or "").strip()
+    return v in ("1", "true", "True", "yes", "YES", "on", "ON")
+
+
+def _env_float(k: str, default: str) -> float:
+    try:
+        return float(os.getenv(k, default))
+    except Exception:
+        return float(default)
+
+
+def _count_err_substr(audit_rep: Optional[Dict[str, Any]], needle: str) -> int:
+    """
+    Conta ocorrências em audit_status_kpis.error_rows cujo api_error contém `needle` (case-insensitive).
+    """
+    try:
+        if not isinstance(audit_rep, dict):
+            return 0
+        xs = audit_rep.get("error_rows") or []
+        if not isinstance(xs, list) or not needle:
+            return 0
+        nd = str(needle).lower()
+        tot = 0
+        for it in xs:
+            if not isinstance(it, dict):
+                continue
+            err = str(it.get("api_error") or "").lower()
+            if nd in err:
+                tot += int(it.get("n") or 0)
+        return int(tot)
+    except Exception:
+        return 0
+
+
+def _sum_status(audit_rep: Optional[Dict[str, Any]], status: str) -> int:
+    try:
+        if not isinstance(audit_rep, dict):
+            return 0
+        tot = 0
+        for v in audit_rep.get("by_version") or []:
+            if not isinstance(v, dict):
+                continue
+            sc = v.get("status_counts") if isinstance(v.get("status_counts"), dict) else {}
+            tot += int(sc.get(status) or 0)
+        return int(tot)
+    except Exception:
+        return 0
+
+
+def _sum_total(audit_rep: Optional[Dict[str, Any]]) -> int:
+    try:
+        if not isinstance(audit_rep, dict):
+            return 0
+        tot = 0
+        for v in audit_rep.get("by_version") or []:
+            if isinstance(v, dict):
+                tot += int(v.get("total") or 0)
+        return int(tot)
+    except Exception:
+        return 0
+
+
+def _sum_ok_valid(audit_rep: Optional[Dict[str, Any]]) -> int:
+    try:
+        if not isinstance(audit_rep, dict):
+            return 0
+        tot = 0
+        for v in audit_rep.get("by_version") or []:
+            if isinstance(v, dict):
+                tot += int(v.get("ok_valid") or 0)
+        return int(tot)
+    except Exception:
+        return 0
+
+
+def _sum_ok(audit_rep: Optional[Dict[str, Any]]) -> int:
+    try:
+        if not isinstance(audit_rep, dict):
+            return 0
+        tot = 0
+        for v in audit_rep.get("by_version") or []:
+            if isinstance(v, dict):
+                sc = v.get("status_counts") if isinstance(v.get("status_counts"), dict) else {}
+                tot += int(sc.get("OK") or 0)
+        return int(tot)
+    except Exception:
+        return 0
+
+
+def _fmt_status(ok: Optional[bool]) -> str:
+    if ok is None:
+        return "—"
+    return "OK" if ok else "FAIL"
+
 
 def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
@@ -655,6 +750,94 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             )
     except Exception:
         pass
+
+    # ------------------------------------------------------------
+    # Prontidão para LIVE (go/no-go) — checklist objetivo
+    # ------------------------------------------------------------
+    s0.append("\n**Prontidão para LIVE (go/no-go)**\n\n")
+    allow_live = _env_bool("EXECUTOR_ALLOW_LIVE", "0")
+    # thresholds (configuráveis por env; defaults conservadores)
+    thr_ok_valid_pct = _env_float("DAILY_LIVE_MIN_OK_VALID_PCT", "5.0")
+    thr_api_failed_pct = _env_float("DAILY_LIVE_MAX_API_FAILED_PCT", "20.0")
+    thr_stale_pct = _env_float("DAILY_LIVE_MAX_STALE_QUEUE_PCT", "10.0")
+    thr_gaps_15m = int(_env_float("DAILY_LIVE_MAX_GAPS_15MIN", "8"))
+    thr_p90_ms = int(_env_float("DAILY_LIVE_MAX_CALL_TO_DONE_P90_MS", "8000"))
+    thr_open_betslips = int(_env_float("DAILY_LIVE_MAX_TOO_MANY_OPEN_BETSLIPS", "0"))
+    thr_no_pmms = int(_env_float("DAILY_LIVE_MAX_NO_PMMS", "0"))
+
+    tot24 = _sum_total(audit_rep)
+    ok24 = _sum_ok(audit_rep)
+    okv24 = _sum_ok_valid(audit_rep)
+    api_failed24 = _sum_status(audit_rep, "API_FAILED")
+    stale24 = _sum_status(audit_rep, "STALE_QUEUE_WAIT")
+    err_open = _count_err_substr(audit_rep, "too_many_open_betslips")
+    err_pmms = _count_err_substr(audit_rep, "no pmms received")
+
+    ok_valid_pct = (100.0 * okv24 / tot24) if tot24 > 0 else None
+    api_failed_pct = (100.0 * api_failed24 / tot24) if tot24 > 0 else None
+    stale_pct = (100.0 * stale24 / tot24) if tot24 > 0 else None
+
+    # latência p90 (somente sucessos)
+    p90_call = None
+    try:
+        p90_call = int(((kpi_ok.get("timing_ms") or {}).get("call_to_done") or {}).get("p90") or 0) or None
+    except Exception:
+        p90_call = None
+
+    gaps15 = None
+    try:
+        gaps15 = int(gaps.get("gaps_gt_900s")) if isinstance(gaps, dict) and gaps.get("gaps_gt_900s") is not None else None
+    except Exception:
+        gaps15 = None
+
+    # checks
+    chk_allow = bool(allow_live)
+    chk_okv = (ok_valid_pct is not None and float(ok_valid_pct) >= float(thr_ok_valid_pct))
+    chk_api = (api_failed_pct is not None and float(api_failed_pct) <= float(thr_api_failed_pct))
+    chk_stale = (stale_pct is not None and float(stale_pct) <= float(thr_stale_pct))
+    chk_gap = (gaps15 is None) or (int(gaps15) <= int(thr_gaps_15m))
+    chk_p90 = (p90_call is None) or (int(p90_call) <= int(thr_p90_ms))
+    chk_open = int(err_open) <= int(thr_open_betslips)
+    chk_pmms = int(err_pmms) <= int(thr_no_pmms)
+
+    s0.append("| Critério | Atual | Alvo | Status |\n|---|---:|---:|---|\n")
+    s0.append(f"| Live liberado (`EXECUTOR_ALLOW_LIVE`) | `{allow_live}` | `True` | **{_fmt_status(chk_allow)}** |\n")
+    s0.append(f"| OK_valid/total (24h, DB) | {_fmt_num(ok_valid_pct,1)}% | ≥{_fmt_num(thr_ok_valid_pct,1)}% | **{_fmt_status(chk_okv)}** |\n")
+    s0.append(f"| API_FAILED/total (24h, DB) | {_fmt_num(api_failed_pct,1)}% | ≤{_fmt_num(thr_api_failed_pct,1)}% | **{_fmt_status(chk_api)}** |\n")
+    s0.append(f"| STALE_QUEUE_WAIT/total (24h, DB) | {_fmt_num(stale_pct,1)}% | ≤{_fmt_num(thr_stale_pct,1)}% | **{_fmt_status(chk_stale)}** |\n")
+    s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
+    s0.append(f"| `too_many_open_betslips` (24h, DB) | {int(err_open)} | ≤{int(thr_open_betslips)} | **{_fmt_status(chk_open)}** |\n")
+    s0.append(f"| Latência p90 `call_to_done_ms` (sucessos) | {_fmt_num(p90_call,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n")
+    s0.append(f"| Gaps >15min no executor_jsonl (proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
+    s0.append("\n")
+
+    hard_fails = []
+    if not chk_allow:
+        hard_fails.append("LIVE bloqueado (`EXECUTOR_ALLOW_LIVE=0`)")
+    if ok_valid_pct is None or not chk_okv:
+        hard_fails.append("conversão `OK_valid/total` baixa")
+    if api_failed_pct is None or not chk_api:
+        hard_fails.append("taxa de `API_FAILED` alta")
+    if stale_pct is None or not chk_stale:
+        hard_fails.append("taxa de `STALE_QUEUE_WAIT` alta")
+    if not chk_pmms:
+        hard_fails.append("erros `No PMMs received` presentes")
+    if not chk_open:
+        hard_fails.append("erros `too_many_open_betslips` presentes")
+
+    verdict = "APTO (com cautela)" if not hard_fails else "NÃO APTO"
+    s0.append(f"**Veredito**: **{verdict}**\n\n")
+    if hard_fails:
+        s0.append("**Motivos (prioridade)**\n\n")
+        for x in hard_fails[:8]:
+            s0.append(f"- {x}\n")
+        s0.append("\n")
+        s0.append(
+            "**Próximos passos recomendados (para destravar LIVE)**\n\n"
+            "- Atacar `No PMMs received` (timeout/min_wait/idle + estabilidade de sessão) antes de aumentar volume.\n"
+            "- Zerar `too_many_open_betslips` (caps/janelas + cleanup agressivo) para evitar bloqueio global.\n"
+            "- Reduzir `STALE_QUEUE_WAIT` (fila/concurrency) para não operar atrasado.\n\n"
+        )
 
     # leitura executiva (heurística): onde atacar primeiro
     s0.append(
