@@ -5589,6 +5589,13 @@ async def main() -> int:
                     lay_pre_all = lay_pre_roi = 0.0
                     back_in_all = back_in_roi = 0.0
                     lay_in_all = lay_in_roi = 0.0
+                    # contagens Pre/In (para diagnosticar quedas bruscas de turnover)
+                    n_ev_elig_pre = sum(1 for ev in test_elig if str(ev.get("regime")) == "Pre")
+                    n_ev_elig_in = sum(1 for ev in test_elig if str(ev.get("regime")) != "Pre")
+                    n_ev_sized_pre = 0
+                    n_ev_sized_in = 0
+                    n_ev_after_budget_pre = 0
+                    n_ev_after_budget_in = 0
                     # budget por jogo (padrão)
                     bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
                     if bank_ref_budget is None or float(bank_ref_budget) <= 0:
@@ -5620,6 +5627,10 @@ async def main() -> int:
                         if st_eq is None or exp is None:
                             continue
                         n_ev_sized += 1
+                        if str(ev.get("regime")) == "Pre":
+                            n_ev_sized_pre += 1
+                        else:
+                            n_ev_sized_in += 1
                         # aplica budget por jogo como padrão
                         mid = int(ev.get("match_id"))
                         if ev.get("side") == "Back":
@@ -5659,6 +5670,10 @@ async def main() -> int:
                             st_eq = float(st_eq) * float(ratio)
                             spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
                         n_ev_after_budget += 1
+                        if str(ev.get("regime")) == "Pre":
+                            n_ev_after_budget_pre += 1
+                        else:
+                            n_ev_after_budget_in += 1
                         turn_all += float(st_eq)
                         if ev.get("side") == "Back":
                             back_st_all += float(exp)
@@ -5781,6 +5796,12 @@ async def main() -> int:
                             "n_ev_elig": int(n_ev_elig),
                             "n_ev_sized": int(n_ev_sized),
                             "n_ev_after_budget": int(n_ev_after_budget),
+                            "n_ev_elig_pre": int(n_ev_elig_pre),
+                            "n_ev_elig_in": int(n_ev_elig_in),
+                            "n_ev_sized_pre": int(n_ev_sized_pre),
+                            "n_ev_sized_in": int(n_ev_sized_in),
+                            "n_ev_after_budget_pre": int(n_ev_after_budget_pre),
+                            "n_ev_after_budget_in": int(n_ev_after_budget_in),
                             "pnl_obs": pnl_obs,
                             "pnl_exp": pnl_exp,
                             "diag": diag,
@@ -5863,12 +5884,12 @@ async def main() -> int:
                 # Transparência do turnover (diagnóstico de quedas bruscas)
                 lines.append(
                     "\n**Diagnóstico do turnover (por step)**\n\n"
-                    "| Test window | N elig | N sized | N após budget | Turnover Pre | Turnover In | Turnover total |\n"
+                    "| Test window | N elig (Pre/In) | N sized (Pre/In) | N após budget (Pre/In) | Turnover Pre | Turnover In | Turnover total |\n"
                     "|---|---:|---:|---:|---:|---:|---:|\n"
                 )
                 for s in steps[:20]:
                     lines.append(
-                        f"| {s['test']} | {int(s.get('n_ev_elig') or 0)} | {int(s.get('n_ev_sized') or 0)} | {int(s.get('n_ev_after_budget') or 0)} | "
+                        f"| {s['test']} | {int(s.get('n_ev_elig_pre') or 0)}/{int(s.get('n_ev_elig_in') or 0)} | {int(s.get('n_ev_sized_pre') or 0)}/{int(s.get('n_ev_sized_in') or 0)} | {int(s.get('n_ev_after_budget_pre') or 0)}/{int(s.get('n_ev_after_budget_in') or 0)} | "
                         f"{_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('turn_all'),2)} |\n"
                     )
                 lines.append("\n")
