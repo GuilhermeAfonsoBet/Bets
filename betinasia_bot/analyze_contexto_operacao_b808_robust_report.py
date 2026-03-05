@@ -4975,6 +4975,55 @@ async def main() -> int:
                         return f"{base}__{lg}"
                     return base
 
+                def _ev_ts_utc(ev: dict) -> float:
+                    """
+                    Timestamp para ordenar eventos dentro do match.
+                    Usamos `audited_at` do registro audit original (via audit_id).
+                    """
+                    try:
+                        aid = int(ev.get("audit_id"))
+                    except Exception:
+                        return 0.0
+                    d0 = audit_by_id.get(aid)
+                    ts = (d0 or {}).get("audited_at")
+                    if isinstance(ts, datetime):
+                        try:
+                            return float(ts.astimezone(timezone.utc).timestamp())
+                        except Exception:
+                            return float(ts.timestamp())
+                    return 0.0
+
+                def _dedup_match_key(events: List[dict]) -> List[dict]:
+                    """
+                    IMPORTANT (robustez do turnover):
+                    Em alguns regimes coletamos múltiplas auditorias por jogo (ex.: BS temporal),
+                    enquanto em outros há ~1 evento por jogo (ex.: WS gate t+5).
+                    Se somarmos em nível de evento, o turnover vira uma métrica de instrumentação,
+                    e não de oportunidade.
+
+                    Portanto, deduplicamos por (match_id, key) e mantemos o evento mais cedo no tempo
+                    (proxy do “primeiro ponto executável”).
+                    """
+                    if not events:
+                        return []
+                    best: Dict[Tuple[int, str], dict] = {}
+                    best_ts: Dict[Tuple[int, str], float] = {}
+                    for ev in events:
+                        try:
+                            mid = int(ev.get("match_id"))
+                        except Exception:
+                            continue
+                        kk = str(_key(ev))
+                        k = (mid, kk)
+                        t = _ev_ts_utc(ev)
+                        if k not in best or t < float(best_ts.get(k, 9e18)):
+                            best[k] = ev
+                            best_ts[k] = float(t)
+                    # retorna em ordem temporal (melhor para budget por match)
+                    out = list(best.values())
+                    out.sort(key=_ev_ts_utc)
+                    return out
+
                 def _bym(sub: List[dict], key: str) -> Dict[int, List[float]]:
                     bym: Dict[int, List[float]] = {}
                     for e in sub:
@@ -5267,8 +5316,11 @@ async def main() -> int:
                     # Aplica políticas operacionais determinísticas também no treino/teste (sem lookahead):
                     # - filtro por linha AH (|line|)
                     # Observação: gates baseados em percentil de limit (p50/p75) são aplicados no teste com limiar do treino.
-                    train = [e for e in combo_events if e["day"] in train_days and _ah_ok(e)]
-                    test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None and _ah_ok(e)]
+                    train_raw = [e for e in combo_events if e["day"] in train_days and _ah_ok(e)]
+                    test_raw = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None and _ah_ok(e)]
+                    # Dedup por jogo×chave para estabilizar turnover/ROI contra diferenças de instrumentação
+                    train = _dedup_match_key(train_raw)
+                    test = _dedup_match_key(test_raw)
 
                     # thresholds de liquidez estimados na janela de treino (sem lookahead)
                     thr_p50_pre = thr_p75_pre = None
@@ -5488,7 +5540,8 @@ async def main() -> int:
 
                     # sizing + P&L no período de teste
                     # Conjunto elegível no teste (inclui sem ROI para turnover)
-                    test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active) and _liq_ok(e, thr=thr_use) and _ah_ok(e)]
+                    test_elig_raw = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active) and _liq_ok(e, thr=thr_use) and _ah_ok(e)]
+                    test_elig = _dedup_match_key(test_elig_raw)
                     back_st_all = back_st_roi = 0.0
                     lay_liab_all = lay_liab_roi = 0.0
                     turn_all = turn_roi = 0.0
