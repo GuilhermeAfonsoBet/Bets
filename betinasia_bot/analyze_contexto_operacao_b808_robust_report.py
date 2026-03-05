@@ -5125,7 +5125,15 @@ async def main() -> int:
                 oos_jobs: List[Tuple[datetime, datetime, float]] = []  # (t0, t1, exposure)
 
                 def _scheme_for_event(ev: dict) -> str:
-                    return wf_scheme_pre if ev.get("regime") == "Pre" else wf_scheme_in
+                    sc = wf_scheme_pre if ev.get("regime") == "Pre" else wf_scheme_in
+                    # Guardrail: Kelly depende de closing_odd pré‑jogo e não é aplicável no in‑match.
+                    # Se o usuário configurar wf_scheme_in=KELLY_*, caímos para FLAT para não “sumir” turnover/lucro.
+                    try:
+                        if str(ev.get("regime")) != "Pre" and str(sc).upper().startswith("KELLY"):
+                            return "FLAT"
+                    except Exception:
+                        pass
+                    return sc
 
                 def _sizing_for_event(
                     ev: dict,
@@ -5151,7 +5159,15 @@ async def main() -> int:
                         elif str(sc).startswith("KELLY"):
                             # Kelly no WF deve usar a odd de entrada do evento (pode vir de WS proxy em ws-only)
                             if d0.get("is_live") is True:
-                                return (None, None)
+                                # Kelly não é aplicável in-match; fallback para FLAT/PROXY.
+                                st_fb = _sizing_back(d0, "PROXY", bank_ref=float(back_bank_ref))
+                                if st_fb is None or float(st_fb) <= 0:
+                                    st_fb = float(wf_flat_stake_back)
+                                st = float(st_fb)
+                                st = min(float(st), float(_max_back_stake_event(d0)))
+                                if st is None or float(st) <= 0:
+                                    return (None, None)
+                                return (float(st), float(st))
                             try:
                                 frac = float(str(sc).split("_")[1])
                             except Exception:
@@ -5210,6 +5226,26 @@ async def main() -> int:
                         st = stake_from_limit(float(lay_lim or 0.0))
                         liab = float(st) * max(0.0, float(lay_odd) - 1.0)
                     elif sc.startswith("KELLY"):
+                        # Kelly não faz sentido in-match (closing_odd é pré‑jogo); ainda assim não “mata” turnover.
+                        if d0.get("is_live") is True:
+                            # fallback para PROXY/FLAT
+                            h = d0.get("hypothesis_details") or {}
+                            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                            if lay_lim is None:
+                                lay_lim = _safe_float(d0.get("limit"))
+                            st_fb = stake_from_limit(float(lay_lim or 0.0))
+                            if st_fb is None or float(st_fb) <= 0:
+                                liab = float(wf_flat_liab_lay)
+                            else:
+                                liab = float(st_fb) * max(0.0, float(lay_odd) - 1.0)
+                            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                            liab = min(float(liab), float(cap))
+                            max_st = _max_lay_stake_event(d0)
+                            liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                            if liab is None or float(liab) <= 0:
+                                return (None, None)
+                            stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                            return (float(stake_eq), float(liab))
                         frac = float(sc.split("_")[1])
                         f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
                         if f0 is None:
@@ -5564,6 +5600,9 @@ async def main() -> int:
                     cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
                     spent_back: Dict[int, float] = {}
                     spent_lay: Dict[int, float] = {}
+                    n_ev_elig = len(test_elig)
+                    n_ev_sized = 0
+                    n_ev_after_budget = 0
 
                     # ordena por tempo para consumir budget de forma realista
                     def _ts_ev(ev: dict) -> float:
@@ -5580,6 +5619,7 @@ async def main() -> int:
                         st_eq, exp = _sizing_for_event(ev)
                         if st_eq is None or exp is None:
                             continue
+                        n_ev_sized += 1
                         # aplica budget por jogo como padrão
                         mid = int(ev.get("match_id"))
                         if ev.get("side") == "Back":
@@ -5618,6 +5658,7 @@ async def main() -> int:
                             exp = exp_use
                             st_eq = float(st_eq) * float(ratio)
                             spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
+                        n_ev_after_budget += 1
                         turn_all += float(st_eq)
                         if ev.get("side") == "Back":
                             back_st_all += float(exp)
@@ -5735,6 +5776,11 @@ async def main() -> int:
                             "oos_mean": oos_mean,
                             "oos_ci": oos_ci,
                             "turn_all": turn_all,
+                            "turn_pre": turn_pre,
+                            "turn_in": turn_in,
+                            "n_ev_elig": int(n_ev_elig),
+                            "n_ev_sized": int(n_ev_sized),
+                            "n_ev_after_budget": int(n_ev_after_budget),
                             "pnl_obs": pnl_obs,
                             "pnl_exp": pnl_exp,
                             "diag": diag,
@@ -5814,6 +5860,18 @@ async def main() -> int:
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
                             f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
                         )
+                # Transparência do turnover (diagnóstico de quedas bruscas)
+                lines.append(
+                    "\n**Diagnóstico do turnover (por step)**\n\n"
+                    "| Test window | N elig | N sized | N após budget | Turnover Pre | Turnover In | Turnover total |\n"
+                    "|---|---:|---:|---:|---:|---:|---:|\n"
+                )
+                for s in steps[:20]:
+                    lines.append(
+                        f"| {s['test']} | {int(s.get('n_ev_elig') or 0)} | {int(s.get('n_ev_sized') or 0)} | {int(s.get('n_ev_after_budget') or 0)} | "
+                        f"{_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('turn_all'),2)} |\n"
+                    )
+                lines.append("\n")
                 if wf_key_by_league2:
                     scope = str(getattr(args, "wf_key_by_league_scope", "pre") or "pre").strip().lower()
                     lines.append(

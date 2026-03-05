@@ -296,6 +296,23 @@ def _executor_gaps_summary(lines: list[str]) -> Dict[str, Any]:
         "gaps_gt_900s": int(sum(1 for g in gaps if g > 900.0)),
     }
 
+
+def _parse_iso_dt_best(s: Any) -> Optional[datetime]:
+    try:
+        if s is None:
+            return None
+        t = str(s).strip()
+        if not t:
+            return None
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 def _env_bool(k: str, default: str = "0") -> bool:
     v = str(os.getenv(k, default) or "").strip()
     return v in ("1", "true", "True", "yes", "YES", "on", "ON")
@@ -748,6 +765,21 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             s0.append(
                 f"- Maior gap: `{_fmt_num(gaps.get('max_gap_s'),1)}s` | gaps>5min: `{gaps.get('gaps_gt_300s')}` | gaps>15min: `{gaps.get('gaps_gt_900s')}`\n"
             )
+    except Exception:
+        pass
+
+    # Se o JSONL está stale, a seção "Execução por dia" vai aparecer zerada mesmo que o bridge/audit estejam rodando.
+    try:
+        exec_last_ts = _parse_iso_dt_best((gaps or {}).get("last_ts"))
+        if exec_last_ts:
+            age_h = (datetime.now(timezone.utc) - exec_last_ts).total_seconds() / 3600.0
+            thr_h = float(os.getenv("DAILY_EXECUTOR_JSONL_STALE_HOURS", "6.0"))
+            if age_h > thr_h:
+                s0.append(
+                    f"\n**Alerta: executor_jsonl possivelmente desatualizado**\n\n"
+                    f"- Último registro no `executor_jsonl`: `{exec_last_ts.isoformat()}` (idade ≈ `{_fmt_num(age_h,1)}h`, limiar `{_fmt_num(thr_h,1)}h`).\n"
+                    "- Isso explica dias com `Exec rows=0` mesmo com auditoria DB (funil) mostrando volume.\n\n"
+                )
     except Exception:
         pass
 
