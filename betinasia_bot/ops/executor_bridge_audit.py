@@ -161,6 +161,24 @@ async def _finalize_seen_key(
         )
         await session.commit()
 
+async def _unreserve_seen_key(
+    db: Database,
+    *,
+    src_key: str,
+    action: str,
+) -> None:
+    """
+    Remove a reserva em executor_bridge_seen_keys para permitir retry em falhas transitórias
+    (ex.: executor not_ready / socket down). Safe-noop se não existir.
+    """
+    q = """
+    DELETE FROM executor_bridge_seen_keys
+    WHERE src_table='betslip_audit_results' AND src_key=:src_key AND action=:action AND execution_id IS NULL
+    """
+    async with db.async_session() as session:
+        await session.execute(text(q), {"src_key": str(src_key), "action": str(action)})
+        await session.commit()
+
 
 def _load_policy_json(path: str) -> Optional[Dict[str, Any]]:
     try:
@@ -438,10 +456,33 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     f"[bridge] submit src_id={src_id} accepted={accepted} execution_id={eid} http={hs} "
                     + (f"err={err_s}" if (not accepted and err_s) else "")
                 )
+
+                # Em falhas transitórias, não “consumir” a oportunidade: desfaz a reserva e tenta novamente em ciclos futuros.
+                # Isso evita perder horas de operação quando o executor está not_ready ou o socket está instável.
+                retry_transient = (os.getenv("BRIDGE_RETRY_TRANSIENT", "1").strip() not in ("0", "false", "False", "no", "NO"))
+                transient_http = int(hs) in (503, 429) if hs is not None else False
+                transient_err = ("not_ready" in err_s.lower()) or ("queue_full" in err_s.lower())
+                if (not accepted) and retry_transient and (transient_http or transient_err):
+                    await _unreserve_seen_key(db, src_key=skey, action=action)
+                    # pequeno backoff para não martelar o executor
+                    await asyncio.sleep(float(os.getenv("BRIDGE_TRANSIENT_BACKOFF_SEC", "1.0")))
+                    continue
+
                 await _finalize_seen_key(db, src_key=skey, action=action, execution_id=(eid or None))
                 await _mark_seen(db, src_id=src_id, action=action, execution_id=(eid or None), meta={"accepted": accepted, "resp": res})
             except Exception as e:
+                msg = str(e)
                 logger.exception(f"[bridge] failed src_id={src_id}: {e}")
+                # Se falha de transporte/socket, libera a reserva para retry e NÃO marca seen (senão perde oportunidade).
+                retry_transient = (os.getenv("BRIDGE_RETRY_TRANSIENT", "1").strip() not in ("0", "false", "False", "no", "NO"))
+                is_transient = ("Connection refused" in msg) or ("Connection reset" in msg) or ("Cannot connect to unix socket" in msg)
+                if retry_transient and is_transient:
+                    try:
+                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(float(os.getenv("BRIDGE_TRANSIENT_BACKOFF_SEC", "1.0")))
+                    continue
                 await _mark_seen(db, src_id=src_id, action=action, execution_id=None, meta={"error": str(e)[:500]})
 
         dt = time.time() - t0
