@@ -429,7 +429,15 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
                 eid = str(res.get("execution_id") or "")
                 accepted = bool(res.get("accepted"))
-                logger.info(f"[bridge] submit src_id={src_id} accepted={accepted} execution_id={eid}")
+                hs = res.get("_http_status")
+                err = (res.get("error") or res.get("detail") or res.get("status") or "")
+                err_s = str(err).replace("\n", " ").replace("\r", " ").strip()
+                if len(err_s) > 160:
+                    err_s = err_s[:160].rstrip() + "…"
+                logger.info(
+                    f"[bridge] submit src_id={src_id} accepted={accepted} execution_id={eid} http={hs} "
+                    + (f"err={err_s}" if (not accepted and err_s) else "")
+                )
                 await _finalize_seen_key(db, src_key=skey, action=action, execution_id=(eid or None))
                 await _mark_seen(db, src_id=src_id, action=action, execution_id=(eid or None), meta={"accepted": accepted, "resp": res})
             except Exception as e:

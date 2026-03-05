@@ -229,6 +229,53 @@ def create_app(svc: ExecutorService) -> web.Application:
 
         svc._start_task = asyncio.create_task(_bg_start())
 
+        def _on_done(t: asyncio.Task):
+            try:
+                _ = t.result()
+            except Exception as e:
+                # Se o start falhar, o serviço fica "not_ready" e o bridge começa a receber 503.
+                # Loga explicitamente para aparecer em executor_error.log (systemd StandardError).
+                try:
+                    logger.error(f"[executor] start failed: {str(e)[:400]}")
+                except Exception:
+                    pass
+
+        try:
+            svc._start_task.add_done_callback(_on_done)
+        except Exception:
+            pass
+
+        # Watchdog opcional: se o executor não ficar pronto em X segundos, reinicia via systemd.
+        # Isso resolve casos de Playwright/sessão travada que deixam o /execute em 503 indefinidamente.
+        try:
+            deadline = float(os.getenv("EXECUTOR_STARTUP_DEADLINE_SEC", "600") or 600.0)
+        except Exception:
+            deadline = 600.0
+
+        async def _watchdog():
+            if deadline <= 0:
+                return
+            t0 = time.time()
+            while True:
+                await asyncio.sleep(2.0)
+                if bool(getattr(svc, "_ready", False)):
+                    return
+                if (time.time() - t0) >= float(deadline):
+                    try:
+                        svc._start_error = str(svc._start_error or "startup_timeout")[:300]
+                    except Exception:
+                        pass
+                    try:
+                        logger.error(f"[executor] startup timeout after {deadline:.0f}s (ready=false). Exiting for restart.")
+                    except Exception:
+                        pass
+                    os._exit(2)
+
+        try:
+            asyncio.create_task(_watchdog())
+        except Exception:
+            pass
+
     async def on_cleanup(_app: web.Application):
         await svc.close()
 
