@@ -106,8 +106,36 @@ def _slip_raw_3bucket_rows(buckets: list[dict]) -> list[dict]:
     out = []
     for lab in want:
         it = by.get(lab) or {}
-        out.append({"bucket": lab, "n": int(it.get("n") or 0), "roi_mean": it.get("roi_mean")})
+        out.append(
+            {
+                "bucket": lab,
+                "n": int(it.get("n") or 0),
+                "roi_mean": it.get("roi_mean"),
+                "roi_se": it.get("roi_se"),
+                "roi_ci95": it.get("roi_ci95"),
+            }
+        )
     return out
+
+
+def _fmt_roi_mean_se_ci_pct(row: dict) -> str:
+    """
+    Formata ROI (mean) com SE e IC95% (quando disponíveis).
+    """
+    try:
+        mean = row.get("roi_mean")
+        if mean is None:
+            return "—"
+        se = row.get("roi_se")
+        ci = row.get("roi_ci95") if isinstance(row.get("roi_ci95"), dict) else None
+        if se is None and not ci:
+            return _fmt_pct(mean)
+        se_s = _fmt_pct(se) if se is not None else "—"
+        if ci and (ci.get("lb") is not None) and (ci.get("ub") is not None):
+            return f"{_fmt_pct(mean)} (SE {se_s}) [{_fmt_pct(ci.get('lb'))}, {_fmt_pct(ci.get('ub'))}]"
+        return f"{_fmt_pct(mean)} (SE {se_s})"
+    except Exception:
+        return "—"
 
 
 def _demote_h2_to_h3(md: str) -> str:
@@ -1059,9 +1087,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 if not any(int(r.get("n") or 0) > 0 for r in buckets):
                     continue
                 s1.append(f"- **{title}**\n\n")
-                s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
                 for row in buckets:
-                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
+                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)} |\n")
                 s1.append("\n")
             # Por combinação (top por volume)
             rows = adh.get("slippage_vs_roi_raw_by_combo_top") if isinstance(adh.get("slippage_vs_roi_raw_by_combo_top"), list) else []
@@ -1084,12 +1112,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             bmap = {str(b.get("bucket")): b for b in (r.get("buckets") or []) if isinstance(b, dict)}
                             def _bn(lab: str) -> tuple[int, Any]:
                                 bb = bmap.get(lab) or {}
-                                return int(bb.get("n") or 0), bb.get("roi_mean")
+                                return int(bb.get("n") or 0), bb
                             n1, roi1 = _bn("<= -2%")
                             n2, roi2 = _bn("(-2, 2]")
                             n3, roi3 = _bn("> 2%")
                             s1.append(
-                                f"| {comb} | {n} | {_fmt_pct(roi1)} | {n1} | {_fmt_pct(roi2)} | {n2} | {_fmt_pct(roi3)} | {n3} | {_fmt_num(corr,2)} |\n"
+                                f"| {comb} | {n} | {_fmt_roi_mean_se_ci_pct(roi1)} | {n1} | {_fmt_roi_mean_se_ci_pct(roi2)} | {n2} | {_fmt_roi_mean_se_ci_pct(roi3)} | {n3} | {_fmt_num(corr,2)} |\n"
                             )
                         s1.append("\n")
                     # já está ordenado por n desc
@@ -1112,9 +1140,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         if not any(int(r.get("n") or 0) > 0 for r in buckets):
                             continue
                         s1.append(f"- **{title}**\n\n")
-                        s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                        s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
                         for row in buckets:
-                            s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
+                            s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)} |\n")
                         s1.append("\n")
             else:
                 s1.append(

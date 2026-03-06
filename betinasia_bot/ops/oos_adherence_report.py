@@ -165,6 +165,30 @@ def _slip_raw_pct(*, odd_dec: Optional[float], odd_fin: Optional[float]) -> Opti
     return float((float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0)
 
 
+def _mean_se_ci95(ys: List[float]) -> Dict[str, Any]:
+    """
+    Estatística clássica (SEM + IC95% normal approx).
+    Não assume independência perfeita (o ideal seria cluster por match), mas é um
+    baseline útil para decisão e para comparar buckets.
+    """
+    try:
+        n = int(len(ys))
+        if n <= 0:
+            return {"n": 0, "mean": None, "sd": None, "se": None, "ci95": None}
+        mu = float(sum(float(x) for x in ys) / float(n))
+        if n < 2:
+            return {"n": n, "mean": mu, "sd": None, "se": None, "ci95": None}
+        # sample sd
+        var = float(sum((float(x) - mu) ** 2 for x in ys) / float(n - 1))
+        sd = float(var ** 0.5)
+        se = float(sd / (float(n) ** 0.5)) if sd > 0 else 0.0
+        z = 1.96
+        ci = {"lb": float(mu - z * se), "ub": float(mu + z * se)}
+        return {"n": n, "mean": mu, "sd": sd, "se": se, "ci95": ci}
+    except Exception:
+        return {"n": int(len(ys)), "mean": None, "sd": None, "se": None, "ci95": None}
+
+
 def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
     """
     Bucketiza por slippage_raw_pct (com sinal), em 3 faixas:
@@ -185,7 +209,17 @@ def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]
         ys = [roi for (slip, roi) in pairs if fn(float(slip))]
         if not ys:
             continue
-        outb.append({"bucket": lab, "n": int(len(ys)), "roi_mean": float(sum(ys) / len(ys))})
+        st = _mean_se_ci95([float(x) for x in ys])
+        outb.append(
+            {
+                "bucket": lab,
+                "n": int(st.get("n") or 0),
+                "roi_mean": st.get("mean"),
+                "roi_sd": st.get("sd"),
+                "roi_se": st.get("se"),
+                "roi_ci95": st.get("ci95"),
+            }
+        )
     return outb
 
 
