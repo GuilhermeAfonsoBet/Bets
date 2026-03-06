@@ -212,32 +212,116 @@ class BetinAsiaScraper:
         except Exception as e:
             logger.warning(f"Erro ao salvar sessão: {e}")
             
+    async def _has_root_session_cookie(self) -> bool:
+        try:
+            cookies = await self._context.cookies()
+            return any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
+        except Exception:
+            return False
+
+    async def _api_auth_check_orders(self, *, username: str) -> Dict[str, Any]:
+        """
+        Checa se o cookie `root-session` autentica chamadas internas (sem depender do DOM do sportsbook).
+        Retorna {ok,status,prefix} (prefix é apenas o início do body, sem segredos).
+        """
+        try:
+            # token root-session
+            session_token = ""
+            cookies = await self._context.cookies()
+            for c in (cookies or []):
+                if c.get("name") == "root-session" and c.get("value"):
+                    session_token = str(c.get("value"))
+                    break
+            if not session_token:
+                return {"ok": False, "status": 0, "prefix": "NO_ROOT_SESSION"}
+
+            # Garante estar em origin correta para fetch relativo.
+            # `commit` costuma ser mais rápido/robusto do que esperar domcontentloaded em páginas pesadas.
+            try:
+                if not str(self._page.url or "").startswith(self.BASE_URL):
+                    await self._page.goto(self.BASE_URL, timeout=20000, wait_until="commit")
+            except Exception:
+                # mesmo se falhar, tentamos avaliar; pode estar em origin correta já
+                pass
+
+            resp = await self._page.evaluate(
+                """
+                async (params) => {
+                    try {
+                        const u = '/v1/orders/?placer=' + encodeURIComponent(params.username) + '&page_size=1';
+                        const r = await fetch(u, {
+                            method: 'GET',
+                            credentials: 'same-origin',
+                            headers: {
+                                'Accept': 'application/json, text/plain, */*',
+                                'session': params.sessionToken,
+                                'x-molly-client-name': 'sonic',
+                                'x-molly-client-version': '2.5.54'
+                            }
+                        });
+                        let text = '';
+                        try { text = await r.text(); } catch(e) { text = ''; }
+                        return {ok: r.ok, status: r.status, prefix: (text || '').slice(0, 220)};
+                    } catch(e) {
+                        return {ok: false, status: 0, prefix: String(e && e.message ? e.message : e)};
+                    }
+                }
+                """,
+                {"username": str(username), "sessionToken": session_token},
+            )
+            return resp if isinstance(resp, dict) else {"ok": False, "status": 0, "prefix": "BAD_RESP"}
+        except Exception as e:
+            return {"ok": False, "status": 0, "prefix": str(e)[:220]}
+
+    async def _looks_logged_in_fast(self, *, username: Optional[str]) -> bool:
+        """
+        Heurística de UI (sem API): útil quando /login redireciona para sportsbook/trade e inputs somem.
+        """
+        try:
+            # Evita custo alto; não usamos inner_text em páginas enormes
+            txt = await self._page.text_content("body")
+            s = " ".join((txt or "").split()).lower()
+            if username and str(username).strip().lower() in s:
+                return True
+            # fallback: termos típicos de usuário logado
+            if "orders" in s and ("trade" in s or "sportsbook" in s):
+                return True
+        except Exception:
+            return False
+        return False
+
     async def is_session_valid(self) -> bool:
         """Verifica se a sessão atual ainda é válida."""
         try:
-            # Navega para uma página que requer login
-            await self._page.goto(
-                self.SPORTSBOOK_URL,
-                timeout=self.DEFAULT_NAV_TIMEOUT_MS,
-                wait_until=self.DEFAULT_GOTO_WAIT_UNTIL,
-            )
-            await self._page.wait_for_timeout(1000)
-            
-            # Se redirecionou para login, sessão expirou
-            current_url = self._page.url
-            if "login" in current_url.lower():
-                logger.info("Sessão expirada, necessário novo login")
-                return False
-
-            # Garante que o cookie root-session exista (necessário para API /v1/betslips/).
-            try:
-                cookies = await self._context.cookies()
-                has_root = any((c.get("name") == "root-session" and c.get("value")) for c in (cookies or []))
-            except Exception:
-                has_root = False
-            if not has_root:
+            # 1) Cookie root-session (pré-requisito)
+            if not await self._has_root_session_cookie():
                 logger.info("Sessão sem cookie root-session (API não autenticará) — necessário novo login")
                 return False
+
+            # 2) Checagem via API interna (mais confiável do que depender de /sportsbook carregar via proxy)
+            username = settings.betinasia_username
+            chk = await self._api_auth_check_orders(username=str(username or ""))
+            if bool(chk.get("ok")) and int(chk.get("status") or 0) == 200:
+                logger.info("Sessão válida (API auth OK)")
+                self._logged_in = True
+                return True
+
+            # 3) Fallback: tentativa rápida de navegação (commit), só para detectar redirect para /login
+            try:
+                await self._page.goto(self.SPORTSBOOK_URL, timeout=25000, wait_until="commit")
+                await self._page.wait_for_timeout(500)
+                current_url = self._page.url or ""
+                if "login" in current_url.lower():
+                    logger.info("Sessão expirada (redirect para /login)")
+                    return False
+            except Exception:
+                pass
+
+            # 4) UI heuristic (evita false-negative quando o site fica lento mas já está logado)
+            if await self._looks_logged_in_fast(username=str(username or "")):
+                logger.info("Sessão parece válida (UI indica logado), apesar de API check falhar")
+                self._logged_in = True
+                return True
                 
             logger.info("Sessão válida!")
             self._logged_in = True
@@ -337,6 +421,12 @@ class BetinAsiaScraper:
                 timeout=self.DEFAULT_NAV_TIMEOUT_MS,
                 wait_until=self.DEFAULT_GOTO_WAIT_UNTIL,
             )
+            # Se /login redirecionar para sportsbook/trade (já logado), não tenta preencher inputs escondidos.
+            if await self._has_root_session_cookie() and await self._looks_logged_in_fast(username=username):
+                self._logged_in = True
+                logger.info("Já parece logado após /login (redirect). Salvando sessão.")
+                await self.save_session()
+                return True
             
             # Aguarda os campos de login aparecerem
             # O site usa inputs dentro de um form
@@ -351,9 +441,21 @@ class BetinAsiaScraper:
             except Exception:
                 pass
             
-            # Inputs (alguns layouts usam type=email)
-            user_inputs = await self._page.query_selector_all("input[type='text'], input[type='email']")
+            # Inputs (alguns layouts usam type=email). IMPORTANTE: filtrar apenas visíveis/editáveis.
+            all_user_inputs = await self._page.query_selector_all("input[type='text'], input[type='email']")
+            user_inputs = []
+            for el in all_user_inputs:
+                try:
+                    if await el.is_visible() and await el.is_enabled():
+                        user_inputs.append(el)
+                except Exception:
+                    continue
             password_input = await self._page.query_selector("input[type='password']")
+            try:
+                if password_input and (not (await password_input.is_visible())):
+                    password_input = None
+            except Exception:
+                pass
             
             if not user_inputs or not password_input:
                 logger.error("Não encontrou campos de login")
