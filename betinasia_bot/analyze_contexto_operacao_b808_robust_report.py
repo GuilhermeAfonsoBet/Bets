@@ -3764,7 +3764,17 @@ async def main() -> int:
         MAX_STAKE_CAP = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
 
         def _max_stake_from_limit(limit_value: float) -> float:
-            s = max(0.0, float(limit_value)) * float(MAX_STAKE_PCT_OF_LIMIT)
+            # IMPORTANTE (robustez do turnover):
+            # Em alguns períodos/versões o `limit` pode vir como 0.0 (não medido/indisponível),
+            # o que não deve "matar" o sizing no OOS (especialmente em KELLY, que já é capado por fração da banca).
+            try:
+                lim = float(limit_value)
+            except Exception:
+                lim = 0.0
+            if lim <= 0:
+                # se houver cap absoluto, usa ele; senão retorna um teto alto para não limitar
+                return float(MAX_STAKE_CAP) if float(MAX_STAKE_CAP) > 0 else float(1e18)
+            s = float(lim) * float(MAX_STAKE_PCT_OF_LIMIT)
             if MAX_STAKE_CAP > 0:
                 s = min(s, float(MAX_STAKE_CAP))
             return float(s)
@@ -5182,6 +5192,9 @@ async def main() -> int:
                             st = float(wf_flat_stake_back)
                         elif sc == "PROXY":
                             st = _sizing_back(d0, "PROXY", bank_ref=float(back_bank_ref))
+                            # se o limit vier 0/None, o PROXY pode virar 0; não queremos “sumir” do turnover
+                            if st is None or float(st) <= 0:
+                                st = float(wf_flat_stake_back)
                         elif str(sc).startswith("KELLY"):
                             # Kelly no WF deve usar a odd de entrada do evento (pode vir de WS proxy em ws-only)
                             if d0.get("is_live") is True:
@@ -5249,8 +5262,15 @@ async def main() -> int:
                         lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
                         if lay_lim is None:
                             lay_lim = _safe_float(d0.get("limit"))
-                        st = stake_from_limit(float(lay_lim or 0.0))
-                        liab = float(st) * max(0.0, float(lay_odd) - 1.0)
+                        if lay_lim is None or float(lay_lim or 0.0) <= 0:
+                            # limit indisponível/zerado: usa fallback FLAT para não zerar turnover
+                            liab = float(wf_flat_liab_lay)
+                        else:
+                            st = stake_from_limit(float(lay_lim or 0.0))
+                            if st is None or float(st) <= 0:
+                                liab = float(wf_flat_liab_lay)
+                            else:
+                                liab = float(st) * max(0.0, float(lay_odd) - 1.0)
                     elif sc.startswith("KELLY"):
                         # Kelly não faz sentido in-match (closing_odd é pré‑jogo); ainda assim não “mata” turnover.
                         if d0.get("is_live") is True:
