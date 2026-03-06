@@ -340,6 +340,26 @@ class ExecutorWorker:
             status = ExecStatus.RATE_LIMIT
             err = f"RATE_LIMIT retry_after={retry_after}s"
 
+        # Slippage guard (pré-decisão): calcula sempre que houver odd_final e odd_at_decision.
+        # Útil para teste em shadow (log) e para bloqueio em LIVE.
+        guard = {"enabled": False, "adverse_thr_pct": None, "would_block": None}
+        try:
+            thr_any = float(os.getenv("EXECUTOR_SLIPPAGE_GUARD_ADVERSE_PCT", "0") or 0.0)
+            thr_back = float(os.getenv("EXECUTOR_SLIPPAGE_GUARD_ADVERSE_PCT_BACK", str(thr_any)) or 0.0)
+            thr_lay = float(os.getenv("EXECUTOR_SLIPPAGE_GUARD_ADVERSE_PCT_LAY", str(thr_any)) or 0.0)
+            thr = float(thr_back) if req.exec_side == ExecSide.BACK else float(thr_lay)
+            if thr > 0 and delta_pct is not None:
+                would = False
+                if req.exec_side == ExecSide.BACK:
+                    # Back piora quando a odd cai (delta_pct < 0)
+                    would = float(delta_pct) < (-float(thr))
+                else:
+                    # Lay piora quando a odd sobe (delta_pct > 0)
+                    would = float(delta_pct) > float(thr)
+                guard = {"enabled": True, "adverse_thr_pct": float(thr), "would_block": bool(would), "delta_pct": float(delta_pct)}
+        except Exception:
+            guard = {"enabled": False, "adverse_thr_pct": None, "would_block": None}
+
         # Cleanup: no shadow/dryrun, tenta reduzir "open betslips" no servidor.
         # Em LIVE, precisamos manter o betslip aberto para o place_order().
         try:
@@ -389,6 +409,7 @@ class ExecutorWorker:
                 "cap": cap_meta,
                 "bet_type": bet_type,
                 "betslip_type": betslip_type,
+                "slippage_guard": guard,
             },
         )
 
@@ -587,6 +608,29 @@ class ExecutorWorker:
         if stake > max_stake:
             dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
             return dry
+
+        # 2b) Slippage guard (pré-decisão) — opcionalmente bloqueia antes de apostar
+        try:
+            block_live = os.getenv("EXECUTOR_SLIPPAGE_GUARD_BLOCK_LIVE", "0").strip() in ("1", "true", "True", "yes", "YES")
+            sg = (dry.raw or {}).get("slippage_guard") if isinstance(dry.raw, dict) else None
+            if block_live and isinstance(sg, dict) and bool(sg.get("enabled")) and bool(sg.get("would_block")):
+                # tenta fechar betslip para não acumular "open"
+                try:
+                    if self._api is not None:
+                        await self._api.close_betslip(str(betslip_id))
+                except Exception:
+                    pass
+                dry.status = ExecStatus.SLIPPAGE_GUARD
+                try:
+                    dp = float(sg.get("delta_pct")) if sg.get("delta_pct") is not None else None
+                except Exception:
+                    dp = None
+                dry.error = f"SLIPPAGE_GUARD delta_pct={dp:.2f}% thr={float(sg.get('adverse_thr_pct') or 0.0):.2f}%" if dp is not None else "SLIPPAGE_GUARD"
+                dry.raw = dict(dry.raw or {})
+                dry.raw.update({"live": True, "blocked_before_place": True})
+                return dry
+        except Exception:
+            pass
 
         # 3) Place order (com 1 retry via relogin se 401)
         assert self._api is not None
