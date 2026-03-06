@@ -259,6 +259,14 @@ def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[st
         st = _mean_se_ci95(rois)
         odds = [float(r.get("odd")) for r in sub if r.get("odd") is not None]
         exps = [float(r.get("exposure")) for r in sub if r.get("exposure") is not None]
+        exp_sum = float(sum(exps)) if exps else 0.0
+        # ROI ponderado por exposição (mais robusto quando liabilities são minúsculas)
+        roi_w = None
+        try:
+            if exp_sum > 0:
+                roi_w = float(sum(float(r.get("roi")) * float(r.get("exposure")) for r in sub if r.get("roi") is not None and r.get("exposure") is not None) / exp_sum)
+        except Exception:
+            roi_w = None
         outb.append(
             {
                 "bucket": lab,
@@ -269,6 +277,8 @@ def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[st
                 "roi_ci95": st.get("ci95"),
                 "odd_median": _median(odds),
                 "exposure_median": _median(exps),
+                "exposure_sum": exp_sum,
+                "roi_weighted": roi_w,
             }
         )
     return outb

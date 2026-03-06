@@ -5178,7 +5178,7 @@ async def main() -> int:
                     ev: dict,
                     *,
                     roi_train_map: Optional[Dict[str, float]] = None,
-                ) -> Tuple[Optional[float], Optional[float]]:
+                ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
                     """
                     Retorna (stake_turnover_equivalente, exposure_risk).
                     - Back: stake=exposure=stake
@@ -5187,7 +5187,7 @@ async def main() -> int:
                     aid = int(ev.get("audit_id"))
                     d0 = audit_by_id.get(aid)
                     if not d0:
-                        return (None, None)
+                        return (None, None, "NO_AUDIT_ROW")
                     sc = _scheme_for_event(ev)
                     if ev.get("side") == "Back":
                         st = None
@@ -5208,12 +5208,12 @@ async def main() -> int:
                                 st = float(st_fb)
                                 st = min(float(st), float(_max_back_stake_event(d0)))
                                 if st is None or float(st) <= 0:
-                                    return (None, None)
-                                return (float(st), float(st))
+                                    return (None, None, "BACK_ST_NONPOS_IN_FB")
+                                return (float(st), float(st), None)
                             try:
                                 frac = float(str(sc).split("_")[1])
                             except Exception:
-                                return (None, None)
+                                return (None, None, "BACK_BAD_SCHEME")
                             entry_odd = _safe_float(ev.get("entry_odd"))
                             if entry_odd is None:
                                 entry_odd = _safe_float(d0.get("bs_odd"))
@@ -5227,8 +5227,8 @@ async def main() -> int:
                                 st = float(st_fb)
                                 st = min(float(st), float(_max_back_stake_event(d0)))
                                 if st is None or float(st) <= 0:
-                                    return (None, None)
-                                return (float(st), float(st))
+                                    return (None, None, "BACK_ST_NONPOS_FB")
+                                return (float(st), float(st), "BACK_KELLY_FALLBACK_NO_CLOSING")
                             f = max(0.0, float(f0)) * float(frac)
                             bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
                             cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
@@ -5238,7 +5238,7 @@ async def main() -> int:
                             k = _key(ev)
                             roi_hat = _safe_float(((roi_train_map or roi_train_by_key) or {}).get(k))
                             if roi_hat is None:
-                                return (None, None)
+                                return (None, None, "BACK_ROI_TRAIN_MISSING")
                             # proxy de Kelly: f ~= EV (assumindo odds típicas ~2.0). Caps + limit controlam.
                             f = max(0.0, float(roi_hat)) / 100.0
                             # escala pela mesma referência usada no budget (coerente com governança)
@@ -5247,8 +5247,8 @@ async def main() -> int:
                             st = min(f * bank_ref_budget_local, cap)
                             st = min(float(st), float(_max_back_stake_event(d0)))
                         if st is None or float(st) <= 0:
-                            return (None, None)
-                        return (float(st), float(st))
+                            return (None, None, "BACK_ST_NONPOS")
+                        return (float(st), float(st), None)
                     # Lay
                     # Usa odd de entrada (reversão/último) para sizing coerente com a estratégia
                     lay_odd = _safe_float(ev.get("entry_odd"))
@@ -5256,7 +5256,7 @@ async def main() -> int:
                         h = d0.get("hypothesis_details") or {}
                         lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
                     if lay_odd is None or float(lay_odd) <= 1.0:
-                        return (None, None)
+                        return (None, None, "LAY_ODD_MISSING_OR_LE1")
                     if sc == "FLAT":
                         liab = float(wf_flat_liab_lay)
                     elif sc == "PROXY":
@@ -5292,9 +5292,9 @@ async def main() -> int:
                             max_st = _max_lay_stake_event(d0)
                             liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                             if liab is None or float(liab) <= 0:
-                                return (None, None)
+                                return (None, None, "LAY_LIAB_NONPOS_IN_FB")
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
-                            return (float(stake_eq), float(liab))
+                            return (float(stake_eq), float(liab), None)
                         frac = float(sc.split("_")[1])
                         f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
                         if f0 is None:
@@ -5314,9 +5314,9 @@ async def main() -> int:
                             max_st = _max_lay_stake_event(d0)
                             liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                             if liab is None or float(liab) <= 0:
-                                return (None, None)
+                                return (None, None, "LAY_LIAB_NONPOS_FB")
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
-                            return (float(stake_eq), float(liab))
+                            return (float(stake_eq), float(liab), "LAY_KELLY_FALLBACK_NO_CLOSING")
                         f = max(0.0, float(f0)) * float(frac)
                         cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
                         liab = min(f * float(lay_bank_ref), cap)
@@ -5675,9 +5675,21 @@ async def main() -> int:
                     # concentração observada (risk-adaptive): usa a própria quantidade de sinais do match na janela de teste
                     cnt_back = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") == "Back")
                     cnt_lay = Counter(int(ev.get("match_id")) for ev in test_elig if ev.get("side") != "Back")
+                    # Diagnóstico: quando N elig existe mas N sized colapsa, queremos saber "por quê" por regime/side
+                    fail_sizing_pre: Counter[str] = Counter()
+                    fail_sizing_in: Counter[str] = Counter()
+                    fail_sizing_side_pre: Counter[str] = Counter()
+                    fail_sizing_side_in: Counter[str] = Counter()
                     for ev in test_elig:
-                        st_eq, exp = _sizing_for_event(ev)
+                        st_eq, exp, why = _sizing_for_event(ev)
                         if st_eq is None or exp is None:
+                            w = str(why or "UNKNOWN")
+                            if str(ev.get("regime")) == "Pre":
+                                fail_sizing_pre[w] += 1
+                                fail_sizing_side_pre[str(ev.get("side") or "UNK")] += 1
+                            else:
+                                fail_sizing_in[w] += 1
+                                fail_sizing_side_in[str(ev.get("side") or "UNK")] += 1
                             continue
                         n_ev_sized += 1
                         if str(ev.get("regime")) == "Pre":
@@ -5855,6 +5867,10 @@ async def main() -> int:
                             "n_ev_sized_in": int(n_ev_sized_in),
                             "n_ev_after_budget_pre": int(n_ev_after_budget_pre),
                             "n_ev_after_budget_in": int(n_ev_after_budget_in),
+                            "fail_sizing_pre": dict(fail_sizing_pre),
+                            "fail_sizing_in": dict(fail_sizing_in),
+                            "fail_sizing_side_pre": dict(fail_sizing_side_pre),
+                            "fail_sizing_side_in": dict(fail_sizing_side_in),
                             "pnl_obs": pnl_obs,
                             "pnl_exp": pnl_exp,
                             "diag": diag,
@@ -5945,6 +5961,17 @@ async def main() -> int:
                         f"| {s['test']} | {int(s.get('n_ev_elig_pre') or 0)}/{int(s.get('n_ev_elig_in') or 0)} | {int(s.get('n_ev_sized_pre') or 0)}/{int(s.get('n_ev_sized_in') or 0)} | {int(s.get('n_ev_after_budget_pre') or 0)}/{int(s.get('n_ev_after_budget_in') or 0)} | "
                         f"{_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('turn_all'),2)} |\n"
                     )
+                lines.append("\n")
+
+                # Diagnóstico causal: por que eventos elegíveis não viram sized (especialmente no Pre)
+                lines.append("\n**Falhas de sizing (top motivos; steps recentes)**\n\n")
+                lines.append("| Test window | Fail sizing Pre (top) | Fail sizing In (top) |\n|---|---|---|\n")
+                for s in steps[-12:]:
+                    fp = s.get("fail_sizing_pre") or {}
+                    fi = s.get("fail_sizing_in") or {}
+                    top_pre = ", ".join([f"{k}×{v}" for k, v in sorted(fp.items(), key=lambda x: x[1], reverse=True)[:3]]) or "—"
+                    top_in = ", ".join([f"{k}×{v}" for k, v in sorted(fi.items(), key=lambda x: x[1], reverse=True)[:3]]) or "—"
+                    lines.append(f"| {s['test']} | {top_pre} | {top_in} |\n")
                 lines.append("\n")
                 if wf_key_by_league2:
                     scope = str(getattr(args, "wf_key_by_league_scope", "pre") or "pre").strip().lower()
@@ -6252,7 +6279,7 @@ async def main() -> int:
                             turn_all = 0.0
 
                             for ev in test_elig:
-                                st_eq, exp = _sizing_for_event(ev, roi_train_map=roi_map)
+                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map=roi_map)
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -6809,7 +6836,7 @@ async def main() -> int:
                             back_all = back_roi = 0.0
                             lay_all = lay_roi = 0.0
                             for ev in test_elig:
-                                st_eq, exp = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -6987,7 +7014,7 @@ async def main() -> int:
                             back_all = back_roi = 0.0
                             lay_all = lay_roi = 0.0
                             for ev in test_elig:
-                                st_eq, exp = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -7090,7 +7117,7 @@ async def main() -> int:
                         seen_matches: Dict[str, set] = {}
                         for ev in test_elig:
                             k = _key(ev)
-                            st_eq, exp = _sizing_for_event(ev)
+                            st_eq, exp, _why = _sizing_for_event(ev)
                             if st_eq is None or exp is None:
                                 continue
                             combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})

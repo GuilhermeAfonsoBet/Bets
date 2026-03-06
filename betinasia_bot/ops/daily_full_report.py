@@ -132,8 +132,13 @@ def _fmt_roi_mean_se_ci_pct(row: dict) -> str:
             return _fmt_pct(mean)
         se_s = _fmt_pct(se) if se is not None else "—"
         if ci and (ci.get("lb") is not None) and (ci.get("ub") is not None):
-            return f"{_fmt_pct(mean)} (SE {se_s}) [{_fmt_pct(ci.get('lb'))}, {_fmt_pct(ci.get('ub'))}]"
-        return f"{_fmt_pct(mean)} (SE {se_s})"
+            base = f"{_fmt_pct(mean)} (SE {se_s}) [{_fmt_pct(ci.get('lb'))}, {_fmt_pct(ci.get('ub'))}]"
+        else:
+            base = f"{_fmt_pct(mean)} (SE {se_s})"
+        # ROI ponderado por exposição (quando disponível)
+        if row.get("roi_weighted") is not None:
+            base += f" | ROIw {_fmt_pct(row.get('roi_weighted'))}"
+        return base
     except Exception:
         return "—"
 
