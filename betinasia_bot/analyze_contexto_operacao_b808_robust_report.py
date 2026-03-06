@@ -4728,6 +4728,26 @@ async def main() -> int:
                 return best
 
             # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
+            def _is_live_eff(d: dict, *, ts: Optional[datetime] = None) -> bool:
+                """
+                Robustez: quando a instrumentação muda (ex.: BS -> WS), o campo `is_live` pode vir inconsistente.
+                Se `kickoff_time`/`kickoff` estiver disponível, inferimos `is_live` por timestamp (`audited_at >= kickoff`).
+                """
+                try:
+                    ko = d.get("kickoff") or d.get("kickoff_time")
+                    if ts is not None and isinstance(ko, datetime):
+                        return bool(ts >= ko)
+                except Exception:
+                    pass
+                try:
+                    if d.get("is_live") is True:
+                        return True
+                    if d.get("is_live") is False:
+                        return False
+                except Exception:
+                    pass
+                return False
+
             for d0 in all_data:
                 if str(d0.get("status", "")).upper() != "OK":
                     continue
@@ -4739,6 +4759,7 @@ async def main() -> int:
                 ts = d0.get("audited_at")
                 if not isinstance(ts, datetime):
                     continue
+                is_live_eff = _is_live_eff(d0, ts=ts)
                 ws0 = _safe_float(d0.get("ws_odd"))
                 if ws0 is None or ws0 <= 0:
                     continue
@@ -4777,7 +4798,7 @@ async def main() -> int:
                 )
                 # CLV pre-match
                 clv_entry = None
-                if d0.get("is_live") is False:
+                if not is_live_eff:
                     clo = _safe_float(d0.get("closing_odd"))
                     if clo is not None and clo > 0:
                         clv_entry = (float(entry) - float(clo)) / float(clo) * 100.0
@@ -4786,7 +4807,7 @@ async def main() -> int:
                         "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
                         "audit_id": int(aid),
                         "side": "Back",
-                        "regime": "Pre" if d0.get("is_live") is False else "In",
+                        "regime": "Pre" if (not is_live_eff) else "In",
                         "reversal": "Any",
                         "match_id": int(d0.get("match_id")),
                         "league": str(d0.get("league") or ""),
@@ -4812,6 +4833,7 @@ async def main() -> int:
                 ts = r.get("audited_at")
                 if not isinstance(ts, datetime):
                     continue
+                is_live_eff = _is_live_eff(d0 or {}, ts=ts) if isinstance(d0, dict) else bool(r.get("is_live") is True)
                 ws0 = _safe_float((d0 or {}).get("ws_odd"))
                 if ws0 is None or ws0 <= 0:
                     continue
@@ -4835,7 +4857,7 @@ async def main() -> int:
                         "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
                         "audit_id": int(aid),
                         "side": "Lay",
-                        "regime": "Pre" if r.get("is_live") is False else "In",
+                        "regime": "Pre" if (not is_live_eff) else "In",
                         "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
                         "match_id": int(r.get("match_id")),
                         "league": str((d0 or {}).get("league") or ""),
@@ -4846,7 +4868,7 @@ async def main() -> int:
                             else (_safe_float((d0 or {}).get("limit")) if (_safe_float((d0 or {}).get("limit")) or 0.0) > 0 else None)
                         ),
                         "clv_back": None,
-                        "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False) else None,
+                        "clv_lay_conv": r.get("clv_conv_entry") if (not is_live_eff) else None,
                         "roi": r.get("roi_entry"),
                         "entry_odd": r.get("odd_entry"),
                         "entry_source": str(r.get("entry_policy") or "WS_ENTRY"),
@@ -4901,6 +4923,8 @@ async def main() -> int:
             day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_any if _day_utc_from_ts(d.get("audited_at")))
             day_back_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Back" and e.get("day"))
             day_lay_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Lay" and e.get("day"))
+            day_pre_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("regime") == "Pre" and e.get("day"))
+            day_in_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("regime") != "Pre" and e.get("day"))
 
             day_non_ok_top: Dict[str, str] = {}
             tmp: Dict[str, Counter] = {}
@@ -4918,8 +4942,8 @@ async def main() -> int:
 
             lines.append("\n**Diagnóstico por dia (audited_at): betslip vs qualidade vs edge**\n\n")
             lines.append(
-                "| Dia | Auditorias carregadas | Betslip bruto | Betslip conf. | OK (conf.) | Edge Back/Lay | %OK/conf. | Status não-OK dominante |\n"
-                "|---|---:|---:|---:|---:|---:|---:|---|\n"
+                "| Dia | Auditorias carregadas | Betslip bruto | Betslip conf. | OK (conf.) | Edge Back/Lay | Edge Pre/In | %OK/conf. | Status não-OK dominante |\n"
+                "|---|---:|---:|---:|---:|---:|---:|---:|---|\n"
             )
             for day in days_loaded:
                 a = int(day_all_cnt.get(day, 0))
@@ -4928,9 +4952,11 @@ async def main() -> int:
                 ok = int(day_ok_cnt.get(day, 0))
                 eb = int(day_back_edge_cnt.get(day, 0))
                 el = int(day_lay_edge_cnt.get(day, 0))
+                ep = int(day_pre_edge_cnt.get(day, 0))
+                ei = int(day_in_edge_cnt.get(day, 0))
                 ok_rate = (100.0 * ok / conf) if conf > 0 else None
                 lines.append(
-                    f"| {day} | {a} | {br} | {conf} | {ok} | {eb}/{el} | {_fmt_num(ok_rate,1)}% | {day_non_ok_top.get(day,'—')} |\n"
+                    f"| {day} | {a} | {br} | {conf} | {ok} | {eb}/{el} | {ep}/{ei} | {_fmt_num(ok_rate,1)}% | {day_non_ok_top.get(day,'—')} |\n"
                 )
             lines.append(
                 "\nLeitura:\n"
