@@ -5485,6 +5485,7 @@ async def main() -> int:
                             bym_clv = _bym(sub, "clv_back")
                             clv_mean, clv_ci = _mean_ci90(bym_clv) if bym_clv else (None, None)
                             clv_pos = bool(clv_mean is not None and float(clv_mean) > 0)
+                            clv_avail = bool(clv_mean is not None)
                             if not eligible:
                                 ok_sel = False
                                 reason = f"BackPre: N_ROI<{wf_min_m} (N={len(bym_roi)})"
@@ -5494,12 +5495,12 @@ async def main() -> int:
                             elif roi_sig_pos:
                                 ok_sel = True
                                 reason = "BackPre: ROI sig>0"
-                            elif roi_pos and clv_pos:
+                            elif roi_pos and ((not clv_avail) or clv_pos):
                                 ok_sel = True
-                                reason = "BackPre: ROI>0 (NS) AND CLV>0"
+                                reason = "BackPre: ROI>0 (NS) AND (CLV ausente OU CLV>0)"
                             else:
                                 ok_sel = False
-                                reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos}"
+                                reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos} (CLV ausente={not clv_avail})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
@@ -5508,6 +5509,7 @@ async def main() -> int:
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
                                 "clv_mean": clv_mean,
                                 "clv_ci90": clv_ci,
+                                "clv_available": clv_avail,
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
                                 "roi_mean_eff": roi_mean_eff,
@@ -5547,6 +5549,7 @@ async def main() -> int:
                             # clv_conv = -(entry - closing) / closing  => Lay "bom" tende a ser POSITIVO.
                             clv_mean, clv_ci = _mean_ci90(bym_clv) if bym_clv else (None, None)
                             clv_pos = bool(clv_mean is not None and float(clv_mean) > 0)
+                            clv_avail = bool(clv_mean is not None)
                             if not eligible:
                                 ok_sel = False
                                 reason = f"LayPre: N_ROI<{wf_min_m} (N={len(bym_roi)})"
@@ -5556,12 +5559,12 @@ async def main() -> int:
                             elif roi_sig_pos:
                                 ok_sel = True
                                 reason = "LayPre: ROI sig>0"
-                            elif roi_pos and clv_pos:
+                            elif roi_pos and ((not clv_avail) or clv_pos):
                                 ok_sel = True
-                                reason = "LayPre: ROI>0 (NS) AND CLV_CONV>0"
+                                reason = "LayPre: ROI>0 (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
                             else:
                                 ok_sel = False
-                                reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos}"
+                                reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
@@ -5570,6 +5573,7 @@ async def main() -> int:
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
                                 "clv_mean": clv_mean,
                                 "clv_ci90": clv_ci,
+                                "clv_available": clv_avail,
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
                                 "roi_mean_eff": roi_mean_eff,

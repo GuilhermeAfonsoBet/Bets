@@ -138,6 +138,26 @@ def _fmt_roi_mean_se_ci_pct(row: dict) -> str:
         return "—"
 
 
+def _fmt_ctx_suffix(row: dict) -> str:
+    """
+    Sufixo opcional com contexto para interpretar ROIs extremos:
+    odd_median e exposure_median (stake para Back; liability para Lay).
+    """
+    try:
+        om = row.get("odd_median")
+        em = row.get("exposure_median")
+        if om is None and em is None:
+            return ""
+        s = []
+        if om is not None:
+            s.append(f"odd~{_fmt_num(om,2)}")
+        if em is not None:
+            s.append(f"exp~{_fmt_num(em,2)}")
+        return " (" + ", ".join(s) + ")"
+    except Exception:
+        return ""
+
+
 def _demote_h2_to_h3(md: str) -> str:
     # Usado para "embrulhar" o bloco in-sample sem reescrever o conteúdo.
     out = []
@@ -1077,7 +1097,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         s1.append("\n")
 
         # slippage x ROI (3 buckets raw com sinal) — acumulado na janela (não só um dia)
-        raw_total = adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
+        raw_total = adh.get("slippage_vs_roi_raw_total_ctx") if isinstance(adh.get("slippage_vs_roi_raw_total_ctx"), dict) else (
+            adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
+        )
         if isinstance(raw_total, dict) and raw_total:
             s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (últimos `{int(adh.get('range', {}).get('days') or 0)}` dias)**\n\n")
             for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
@@ -1089,7 +1111,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 s1.append(f"- **{title}**\n\n")
                 s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
                 for row in buckets:
-                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)} |\n")
+                    s1.append(
+                        f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n"
+                    )
                 s1.append("\n")
             # Por combinação (top por volume)
             rows = adh.get("slippage_vs_roi_raw_by_combo_top") if isinstance(adh.get("slippage_vs_roi_raw_by_combo_top"), list) else []

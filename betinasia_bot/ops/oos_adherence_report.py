@@ -189,6 +189,19 @@ def _mean_se_ci95(ys: List[float]) -> Dict[str, Any]:
         return {"n": int(len(ys)), "mean": None, "sd": None, "se": None, "ci95": None}
 
 
+def _median(xs: List[float]) -> Optional[float]:
+    try:
+        if not xs:
+            return None
+        ys = sorted(float(x) for x in xs)
+        n = len(ys)
+        if n % 2 == 1:
+            return float(ys[n // 2])
+        return float((ys[n // 2 - 1] + ys[n // 2]) / 2.0)
+    except Exception:
+        return None
+
+
 def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
     """
     Bucketiza por slippage_raw_pct (com sinal), em 3 faixas:
@@ -218,6 +231,44 @@ def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]
                 "roi_sd": st.get("sd"),
                 "roi_se": st.get("se"),
                 "roi_ci95": st.get("ci95"),
+            }
+        )
+    return outb
+
+
+def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    rows: [{slip_raw_pct, roi, odd, exposure}]
+    Além de mean/SE/IC, retorna median(odd) e median(exposure) para interpretar ROIs extremos.
+    """
+    outb: List[Dict[str, Any]] = []
+    if not rows:
+        return outb
+    buckets = [
+        ("<= -2%", lambda s: s <= -2.0),
+        ("(-2, 2]", lambda s: (s > -2.0) and (s <= 2.0)),
+        ("> 2%", lambda s: s > 2.0),
+    ]
+    for lab, fn in buckets:
+        sub = [r for r in rows if (r.get("slip_raw_pct") is not None) and fn(float(r.get("slip_raw_pct")))]
+        if not sub:
+            continue
+        rois = [float(r.get("roi")) for r in sub if r.get("roi") is not None]
+        if not rois:
+            continue
+        st = _mean_se_ci95(rois)
+        odds = [float(r.get("odd")) for r in sub if r.get("odd") is not None]
+        exps = [float(r.get("exposure")) for r in sub if r.get("exposure") is not None]
+        outb.append(
+            {
+                "bucket": lab,
+                "n": int(st.get("n") or 0),
+                "roi_mean": st.get("mean"),
+                "roi_sd": st.get("sd"),
+                "roi_se": st.get("se"),
+                "roi_ci95": st.get("ci95"),
+                "odd_median": _median(odds),
+                "exposure_median": _median(exps),
             }
         )
     return outb
@@ -528,6 +579,9 @@ async def run_report(
     # acumulado por combinação (top N por volume)
     comb_pairs_raw: Dict[str, List[Tuple[float, float]]] = {}
     comb_meta: Dict[str, Dict[str, Any]] = {}
+    # contexto para interpretação (odd/exposure)
+    total_rows_ctx_back: List[Dict[str, Any]] = []
+    total_rows_ctx_lay: List[Dict[str, Any]] = []
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
 
@@ -635,6 +689,7 @@ async def run_report(
                     pairs_back.append((float(cost_pct), float(roi)))
                 if raw_pct is not None:
                     pairs_raw_back.append((float(raw_pct), float(roi)))
+                    total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
                     # por combinação (alinha com chave do WF quando key_by_league está ativo)
                     try:
                         wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
@@ -682,6 +737,7 @@ async def run_report(
                     pairs_lay.append((float(cost_pct), float(roi_liab)))
                 if raw_pct is not None and roi_liab is not None:
                     pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
+                    total_rows_ctx_lay.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_liab), "odd": float(odd), "exposure": float(liab)})
                     try:
                         wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
                         key_by_league = bool(wf.get("key_by_league"))
@@ -776,6 +832,10 @@ async def run_report(
         "slippage_vs_roi_raw_total": {
             "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
             "lay": {"buckets": _bucketize_3way_raw(total_pairs_raw_lay)},
+        },
+        "slippage_vs_roi_raw_total_ctx": {
+            "back": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back)},
+            "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay)},
         },
         "slippage_vs_roi_total": {
             "back": {
