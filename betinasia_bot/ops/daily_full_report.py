@@ -1063,6 +1063,40 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 for row in buckets:
                     s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
                 s1.append("\n")
+            # Por combinação (top por volume)
+            rows = adh.get("slippage_vs_roi_raw_by_combo_top") if isinstance(adh.get("slippage_vs_roi_raw_by_combo_top"), list) else []
+            if rows:
+                try:
+                    back_rows = [r for r in rows if isinstance(r, dict) and str(r.get("side")) == "Back"]
+                    lay_rows = [r for r in rows if isinstance(r, dict) and str(r.get("side")) == "Lay"]
+                    def _print_combo_block(title: str, xs: list[dict], limit: int = 12) -> None:
+                        if not xs:
+                            return
+                        s1.append(f"**Slippage × ROI por combinação (top {min(limit, len(xs))} por volume; acumulado)**\n\n")
+                        s1.append(f"- **{title}**\n\n")
+                        s1.append("| Combinação | n | ROI<=-2% | n | ROI(-2..2] | n | ROI>2% | n | corr(slip_raw,ROI) |\n")
+                        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                        for r in xs[:limit]:
+                            comb = str(r.get("comb") or "")
+                            n = int(r.get("n") or 0)
+                            corr = r.get("corr_raw_pct_vs_roi")
+                            # buckets dict
+                            bmap = {str(b.get("bucket")): b for b in (r.get("buckets") or []) if isinstance(b, dict)}
+                            def _bn(lab: str) -> tuple[int, Any]:
+                                bb = bmap.get(lab) or {}
+                                return int(bb.get("n") or 0), bb.get("roi_mean")
+                            n1, roi1 = _bn("<= -2%")
+                            n2, roi2 = _bn("(-2, 2]")
+                            n3, roi3 = _bn("> 2%")
+                            s1.append(
+                                f"| {comb} | {n} | {_fmt_pct(roi1)} | {n1} | {_fmt_pct(roi2)} | {n2} | {_fmt_pct(roi3)} | {n3} | {_fmt_num(corr,2)} |\n"
+                            )
+                        s1.append("\n")
+                    # já está ordenado por n desc
+                    _print_combo_block("Back", back_rows)
+                    _print_combo_block("Lay", lay_rows)
+                except Exception:
+                    pass
         else:
             # fallback: último dia com dados
             last = _pick_last_day_with_slippage_vs_roi_raw(list(adh.get("per_day") or []))

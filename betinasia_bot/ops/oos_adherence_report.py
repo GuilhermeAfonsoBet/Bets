@@ -189,6 +189,44 @@ def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]
     return outb
 
 
+def _combo_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime) -> str:
+    """
+    Robustez: se kickoff_time existir, inferimos Pre/In por timestamp (created_at >= kickoff => In).
+    Caso contrário, usa a.is_live.
+    """
+    try:
+        ko = a.get("kickoff_time")
+        if isinstance(ko, datetime):
+            return "In" if exec_created_at >= ko else "Pre"
+    except Exception:
+        pass
+    try:
+        return "In" if bool(a.get("is_live") is True) else "Pre"
+    except Exception:
+        return "Pre"
+
+
+def _combo_rev_yes_no(a: Dict[str, Any]) -> str:
+    """
+    Para Lay, usa had_reversal quando disponível; fallback para reversal_direction.
+    """
+    details = a.get("hypothesis_details")
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except Exception:
+            details = None
+    try:
+        if isinstance(details, dict) and "had_reversal" in details:
+            return "Yes" if bool(details.get("had_reversal")) else "No"
+    except Exception:
+        pass
+    try:
+        return "Yes" if bool(str(a.get("reversal_direction") or "").strip()) else "No"
+    except Exception:
+        return "No"
+
+
 def _slip_cost_pct(*, exec_side: str, odd_dec: Optional[float], odd_fin: Optional[float]) -> Optional[float]:
     """
     Slippage "custo" em % (sempre >=0), normalizado por lado:
@@ -453,6 +491,9 @@ async def run_report(
     total_pairs_raw_lay: List[Tuple[float, float]] = []
     total_pairs_cost_back: List[Tuple[float, float]] = []
     total_pairs_cost_lay: List[Tuple[float, float]] = []
+    # acumulado por combinação (top N por volume)
+    comb_pairs_raw: Dict[str, List[Tuple[float, float]]] = {}
+    comb_meta: Dict[str, Dict[str, Any]] = {}
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
 
@@ -560,6 +601,20 @@ async def run_report(
                     pairs_back.append((float(cost_pct), float(roi)))
                 if raw_pct is not None:
                     pairs_raw_back.append((float(raw_pct), float(roi)))
+                    # por combinação (alinha com chave do WF quando key_by_league está ativo)
+                    try:
+                        wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
+                        key_by_league = bool(wf.get("key_by_league"))
+                        scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
+                        regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                        league = str(a.get("league") or "").strip()
+                        comb = f"Back_{regime}_Any"
+                        if key_by_league and (scope == "all" or regime == "Pre") and league:
+                            comb = f"{comb}__{league}"
+                        comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi)))
+                        comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": league if league else None})
+                    except Exception:
+                        pass
             elif side.lower() == "lay":
                 perf["lay"]["n"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
@@ -593,6 +648,20 @@ async def run_report(
                     pairs_lay.append((float(cost_pct), float(roi_liab)))
                 if raw_pct is not None and roi_liab is not None:
                     pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
+                    try:
+                        wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
+                        key_by_league = bool(wf.get("key_by_league"))
+                        scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
+                        regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                        league = str(a.get("league") or "").strip()
+                        rev = _combo_rev_yes_no(a)
+                        comb = f"Lay_{regime}_{rev}"
+                        if key_by_league and (scope == "all" or regime == "Pre") and league:
+                            comb = f"{comb}__{league}"
+                        comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi_liab)))
+                        comb_meta.setdefault(comb, {"side": "Lay", "regime": regime, "reversal": rev, "league": league if league else None})
+                    except Exception:
+                        pass
 
         # ROIs agregados
         back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum"]) * 100.0) if perf["back"]["stake_sum"] else None
@@ -685,6 +754,31 @@ async def run_report(
             },
         },
     }
+    # Top combinações por volume (slippage_raw_pct vs ROI)
+    try:
+        rows = []
+        for comb, pairs in (comb_pairs_raw or {}).items():
+            if not pairs:
+                continue
+            meta = comb_meta.get(comb) or {}
+            buckets = _bucketize_3way_raw(pairs)
+            corr = _pearson([s for s, _ in pairs], [r for _, r in pairs]) if len(pairs) >= 5 else None
+            rows.append(
+                {
+                    "comb": comb,
+                    "n": int(len(pairs)),
+                    "side": meta.get("side"),
+                    "regime": meta.get("regime"),
+                    "reversal": meta.get("reversal"),
+                    "league": meta.get("league"),
+                    "corr_raw_pct_vs_roi": corr,
+                    "buckets": buckets,
+                }
+            )
+        rows.sort(key=lambda r: int(r.get("n") or 0), reverse=True)
+        out["slippage_vs_roi_raw_by_combo_top"] = rows[:40]
+    except Exception:
+        pass
     out = _json_safe(out)
     if out_json:
         out_json.parent.mkdir(parents=True, exist_ok=True)
