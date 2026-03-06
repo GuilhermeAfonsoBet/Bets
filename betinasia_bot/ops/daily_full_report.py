@@ -1048,29 +1048,44 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             )
         s1.append("\n")
 
-        # slippage x ROI (3 buckets raw com sinal) — último dia com dados
-        last = _pick_last_day_with_slippage_vs_roi_raw(list(adh.get("per_day") or []))
-        if isinstance(last, dict):
-            ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
-            rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
-            if rawblk:
-                s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — exemplo do dia `{last.get('day')}`**\n\n")
-                for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
-                    b = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
-                    buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
-                    buckets = _slip_raw_3bucket_rows(buckets0)
-                    # só mostra se há alguma amostra (N>0)
-                    if not any(int(r.get("n") or 0) > 0 for r in buckets):
-                        continue
-                    s1.append(f"- **{title}**\n\n")
-                    s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
-                    for row in buckets:
-                        s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
-                    s1.append("\n")
+        # slippage x ROI (3 buckets raw com sinal) — acumulado na janela (não só um dia)
+        raw_total = adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
+        if isinstance(raw_total, dict) and raw_total:
+            s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (últimos `{int(adh.get('range', {}).get('days') or 0)}` dias)**\n\n")
+            for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                b = raw_total.get(side_key) if isinstance(raw_total.get(side_key), dict) else {}
+                buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
+                buckets = _slip_raw_3bucket_rows(buckets0)
+                if not any(int(r.get("n") or 0) > 0 for r in buckets):
+                    continue
+                s1.append(f"- **{title}**\n\n")
+                s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                for row in buckets:
+                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
+                s1.append("\n")
         else:
-            s1.append(
-                "_Slippage × ROI (por bucket) indisponível na janela: precisa de execuções com odd (decision/final) **e** placar (ROI) no DB._\n\n"
-            )
+            # fallback: último dia com dados
+            last = _pick_last_day_with_slippage_vs_roi_raw(list(adh.get("per_day") or []))
+            if isinstance(last, dict):
+                ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
+                rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
+                if rawblk:
+                    s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — exemplo do dia `{last.get('day')}`**\n\n")
+                    for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                        b = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
+                        buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
+                        buckets = _slip_raw_3bucket_rows(buckets0)
+                        if not any(int(r.get("n") or 0) > 0 for r in buckets):
+                            continue
+                        s1.append(f"- **{title}**\n\n")
+                        s1.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                        for row in buckets:
+                            s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_pct(row.get('roi_mean'))} |\n")
+                        s1.append("\n")
+            else:
+                s1.append(
+                    "_Slippage × ROI (por bucket) indisponível na janela: precisa de execuções com odd (decision/final) **e** placar (ROI) no DB._\n\n"
+                )
 
     # Funil (24h) por auditoria: total → OK/valid → erros principais
     if isinstance(audit_rep, dict) and isinstance(audit_rep.get("by_version"), list) and audit_rep.get("by_version"):
@@ -1628,24 +1643,21 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            # Slippage × ROI (com sinal): 3 buckets por lado (<=-2%, -2..2, >2)
-            last = _pick_last_day_with_slippage_vs_roi_raw(list(adh.get("per_day") or []))
-            if isinstance(last, dict):
-                ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
-                rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
-                if rawblk:
-                    extra.append(f"**Slippage × ROI (raw, com sinal; 3 buckets) — exemplo do dia `{last.get('day')}`**\n\n")
-                    for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
-                        blk = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
-                        buckets0 = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
-                        buckets = _slip_raw_3bucket_rows(buckets0)
-                        if not any(int(r.get("n") or 0) > 0 for r in buckets):
-                            continue
-                        extra.append(f"- **{title}**\n\n")
-                        extra.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
-                        for b in buckets:
-                            extra.append(f"| {b.get('bucket')} | {int(b.get('n') or 0)} | {_fmt_pct(b.get('roi_mean'))} |\n")
-                        extra.append("\n")
+            # Slippage × ROI (com sinal): acumulado na janela (para análise estatística)
+            raw_total = adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
+            if isinstance(raw_total, dict) and raw_total:
+                extra.append(f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (últimos `{int(adh.get('range', {}).get('days') or 0)}` dias)**\n\n")
+                for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                    blk = raw_total.get(side_key) if isinstance(raw_total.get(side_key), dict) else {}
+                    buckets0 = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
+                    buckets = _slip_raw_3bucket_rows(buckets0)
+                    if not any(int(r.get("n") or 0) > 0 for r in buckets):
+                        continue
+                    extra.append(f"- **{title}**\n\n")
+                    extra.append("| Bucket slippage_raw_pct | n | ROI mean |\n|---|---:|---:|\n")
+                    for b in buckets:
+                        extra.append(f"| {b.get('bucket')} | {int(b.get('n') or 0)} | {_fmt_pct(b.get('roi_mean'))} |\n")
+                    extra.append("\n")
             else:
                 extra.append(
                     "_Slippage × ROI (por bucket) indisponível na janela: precisa de execuções com odd (decision/final) **e** placar (ROI) no DB._\n\n"

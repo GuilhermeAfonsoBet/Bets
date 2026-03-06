@@ -448,6 +448,11 @@ async def run_report(
     await db.connect()
 
     per_day = []
+    # acumulado na janela (para análise estatística)
+    total_pairs_raw_back: List[Tuple[float, float]] = []
+    total_pairs_raw_lay: List[Tuple[float, float]] = []
+    total_pairs_cost_back: List[Tuple[float, float]] = []
+    total_pairs_cost_lay: List[Tuple[float, float]] = []
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
 
@@ -618,6 +623,16 @@ async def run_report(
             "lay": {"buckets": _bucketize_3way_raw(pairs_raw_lay)},
         }
 
+        # acumula (janela inteira)
+        if pairs_raw_back:
+            total_pairs_raw_back.extend(list(pairs_raw_back))
+        if pairs_raw_lay:
+            total_pairs_raw_lay.extend(list(pairs_raw_lay))
+        if pairs_back:
+            total_pairs_cost_back.extend(list(pairs_back))
+        if pairs_lay:
+            total_pairs_cost_lay.extend(list(pairs_lay))
+
         per_day.append(
             {
                 "day": d.isoformat(),
@@ -654,6 +669,21 @@ async def run_report(
         "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
         "policy_days": active_by_day,
         "per_day": per_day,
+        # Estatística acumulada na janela
+        "slippage_vs_roi_raw_total": {
+            "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
+            "lay": {"buckets": _bucketize_3way_raw(total_pairs_raw_lay)},
+        },
+        "slippage_vs_roi_total": {
+            "back": {
+                "n": int(len(total_pairs_cost_back)),
+                "corr_cost_pct_vs_roi": _pearson([c for c, _ in total_pairs_cost_back], [r for _, r in total_pairs_cost_back]) if total_pairs_cost_back else None,
+            },
+            "lay": {
+                "n": int(len(total_pairs_cost_lay)),
+                "corr_cost_pct_vs_roi": _pearson([c for c, _ in total_pairs_cost_lay], [r for _, r in total_pairs_cost_lay]) if total_pairs_cost_lay else None,
+            },
+        },
     }
     out = _json_safe(out)
     if out_json:

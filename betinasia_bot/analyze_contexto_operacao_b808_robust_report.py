@@ -4848,12 +4848,14 @@ async def main() -> int:
                 if ws0 is None or ws0 <= 0:
                     continue
                 entry = _safe_float(r.get("odd_entry"))
+                src = str(r.get("entry_policy") or "WS_ENTRY")
                 if entry is None or entry <= 0:
                     # fallback: se odd_entry não vier, tentar WS proxy no offset (melhor que nada)
                     ref = _ws_proxy_odd(d0 or {})
                     if not ref:
                         continue
                     entry = float(ref[0])
+                    src = f"WS@t+{float(ref[1]):.1f}s"
                 diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
                 if diff is None:
                     continue
@@ -4880,8 +4882,9 @@ async def main() -> int:
                         "clv_back": None,
                         "clv_lay_conv": r.get("clv_conv_entry") if (not is_live_eff) else None,
                         "roi": r.get("roi_entry"),
-                        "entry_odd": r.get("odd_entry"),
-                        "entry_source": str(r.get("entry_policy") or "WS_ENTRY"),
+                        # IMPORTANT: use a odd efetivamente usada na elegibilidade/edge; não o campo cru (pode vir None)
+                        "entry_odd": float(entry),
+                        "entry_source": src,
                         "diff_pct": float(diff),
                     }
                 )
