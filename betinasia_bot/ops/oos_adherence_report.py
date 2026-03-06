@@ -206,6 +206,31 @@ def _slip_cost_pct(*, exec_side: str, odd_dec: Optional[float], odd_fin: Optiona
     return float(abs(raw))
 
 
+def _sanitize_decimal_odd(odd: Optional[float]) -> Optional[float]:
+    """
+    Odds decimais típicas (AH/futebol) raramente passam de ~20.
+    Para evitar explosões de ROI por dados corrompidos (ex.: 98 ao invés de 1.98),
+    descartamos odds fora de um range plausível e tentamos um rescale simples quando fizer sentido.
+    """
+    if odd is None:
+        return None
+    try:
+        o = float(odd)
+    except Exception:
+        return None
+    if not (o > 1.0):
+        return None
+    # heurística: se vierem odds em "centavos" (ex.: 198 => 1.98), reescala
+    if o >= 100.0 and o <= 3000.0:
+        o2 = o / 100.0
+        if o2 > 1.0 and o2 <= 30.0:
+            return float(o2)
+    # odds absurdas (ex.: 98) são quase sempre bug de parsing/scrape
+    if o > 30.0:
+        return None
+    return float(o)
+
+
 @dataclass
 class ExecRow:
     created_at: datetime
@@ -244,6 +269,10 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
         raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
         sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
         stake_sent = _safe_float(sent.get("stake"))
+        if stake_sent is None:
+            # fallback: muitos executores registram stake na policy (request/result) e não em raw.sent
+            pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
+            stake_sent = _safe_float((pol or {}).get("stake_requested"))
         out.append(
             ExecRow(
                 created_at=created,
@@ -436,6 +465,7 @@ async def run_report(
             "status_counts": {},
             "back": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "stake_sum": 0.0, "pnl_sum": 0.0},
             "lay": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "liability_sum": 0.0, "pnl_sum": 0.0},
+            "odd_anomalies": {"back": {"n": 0, "max": None}, "lay": {"n": 0, "max": None}},
             "slippage": {
                 "back": {"n": 0, "raw_pct_mean": None, "cost_pct_mean": None},
                 "lay": {"n": 0, "raw_pct_mean": None, "cost_pct_mean": None},
@@ -479,8 +509,20 @@ async def run_report(
             mult = _mult_back_from_scores(a.get("line") or e.line, a.get("side") or (e.side or ""), a.get("home_score"), a.get("away_score"))
             if mult is None:
                 continue
-            odd = e.odd_final or e.odd_decision
-            if odd is None or float(odd) <= 1.0:
+            odd = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+            if odd is None:
+                # registra anomalia por lado (quando havia algo preenchido)
+                raw_odd = e.odd_final if e.odd_final is not None else e.odd_decision
+                side0 = str(e.exec_side or "").strip().lower()
+                if raw_odd is not None and side0 in ("back", "lay"):
+                    blk = perf.get("odd_anomalies", {}).get(side0, {})
+                    try:
+                        blk["n"] = int(blk.get("n") or 0) + 1
+                        mx = blk.get("max")
+                        v = float(raw_odd)
+                        blk["max"] = v if mx is None else max(float(mx), v)
+                    except Exception:
+                        pass
                 continue
 
             side = str(e.exec_side or "").strip()
