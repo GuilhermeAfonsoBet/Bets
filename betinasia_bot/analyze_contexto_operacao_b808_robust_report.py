@@ -825,6 +825,20 @@ async def main() -> int:
     # Robustez: `steps` pode ser referenciado em blocos de transparência do OOS.
     # Inicializamos aqui para evitar `UnboundLocalError` em variações de parâmetros/fluxo.
     steps: List[dict] = []
+    # Robustez adicional: séries OOS podem ser referenciadas em seções 12.1+.
+    # Em alguns caminhos de execução (ex.: filtros/early-exit), a atribuição poderia não ocorrer.
+    daily_turn: Dict[str, float] = {}
+    daily_turn_pre: Dict[str, float] = {}
+    daily_turn_in: Dict[str, float] = {}
+    daily_pnl_obs: Dict[str, float] = {}
+    daily_pnl_obs_pre: Dict[str, float] = {}
+    daily_pnl_obs_in: Dict[str, float] = {}
+    daily_pnl_exp: Dict[str, float] = {}
+    daily_pnl_exp_pre: Dict[str, float] = {}
+    daily_pnl_exp_in: Dict[str, float] = {}
+    oos_back_stakes_all: List[float] = []
+    oos_lay_liab_all: List[float] = []
+    oos_jobs: List[Tuple[datetime, datetime, float]] = []
 
     db = Database(database_url=args.database_url) if args.database_url else Database()
     try:
