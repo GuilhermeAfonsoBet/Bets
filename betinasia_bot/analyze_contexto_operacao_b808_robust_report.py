@@ -822,6 +822,9 @@ async def main() -> int:
 
     versions = [v.strip() for v in str(args.versions).split(",") if v.strip()]
     out_path = Path(args.out)
+    # Robustez: `steps` pode ser referenciado em blocos de transparência do OOS.
+    # Inicializamos aqui para evitar `UnboundLocalError` em variações de parâmetros/fluxo.
+    steps: List[dict] = []
 
     db = Database(database_url=args.database_url) if args.database_url else Database()
     try:
