@@ -825,6 +825,7 @@ async def main() -> int:
     # Robustez: `steps` pode ser referenciado em blocos de transparência do OOS.
     # Inicializamos aqui para evitar `UnboundLocalError` em variações de parâmetros/fluxo.
     steps: List[dict] = []
+    active_counts: Dict[str, int] = {}
     # Robustez adicional: séries OOS podem ser referenciadas em seções 12.1+.
     # Em alguns caminhos de execução (ex.: filtros/early-exit), a atribuição poderia não ocorrer.
     daily_turn: Dict[str, float] = {}
@@ -6021,6 +6022,38 @@ async def main() -> int:
                     top_in = ", ".join([f"{k}×{v}" for k, v in sorted(fi.items(), key=lambda x: x[1], reverse=True)[:3]]) or "—"
                     lines.append(f"| {s['test']} | {top_pre} | {top_in} |\n")
                 lines.append("\n")
+
+                # Modo rápido: para diagnosticar o colapso do turnover (ex.: 22-02), não precisamos das projeções 12.1/12.2+.
+                # Aqui encerramos o relatório após as tabelas essenciais e escrevemos somente o bloco OOS.
+                if bool(getattr(args, "only_oos", False)):
+                    try:
+                        def _extract_oos_block(doc_lines: List[str]) -> List[str]:
+                            i0 = None
+                            for ii, ln in enumerate(doc_lines):
+                                if str(ln).startswith("## 12) OOS walk-forward"):
+                                    i0 = ii
+                                    break
+                            if i0 is None:
+                                return doc_lines
+                            j0 = len(doc_lines)
+                            for jj in range(i0 + 1, len(doc_lines)):
+                                ln = str(doc_lines[jj] or "")
+                                if ln.startswith("## ") and (not ln.startswith("## 12) OOS walk-forward")):
+                                    j0 = jj
+                                    break
+                            hdr = [
+                                "## OOS (extraído) — modo `--only-oos`\n\n",
+                                "_Este arquivo contém **apenas** o bloco de walk-forward, para inspeção rápida (turnover, N elig/sized, e falhas de sizing)._ \n\n",
+                            ]
+                            return hdr + doc_lines[i0:j0]
+
+                        out_lines = _extract_oos_block(lines)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_text("".join(out_lines), encoding="utf-8")
+                        print(f"Relatório gerado em: {out_path}")
+                    except Exception as e:
+                        print(f"[WARN] Falha ao escrever saída only-oos: {e}")
+                    return 0
                 if wf_key_by_league2:
                     scope = str(getattr(args, "wf_key_by_league_scope", "pre") or "pre").strip().lower()
                     lines.append(
