@@ -557,6 +557,11 @@ async def main() -> int:
         help="Opcional. Filtra o relatório para um (ou mais) regimes operacionais por tempo total. "
         "Ex.: \"< 5s\" ou \"< 5s,5-10s\".",
     )
+    parser.add_argument(
+        "--only-oos",
+        action="store_true",
+        help="Gera somente a seção OOS walk-forward (mais rápido). Ignora in-sample e blocos pesados.",
+    )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
     parser.add_argument(
         "--pdf",
@@ -7341,6 +7346,39 @@ async def main() -> int:
                 return rest[:ins] + oos2 + appendix_hdr + rest[ins:]
 
             lines = _reorder_oos_first(lines)
+
+        # ============================================================
+        # Modo rápido de inspeção: somente OOS (sem PDF)
+        # ============================================================
+        if bool(getattr(args, "only_oos", False)):
+            try:
+                def _find_oos_block(doc_lines: List[str]) -> List[str]:
+                    i0 = None
+                    for ii, ln in enumerate(doc_lines):
+                        if "OOS walk-forward" in str(ln):
+                            # pega o heading mais alto encontrado
+                            if str(ln).startswith("## "):
+                                i0 = ii
+                                break
+                    if i0 is None:
+                        return doc_lines
+                    j0 = len(doc_lines)
+                    for jj in range(i0 + 1, len(doc_lines)):
+                        ln = str(doc_lines[jj] or "")
+                        if ln.startswith("## ") and ("OOS walk-forward" not in ln):
+                            j0 = jj
+                            break
+                    hdr = [
+                        "## OOS (extraído) — modo `--only-oos`\n\n",
+                        "_Este arquivo contém **apenas** o bloco de walk-forward, para inspeção rápida (turnover, N elig/sized, e falhas de sizing)._ \n\n",
+                    ]
+                    return hdr + doc_lines[i0:j0]
+
+                lines = _find_oos_block(lines)
+                # não faz sentido PDF quando só queremos o bloco OOS
+                args.pdf = None
+            except Exception:
+                pass
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("".join(lines), encoding="utf-8")
