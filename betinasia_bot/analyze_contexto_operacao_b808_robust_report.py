@@ -5030,10 +5030,39 @@ async def main() -> int:
                 "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
                 "Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.\n\n"
             )
+            # Transparência: parâmetros efetivos do WF (evita confusão quando env vars/CLI mudam defaults)
+            try:
+                lines.append(
+                    f"**Parâmetros efetivos (WF)**: dias_unicos={len(days)} | wf_train_days={wf_train} | wf_test_days={wf_test} | wf_step_days={wf_step} | only_oos={'ON' if bool(getattr(args,'only_oos',False)) else 'OFF'}\n\n"
+                )
+            except Exception:
+                pass
+
+            # Modo `--only-oos`: se a janela for curta, preferimos AJUSTAR o treino para caber no recorte (ao invés de abortar o WF)
+            # e, se ainda assim não couber, encerramos cedo para não cair em seções 12.1+.
+            if bool(getattr(args, "only_oos", False)) and (len(days) > 0) and (len(days) < (wf_train + wf_test)):
+                try:
+                    wf_train_old = int(wf_train)
+                    # garante pelo menos 1 passo: precisamos de i=wf_train <= len(days)-wf_test
+                    wf_train = int(max(1, min(int(wf_train), int(max(1, len(days) - wf_test)))))
+                    if wf_train != wf_train_old:
+                        lines.append(
+                            f"[INFO] only-oos: ajustando `wf_train_days` de {wf_train_old} para {wf_train} para caber em dias_unicos={len(days)}.\n\n"
+                        )
+                except Exception:
+                    pass
             if len(days) < (wf_train + wf_test):
                 lines.append(
                     f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test}.\n\n"
                 )
+                if bool(getattr(args, "only_oos", False)):
+                    try:
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_text("".join(lines), encoding="utf-8")
+                        print(f"Relatório gerado em: {out_path}")
+                    except Exception as e:
+                        print(f"[WARN] Falha ao escrever saída only-oos (janela curta): {e}")
+                    return 0
             else:
                 def _key(e: dict) -> str:
                     """
