@@ -5403,20 +5403,20 @@ async def main() -> int:
                             k = _key(ev)
                             roi_hat = _safe_float(((roi_train_map or roi_train_by_key) or {}).get(k))
                             if roi_hat is None:
-                                return (None, None)
+                                return (None, None, "LAY_ROI_TRAIN_MISSING")
                             f = max(0.0, float(roi_hat)) / 100.0
                             bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
                             cap = LAY_CAP_FRAC * max(1e-9, bank_ref_budget_local)
                             liab = min(f * bank_ref_budget_local, cap)
                         else:
-                            return (None, None)
+                            return (None, None, "LAY_UNSUPPORTED_SCHEME")
                     # cap por evento (limit): converte stake max -> liab max
                     max_st = _max_lay_stake_event(d0)
                     liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                     if liab is None or float(liab) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
-                        return (None, None)
+                        return (None, None, "LAY_LIAB_NONPOS")
                     stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
-                    return (float(stake_eq), float(liab))
+                    return (float(stake_eq), float(liab), None)
 
                 def _append_job(ev: dict, exposure: float):
                     """Para banca de liquidez: capital simultaneamente travado."""
@@ -5759,7 +5759,12 @@ async def main() -> int:
                     fail_sizing_side_pre: Counter[str] = Counter()
                     fail_sizing_side_in: Counter[str] = Counter()
                     for ev in test_elig:
-                        st_eq, exp, why = _sizing_for_event(ev)
+                        res_sz = _sizing_for_event(ev)
+                        if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                            st_eq, exp = res_sz
+                            why = None
+                        else:
+                            st_eq, exp, why = res_sz
                         if st_eq is None or exp is None:
                             w = str(why or "UNKNOWN")
                             if str(ev.get("regime")) == "Pre":
@@ -6389,7 +6394,11 @@ async def main() -> int:
                             turn_all = 0.0
 
                             for ev in test_elig:
-                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map=roi_map)
+                                res_sz = _sizing_for_event(ev, roi_train_map=roi_map)
+                                if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                                    st_eq, exp = res_sz
+                                else:
+                                    st_eq, exp, _why = res_sz
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -6946,7 +6955,11 @@ async def main() -> int:
                             back_all = back_roi = 0.0
                             lay_all = lay_roi = 0.0
                             for ev in test_elig:
-                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                res_sz = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                                    st_eq, exp = res_sz
+                                else:
+                                    st_eq, exp, _why = res_sz
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -7124,7 +7137,11 @@ async def main() -> int:
                             back_all = back_roi = 0.0
                             lay_all = lay_roi = 0.0
                             for ev in test_elig:
-                                st_eq, exp, _why = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                res_sz = _sizing_for_event(ev, roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys})
+                                if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                                    st_eq, exp = res_sz
+                                else:
+                                    st_eq, exp, _why = res_sz
                                 if st_eq is None or exp is None:
                                     continue
                                 mid = int(ev.get("match_id"))
@@ -7227,7 +7244,11 @@ async def main() -> int:
                         seen_matches: Dict[str, set] = {}
                         for ev in test_elig:
                             k = _key(ev)
-                            st_eq, exp, _why = _sizing_for_event(ev)
+                            res_sz = _sizing_for_event(ev)
+                            if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                                st_eq, exp = res_sz
+                            else:
+                                st_eq, exp, _why = res_sz
                             if st_eq is None or exp is None:
                                 continue
                             combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
