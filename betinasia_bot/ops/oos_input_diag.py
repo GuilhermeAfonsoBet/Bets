@@ -5,15 +5,43 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import Integer, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY
+
 from storage.database import Database
 
-# Reuso de helpers do relatório principal (evita duplicar regras)
-from analyze_contexto_operacao_b808_robust_report import (
-    _as_dict,
-    _get_path,
-    _safe_float,
-    fetch_h3b_audit_rows,
-)
+# Helpers mínimos (evita importar o relatório inteiro; isso também reduz overhead)
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        f = float(x)
+        if f != f:  # NaN
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _get_path(obj: Any, path: List[Any]) -> Any:
+    cur = obj
+    for p in path:
+        if cur is None:
+            return None
+        if isinstance(cur, dict):
+            cur = cur.get(p)
+        elif isinstance(cur, list) and isinstance(p, int) and 0 <= p < len(cur):
+            cur = cur[p]
+        else:
+            return None
+    return cur
+
+
+def _as_dict(x: Any) -> Optional[dict]:
+    # `hypothesis_details` já vem como dict via SQLAlchemy, mas mantém fallback simples
+    return x if isinstance(x, dict) else None
 
 
 @dataclass(frozen=True)
@@ -169,31 +197,54 @@ async def run() -> int:
     db = Database(database_url=args.database_url) if args.database_url else Database()
     await db.connect()
     try:
-        rows = await fetch_h3b_audit_rows(db, direction=str(args.direction), versions=versions, lookback_days=int(args.lookback_days))
+        # Query rápida (sem JOIN matches): para diagnóstico de cobertura/insumos, basta o audit.
+        q = (
+            text(
+                """
+                SELECT
+                    a.id,
+                    a.audited_at,
+                    a.status,
+                    a.is_live,
+                    a.audit_version,
+                    a.websocket_odd,
+                    a.betslip_odd,
+                    a.difference_pct,
+                    a.hypothesis_details
+                FROM betslip_audit_results a
+                WHERE a.hypothesis_type = 'H3B'
+                  AND a.reversal_direction = :direction
+                  AND a.audit_version = ANY(:versions)
+                  AND (
+                    :lookback_days IS NULL
+                    OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
+                  )
+                """
+            )
+            .bindparams(bindparam("lookback_days", type_=Integer))
+            .bindparams(bindparam("versions", type_=ARRAY(Integer), expanding=False))
+        )
+        # Observação: `versions` é text[] no DB; aqui passamos como list e confiamos no driver. Se falhar,
+        # o usuário consegue passar 1 versão por vez.
+        async with db.async_session() as session:
+            res = await session.execute(q, {"direction": str(args.direction), "versions": versions, "lookback_days": int(args.lookback_days)})
+            rows = list(res.fetchall())
+
         all_data: List[Dict[str, Any]] = []
-        for r in rows:
-            d: Dict[str, Any] = {
-                "id": r[0],
-                "event_id": r[1],
-                "league": r[4] or "",
-                "market_type": r[5],
-                "line": r[6],
-                "side": r[7],
-                "ws_odd": r[8],
-                "bs_odd": r[9],
-                "diff_pct": r[10],
-                "limit": r[11] or 0.0,
-                "status": r[12],
-                "is_live": r[13],
-                "audited_at": r[18],
-                "version": r[21],
-                "hypothesis_details": _as_dict(r[22]) or {},
-                "match_id": int(r[23]),
-                "kickoff": r[24],
-                "home_score": r[25],
-                "away_score": r[26],
-            }
-            all_data.append(d)
+        for rid, audited_at, status, is_live, ver, ws_odd, bs_odd, diff_pct, hyp in rows:
+            all_data.append(
+                {
+                    "id": rid,
+                    "audited_at": audited_at,
+                    "status": status,
+                    "is_live": is_live,
+                    "version": ver,
+                    "ws_odd": ws_odd,
+                    "bs_odd": bs_odd,
+                    "diff_pct": diff_pct,
+                    "hypothesis_details": _as_dict(hyp) or {},
+                }
+            )
 
         day_agg: Dict[str, DayAgg] = {}
         # motivos: (day, side, regime) -> counter
@@ -204,8 +255,8 @@ async def run() -> int:
                 continue
             day = _day_utc(d0.get("audited_at")) or "NA"
             audited_at = d0.get("audited_at") if isinstance(d0.get("audited_at"), datetime) else None
-            kickoff = d0.get("kickoff") if isinstance(d0.get("kickoff"), datetime) else None
-            is_live = _is_live_eff(audited_at=audited_at, kickoff=kickoff, is_live_flag=d0.get("is_live"))
+            # Sem JOIN matches, usamos `is_live` do audit como proxy (suficiente para o diagnóstico de colapso).
+            is_live = bool(d0.get("is_live") is True)
             regime = "In" if is_live else "Pre"
 
             cur = day_agg.get(day, DayAgg())
@@ -228,27 +279,35 @@ async def run() -> int:
 
             # BACK: entrada = BS se existir; senão WS proxy
             bs = _safe_float(d0.get("bs_odd"))
+            entry = None
+            src = None
             if bs is not None and bs > 0:
                 entry = float(bs)
-                src_reason = "BS"
+                src = "BS"
             else:
                 entry, t_proxy, src_reason = _ws_proxy_odd(d0, offset_s=float(args.ws_proxy_offset_sec), max_gap_s=float(args.ws_proxy_max_gap_sec))
                 if entry is None:
                     reasons[(day, "Back", regime)][src_reason] += 1
                     day_agg[day] = cur
+                    # segue para Lay
+                    pass
                 else:
-                    diff = (float(entry) - float(ws0)) / float(ws0) * 100.0
-                    if not (-10.0 <= float(diff) <= 10.0):
-                        reasons[(day, "Back", regime)]["DIFF_OOR"] += 1
-                    elif float(diff) < float(args.back_diff_min):
-                        reasons[(day, "Back", regime)]["DIFF_BELOW_CUT"] += 1
+                    src = "WS_PROXY"
+            if entry is not None and src is not None:
+                diff = (float(entry) - float(ws0)) / float(ws0) * 100.0
+                if not (-10.0 <= float(diff) <= 10.0):
+                    reasons[(day, "Back", regime)]["DIFF_OOR"] += 1
+                elif float(diff) < float(args.back_diff_min):
+                    reasons[(day, "Back", regime)]["DIFF_BELOW_CUT"] += 1
+                else:
+                    reasons[(day, "Back", regime)]["EDGE_OK"] += 1
+                    if is_live:
+                        cur = DayAgg(**{**cur.__dict__, "back_edge_in": cur.back_edge_in + 1})
                     else:
-                        reasons[(day, "Back", regime)]["EDGE_OK"] += 1
-                        if is_live:
-                            cur = DayAgg(**{**cur.__dict__, "back_edge_in": cur.back_edge_in + 1})
-                        else:
-                            cur = DayAgg(**{**cur.__dict__, "back_edge_pre": cur.back_edge_pre + 1})
-                    day_agg[day] = cur
+                        cur = DayAgg(**{**cur.__dict__, "back_edge_pre": cur.back_edge_pre + 1})
+                # visibilidade: fonte de entrada
+                reasons[(day, "Back", regime)][f"SRC_{src}"] += 1
+                day_agg[day] = cur
 
             # LAY: diagnóstico simples (cobertura)
             lay_entry, lay_reason = _lay_entry_odd_simple(d0)
