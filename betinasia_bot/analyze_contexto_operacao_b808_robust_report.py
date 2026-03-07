@@ -840,6 +840,32 @@ async def main() -> int:
     oos_lay_liab_all: List[float] = []
     oos_jobs: List[Tuple[datetime, datetime, float]] = []
 
+    def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
+        """
+        Banca de liquidez (p99) a partir de exposições simultâneas.
+        Definido no escopo externo para não depender de blocos condicionais do walk-forward.
+        """
+        if not jobs:
+            return None
+        grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+        buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
+        step = max(1, grid_min)
+        t_min = min(j[0] for j in jobs)
+        t_max = max(j[1] for j in jobs)
+        t = t_min
+        vals: List[float] = []
+        while t <= t_max:
+            s = 0.0
+            for a, b, exp in jobs:
+                if a <= t <= b:
+                    s += float(exp)
+            vals.append(float(s))
+            t = t + timedelta(minutes=step)
+        if not vals:
+            return None
+        p99 = float(np.quantile(vals, 0.99))
+        return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
+
     db = Database(database_url=args.database_url) if args.database_url else Database()
     try:
         await db.connect()
