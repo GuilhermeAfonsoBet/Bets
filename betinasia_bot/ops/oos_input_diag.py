@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import Integer, bindparam, text
+from sqlalchemy import Integer, String, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from storage.database import Database
@@ -222,7 +222,8 @@ async def run() -> int:
                 """
             )
             .bindparams(bindparam("lookback_days", type_=Integer))
-            .bindparams(bindparam("versions", type_=ARRAY(Integer), expanding=False))
+            # audit_version é texto (varchar) no banco
+            .bindparams(bindparam("versions", type_=ARRAY(String), expanding=False))
         )
         # Observação: `versions` é text[] no DB; aqui passamos como list e confiamos no driver. Se falhar,
         # o usuário consegue passar 1 versão por vez.
