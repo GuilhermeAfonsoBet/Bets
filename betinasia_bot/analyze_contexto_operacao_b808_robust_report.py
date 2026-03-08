@@ -2921,9 +2921,16 @@ async def main() -> int:
 
             series: List[dict] = []
             if lay0 is not None and lay0 > 0:
+                # Fonte preferida: lay0 explícito (betslip / lay snapshot)
                 series.append({"t": 0.0, "odd": float(lay0), "diff_pct": float((lay0 - ws0) / ws0 * 100.0)})
+            elif ws_series:
+                # Robustez pós-mudança BS->WS: alguns pipelines passaram a gravar apenas WS.
+                # Para não “matar” o universo Lay (e o turnover OOS), permitimos iniciar a série usando WS@t0 como proxy.
+                o0 = _safe_float(ws_series[0].get("odd"))
+                if o0 is None or float(o0) <= 0:
+                    return []
+                series.append({"t": 0.0, "odd": float(o0), "diff_pct": float((float(o0) - ws0) / ws0 * 100.0)})
             else:
-                # Sem lay0: não inventamos série de lay, a menos que haja dados explícitos.
                 return []
 
             arr = h.get("lay_temporal") if isinstance(h, dict) else None
