@@ -4791,8 +4791,21 @@ async def main() -> int:
             # Mapeamento preenchido por step (train window) e usado no loop de sizing do test.
             roi_train_by_key: Dict[str, float] = {}
 
-            # index para recuperar campos de sizing/liquidez (inclui ws-only)
-            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_any if d.get("id") is not None}
+            # Universo "usável" para OOS:
+            # - Em versões ws_gate_* o auditor pode salvar `GATE_NOT_ELIGIBLE` sem abrir betslip,
+            #   mas ainda assim com `ws_series` suficiente para avaliar a regra operacional (Lay pós-reversal / t+30s).
+            # - Para não colapsar o turnover por um gate "cedo" (ex.: t+5s), tratamos alguns status GATE_* como
+            #   eventos analisáveis no OOS (o edge é reavaliado pela regra do relatório).
+            oos_status_allow = {
+                "OK",
+                "GATE_NOT_ELIGIBLE",
+                "GATE_BLOCKED_CAP",
+                "GATE_BLOCKED_BACKOFF",
+            }
+            oos_any = [d for d in all_data if str(d.get("status", "")).upper() in oos_status_allow]
+
+            # index para recuperar campos de sizing/liquidez (inclui ws-only + gate_*)
+            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in oos_any if d.get("id") is not None}
 
             # dataset de entradas com timestamp
             combo_events: List[dict] = []
@@ -4899,9 +4912,7 @@ async def main() -> int:
                     pass
                 return False
 
-            for d0 in all_data:
-                if str(d0.get("status", "")).upper() != "OK":
-                    continue
+            for d0 in oos_any:
                 aid = d0.get("id")
                 if aid is None:
                     continue
@@ -4973,26 +4984,27 @@ async def main() -> int:
                     }
                 )
 
-            # --- Lay: entrada pós-reversal (ou último ponto). Alinha com operação WS (não depende de betslip). ---
-            for r in lay_entries:
-                aid = r.get("audit_id")
+            # --- Lay: entrada pós-reversal (ou fim do período). Alinha com operação WS e NÃO depende de status OK. ---
+            for d0 in oos_any:
+                aid = d0.get("id")
                 if aid is None:
                     continue
-                d0 = audit_by_id.get(int(aid))
-                if d0 and wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
+                if wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
                     continue
-                ts = r.get("audited_at")
+                ts = d0.get("audited_at")
                 if not isinstance(ts, datetime):
                     continue
-                is_live_eff = _is_live_eff(d0 or {}, ts=ts) if isinstance(d0, dict) else bool(r.get("is_live") is True)
-                ws0 = _safe_float((d0 or {}).get("ws_odd"))
+                ws0 = _safe_float(d0.get("ws_odd"))
                 if ws0 is None or ws0 <= 0:
                     continue
-                entry = _safe_float(r.get("odd_entry"))
-                src = str(r.get("entry_policy") or "WS_ENTRY")
+                em = _entry_metrics_lay(d0)
+                if not isinstance(em, dict):
+                    continue
+                entry = _safe_float(em.get("odd_entry"))
+                src = "WS_ENTRY"
                 if entry is None or entry <= 0:
                     # fallback: se odd_entry não vier, tentar WS proxy no offset (melhor que nada)
-                    ref = _ws_proxy_odd(d0 or {})
+                    ref = _ws_proxy_odd(d0)
                     if not ref:
                         continue
                     entry = float(ref[0])
@@ -5005,25 +5017,25 @@ async def main() -> int:
                 # edge Lay (mesmo corte antigo, mas agora usando WS-entry vs WS0)
                 if float(diff) > float(lay_cut):
                     continue
+                is_live_eff = _is_live_eff(d0, ts=ts)
                 combo_events.append(
                     {
                         "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
                         "audit_id": int(aid),
                         "side": "Lay",
                         "regime": "Pre" if (not is_live_eff) else "In",
-                        "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
-                        "match_id": int(r.get("match_id")),
-                        "league": str((d0 or {}).get("league") or ""),
-                        "ah_abs": line_abs((d0 or {}).get("line")),
+                        "reversal": "Yes" if bool(em.get("had_reversal")) else "No",
+                        "match_id": int(d0.get("match_id")),
+                        "league": str(d0.get("league") or ""),
+                        "ah_abs": line_abs(d0.get("line")),
                         "liq_limit": (
-                            _safe_float(_get_path((d0 or {}).get("hypothesis_details") or {}, ["lay", "available_limit"]))
-                            if (_safe_float(_get_path((d0 or {}).get("hypothesis_details") or {}, ["lay", "available_limit"])) or 0.0) > 0
-                            else (_safe_float((d0 or {}).get("limit")) if (_safe_float((d0 or {}).get("limit")) or 0.0) > 0 else None)
+                            _safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"]))
+                            if (_safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"])) or 0.0) > 0
+                            else (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None)
                         ),
                         "clv_back": None,
-                        "clv_lay_conv": r.get("clv_conv_entry") if (not is_live_eff) else None,
-                        "roi": r.get("roi_entry"),
-                        # IMPORTANT: use a odd efetivamente usada na elegibilidade/edge; não o campo cru (pode vir None)
+                        "clv_lay_conv": em.get("clv_conv_entry") if (not is_live_eff) else None,
+                        "roi": em.get("roi_entry"),
                         "entry_odd": float(entry),
                         "entry_source": src,
                         "diff_pct": float(diff),
@@ -5038,7 +5050,7 @@ async def main() -> int:
                 return None
 
             days_loaded = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in all_data) if d})
-            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_any) if d})
+            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in oos_any) if d})
             days_combo = sorted({e["day"] for e in combo_events})
             days = days_loaded if days_loaded else days_combo
             # Ajuste do início do calendário:
@@ -5073,12 +5085,12 @@ async def main() -> int:
             # Diagnóstico por dia: ajuda a distinguir "dia vazio por falta de oportunidade" vs "dia vazio por falha operacional"
             # Importante (pós-mudança BS->WS): não usamos mais betslip como proxy primário de entrada/qualidade.
             day_all_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in all_data if _day_utc_from_ts(d.get("audited_at")))
-            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_any if _day_utc_from_ts(d.get("audited_at")))
+            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in oos_any if _day_utc_from_ts(d.get("audited_at")))
             # Cobertura de entrada WS proxy (Back: WS@t+offset) e cobertura de série Lay (WS/reversal/end)
             day_back_wsproxy_cnt = Counter()
             day_lay_series_cnt = Counter()
             try:
-                for d in ok_any:
+                for d in oos_any:
                     day = _day_utc_from_ts(d.get("audited_at"))
                     if not day:
                         continue
