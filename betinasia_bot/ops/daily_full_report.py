@@ -715,6 +715,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     active_keys = None
     active_keys_base = None
+    policy_wf: Optional[Dict[str, Any]] = None
+    policy_last_step: Optional[Dict[str, Any]] = None
     if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
         try:
             pol = json.loads(policy_hist.read_text(encoding="utf-8"))
@@ -723,6 +725,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             if isinstance(last, dict):
                 active_keys = last.get("active_keys")
                 active_keys_base = last.get("active_keys_base")
+                policy_last_step = last
+            if isinstance(pol, dict) and isinstance(pol.get("wf"), dict):
+                policy_wf = pol.get("wf")
             rec = {
                 "ts": ts.isoformat(),
                 "policy_path": str(policy_hist),
@@ -1416,14 +1421,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     )
 
     # Critérios (OOS e real) + clareza do filtro de AH
+    # Preferir policy_current (fonte da verdade operacional) quando disponível.
+    wf_key_by_league = bool(policy_wf.get("key_by_league")) if isinstance(policy_wf, dict) else (
+        str(os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+    )
+    wf_key_scope = str(policy_wf.get("key_by_league_scope") or "") if isinstance(policy_wf, dict) else str(os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", str(cfg.wf_key_by_league_scope)) or "")
+    wf_key_scope = wf_key_scope.strip() or "pre"
     try:
-        wf_ah = float(os.getenv("DAILY_WF_AH_MAX_ABS_LINE", str(cfg.wf_ah_max_abs_line)) or 0.0)
+        wf_ah = float(policy_wf.get("ah_max_abs_line")) if isinstance(policy_wf, dict) and policy_wf.get("ah_max_abs_line") is not None else float(os.getenv("DAILY_WF_AH_MAX_ABS_LINE", str(cfg.wf_ah_max_abs_line)) or 0.0)
     except Exception:
         wf_ah = 0.0
-    wf_ah_scope = str(os.getenv("DAILY_WF_AH_SCOPE", str(cfg.wf_ah_scope)) or "").strip() or "pre"
-    wf_key_by_league = str(os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1")).strip() not in ("0", "false", "False", "no", "NO")
-    wf_key_scope = str(os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", str(cfg.wf_key_by_league_scope)) or "").strip() or "pre"
-    wf_min_matches = str(os.getenv("DAILY_WF_MIN_MATCHES", str(cfg.wf_min_matches)) or "").strip() or "0"
+    wf_ah_scope = str(policy_wf.get("ah_scope") or "") if isinstance(policy_wf, dict) else str(os.getenv("DAILY_WF_AH_SCOPE", str(cfg.wf_ah_scope)) or "")
+    wf_ah_scope = wf_ah_scope.strip() or "pre"
+    wf_min_matches = str(policy_wf.get("min_matches") or "") if isinstance(policy_wf, dict) else str(os.getenv("DAILY_WF_MIN_MATCHES", str(cfg.wf_min_matches)) or "")
+    wf_min_matches = wf_min_matches.strip() or "0"
     s1.append("**Critérios de seleção (OOS) e critérios do real (bridge/executor)**\n\n")
     s1.append(
         "- **OOS (walk-forward)** decide o portfólio `active_keys`.\n"
@@ -1441,6 +1452,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "  - O bridge só envia oportunidades cuja chave esteja em `active_keys` (policy current).\n"
         "  - `DRY_OK` = **shadow** (não apostou); `LIVE_OK` = **efetivo** (apostou).\n\n"
     )
+    # Transparência do step vigente (train/test) usado para gerar o policy current.
+    if isinstance(policy_last_step, dict):
+        try:
+            s1.append("**Policy current: janela de treino/teste (do último step exportado)**\n\n")
+            s1.append(
+                f"- Train window: `{policy_last_step.get('train')}` | Test window: `{policy_last_step.get('test')}` | "
+                f"train_days={len(policy_last_step.get('train_days') or [])} | test_days={len(policy_last_step.get('test_days') or [])}\n\n"
+            )
+        except Exception:
+            pass
     # explicitar shadow vs live na janela
     try:
         live_ok = int((kpi_all.get("status_counts") or {}).get("LIVE_OK") or 0)
@@ -1609,6 +1630,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "AUDIT_TEMPORAL_WORKERS",
         "AUDIT_MAX_QUEUE_DEPTH",
         "AUDIT_MAX_QUEUE_WAIT_MS",
+        "WS_SAMPLE_OFFSETS_SEC",
         "GATE_DROP_OFFSET_SEC",
         "GATE_DROP_RATIO",
         "GATE_RISE_OFFSET_SEC",
@@ -1619,6 +1641,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "GATE_LAY_REFRESH_TIMES_SEC",
     ]:
         extra.append(f"| {k} | `{_env(k)}` |\n")
+    extra.append("\n")
+
+    # Interpretação operacional (audit/entrada) para reduzir ambiguidade
+    extra.append("**Interpretação operacional (timing de entrada)**\n\n")
+    extra.append("| Item | Regra efetiva |\n|---|---|\n")
+    extra.append("| Back (mais cedo possível) | Depende do executor: `EXECUTOR_FAST_PMM`, `EXECUTOR_PMM_MIN_WAIT_SEC`, `EXECUTOR_PMM_TIMEOUT_SEC` (ver tabela Executor). |\n")
+    extra.append(
+        "| Lay (reversão vs fim) | Depende do `AUDIT_MODE`/audit_version: `ws_gate_lay` abre Lay só quando o gate em `t+GATE_DROP_OFFSET_SEC` passa; "
+        "`ws_reversal_lay` tende a entrar no pós-reversal; `ws_only` usa a série WS (offsets até o último ponto, tipicamente 30s). |\n"
+    )
     extra.append("\n")
 
     extra.append("**Bridge**\n\n")
