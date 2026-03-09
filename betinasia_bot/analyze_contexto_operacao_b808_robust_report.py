@@ -5365,7 +5365,10 @@ async def main() -> int:
                         h = d0.get("hypothesis_details") or {}
                         lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
                     if lay_odd is None or float(lay_odd) <= 1.0:
-                        return (None, None, "LAY_ODD_MISSING_OR_LE1")
+                        try:
+                            return (None, None, f"LAY_ODD_MISSING_OR_LE1(odd={_fmt_num(lay_odd,3)})")
+                        except Exception:
+                            return (None, None, "LAY_ODD_MISSING_OR_LE1")
                     if sc == "FLAT":
                         liab = float(wf_flat_liab_lay)
                     elif sc == "PROXY":
@@ -5401,7 +5404,10 @@ async def main() -> int:
                             max_st = _max_lay_stake_event(d0)
                             liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                             if liab is None or float(liab) <= 0:
-                                return (None, None, "LAY_LIAB_NONPOS_IN_FB")
+                                try:
+                                    return (None, None, f"LAY_LIAB_NONPOS_IN_FB(liab={_fmt_num(liab,6)}, odd={_fmt_num(lay_odd,4)}, max_st={_fmt_num(max_st,4)}, lay_bank_ref={_fmt_num(lay_bank_ref,2)})")
+                                except Exception:
+                                    return (None, None, "LAY_LIAB_NONPOS_IN_FB")
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
                             return (float(stake_eq), float(liab), None)
                         frac = float(sc.split("_")[1])
@@ -5423,7 +5429,10 @@ async def main() -> int:
                             max_st = _max_lay_stake_event(d0)
                             liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                             if liab is None or float(liab) <= 0:
-                                return (None, None, "LAY_LIAB_NONPOS_FB")
+                                try:
+                                    return (None, None, f"LAY_LIAB_NONPOS_FB(liab={_fmt_num(liab,6)}, odd={_fmt_num(lay_odd,4)}, max_st={_fmt_num(max_st,4)}, lay_bank_ref={_fmt_num(lay_bank_ref,2)})")
+                                except Exception:
+                                    return (None, None, "LAY_LIAB_NONPOS_FB")
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
                             return (float(stake_eq), float(liab), "LAY_KELLY_FALLBACK_NO_CLOSING")
                         f = max(0.0, float(f0)) * float(frac)
@@ -5445,7 +5454,10 @@ async def main() -> int:
                     max_st = _max_lay_stake_event(d0)
                     liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
                     if liab is None or float(liab) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
-                        return (None, None, "LAY_LIAB_NONPOS")
+                        try:
+                            return (None, None, f"LAY_LIAB_NONPOS(liab={_fmt_num(liab,6)}, odd={_fmt_num(lay_odd,4)}, max_st={_fmt_num(max_st,4)}, lay_bank_ref={_fmt_num(lay_bank_ref,2)})")
+                        except Exception:
+                            return (None, None, "LAY_LIAB_NONPOS")
                     stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
                     return (float(stake_eq), float(liab), None)
 
