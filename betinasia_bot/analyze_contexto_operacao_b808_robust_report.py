@@ -22,6 +22,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from collections import Counter
 
 import numpy as np
-from sqlalchemy import Integer, bindparam, text
+from sqlalchemy import DateTime, Integer, bindparam, text
 
 # Mantém padrão dos scripts existentes
 import sys
@@ -418,6 +419,7 @@ async def fetch_h3b_audit_rows(
     direction: str,
     versions: List[str],
     lookback_days: Optional[int] = None,
+    end_utc: Optional[datetime] = None,
 ) -> List[Tuple[Any, ...]]:
     """
     Traz a base principal:
@@ -429,6 +431,9 @@ async def fetch_h3b_audit_rows(
     # para CADA auditoria. Isso explode o tempo para janelas maiores (ex.: 14 dias).
     #
     # Aqui buscamos a base "audit + match" primeiro (rápido) e calculamos `closing_odd` em batch depois.
+    end_utc = end_utc or datetime.now(timezone.utc)
+    start_utc = (end_utc - timedelta(days=int(lookback_days))) if lookback_days is not None else None
+
     q = (
         text(
             """
@@ -465,18 +470,30 @@ async def fetch_h3b_audit_rows(
             JOIN matches m ON m.external_id = a.event_id
             WHERE a.hypothesis_type = 'H3B'
               AND a.reversal_direction = :direction
-              AND m.kickoff_time < NOW()
+              AND m.kickoff_time < :end_utc
               AND a.audit_version = ANY(:versions)
+              AND a.audited_at < :end_utc
               AND (
                 :lookback_days IS NULL
-                OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
+                OR a.audited_at >= :start_utc
               )
             """
         )
         .bindparams(bindparam("lookback_days", type_=Integer))
+        .bindparams(bindparam("start_utc", type_=DateTime(timezone=True)))
+        .bindparams(bindparam("end_utc", type_=DateTime(timezone=True)))
     )
     async with db.async_session() as session:
-        res = await session.execute(q, {"direction": direction, "versions": versions, "lookback_days": lookback_days})
+        res = await session.execute(
+            q,
+            {
+                "direction": direction,
+                "versions": versions,
+                "lookback_days": lookback_days,
+                "start_utc": start_utc,
+                "end_utc": end_utc,
+            },
+        )
         return list(res.fetchall())
 
 
@@ -549,7 +566,14 @@ async def main() -> int:
         "--lookback-days",
         type=int,
         default=None,
-        help="Se definido, filtra auditorias por janela móvel (a.audited_at >= NOW() - N dias).",
+        help="Se definido, filtra auditorias por janela móvel (a.audited_at >= end_utc - N dias).",
+    )
+    parser.add_argument(
+        "--end-utc",
+        default="",
+        help="Fim do recorte em UTC (para reprodutibilidade). "
+        "Aceita ISO-8601 (ex.: 2026-02-25T10:30:00Z) ou YYYY-MM-DD (interpreta como 00:00Z do dia seguinte). "
+        "Se vazio, usa 'agora'.",
     )
     parser.add_argument(
         "--exec-bucket",
@@ -828,6 +852,24 @@ async def main() -> int:
     )
     args = parser.parse_args()
 
+    # Reprodutibilidade: `end_utc` controla o "as-of" do recorte (audited_at e kickoff_time).
+    def _parse_end_utc(s: str) -> datetime:
+        s = (s or "").strip()
+        if not s:
+            return datetime.now(timezone.utc)
+        # YYYY-MM-DD => assume "dia fechado": end = próximo dia 00:00Z
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            y, m, d = [int(x) for x in s.split("-")]
+            return datetime(y, m, d, tzinfo=timezone.utc) + timedelta(days=1)
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    end_utc = _parse_end_utc(getattr(args, "end_utc", ""))
+    start_utc = (end_utc - timedelta(days=int(args.lookback_days))) if args.lookback_days is not None else None
+
     # seed global para reprodutibilidade do bootstrap
     random.seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -902,8 +944,11 @@ async def main() -> int:
         raise
 
     try:
+        end_lbl = end_utc.isoformat().replace("+00:00", "Z")
+        start_lbl = (start_utc.isoformat().replace("+00:00", "Z") if isinstance(start_utc, datetime) else None)
         print(
-            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, lookback_days={args.lookback_days})...",
+            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, "
+            f"lookback_days={args.lookback_days}, start_utc={start_lbl}, end_utc={end_lbl})...",
             flush=True,
         )
         t0 = time.perf_counter()
@@ -912,6 +957,7 @@ async def main() -> int:
             direction=str(args.direction),
             versions=versions,
             lookback_days=args.lookback_days,
+            end_utc=end_utc,
         )
         dt = time.perf_counter() - t0
         print(f"[INFO] Linhas carregadas: {len(rows)} (tempo: {dt:.1f}s)", flush=True)
@@ -6181,7 +6227,34 @@ async def main() -> int:
                                 "## OOS (extraído) — modo `--only-oos`\n\n",
                                 "_Este arquivo contém **apenas** o bloco de walk-forward, para inspeção rápida (turnover, N elig/sized, e falhas de sizing)._ \n\n",
                             ]
-                            return hdr + doc_lines[i0:j0]
+                            # Critérios efetivos (para conciliação entre relatórios)
+                            end_lbl = end_utc.isoformat().replace("+00:00", "Z") if isinstance(end_utc, datetime) else "—"
+                            start_lbl = (
+                                (start_utc.isoformat().replace("+00:00", "Z") if isinstance(start_utc, datetime) else "—")
+                                if "start_utc" in globals() or True
+                                else "—"
+                            )
+                            crit = [
+                                "### Critérios efetivos (run config)\n\n",
+                                f"- **Recorte**: direction=`{args.direction}`, versions=`{','.join(versions)}`, lookback_days=`{args.lookback_days}`, "
+                                f"start_utc=`{start_lbl}`, end_utc=`{end_lbl}`\n",
+                                f"- **WF**: train_mode=`{wf_train_mode}`, train_days=`{wf_train}`, test_days=`{wf_test}`, step_days=`{wf_step}`; "
+                                f"min_matches=`{wf_min_m}`; key_by_league=`{bool(getattr(args,'wf_key_by_league',False))}` "
+                                f"(scope=`{getattr(args,'wf_key_by_league_scope','pre')}`)\n",
+                                f"- **Filtros OOS**: AH_max_abs_line=`{_fmt_num(getattr(args,'wf_ah_max_abs_line',0.0),2)}`, "
+                                f"AH_scope=`{getattr(args,'wf_ah_scope','all')}`; "
+                                f"exclude_exec_buckets_back=`{getattr(args,'wf_exclude_exec_buckets_back','')}`; "
+                                f"exclude_exec_buckets_lay=`{getattr(args,'wf_exclude_exec_buckets_lay','')}`\n",
+                                f"- **Sizing**: pre=`{getattr(args,'wf_scheme_pre','')}`, in=`{getattr(args,'wf_scheme_in','')}`, "
+                                f"flat_back=`{_fmt_num(getattr(args,'wf_flat_stake_back',1.0),2)}`, flat_lay=`{_fmt_num(getattr(args,'wf_flat_liab_lay',1.0),2)}`; "
+                                f"kelly_bankroll=`{_fmt_num(getattr(args,'kelly_bankroll',None),2)}`\n",
+                                f"- **Budget por match_id**: match_budget=`{bool(getattr(args,'wf_match_budget',True))}`; "
+                                f"back_frac=`{float(getattr(args,'wf_budget_back_frac',0.0) or 0.0):.4f}`, "
+                                f"lay_frac=`{float(getattr(args,'wf_budget_lay_frac',0.0) or 0.0):.4f}`, "
+                                f"cap_signal_frac=`{float(getattr(args,'wf_budget_cap_signal_frac',0.0) or 0.0):.2f}`, "
+                                f"risk_mode=`{getattr(args,'wf_budget_risk_mode','fixed')}`\n\n",
+                            ]
+                            return hdr + crit + doc_lines[i0:j0]
 
                         out_lines = _extract_oos_block(lines)
                         out_path.parent.mkdir(parents=True, exist_ok=True)
