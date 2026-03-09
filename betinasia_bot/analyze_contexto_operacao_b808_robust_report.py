@@ -5412,7 +5412,7 @@ async def main() -> int:
                             return (float(stake_eq), float(liab), None)
                         frac = float(sc.split("_")[1])
                         f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
-                        if f0 is None:
+                        if f0 is None or float(f0) <= 0.0:
                             # fallback: sem closing_odd não dá para Kelly. Usa PROXY/FLAT para não distorcer turnover.
                             h = d0.get("hypothesis_details") or {}
                             lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
@@ -5434,7 +5434,7 @@ async def main() -> int:
                                 except Exception:
                                     return (None, None, "LAY_LIAB_NONPOS_FB")
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
-                            return (float(stake_eq), float(liab), "LAY_KELLY_FALLBACK_NO_CLOSING")
+                            return (float(stake_eq), float(liab), "LAY_KELLY_FALLBACK_NO_CLOSING_OR_F0_NONPOS")
                         f = max(0.0, float(f0)) * float(frac)
                         cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
                         liab = min(f * float(lay_bank_ref), cap)
@@ -5448,6 +5448,9 @@ async def main() -> int:
                             bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
                             cap = LAY_CAP_FRAC * max(1e-9, bank_ref_budget_local)
                             liab = min(f * bank_ref_budget_local, cap)
+                            if liab <= 0:
+                                # não “mata” turnover por EV<=0; cai para FLAT (diagnóstico ainda mostra motivo)
+                                liab = float(wf_flat_liab_lay)
                         else:
                             return (None, None, "LAY_UNSUPPORTED_SCHEME")
                     # cap por evento (limit): converte stake max -> liab max
