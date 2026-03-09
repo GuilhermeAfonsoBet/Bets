@@ -698,6 +698,18 @@ async def main() -> int:
         help="Tolerância máxima (s) entre o offset alvo e o ponto WS observado para aceitar o proxy. Default=2.5.",
     )
     parser.add_argument(
+        "--wf-lay-end-sec",
+        type=float,
+        default=float(os.getenv("WF_LAY_END_SEC", "30.0")),
+        help="Quando NÃO há reversão no Lay, entrar no ponto mais próximo de WS+t+X (fim do período). Default=30.0.",
+    )
+    parser.add_argument(
+        "--wf-lay-end-max-gap-sec",
+        type=float,
+        default=float(os.getenv("WF_LAY_END_MAX_GAP_SEC", "12.0")),
+        help="Gap máximo (s) aceito para o ponto de fim do Lay (WS+t+X). Se não houver, usa o último ponto. Default=12.0.",
+    )
+    parser.add_argument(
         "--wf-exclude-exec-buckets",
         default=os.getenv("WF_EXCLUDE_EXEC_BUCKETS", "").strip(),
         help="CSV de exec_bucket a excluir SOMENTE no OOS (walk-forward), aplicado a Back e Lay. "
@@ -3294,6 +3306,18 @@ async def main() -> int:
             closing = d.get("closing_odd")
             p0 = series[0]
             plast = series[-1]
+            # ponto do "fim" (regra operacional: ~WS+t+30s se não houver reversão)
+            lay_end_sec = float(getattr(args, "wf_lay_end_sec", 30.0) or 30.0)
+            lay_end_max_gap = float(getattr(args, "wf_lay_end_max_gap_sec", 12.0) or 12.0)
+            p_end = plast
+            try:
+                if series:
+                    # pega o ponto mais próximo de t=end
+                    p_end0 = min(series, key=lambda p: abs(float(p.get("t") or 0.0) - float(lay_end_sec)))
+                    if abs(float(p_end0.get("t") or 0.0) - float(lay_end_sec)) <= float(lay_end_max_gap):
+                        p_end = p_end0
+            except Exception:
+                p_end = plast
             mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
             roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
             roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
@@ -3313,10 +3337,10 @@ async def main() -> int:
 
             # Política de entrada Lay (para 8.3 e OOS):
             # - se há reversão: entrar **logo após a reversão** (odd_reversal)
-            # - se não há reversão: entrar no **último ponto** (t_last, ~t+20s)
+            # - se não há reversão: entrar no **fim do período** (~t+30s quando WS) se existir; senão no último ponto
             has_rev = bool(a.get("had_reversal")) and (odd_rev is not None)
-            odd_entry = float(odd_rev) if has_rev else float(plast["odd"])
-            roi_entry = roirev if has_rev else roilast
+            odd_entry = float(odd_rev) if has_rev else float(p_end["odd"])
+            roi_entry = roirev if has_rev else (_roi_lay_pct_per_liability(p_end["odd"], mult) if mult is not None else None)
             clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
             clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
             # diff no ponto de entrada vs ws_t0 (para coerência com OOS)
@@ -4829,19 +4853,19 @@ async def main() -> int:
                 ws0 = _safe_float(d0.get("ws_odd"))
                 if ws0 is None or ws0 <= 0:
                     continue
-                # entry odd: BS real se existir; senão WS proxy
+                # Operação atual: Back entra por WS@t+5s (ou offset configurado).
+                # Mantemos fallback para BS apenas se o proxy WS não existir.
                 bs = _safe_float(d0.get("bs_odd"))
-                src = "BS"
+                src = None
                 t_proxy = None
                 entry = None
-                if bs is not None and bs > 0:
-                    entry = float(bs)
-                else:
-                    ref = _ws_proxy_odd(d0)
-                    if not ref:
-                        continue
+                ref = _ws_proxy_odd(d0)
+                if ref:
                     entry, t_proxy = float(ref[0]), float(ref[1])
                     src = f"WS@t+{t_proxy:.1f}s"
+                elif bs is not None and bs > 0:
+                    entry = float(bs)
+                    src = "BS_FALLBACK"
                 if entry is None or entry <= 0:
                     continue
                 diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
