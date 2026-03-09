@@ -5312,6 +5312,15 @@ async def main() -> int:
                         pass
                     return sc
 
+                # Escala de banca para sizing/caps (coerente com budgets):
+                # - se `--kelly-bankroll` foi fornecido, ele define a escala
+                # - caso contrário, usamos as referências estimadas pelo relatório (proxy)
+                wf_bankroll_scale = _safe_float(getattr(args, "kelly_bankroll", None))
+                if wf_bankroll_scale is None or float(wf_bankroll_scale) <= 0:
+                    wf_bankroll_scale = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
+                else:
+                    wf_bankroll_scale = float(wf_bankroll_scale)
+
                 def _sizing_for_event(
                     ev: dict,
                     *,
@@ -5368,9 +5377,8 @@ async def main() -> int:
                                     return (None, None, "BACK_ST_NONPOS_FB")
                                 return (float(st), float(st), "BACK_KELLY_FALLBACK_NO_CLOSING")
                             f = max(0.0, float(f0)) * float(frac)
-                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
-                            cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
-                            st = min(f * bank_ref_budget_local, cap)
+                            cap = BACK_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
+                            st = min(f * float(wf_bankroll_scale), cap)
                             st = min(float(st), float(_max_back_stake_event(d0)))
                         elif str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
@@ -5380,9 +5388,8 @@ async def main() -> int:
                             # proxy de Kelly: f ~= EV (assumindo odds típicas ~2.0). Caps + limit controlam.
                             f = max(0.0, float(roi_hat)) / 100.0
                             # escala pela mesma referência usada no budget (coerente com governança)
-                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
-                            cap = BACK_CAP_FRAC * max(1e-9, bank_ref_budget_local)
-                            st = min(f * bank_ref_budget_local, cap)
+                            cap = BACK_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
+                            st = min(f * float(wf_bankroll_scale), cap)
                             st = min(float(st), float(_max_back_stake_event(d0)))
                         if st is None or float(st) <= 0:
                             return (None, None, "BACK_ST_NONPOS")
@@ -5428,7 +5435,7 @@ async def main() -> int:
                                 liab = float(wf_flat_liab_lay)
                             else:
                                 liab = float(st_fb) * max(0.0, float(lay_odd) - 1.0)
-                            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                            cap = LAY_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
                             liab = min(float(liab), float(cap))
                             max_st = _max_lay_stake_event(d0)
                             liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
@@ -5452,7 +5459,7 @@ async def main() -> int:
                                 liab = float(wf_flat_liab_lay)
                             else:
                                 liab = float(st_fb) * max(0.0, float(lay_odd) - 1.0)
-                            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                            cap = LAY_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
                             liab = min(float(liab), float(cap))
                             # cap por evento (limit)
                             max_st = _max_lay_stake_event(d0)
@@ -5465,8 +5472,8 @@ async def main() -> int:
                             stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
                             return (float(stake_eq), float(liab), "LAY_KELLY_FALLBACK_NO_CLOSING_OR_F0_NONPOS")
                         f = max(0.0, float(f0)) * float(frac)
-                        cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
-                        liab = min(f * float(lay_bank_ref), cap)
+                        cap = LAY_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
+                        liab = min(f * float(wf_bankroll_scale), cap)
                     else:
                         if str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
@@ -5474,9 +5481,8 @@ async def main() -> int:
                             if roi_hat is None:
                                 return (None, None, "LAY_ROI_TRAIN_MISSING")
                             f = max(0.0, float(roi_hat)) / 100.0
-                            bank_ref_budget_local = float(max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0))
-                            cap = LAY_CAP_FRAC * max(1e-9, bank_ref_budget_local)
-                            liab = min(f * bank_ref_budget_local, cap)
+                            cap = LAY_CAP_FRAC * max(1e-9, float(wf_bankroll_scale))
+                            liab = min(f * float(wf_bankroll_scale), cap)
                             if liab <= 0:
                                 # não “mata” turnover por EV<=0; cai para FLAT (diagnóstico ainda mostra motivo)
                                 liab = float(wf_flat_liab_lay)
