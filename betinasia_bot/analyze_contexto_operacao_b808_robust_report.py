@@ -843,12 +843,18 @@ async def main() -> int:
     daily_turn: Dict[str, float] = {}
     daily_turn_pre: Dict[str, float] = {}
     daily_turn_in: Dict[str, float] = {}
+    daily_turn_back: Dict[str, float] = {}
+    daily_turn_lay: Dict[str, float] = {}
     daily_pnl_obs: Dict[str, float] = {}
     daily_pnl_obs_pre: Dict[str, float] = {}
     daily_pnl_obs_in: Dict[str, float] = {}
+    daily_pnl_obs_back: Dict[str, float] = {}
+    daily_pnl_obs_lay: Dict[str, float] = {}
     daily_pnl_exp: Dict[str, float] = {}
     daily_pnl_exp_pre: Dict[str, float] = {}
     daily_pnl_exp_in: Dict[str, float] = {}
+    daily_pnl_exp_back: Dict[str, float] = {}
+    daily_pnl_exp_lay: Dict[str, float] = {}
     oos_back_stakes_all: List[float] = []
     oos_lay_liab_all: List[float] = []
     oos_jobs: List[Tuple[datetime, datetime, float]] = []
@@ -5290,12 +5296,18 @@ async def main() -> int:
                 daily_turn = {}  # day -> turnover stake eq (todas elegíveis)
                 daily_turn_pre = {}
                 daily_turn_in = {}
+                daily_turn_back = {}
+                daily_turn_lay = {}
                 daily_pnl_obs = {}  # day -> pnl observado (somente ROI disponível)
                 daily_pnl_obs_pre = {}
                 daily_pnl_obs_in = {}
+                daily_pnl_obs_back = {}
+                daily_pnl_obs_lay = {}
                 daily_pnl_exp = {}  # day -> pnl expandido (se wf_expand)
                 daily_pnl_exp_pre = {}
                 daily_pnl_exp_in = {}
+                daily_pnl_exp_back = {}
+                daily_pnl_exp_lay = {}
                 # exposições para banca/liquidez (todas elegíveis)
                 oos_back_stakes_all: List[float] = []
                 oos_lay_liab_all: List[float] = []
@@ -5794,6 +5806,11 @@ async def main() -> int:
                     lay_liab_all = lay_liab_roi = 0.0
                     turn_all = turn_roi = 0.0
                     pnl_obs = 0.0
+                    # breakdown Back/Lay (turnover + P&L)
+                    turn_back = turn_lay = 0.0
+                    pnl_obs_back = pnl_obs_lay = 0.0
+                    pnl_obs_pre_back = pnl_obs_pre_lay = 0.0
+                    pnl_obs_in_back = pnl_obs_in_lay = 0.0
                     # breakdown Pre/In (com budget efetivamente aplicado)
                     turn_pre = turn_in = 0.0
                     pnl_obs_pre = pnl_obs_in = 0.0
@@ -5906,8 +5923,10 @@ async def main() -> int:
                         turn_all += float(st_eq)
                         if ev.get("side") == "Back":
                             back_st_all += float(exp)
+                            turn_back += float(st_eq)
                         else:
                             lay_liab_all += float(exp)
+                            turn_lay += float(st_eq)
                         _append_job(ev, float(exp))
                         # breakdown Pre/In (turnover + exposição)
                         if ev.get("regime") == "Pre":
@@ -5927,61 +5946,51 @@ async def main() -> int:
                             continue
                         turn_roi += float(st_eq)
                         roi_pct = float(ev.get("roi"))
+                        _p = float(exp) * roi_pct / 100.0
                         if ev.get("side") == "Back":
                             back_st_roi += float(exp)
-                            pnl_obs += float(exp) * roi_pct / 100.0
+                            pnl_obs += _p
+                            pnl_obs_back += _p
                         else:
                             lay_liab_roi += float(exp)
-                            pnl_obs += float(exp) * roi_pct / 100.0
+                            pnl_obs += _p
+                            pnl_obs_lay += _p
+
                         # breakdown Pre/In (lucro + exposições com ROI)
                         if ev.get("regime") == "Pre":
-                            pnl_obs_pre += float(exp) * roi_pct / 100.0
+                            pnl_obs_pre += _p
                             if ev.get("side") == "Back":
                                 back_pre_roi += float(exp)
+                                pnl_obs_pre_back += _p
                             else:
                                 lay_pre_roi += float(exp)
+                                pnl_obs_pre_lay += _p
                         else:
-                            pnl_obs_in += float(exp) * roi_pct / 100.0
+                            pnl_obs_in += _p
                             if ev.get("side") == "Back":
                                 back_in_roi += float(exp)
+                                pnl_obs_in_back += _p
                             else:
                                 lay_in_roi += float(exp)
+                                pnl_obs_in_lay += _p
 
                     pnl_exp = pnl_obs
                     pnl_exp_pre = pnl_obs_pre
                     pnl_exp_in = pnl_obs_in
+                    pnl_exp_back = pnl_obs_back
+                    pnl_exp_lay = pnl_obs_lay
                     if wf_expand:
-                        # expande separadamente por tipo de exposição (stake Back, liability Lay)
-                        scale_back = (back_st_all / back_st_roi) if back_st_roi > 0 else 1.0
-                        scale_lay = (lay_liab_all / lay_liab_roi) if lay_liab_roi > 0 else 1.0
-                        # aproxima: separa pnl por lado no loop acima? como não guardamos, re-estima com base em shares
-                        # fallback: escala global por turnover quando não há como separar
-                        if back_st_roi > 0 and lay_liab_roi > 0:
-                            # estima split por peso de exposição observada
-                            w_back = back_st_roi / (back_st_roi + lay_liab_roi)
-                            w_lay = 1.0 - w_back
-                            pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
-                        elif back_st_roi > 0:
-                            pnl_exp = float(pnl_obs) * float(scale_back)
-                        elif lay_liab_roi > 0:
-                            pnl_exp = float(pnl_obs) * float(scale_lay)
-                        else:
-                            pnl_exp = float(pnl_obs)
-                        # expande por regime (Pre/In) com exposições observadas (já com budget aplicado)
-                        if (back_pre_roi + lay_pre_roi) > 0:
-                            wbp = back_pre_roi / max(1e-9, (back_pre_roi + lay_pre_roi))
-                            wlp = 1.0 - wbp
-                            pnl_exp_pre = float(pnl_obs_pre) * (
-                                wbp * ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0)
-                                + wlp * ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0)
-                            )
-                        if (back_in_roi + lay_in_roi) > 0:
-                            wbi = back_in_roi / max(1e-9, (back_in_roi + lay_in_roi))
-                            wli = 1.0 - wbi
-                            pnl_exp_in = float(pnl_obs_in) * (
-                                wbi * ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0)
-                                + wli * ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0)
-                            )
+                        # expande P&L separadamente por regime × lado (já com budget aplicado)
+                        scale_back_pre = (back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0
+                        scale_lay_pre = (lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0
+                        scale_back_in = (back_in_all / back_in_roi) if back_in_roi > 0 else 1.0
+                        scale_lay_in = (lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0
+
+                        pnl_exp_pre = float(pnl_obs_pre_back) * float(scale_back_pre) + float(pnl_obs_pre_lay) * float(scale_lay_pre)
+                        pnl_exp_in = float(pnl_obs_in_back) * float(scale_back_in) + float(pnl_obs_in_lay) * float(scale_lay_in)
+                        pnl_exp_back = float(pnl_obs_pre_back) * float(scale_back_pre) + float(pnl_obs_in_back) * float(scale_back_in)
+                        pnl_exp_lay = float(pnl_obs_pre_lay) * float(scale_lay_pre) + float(pnl_obs_in_lay) * float(scale_lay_in)
+                        pnl_exp = float(pnl_exp_pre) + float(pnl_exp_in)
 
                     # acumula séries diárias (test pode ter vários dias)
                     for dday in test_days:
@@ -5994,6 +6003,12 @@ async def main() -> int:
                         daily_pnl_obs_in[dday] = daily_pnl_obs_in.get(dday, 0.0) + float(pnl_obs_in) / max(1, len(test_days))
                         daily_pnl_exp_pre[dday] = daily_pnl_exp_pre.get(dday, 0.0) + float(pnl_exp_pre) / max(1, len(test_days))
                         daily_pnl_exp_in[dday] = daily_pnl_exp_in.get(dday, 0.0) + float(pnl_exp_in) / max(1, len(test_days))
+                        daily_turn_back[dday] = daily_turn_back.get(dday, 0.0) + float(turn_back) / max(1, len(test_days))
+                        daily_turn_lay[dday] = daily_turn_lay.get(dday, 0.0) + float(turn_lay) / max(1, len(test_days))
+                        daily_pnl_obs_back[dday] = daily_pnl_obs_back.get(dday, 0.0) + float(pnl_obs_back) / max(1, len(test_days))
+                        daily_pnl_obs_lay[dday] = daily_pnl_obs_lay.get(dday, 0.0) + float(pnl_obs_lay) / max(1, len(test_days))
+                        daily_pnl_exp_back[dday] = daily_pnl_exp_back.get(dday, 0.0) + float(pnl_exp_back) / max(1, len(test_days))
+                        daily_pnl_exp_lay[dday] = daily_pnl_exp_lay.get(dday, 0.0) + float(pnl_exp_lay) / max(1, len(test_days))
 
                     if back_st_all > 0:
                         oos_back_stakes_all.append(float(back_st_all))
@@ -6022,6 +6037,8 @@ async def main() -> int:
                             "turn_all": turn_all,
                             "turn_pre": turn_pre,
                             "turn_in": turn_in,
+                            "turn_back": turn_back,
+                            "turn_lay": turn_lay,
                             "n_ev_elig": int(n_ev_elig),
                             "n_ev_sized": int(n_ev_sized),
                             "n_ev_after_budget": int(n_ev_after_budget),
@@ -6037,6 +6054,10 @@ async def main() -> int:
                             "fail_sizing_side_in": dict(fail_sizing_side_in),
                             "pnl_obs": pnl_obs,
                             "pnl_exp": pnl_exp,
+                            "pnl_obs_back": pnl_obs_back,
+                            "pnl_obs_lay": pnl_obs_lay,
+                            "pnl_exp_back": pnl_exp_back,
+                            "pnl_exp_lay": pnl_exp_lay,
                             "diag": diag,
                             "liq_mode": wf_liq_mode,
                             "liq_scope": wf_liq_scope,
@@ -6098,21 +6119,21 @@ async def main() -> int:
                 wf_key_by_league2 = bool(getattr(args, "wf_key_by_league", False))
                 if wf_key_by_league2:
                     lines.append(
-                        "| Train window | Test window | #ativas (keys) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Pre | Turnover In | Lucro (estratégia, budget) |\n"
-                        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+                        "| Train window | Test window | #ativas (keys) | #ativas (comb) | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Back | Turnover Lay | Lucro (budget) | Lucro Back | Lucro Lay |\n"
+                        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
                     )
                 else:
-                    lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Pre | Turnover In | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
+                    lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Turnover Back | Turnover Lay | Lucro (budget) | Lucro Back | Lucro Lay |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
                 for s in steps[:20]:
                     if wf_key_by_league2:
                         lines.append(
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {int(s.get('active_n_base') or 0)} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_back'),2)} | {_fmt_num(s.get('turn_lay'),2)} | {_fmt_num(s.get('pnl_exp'),2)} | {_fmt_num(s.get('pnl_exp_back'),2)} | {_fmt_num(s.get('pnl_exp_lay'),2)} |\n"
                         )
                     else:
                         lines.append(
                             f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
-                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_pre'),2)} | {_fmt_num(s.get('turn_in'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                            f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('turn_back'),2)} | {_fmt_num(s.get('turn_lay'),2)} | {_fmt_num(s.get('pnl_exp'),2)} | {_fmt_num(s.get('pnl_exp_back'),2)} | {_fmt_num(s.get('pnl_exp_lay'),2)} |\n"
                         )
                 # Transparência do turnover (diagnóstico de quedas bruscas)
                 lines.append(
@@ -6305,6 +6326,12 @@ async def main() -> int:
                 pnl_exp_in_sum = float(sum(daily_pnl_exp_in.values())) if daily_pnl_exp_in else 0.0
                 turn_pre_sum = float(sum(daily_turn_pre.values())) if daily_turn_pre else 0.0
                 turn_in_sum = float(sum(daily_turn_in.values())) if daily_turn_in else 0.0
+                turn_back_sum = float(sum(daily_turn_back.values())) if daily_turn_back else 0.0
+                turn_lay_sum = float(sum(daily_turn_lay.values())) if daily_turn_lay else 0.0
+                pnl_obs_back_sum = float(sum(daily_pnl_obs_back.values())) if daily_pnl_obs_back else 0.0
+                pnl_obs_lay_sum = float(sum(daily_pnl_obs_lay.values())) if daily_pnl_obs_lay else 0.0
+                pnl_exp_back_sum = float(sum(daily_pnl_exp_back.values())) if daily_pnl_exp_back else 0.0
+                pnl_exp_lay_sum = float(sum(daily_pnl_exp_lay.values())) if daily_pnl_exp_lay else 0.0
                 horizon = 30.0
                 scale = (horizon / float(n_oos_days)) if n_oos_days > 0 else None
                 scale_ok = (horizon / float(n_oos_days_ok)) if n_oos_days_ok > 0 else None
@@ -6324,6 +6351,12 @@ async def main() -> int:
                 profit_exp_in_30d = float(pnl_exp_in_sum) * float(scale) if scale is not None else None
                 turn_pre_30d = float(turn_pre_sum) * float(scale) if scale is not None else None
                 turn_in_30d = float(turn_in_sum) * float(scale) if scale is not None else None
+                turn_back_30d = float(turn_back_sum) * float(scale) if scale is not None else None
+                turn_lay_30d = float(turn_lay_sum) * float(scale) if scale is not None else None
+                profit_obs_back_30d = float(pnl_obs_back_sum) * float(scale) if scale is not None else None
+                profit_obs_lay_30d = float(pnl_obs_lay_sum) * float(scale) if scale is not None else None
+                profit_exp_back_30d = float(pnl_exp_back_sum) * float(scale) if scale is not None else None
+                profit_exp_lay_30d = float(pnl_exp_lay_sum) * float(scale) if scale is not None else None
 
                 # banca por risco (unitária) e por liquidez (simultânea)
                 bank_back_p99 = _pctl(oos_back_stakes_all, 99) if oos_back_stakes_all else None
@@ -6355,12 +6388,15 @@ async def main() -> int:
                 lines.append(f"| Turnover 30d (proj., calendário) | {_fmt_num(turn_30d,2)} |\n")
                 lines.append(f"| Turnover 30d (proj., cond OK) | {_fmt_num(turn_30d_ok,2)} |\n")
                 lines.append(f"| Turnover 30d (Pre/In) | {_fmt_num(turn_pre_30d,2)} / {_fmt_num(turn_in_30d,2)} |\n")
+                lines.append(f"| Turnover 30d (Back/Lay) | {_fmt_num(turn_back_30d,2)} / {_fmt_num(turn_lay_30d,2)} |\n")
                 lines.append(f"| Lucro 30d (obs., calendário) | {_fmt_num(profit_obs_30d,2)} |\n")
                 lines.append(f"| Lucro 30d (obs., cond OK) | {_fmt_num(profit_obs_30d_ok,2)} |\n")
                 lines.append(f"| Lucro 30d (obs.) Pre/In | {_fmt_num(profit_obs_pre_30d,2)} / {_fmt_num(profit_obs_in_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs.) Back/Lay | {_fmt_num(profit_obs_back_30d,2)} / {_fmt_num(profit_obs_lay_30d,2)} |\n")
                 lines.append(f"| Lucro 30d (exp., calendário) | {_fmt_num(profit_exp_30d,2)} |\n")
                 lines.append(f"| Lucro 30d (exp., cond OK) | {_fmt_num(profit_exp_30d_ok,2)} |\n")
                 lines.append(f"| Lucro 30d (exp.) Pre/In | {_fmt_num(profit_exp_pre_30d,2)} / {_fmt_num(profit_exp_in_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp.) Back/Lay | {_fmt_num(profit_exp_back_30d,2)} / {_fmt_num(profit_exp_lay_30d,2)} |\n")
                 lines.append(f"| Banca risco p99 (Back+Lay) | {_fmt_num(bank_risk,2)} |\n")
                 lines.append(f"| Banca liquidez p99 (+buf) | {_fmt_num(bank_liq,2)} |\n")
                 lines.append(f"| Banca recomendada (max) | {_fmt_num(bank_eff,2)} |\n")
@@ -6382,6 +6418,16 @@ async def main() -> int:
                 lines.append("|---|---:|---:|---:|\n")
                 lines.append(f"| Só Pre | {_fmt_num(turn_pre_30d,2)} | {_fmt_num(profit_exp_pre_30d,2)} | {_fmt_num(roi_turn_pre,2)}% |\n")
                 lines.append(f"| Só In | {_fmt_num(turn_in_30d,2)} | {_fmt_num(profit_exp_in_30d,2)} | {_fmt_num(roi_turn_in,2)}% |\n")
+                lines.append("\n")
+
+                # Diagnóstico rápido: de onde vem o P&L (Back vs Lay)
+                roi_turn_back = (float(profit_exp_back_30d) / float(turn_back_30d) * 100.0) if (profit_exp_back_30d is not None and turn_back_30d and float(turn_back_30d) > 0) else None
+                roi_turn_lay = (float(profit_exp_lay_30d) / float(turn_lay_30d) * 100.0) if (profit_exp_lay_30d is not None and turn_lay_30d and float(turn_lay_30d) > 0) else None
+                lines.append("**Ablation (OOS): decomposição por lado (Back vs Lay)**\n\n")
+                lines.append("| Lado | Turnover 30d | Lucro 30d (exp.) | ROI/turnover 30d (exp.) |\n")
+                lines.append("|---|---:|---:|---:|\n")
+                lines.append(f"| Back | {_fmt_num(turn_back_30d,2)} | {_fmt_num(profit_exp_back_30d,2)} | {_fmt_num(roi_turn_back,2)}% |\n")
+                lines.append(f"| Lay | {_fmt_num(turn_lay_30d,2)} | {_fmt_num(profit_exp_lay_30d,2)} | {_fmt_num(roi_turn_lay,2)}% |\n")
                 lines.append("\n")
 
                 # ------------------------------------------------------------
