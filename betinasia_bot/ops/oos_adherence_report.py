@@ -592,6 +592,7 @@ async def run_report(
     # contexto para interpretação (odd/exposure)
     total_rows_ctx_back: List[Dict[str, Any]] = []
     total_rows_ctx_lay: List[Dict[str, Any]] = []
+    total_rows_ctx_lay_stake: List[Dict[str, Any]] = []
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
 
@@ -608,7 +609,19 @@ async def run_report(
             "n_exec_rows": len(xs),
             "status_counts": {},
             "back": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "stake_sum": 0.0, "pnl_sum": 0.0},
-            "lay": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "liability_sum": 0.0, "pnl_sum": 0.0},
+            "lay": {
+                "n": 0,
+                "wins": 0,
+                "losses": 0,
+                "push": 0,
+                "half_wins": 0,
+                "half_losses": 0,
+                # stake enviado (unidade natural do executor)
+                "stake_sum": 0.0,
+                # exposição de risco (liability = stake*(odd-1))
+                "liability_sum": 0.0,
+                "pnl_sum": 0.0,
+            },
             "odd_anomalies": {"back": {"n": 0, "max": None}, "lay": {"n": 0, "max": None}},
             "slippage": {
                 "back": {"n": 0, "raw_pct_mean": None, "cost_pct_mean": None},
@@ -618,6 +631,8 @@ async def run_report(
                 "back": {"corr_cost_pct_vs_roi": None, "buckets": []},
                 "lay": {"corr_cost_pct_vs_roi": None, "buckets": []},
             },
+            # ROI por stake (Lay) é limitado e evita explosões quando odd≈1.
+            "lay_roi_pct_per_stake": None,
         }
 
         slip_raw_back: List[float] = []
@@ -718,6 +733,7 @@ async def run_report(
                 perf["lay"]["n"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 liab = stake * max(0.0, float(odd) - 1.0)
+                perf["lay"]["stake_sum"] += float(stake)
                 roi_liab = _roi_lay_pct_per_liability(float(odd), float(mult))
                 if roi_liab is None:
                     continue
@@ -748,6 +764,14 @@ async def run_report(
                 if raw_pct is not None and roi_liab is not None:
                     pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
                     total_rows_ctx_lay.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_liab), "odd": float(odd), "exposure": float(liab)})
+                    # ROI por stake (bounded): pnl / stake
+                    try:
+                        roi_st = (float(pnl) / float(stake) * 100.0) if stake > 0 else None
+                    except Exception:
+                        roi_st = None
+                    if roi_st is not None:
+                        # reusa o mesmo bucketizador (slip_raw_pct vs ROI), mas com exposure=stake
+                        total_rows_ctx_lay_stake.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_st), "odd": float(odd), "exposure": float(stake)})
                     try:
                         wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
                         key_by_league = bool(wf.get("key_by_league"))
@@ -768,6 +792,7 @@ async def run_report(
         lay_roi = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["liability_sum"]) * 100.0) if perf["lay"]["liability_sum"] else None
         perf["back"]["roi_pct"] = back_roi
         perf["lay"]["roi_pct_per_liability"] = lay_roi
+        perf["lay_roi_pct_per_stake"] = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["stake_sum"]) * 100.0) if perf["lay"]["stake_sum"] else None
 
         # slippage agregada
         if slip_raw_back:
@@ -846,6 +871,10 @@ async def run_report(
         "slippage_vs_roi_raw_total_ctx": {
             "back": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back)},
             "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay)},
+        },
+        # Lay também em ROI por stake (bounded; útil para sanity-check de retornos)
+        "slippage_vs_roi_raw_total_ctx_lay_stake": {
+            "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay_stake)},
         },
         "slippage_vs_roi_total": {
             "back": {

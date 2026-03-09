@@ -113,6 +113,10 @@ def _slip_raw_3bucket_rows(buckets: list[dict]) -> list[dict]:
                 "roi_mean": it.get("roi_mean"),
                 "roi_se": it.get("roi_se"),
                 "roi_ci95": it.get("roi_ci95"),
+                "odd_median": it.get("odd_median"),
+                "exposure_median": it.get("exposure_median"),
+                "exposure_sum": it.get("exposure_sum"),
+                "roi_weighted": it.get("roi_weighted"),
             }
         )
     return out
@@ -1085,8 +1089,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # execução (contagens + stake médio) via aderência (7 dias)
     if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
         s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
-        s1.append("| Dia | Exec rows | LIVE_OK | DRY_OK | API_FAILED | P&L Back | ROI Back | P&L Lay | ROI Lay/liab |\n")
-        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        s1.append(
+            "| Dia | Exec rows | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | P&L total | ROI/$ | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
+        )
+        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for it in adh.get("per_day") or []:
             if not isinstance(it, dict):
                 continue
@@ -1094,10 +1100,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             sc = ex.get("status_counts") if isinstance(ex.get("status_counts"), dict) else {}
             back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
             lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+            pnl_back = back.get("pnl_sum")
+            pnl_lay = lay.get("pnl_sum")
+            pnl_total = (float(pnl_back or 0.0) + float(pnl_lay or 0.0)) if (pnl_back is not None or pnl_lay is not None) else None
+            st_back = back.get("stake_sum")
+            st_lay = lay.get("stake_sum")
+            liab_lay = lay.get("liability_sum")
+            st_total = (float(st_back or 0.0) + float(st_lay or 0.0)) if (st_back is not None or st_lay is not None) else None
+            roi_dol = (float(pnl_total) / float(st_total) * 100.0) if (pnl_total is not None and st_total and float(st_total) > 0) else None
             s1.append(
                 f"| {it.get('day')} | {int(ex.get('n_exec_rows') or 0)} | {int(sc.get('LIVE_OK') or 0)} | {int(sc.get('DRY_OK') or 0)} | "
-                f"{int(sc.get('API_FAILED') or 0)} | {_fmt_num(back.get('pnl_sum'),2)} | {_fmt_pct(back.get('roi_pct'))} | "
-                f"{_fmt_num(lay.get('pnl_sum'),2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} |\n"
+                f"{int(sc.get('API_FAILED') or 0)} | {int(back.get('n') or 0)} | {int(lay.get('n') or 0)} | "
+                f"{_fmt_num(st_back,2)} | {_fmt_num(st_lay,2)} | {_fmt_num(liab_lay,2)} | "
+                f"{_fmt_num(pnl_total,2)} | {_fmt_pct(roi_dol)} | {_fmt_num(pnl_back,2)} | {_fmt_pct(back.get('roi_pct'))} | "
+                f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
         s1.append("\n")
 
@@ -1119,6 +1135,17 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     s1.append(
                         f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n"
                     )
+                s1.append("\n")
+            # Lay também em ROI por stake (bounded; sanity-check)
+            lay_stake_blk = adh.get("slippage_vs_roi_raw_total_ctx_lay_stake") if isinstance(adh.get("slippage_vs_roi_raw_total_ctx_lay_stake"), dict) else {}
+            b2 = lay_stake_blk.get("lay") if isinstance(lay_stake_blk.get("lay"), dict) else {}
+            buckets02 = b2.get("buckets") if isinstance(b2.get("buckets"), list) else []
+            buckets2 = _slip_raw_3bucket_rows(buckets02)
+            if any(int(r.get("n") or 0) > 0 for r in buckets2):
+                s1.append("- **Lay (ROI por stake; bounded)**\n\n")
+                s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
+                for row in buckets2:
+                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n")
                 s1.append("\n")
             # Por combinação (top por volume)
             rows = adh.get("slippage_vs_roi_raw_by_combo_top") if isinstance(adh.get("slippage_vs_roi_raw_by_combo_top"), list) else []
