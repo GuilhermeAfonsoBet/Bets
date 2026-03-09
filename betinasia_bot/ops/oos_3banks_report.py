@@ -168,9 +168,7 @@ def main() -> int:
         [
             str(repo_root / "betinasia_bot" / "venv" / "bin" / "python"),
             str(render),
-            "--in",
             str(out_md),
-            "--out",
             str(out_pdf),
         ],
         check=True,
