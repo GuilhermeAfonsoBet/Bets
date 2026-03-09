@@ -4683,6 +4683,8 @@ async def main() -> int:
             wf_flat_liab_lay = max(0.0, float(getattr(args, "wf_flat_liab_lay", 1.0)))
             wf_ws_proxy_offset = max(0.0, float(getattr(args, "wf_ws_proxy_offset_sec", 5.0)))
             wf_ws_proxy_max_gap = max(0.0, float(getattr(args, "wf_ws_proxy_max_gap_sec", 2.5)))
+            wf_lay_end_sec = max(0.0, float(getattr(args, "wf_lay_end_sec", 30.0)))
+            wf_lay_end_max_gap = max(0.0, float(getattr(args, "wf_lay_end_max_gap_sec", 12.0)))
             wf_excl_exec_all = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets", "") or "").split(",") if x.strip()}
             wf_excl_exec_back = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets_back", "") or "").split(",") if x.strip()}
             wf_excl_exec_lay = {x.strip() for x in str(getattr(args, "wf_exclude_exec_buckets_lay", "") or "").split(",") if x.strip()}
@@ -4715,6 +4717,13 @@ async def main() -> int:
                     # sem limiar estimável => não filtra
                     return True
                 return float(lim) >= float(thr)
+
+            # Transparência: regras operacionais de entrada usadas no OOS (alinhadas ao robô atual)
+            lines.append(
+                f"**Regras de entrada (OOS, alinhadas ao robô atual)**:\n"
+                f"- Back: `WS@t+{_fmt_num(wf_ws_proxy_offset,1)}s` (gap máx {_fmt_num(wf_ws_proxy_max_gap,1)}s)\n"
+                f"- Lay: pós-reversal quando existir; senão `~WS@t+{_fmt_num(wf_lay_end_sec,1)}s` (gap máx {_fmt_num(wf_lay_end_max_gap,1)}s)\n\n"
+            )
 
             def _ah_ok(ev: dict) -> bool:
                 if wf_ah_max_abs <= 0:
@@ -5009,11 +5018,32 @@ async def main() -> int:
             lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
             lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
 
-            # Diagnóstico por dia: ajuda a distinguir "dia vazio por falta de oportunidade" vs "dia vazio por falha de qualidade/execução"
+            # Diagnóstico por dia: ajuda a distinguir "dia vazio por falta de oportunidade" vs "dia vazio por falha operacional"
+            # Importante (pós-mudança BS->WS): não usamos mais betslip como proxy primário de entrada/qualidade.
             day_all_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in all_data if _day_utc_from_ts(d.get("audited_at")))
-            day_bs_raw_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs_raw if _day_utc_from_ts(d.get("audited_at")))
-            day_bs_conf_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs if _day_utc_from_ts(d.get("audited_at")))
             day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_any if _day_utc_from_ts(d.get("audited_at")))
+            # Cobertura de entrada WS proxy (Back: WS@t+offset) e cobertura de série Lay (WS/reversal/end)
+            day_back_wsproxy_cnt = Counter()
+            day_lay_series_cnt = Counter()
+            try:
+                for d in ok_any:
+                    day = _day_utc_from_ts(d.get("audited_at"))
+                    if not day:
+                        continue
+                    # Back: proxy WS (t+x) existe?
+                    try:
+                        if _ws_proxy_odd(d):
+                            day_back_wsproxy_cnt[day] += 1
+                    except Exception:
+                        pass
+                    # Lay: conseguimos construir alguma série (mesmo que proxy via WS)?
+                    try:
+                        if _build_lay_series(d):
+                            day_lay_series_cnt[day] += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             day_back_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Back" and e.get("day"))
             day_lay_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("side") == "Lay" and e.get("day"))
             day_pre_edge_cnt = Counter(e.get("day") for e in combo_events if e.get("regime") == "Pre" and e.get("day"))
@@ -5021,7 +5051,7 @@ async def main() -> int:
 
             day_non_ok_top: Dict[str, str] = {}
             tmp: Dict[str, Counter] = {}
-            for d in with_bs:
+            for d in all_data:
                 day = _day_utc_from_ts(d.get("audited_at"))
                 if not day:
                     continue
@@ -5033,29 +5063,28 @@ async def main() -> int:
             for day, c in tmp.items():
                 day_non_ok_top[day] = str(c.most_common(1)[0][0]) if c else "—"
 
-            lines.append("\n**Diagnóstico por dia (audited_at): betslip vs qualidade vs edge**\n\n")
+            lines.append("\n**Diagnóstico por dia (audited_at): cobertura WS vs edge (alinhado ao robô atual)**\n\n")
             lines.append(
-                "| Dia | Auditorias carregadas | Betslip bruto | Betslip conf. | OK (conf.) | Edge Back/Lay | Edge Pre/In | %OK/conf. | Status não-OK dominante |\n"
-                "|---|---:|---:|---:|---:|---:|---:|---:|---|\n"
+                "| Dia | Auditorias carregadas | OK (total) | Back: WS proxy ok | Lay: série ok | Edge Back/Lay | Edge Pre/In | Status não-OK dominante |\n"
+                "|---|---:|---:|---:|---:|---:|---:|---|\n"
             )
             for day in days_loaded:
                 a = int(day_all_cnt.get(day, 0))
-                br = int(day_bs_raw_cnt.get(day, 0))
-                conf = int(day_bs_conf_cnt.get(day, 0))
                 ok = int(day_ok_cnt.get(day, 0))
+                bw = int(day_back_wsproxy_cnt.get(day, 0))
+                lw = int(day_lay_series_cnt.get(day, 0))
                 eb = int(day_back_edge_cnt.get(day, 0))
                 el = int(day_lay_edge_cnt.get(day, 0))
                 ep = int(day_pre_edge_cnt.get(day, 0))
                 ei = int(day_in_edge_cnt.get(day, 0))
-                ok_rate = (100.0 * ok / conf) if conf > 0 else None
                 lines.append(
-                    f"| {day} | {a} | {br} | {conf} | {ok} | {eb}/{el} | {ep}/{ei} | {_fmt_num(ok_rate,1)}% | {day_non_ok_top.get(day,'—')} |\n"
+                    f"| {day} | {a} | {ok} | {bw} | {lw} | {eb}/{el} | {ep}/{ei} | {day_non_ok_top.get(day,'—')} |\n"
                 )
             lines.append(
                 "\nLeitura:\n"
-                "- Se `Auditorias carregadas > 0` mas `Betslip conf.` ≈ 0, geralmente houve **mismatch/parse** (diff fora de [-10,+10]) ou ausência de betslip.\n"
-                "- Se `Betslip conf. > 0` mas `OK (conf.) = 0`, o robô coletou betslip, mas os eventos falharam por **status != OK** (ver coluna de status).\n"
-                "- Dias com `OK (conf.) = 0` **não devem ser tratados como “0 oportunidade”** sem investigar o operacional.\n\n"
+                "- **Back: WS proxy ok** mede cobertura da regra operacional de entrada (`WS@t+x`, ex.: x=5s).\n"
+                "- **Lay: série ok** mede se há dados suficientes para aplicar a regra de entrada (pós-reversal ou ~fim do período).\n"
+                "- **Edge Back/Lay** é contado a partir do universo OOS (já usando WS/entrada efetiva), então não deve ser interpretado via betslip.\n\n"
             )
             lines.append(
                 "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
