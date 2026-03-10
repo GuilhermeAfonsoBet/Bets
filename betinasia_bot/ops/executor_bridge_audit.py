@@ -71,6 +71,19 @@ class BridgeConfig:
     # Override manual do risk_mode do WF (mantém daily estável).
     # Valores: fixed|signals_sqrt|signals_linear
     wf_risk_mode_override: Optional[str] = None
+    # Override manual dos parâmetros numéricos de risco (frações/caps),
+    # separados do daily/policy (para go-live controlado).
+    # Formato esperado (exemplo):
+    # {
+    #   "budget_back_frac": 0.01,
+    #   "budget_lay_frac": 0.005,
+    #   "cap_signal_frac": 0.33,
+    #   "cap_event_back_frac": 0.02,
+    #   "cap_event_lay_frac": 0.01,
+    #   "signals_lookback_h": 36
+    # }
+    risk_params_json: Optional[str] = None
+    risk_params_reload_sec: float = 5.0
     # Guardrail adicional: cap por jogo como fração da banca (0=off). Back em stake; Lay em liability.
     cap_event_back_frac: float = 0.0
     cap_event_lay_frac: float = 0.0
@@ -235,6 +248,30 @@ def _load_bankroll_from_json(path: str) -> Optional[float]:
             return None
         b = _safe_float(obj.get("balance_current"))
         return float(b) if b is not None and b > 0 else None
+    except Exception:
+        return None
+
+
+def _load_risk_params_json(path: str) -> Dict[str, Any]:
+    """
+    Lê overrides manuais de risco/caps (best-effort).
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rp_float(rp: Dict[str, Any], key: str) -> Optional[float]:
+    try:
+        if not rp or key not in rp:
+            return None
+        v = _safe_float(rp.get(key))
+        return float(v) if v is not None else None
     except Exception:
         return None
 
@@ -630,6 +667,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     bankroll_mtime: Optional[float] = None
     bankroll_last_check = 0.0
     bankroll_ref: Optional[float] = cfg.bankroll_ref
+    risk_mtime: Optional[float] = None
+    risk_last_check = 0.0
+    risk_params: Dict[str, Any] = {}
 
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
@@ -680,6 +720,21 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         logger.info(f"[bridge] bankroll reloaded mtime={bankroll_mtime:.0f} bankroll_ref={bankroll_ref:.2f}")
             except Exception as e:
                 logger.warning(f"[bridge] bankroll reload failed: {e}")
+
+        # reload risk params (overrides manuais)
+        if cfg.risk_params_json and (time.time() - risk_last_check) >= float(cfg.risk_params_reload_sec):
+            risk_last_check = time.time()
+            try:
+                p = Path(cfg.risk_params_json)
+                mtime = p.stat().st_mtime if p.exists() else None
+                if mtime and (risk_mtime is None or float(mtime) > float(risk_mtime)):
+                    rp = _load_risk_params_json(cfg.risk_params_json)
+                    if isinstance(rp, dict):
+                        risk_params = rp
+                        risk_mtime = float(mtime)
+                        logger.info(f"[bridge] risk_params reloaded mtime={risk_mtime:.0f} path={cfg.risk_params_json}")
+            except Exception as e:
+                logger.warning(f"[bridge] risk_params reload failed: {e}")
 
         since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
         rows = await _fetch_candidates(db, since=since, cfg=cfg)
@@ -751,11 +806,11 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         bool(cfg.use_wf_budget)
                         and bool(wf.get("match_budget"))
                         and (bankroll_ref is not None and float(bankroll_ref) > 0)
-                        and (float(wf.get("budget_back_frac") or 0.0) > 0 or float(wf.get("budget_lay_frac") or 0.0) > 0)
                     )
                     if use_budget:
                         import math
 
+                        # Parâmetros-base vindos do daily/policy (podem ser sobrescritos manualmente por risk_params_json)
                         bud_back_frac = float(wf.get("budget_back_frac") or 0.0)
                         bud_lay_frac = float(wf.get("budget_lay_frac") or 0.0)
                         cap_sig_frac = float(wf.get("budget_cap_signal_frac") or 0.0)
@@ -764,17 +819,36 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             rm = str(cfg.wf_risk_mode_override or "").strip()
                             if rm in ("fixed", "signals_sqrt", "signals_linear"):
                                 risk_mode = rm
+                        # overrides manuais (frações/caps)
+                        try:
+                            v = _rp_float(risk_params, "budget_back_frac")
+                            if v is not None:
+                                bud_back_frac = float(v)
+                            v = _rp_float(risk_params, "budget_lay_frac")
+                            if v is not None:
+                                bud_lay_frac = float(v)
+                            v = _rp_float(risk_params, "cap_signal_frac")
+                            if v is not None:
+                                cap_sig_frac = float(v)
+                        except Exception:
+                            pass
 
                         ev_id = str(row.get("event_id") or "").strip()
                         match_key = ev_id  # proxy robusto: event_id identifica o jogo
 
-                        bud_base = float(bankroll_ref) * (bud_back_frac if cfg.exec_side == ExecSide.BACK else bud_lay_frac)
+                        # se bud_frac do lado for <=0, não aplicar budget (fallback para stake fixo)
+                        bud_frac_side = float(bud_back_frac if cfg.exec_side == ExecSide.BACK else bud_lay_frac)
+                        if bud_frac_side <= 0:
+                            use_budget = False
+                            raise RuntimeError("WF_BUDGET_DISABLED_FOR_SIDE (bud_frac_side<=0)")
+
+                        bud_base = float(bankroll_ref) * float(bud_frac_side)
                         n_sig = await _signals_count_estimate(
                             db,
                             event_id=ev_id,
                             hyp=str(cfg.only_hypothesis),
                             exec_side=cfg.exec_side,
-                            lookback_h=float(cfg.signals_lookback_h),
+                            lookback_h=float(_rp_float(risk_params, "signals_lookback_h") or cfg.signals_lookback_h),
                         )
                         bud_match = float(bud_base)
                         if risk_mode == "signals_sqrt":
@@ -785,10 +859,12 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         cap_signal = float(cap_sig_frac) * float(bud_match) if cap_sig_frac > 0 else float(bud_match)
 
                         cap_event = None
-                        if cfg.exec_side == ExecSide.BACK and float(cfg.cap_event_back_frac) > 0:
-                            cap_event = float(cfg.cap_event_back_frac) * float(bankroll_ref)
-                        if cfg.exec_side == ExecSide.LAY and float(cfg.cap_event_lay_frac) > 0:
-                            cap_event = float(cfg.cap_event_lay_frac) * float(bankroll_ref)
+                        cap_back = float(_rp_float(risk_params, "cap_event_back_frac") or cfg.cap_event_back_frac)
+                        cap_lay = float(_rp_float(risk_params, "cap_event_lay_frac") or cfg.cap_event_lay_frac)
+                        if cfg.exec_side == ExecSide.BACK and cap_back > 0:
+                            cap_event = float(cap_back) * float(bankroll_ref)
+                        if cfg.exec_side == ExecSide.LAY and cap_lay > 0:
+                            cap_event = float(cap_lay) * float(bankroll_ref)
 
                         spent_before = await _spent_for_match(
                             db, match_key=match_key, exec_side=cfg.exec_side, mode=str(cfg.mode), action=action
@@ -870,6 +946,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             "base_exp": base_exp,
                             "base_why": base_why,
                             "ratio": ratio,
+                            "risk_params_json": (cfg.risk_params_json if cfg.risk_params_json else None),
                         }
                         try:
                             req.meta.setdefault("bridge", {})
@@ -877,6 +954,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         except Exception:
                             pass
                 except Exception as e:
+                    # não derruba o bridge: fallback para stake fixo
                     logger.warning(f"[bridge] wf_budget engine failed src_id={src_id}: {e}")
 
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
@@ -989,6 +1067,12 @@ def main() -> int:
         default=os.getenv("BRIDGE_WF_RISK_MODE_OVERRIDE", "").strip() or None,
         help="Override manual do wf.budget_risk_mode: fixed|signals_sqrt|signals_linear",
     )
+    ap.add_argument(
+        "--risk-params-json",
+        default=os.getenv("BRIDGE_RISK_PARAMS_JSON", "").strip() or None,
+        help="JSON com overrides manuais de risco/caps (budget_*_frac, cap_signal_frac, cap_event_*_frac).",
+    )
+    ap.add_argument("--risk-params-reload-sec", type=float, default=float(os.getenv("BRIDGE_RISK_PARAMS_RELOAD_SEC", "5.0")))
     ap.add_argument("--cap-event-back-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_BACK_FRAC", "0.0")))
     ap.add_argument("--cap-event-lay-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_LAY_FRAC", "0.0")))
     args = ap.parse_args()
@@ -1014,6 +1098,8 @@ def main() -> int:
         bankroll_reload_sec=float(args.bankroll_reload_sec),
         signals_lookback_h=float(args.signals_lookback_h),
         wf_risk_mode_override=(str(args.wf_risk_mode_override) if args.wf_risk_mode_override else None),
+        risk_params_json=(str(args.risk_params_json) if args.risk_params_json else None),
+        risk_params_reload_sec=float(args.risk_params_reload_sec),
         cap_event_back_frac=float(args.cap_event_back_frac),
         cap_event_lay_frac=float(args.cap_event_lay_frac),
     )
