@@ -60,6 +60,17 @@ class BridgeConfig:
     policy_json: Optional[str] = None
     policy_reload_sec: float = 5.0
     policy_use_base: bool = False
+    # Bankroll (para sizing dinâmico)
+    bankroll_ref: Optional[float] = None
+    bankroll_json: Optional[str] = None  # ex.: logs/accounting_daily_report.json
+    bankroll_reload_sec: float = 30.0
+    # Engine de budget por jogo (match_budget do WF)
+    use_wf_budget: bool = False
+    # Contagem de sinais (para signals_sqrt/linear): janela curta (best-effort)
+    signals_lookback_h: float = 36.0
+    # Guardrail adicional: cap por jogo como fração da banca (0=off). Back em stake; Lay em liability.
+    cap_event_back_frac: float = 0.0
+    cap_event_lay_frac: float = 0.0
     # Guardrails simples
     min_limit: float = 0.0
 
@@ -90,11 +101,48 @@ CREATE TABLE IF NOT EXISTS executor_bridge_seen_keys (
 );
 """
 
+DDL_POSITIONS = """
+CREATE TABLE IF NOT EXISTS executor_bridge_positions (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  action TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  exec_side TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  match_key TEXT NOT NULL,
+  src_id BIGINT NULL,
+  src_key TEXT NULL,
+  execution_id UUID NULL,
+  status TEXT NOT NULL DEFAULT 'SUBMITTED',
+  stake_requested DOUBLE PRECISION NULL,
+  liability_requested DOUBLE PRECISION NULL,
+  bankroll_ref DOUBLE PRECISION NULL,
+  budget_match DOUBLE PRECISION NULL,
+  cap_signal DOUBLE PRECISION NULL,
+  cap_event DOUBLE PRECISION NULL,
+  spent_before DOUBLE PRECISION NULL,
+  spent_after DOUBLE PRECISION NULL,
+  n_signals_est INTEGER NULL,
+  risk_mode TEXT NULL,
+  meta JSONB NULL
+);
+"""
+
+DDL_POSITIONS_IDX = [
+    "CREATE INDEX IF NOT EXISTS idx_bridge_pos_match ON executor_bridge_positions (match_key, exec_side, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_bridge_pos_event ON executor_bridge_positions (event_id, exec_side, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_bridge_pos_execid ON executor_bridge_positions (execution_id);",
+]
+
 
 async def _ensure_seen_table(db: Database) -> None:
     async with db.engine.begin() as conn:
         await conn.execute(text(DDL_SEEN))
         await conn.execute(text(DDL_SEEN_KEYS))
+        await conn.execute(text(DDL_POSITIONS))
+        for stmt in DDL_POSITIONS_IDX:
+            await conn.execute(text(stmt))
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -102,6 +150,88 @@ def _safe_float(x: Any) -> Optional[float]:
         if x is None:
             return None
         return float(x)
+    except Exception:
+        return None
+
+
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _parse_details(row: Dict[str, Any]) -> Dict[str, Any]:
+    v = row.get("hypothesis_details")
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            obj = json.loads(v)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _finance_snapshot(details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fin = details.get("finance")
+    return fin if isinstance(fin, dict) else None
+
+
+def _base_exposure_from_finance(
+    *,
+    exec_side: ExecSide,
+    details: Dict[str, Any],
+    odd_hint: Optional[float],
+    stake_fallback: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Retorna (exposure, why) em unidade:
+      - Back: exposure = stake
+      - Lay: exposure = liability
+    """
+    fin = _finance_snapshot(details) or {}
+    if exec_side == ExecSide.BACK:
+        try:
+            s = _safe_float((fin.get("back", {}) or {}).get("suggested_stake"))
+            if s is not None and s > 0:
+                return float(s), "finance.back.suggested_stake"
+        except Exception:
+            pass
+        return float(max(0.0, float(stake_fallback))), "fallback_stake"
+
+    try:
+        ll = _safe_float((fin.get("lay", {}) or {}).get("liability_if_lose"))
+        if ll is not None and ll > 0:
+            return float(ll), "finance.lay.liability_if_lose"
+    except Exception:
+        pass
+    if odd_hint is not None and float(odd_hint) > 1.0:
+        try:
+            liab = float(stake_fallback) * max(0.0, float(odd_hint) - 1.0)
+            if liab > 0:
+                return float(liab), "fallback_stake_x_(odd-1)"
+        except Exception:
+            pass
+    return None, "no_finance_no_odd"
+
+
+def _load_bankroll_from_json(path: str) -> Optional[float]:
+    """
+    Lê um JSON (ex.: logs/accounting_daily_report.json) e retorna balance_current.
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return None
+        b = _safe_float(obj.get("balance_current"))
+        return float(b) if b is not None and b > 0 else None
     except Exception:
         return None
 
@@ -330,7 +460,9 @@ def _build_request(row: Dict[str, Any], cfg: BridgeConfig) -> ExecutionRequest:
         odd_at_decision=odd_dec,
     )
     req.policy.policy_version = f"bridge_{cfg.only_hypothesis.lower()}_{cfg.mode}_v0"
-    req.policy.stake_requested = float(cfg.stake)
+    # stake_requested / liability_requested podem ser sobrescritos pelo engine dinâmico (WF budget).
+    if cfg.exec_side == ExecSide.BACK:
+        req.policy.stake_requested = float(cfg.stake)
     # meta útil para auditoria
     req.meta["bridge"] = {
         "src": "betslip_audit_results",
@@ -340,6 +472,146 @@ def _build_request(row: Dict[str, Any], cfg: BridgeConfig) -> ExecutionRequest:
         "betslip_limit": row.get("betslip_limit"),
     }
     return req
+
+
+async def _signals_count_estimate(
+    db: Database,
+    *,
+    event_id: str,
+    hyp: str,
+    exec_side: ExecSide,
+    lookback_h: float,
+) -> int:
+    """
+    Estimativa do total de sinais para este jogo (event_id) numa janela curta.
+    Usado para risk_mode signals_sqrt/signals_linear (aproxima OOS).
+    """
+    t0 = _utcnow() - timedelta(hours=float(max(1e-6, lookback_h)))
+    q = """
+    SELECT COUNT(*)::bigint AS n
+    FROM betslip_audit_results r
+    WHERE r.audited_at >= :t0
+      AND r.event_id = :event_id
+      AND r.hypothesis_type = :hyp
+      AND r.is_valid_opportunity = TRUE
+      AND (
+        r.hypothesis_details IS NULL
+        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
+        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+      )
+    """
+    async with db.async_session() as session:
+        r = await session.execute(
+            text(q),
+            {
+                "t0": t0,
+                "event_id": str(event_id),
+                "hyp": str(hyp),
+                "exec_side_hint": str(exec_side.value),
+            },
+        )
+        row = r.fetchone()
+        try:
+            n = int(row[0]) if row else 0
+        except Exception:
+            n = 0
+        return max(1, n)
+
+
+async def _spent_for_match(
+    db: Database,
+    *,
+    match_key: str,
+    exec_side: ExecSide,
+    mode: str,
+    action: str,
+) -> float:
+    """
+    Soma de exposição já "consumida" para este match_key.
+    Back: soma stake_requested; Lay: soma liability_requested.
+    """
+    col = "stake_requested" if exec_side == ExecSide.BACK else "liability_requested"
+    q = f"""
+    SELECT COALESCE(SUM(COALESCE({col}, 0)), 0)::double precision AS spent
+    FROM executor_bridge_positions
+    WHERE match_key = :match_key
+      AND exec_side = :exec_side
+      AND mode = :mode
+      AND action = :action
+      AND status IN ('SUBMITTED','DRY_OK','LIVE_OK')
+    """
+    async with db.async_session() as session:
+        r = await session.execute(
+            text(q),
+            {
+                "match_key": str(match_key),
+                "exec_side": str(exec_side.value),
+                "mode": str(mode),
+                "action": str(action),
+            },
+        )
+        row = r.fetchone()
+        try:
+            return float(row[0] or 0.0) if row else 0.0
+        except Exception:
+            return 0.0
+
+
+async def _insert_position(
+    db: Database,
+    *,
+    action: str,
+    mode: str,
+    exec_side: ExecSide,
+    event_id: str,
+    match_key: str,
+    src_id: int,
+    src_key: str,
+    execution_id: Optional[str],
+    stake_requested: Optional[float],
+    liability_requested: Optional[float],
+    ctx: Dict[str, Any],
+) -> None:
+    q = """
+    INSERT INTO executor_bridge_positions (
+      action, mode, exec_side, event_id, match_key, src_id, src_key, execution_id,
+      status, stake_requested, liability_requested,
+      bankroll_ref, budget_match, cap_signal, cap_event, spent_before, spent_after, n_signals_est, risk_mode, meta
+    )
+    VALUES (
+      :action, :mode, :exec_side, :event_id, :match_key, :src_id, :src_key, :execution_id,
+      :status, :stake_requested, :liability_requested,
+      :bankroll_ref, :budget_match, :cap_signal, :cap_event, :spent_before, :spent_after, :n_signals_est, :risk_mode, (:meta)::jsonb
+    )
+    """
+    meta = dict(ctx or {})
+    async with db.async_session() as session:
+        await session.execute(
+            text(q),
+            {
+                "action": str(action),
+                "mode": str(mode),
+                "exec_side": str(exec_side.value),
+                "event_id": str(event_id),
+                "match_key": str(match_key),
+                "src_id": int(src_id),
+                "src_key": str(src_key),
+                "execution_id": (str(execution_id) if execution_id else None),
+                "status": str(meta.pop("status", "SUBMITTED")),
+                "stake_requested": (float(stake_requested) if stake_requested is not None else None),
+                "liability_requested": (float(liability_requested) if liability_requested is not None else None),
+                "bankroll_ref": _safe_float(meta.get("bankroll_ref")),
+                "budget_match": _safe_float(meta.get("budget_match")),
+                "cap_signal": _safe_float(meta.get("cap_signal")),
+                "cap_event": _safe_float(meta.get("cap_event")),
+                "spent_before": _safe_float(meta.get("spent_before")),
+                "spent_after": _safe_float(meta.get("spent_after")),
+                "n_signals_est": _safe_int(meta.get("n_signals_est")),
+                "risk_mode": (str(meta.get("risk_mode")) if meta.get("risk_mode") is not None else None),
+                "meta": json.dumps(meta, ensure_ascii=False),
+            },
+        )
+        await session.commit()
 
 
 async def run_bridge(cfg: BridgeConfig) -> int:
@@ -352,12 +624,18 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     policy_last_check = 0.0
     active_keys: Optional[set] = None
     active_keys_base: Optional[set] = None
+    bankroll_mtime: Optional[float] = None
+    bankroll_last_check = 0.0
+    bankroll_ref: Optional[float] = cfg.bankroll_ref
 
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
-        f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} min_limit={cfg.min_limit}"
+        f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
+        f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
+        f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
+        f"min_limit={cfg.min_limit}"
     )
 
     while True:
@@ -384,6 +662,21 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             )
             except Exception as e:
                 logger.warning(f"[bridge] policy reload failed: {e}")
+
+        # reload bankroll (se configurado)
+        if cfg.bankroll_json and (time.time() - bankroll_last_check) >= float(cfg.bankroll_reload_sec):
+            bankroll_last_check = time.time()
+            try:
+                p = Path(cfg.bankroll_json)
+                mtime = p.stat().st_mtime if p.exists() else None
+                if mtime and (bankroll_mtime is None or float(mtime) > float(bankroll_mtime)):
+                    b = _load_bankroll_from_json(cfg.bankroll_json)
+                    if b is not None and b > 0:
+                        bankroll_ref = float(b)
+                        bankroll_mtime = float(mtime)
+                        logger.info(f"[bridge] bankroll reloaded mtime={bankroll_mtime:.0f} bankroll_ref={bankroll_ref:.2f}")
+            except Exception as e:
+                logger.warning(f"[bridge] bankroll reload failed: {e}")
 
         since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
         rows = await _fetch_candidates(db, since=since, cfg=cfg)
@@ -444,6 +737,141 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     continue
 
                 req = _build_request(row, cfg)
+
+                # -----------------------------
+                # Engine dinâmico (WF budget)
+                # -----------------------------
+                sizing_meta: Dict[str, Any] = {}
+                try:
+                    wf = policy.get("wf") if (policy and isinstance(policy.get("wf"), dict)) else {}
+                    use_budget = (
+                        bool(cfg.use_wf_budget)
+                        and bool(wf.get("match_budget"))
+                        and (bankroll_ref is not None and float(bankroll_ref) > 0)
+                        and (float(wf.get("budget_back_frac") or 0.0) > 0 or float(wf.get("budget_lay_frac") or 0.0) > 0)
+                    )
+                    if use_budget:
+                        import math
+
+                        bud_back_frac = float(wf.get("budget_back_frac") or 0.0)
+                        bud_lay_frac = float(wf.get("budget_lay_frac") or 0.0)
+                        cap_sig_frac = float(wf.get("budget_cap_signal_frac") or 0.0)
+                        risk_mode = str(wf.get("budget_risk_mode") or "fixed").strip() or "fixed"
+
+                        ev_id = str(row.get("event_id") or "").strip()
+                        match_key = ev_id  # proxy robusto: event_id identifica o jogo
+
+                        bud_base = float(bankroll_ref) * (bud_back_frac if cfg.exec_side == ExecSide.BACK else bud_lay_frac)
+                        n_sig = await _signals_count_estimate(
+                            db,
+                            event_id=ev_id,
+                            hyp=str(cfg.only_hypothesis),
+                            exec_side=cfg.exec_side,
+                            lookback_h=float(cfg.signals_lookback_h),
+                        )
+                        bud_match = float(bud_base)
+                        if risk_mode == "signals_sqrt":
+                            bud_match = float(bud_base) / max(1.0, math.sqrt(float(n_sig)))
+                        elif risk_mode == "signals_linear":
+                            bud_match = float(bud_base) / max(1.0, float(n_sig))
+
+                        cap_signal = float(cap_sig_frac) * float(bud_match) if cap_sig_frac > 0 else float(bud_match)
+
+                        cap_event = None
+                        if cfg.exec_side == ExecSide.BACK and float(cfg.cap_event_back_frac) > 0:
+                            cap_event = float(cfg.cap_event_back_frac) * float(bankroll_ref)
+                        if cfg.exec_side == ExecSide.LAY and float(cfg.cap_event_lay_frac) > 0:
+                            cap_event = float(cfg.cap_event_lay_frac) * float(bankroll_ref)
+
+                        spent_before = await _spent_for_match(
+                            db, match_key=match_key, exec_side=cfg.exec_side, mode=str(cfg.mode), action=action
+                        )
+                        rem = max(0.0, float(bud_match) - float(spent_before))
+
+                        details = _parse_details(row)
+                        odd_hint = _safe_float(row.get("betslip_odd")) or _safe_float(row.get("websocket_odd"))
+                        base_exp, base_why = _base_exposure_from_finance(
+                            exec_side=cfg.exec_side,
+                            details=details,
+                            odd_hint=odd_hint,
+                            stake_fallback=float(cfg.stake),
+                        )
+                        if base_exp is None or float(base_exp) <= 0:
+                            await _mark_seen(
+                                db,
+                                src_id=src_id,
+                                action=action,
+                                execution_id=None,
+                                meta={"skipped": True, "reason": "no_base_exposure", "base_why": base_why, "odd_hint": odd_hint},
+                            )
+                            await _unreserve_seen_key(db, src_key=skey, action=action)
+                            continue
+
+                        exp_use = min(float(base_exp), float(rem), float(cap_signal))
+                        if cap_event is not None:
+                            exp_use = min(float(exp_use), float(cap_event))
+                        if exp_use <= 0:
+                            await _mark_seen(
+                                db,
+                                src_id=src_id,
+                                action=action,
+                                execution_id=None,
+                                meta={
+                                    "skipped": True,
+                                    "reason": "budget_blocked",
+                                    "bankroll_ref": bankroll_ref,
+                                    "budget_base": bud_base,
+                                    "budget_match": bud_match,
+                                    "cap_signal": cap_signal,
+                                    "cap_event": cap_event,
+                                    "spent_before": spent_before,
+                                    "rem": rem,
+                                    "n_signals_est": n_sig,
+                                    "risk_mode": risk_mode,
+                                },
+                            )
+                            continue
+
+                        ratio = float(exp_use) / max(1e-9, float(base_exp))
+                        if cfg.exec_side == ExecSide.BACK:
+                            req.policy.stake_requested = float(exp_use)
+                            req.policy.liability_requested = None
+                        else:
+                            req.policy.stake_requested = None
+                            req.policy.liability_requested = float(exp_use)
+
+                        req.policy.bankroll_ref = float(bankroll_ref)
+                        req.policy.bud_back_frac = float(bud_back_frac)
+                        req.policy.bud_lay_frac = float(bud_lay_frac)
+                        req.policy.cap_signal_frac = float(cap_sig_frac)
+                        req.policy.risk_mode = str(risk_mode)
+                        req.policy.spent_before = float(spent_before)
+                        req.policy.spent_after = float(spent_before) + float(exp_use)
+                        req.policy.policy_version = f"bridge_{cfg.only_hypothesis.lower()}_{cfg.mode}_wfBudget_v1"
+
+                        sizing_meta = {
+                            "use_wf_budget": True,
+                            "bankroll_ref": bankroll_ref,
+                            "budget_base": bud_base,
+                            "budget_match": bud_match,
+                            "cap_signal": cap_signal,
+                            "cap_event": cap_event,
+                            "spent_before": spent_before,
+                            "spent_after": float(spent_before) + float(exp_use),
+                            "n_signals_est": n_sig,
+                            "risk_mode": risk_mode,
+                            "base_exp": base_exp,
+                            "base_why": base_why,
+                            "ratio": ratio,
+                        }
+                        try:
+                            req.meta.setdefault("bridge", {})
+                            req.meta["bridge"]["sizing"] = dict(sizing_meta)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"[bridge] wf_budget engine failed src_id={src_id}: {e}")
+
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
                 eid = str(res.get("execution_id") or "")
                 accepted = bool(res.get("accepted"))
@@ -467,6 +895,25 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     # pequeno backoff para não martelar o executor
                     await asyncio.sleep(float(os.getenv("BRIDGE_TRANSIENT_BACKOFF_SEC", "1.0")))
                     continue
+
+                if accepted:
+                    try:
+                        await _insert_position(
+                            db,
+                            action=action,
+                            mode=str(cfg.mode),
+                            exec_side=cfg.exec_side,
+                            event_id=str(row.get("event_id") or ""),
+                            match_key=str(row.get("event_id") or ""),
+                            src_id=src_id,
+                            src_key=skey,
+                            execution_id=(eid or None),
+                            stake_requested=_safe_float(getattr(req.policy, "stake_requested", None)),
+                            liability_requested=_safe_float(getattr(req.policy, "liability_requested", None)),
+                            ctx={"status": "SUBMITTED", **(sizing_meta or {}), "http_submit": hs},
+                        )
+                    except Exception as e:
+                        logger.warning(f"[bridge] insert_position failed src_id={src_id}: {e}")
 
                 await _finalize_seen_key(db, src_key=skey, action=action, execution_id=(eid or None))
                 await _mark_seen(db, src_id=src_id, action=action, execution_id=(eid or None), meta={"accepted": accepted, "resp": res})
@@ -511,6 +958,27 @@ def main() -> int:
         help="Se true, usa active_keys_base (ignora sufixo de liga).",
     )
     ap.add_argument("--min-limit", type=float, default=float(os.getenv("BRIDGE_MIN_LIMIT", "0.0")), help="Se >0, exige betslip_limit >= este mínimo.")
+    ap.add_argument(
+        "--use-wf-budget",
+        action="store_true",
+        default=(os.getenv("BRIDGE_USE_WF_BUDGET", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Se true, aplica match_budget/budgets/risk_mode do wf_policy_current.json para calcular stake/liability dinamicamente.",
+    )
+    ap.add_argument(
+        "--bankroll-ref",
+        type=float,
+        default=(_safe_float(os.getenv("BRIDGE_BANKROLL_REF", "")) if os.getenv("BRIDGE_BANKROLL_REF") else None),
+        help="Banca de referência (override). Se omitido, pode vir de --bankroll-json.",
+    )
+    ap.add_argument(
+        "--bankroll-json",
+        default=os.getenv("BRIDGE_BANKROLL_JSON", "").strip() or None,
+        help="JSON com balance_current (ex.: logs/accounting_daily_report.json).",
+    )
+    ap.add_argument("--bankroll-reload-sec", type=float, default=float(os.getenv("BRIDGE_BANKROLL_RELOAD_SEC", "30.0")))
+    ap.add_argument("--signals-lookback-h", type=float, default=float(os.getenv("BRIDGE_SIGNALS_LOOKBACK_H", "36.0")))
+    ap.add_argument("--cap-event-back-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_BACK_FRAC", "0.0")))
+    ap.add_argument("--cap-event-lay-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_LAY_FRAC", "0.0")))
     args = ap.parse_args()
 
     cfg = BridgeConfig(
@@ -528,6 +996,13 @@ def main() -> int:
         policy_reload_sec=float(args.policy_reload_sec),
         policy_use_base=bool(args.policy_use_base),
         min_limit=float(args.min_limit),
+        use_wf_budget=bool(args.use_wf_budget),
+        bankroll_ref=(float(args.bankroll_ref) if args.bankroll_ref is not None else None),
+        bankroll_json=(str(args.bankroll_json) if args.bankroll_json else None),
+        bankroll_reload_sec=float(args.bankroll_reload_sec),
+        signals_lookback_h=float(args.signals_lookback_h),
+        cap_event_back_frac=float(args.cap_event_back_frac),
+        cap_event_lay_frac=float(args.cap_event_lay_frac),
     )
 
     logger.remove()
