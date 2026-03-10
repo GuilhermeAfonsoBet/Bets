@@ -82,6 +82,31 @@ async def run_daily(cfg: DailyCfg) -> Dict[str, Any]:
         pnl_month_f = float(rep.pnl_by_month_filtered.get(monthk, 0.0))
         closed_f = {k: float(v) for k, v in sorted(rep.pnl_by_month_filtered.items()) if k < monthk}
 
+    # Para uso em relatórios operacionais (ex.: daily_full_report),
+    # expomos uma janela curta por dia (best-effort) para evitar P&L "falso"
+    # quando não há cobertura de ROI via placares/audit.
+    try:
+        from datetime import timedelta as _td
+
+        def _recent_days_map(src: Optional[Dict[str, float]], *, ndays: int) -> Dict[str, float]:
+            if not src:
+                return {}
+            outm: Dict[str, float] = {}
+            d0 = now.date() - _td(days=max(0, int(ndays) - 1))
+            d = d0
+            while d <= now.date():
+                k = d.isoformat()
+                if k in src:
+                    outm[k] = float(src.get(k) or 0.0)
+                d += _td(days=1)
+            return outm
+
+        pnl_by_day_recent = _recent_days_map(rep.pnl_by_day, ndays=21)
+        pnl_by_day_filtered_recent = _recent_days_map(rep.pnl_by_day_filtered, ndays=21) if rep.pnl_by_day_filtered else {}
+    except Exception:
+        pnl_by_day_recent = {}
+        pnl_by_day_filtered_recent = {}
+
     out: Dict[str, Any] = {
         "ts": _utcnow(),
         "tz": cfg.tz_name,
@@ -96,6 +121,8 @@ async def run_daily(cfg: DailyCfg) -> Dict[str, Any]:
         "pnl_filtered_week": pnl_week_f,
         "pnl_filtered_month": pnl_month_f,
         "closed_months_filtered": closed_f,
+        "pnl_by_day_recent": pnl_by_day_recent,
+        "pnl_by_day_filtered_recent": pnl_by_day_filtered_recent,
         "by_type": rep.by_type,
         "rows": rep.rows,
         "dt_col": rep.dt_col,

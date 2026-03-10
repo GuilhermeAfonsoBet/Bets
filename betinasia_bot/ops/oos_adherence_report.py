@@ -378,6 +378,7 @@ class ExecRow:
     odd_decision: Optional[float]
     odd_final: Optional[float]
     stake_sent: Optional[float]
+    betslip_id: Optional[str] = None
 
 
 def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
@@ -400,6 +401,12 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
             continue
 
         raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+        betslip_id = None
+        try:
+            # vários executores colocam o id do slip em raw
+            betslip_id = str(raw.get("betslip_id") or "").strip() or None
+        except Exception:
+            betslip_id = None
         sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
         stake_sent = _safe_float(sent.get("stake"))
         if stake_sent is None:
@@ -420,6 +427,7 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
                 odd_decision=_safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision")),
                 odd_final=_safe_float(res.get("odd_final")),
                 stake_sent=stake_sent,
+                betslip_id=betslip_id,
             )
         )
     return out
@@ -607,10 +615,26 @@ async def run_report(
 
         perf = {
             "n_exec_rows": len(xs),
+            "n_exec_success": 0,
             "status_counts": {},
-            "back": {"n": 0, "wins": 0, "losses": 0, "push": 0, "half_wins": 0, "half_losses": 0, "stake_sum": 0.0, "pnl_sum": 0.0},
+            "back": {
+                "n_success": 0,
+                "n_cov": 0,
+                "wins": 0,
+                "losses": 0,
+                "push": 0,
+                "half_wins": 0,
+                "half_losses": 0,
+                # stake enviado total (sucessos)
+                "stake_sum": 0.0,
+                # stake com cobertura (placar+odd)
+                "stake_sum_cov": 0.0,
+                "pnl_sum": 0.0,
+                "roi_pct": None,
+            },
             "lay": {
-                "n": 0,
+                "n_success": 0,
+                "n_cov": 0,
                 "wins": 0,
                 "losses": 0,
                 "push": 0,
@@ -620,7 +644,10 @@ async def run_report(
                 "stake_sum": 0.0,
                 # exposição de risco (liability = stake*(odd-1))
                 "liability_sum": 0.0,
+                "stake_sum_cov": 0.0,
+                "liability_sum_cov": 0.0,
                 "pnl_sum": 0.0,
+                "roi_pct_per_liability": None,
             },
             "odd_anomalies": {"back": {"n": 0, "max": None}, "lay": {"n": 0, "max": None}},
             "slippage": {
@@ -661,6 +688,22 @@ async def run_report(
         for e in xs:
             perf["status_counts"][e.status] = int(perf["status_counts"].get(e.status, 0)) + 1
 
+            st_norm = str(e.status or "").strip().upper()
+            is_success = st_norm in ("DRY_OK", "LIVE_OK")
+            side0 = str(e.exec_side or "").strip().lower()
+            if is_success:
+                perf["n_exec_success"] = int(perf.get("n_exec_success") or 0) + 1
+                stake0 = float(e.stake_sent) if e.stake_sent is not None else 1.0
+                if side0 == "back":
+                    perf["back"]["n_success"] += 1
+                    perf["back"]["stake_sum"] += float(stake0)
+                elif side0 == "lay":
+                    perf["lay"]["n_success"] += 1
+                    perf["lay"]["stake_sum"] += float(stake0)
+                    odd0 = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+                    if odd0 is not None:
+                        perf["lay"]["liability_sum"] += float(stake0) * max(0.0, float(odd0) - 1.0)
+
             # só calcula "resultado" quando há placar e odd
             a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
             if not a:
@@ -672,7 +715,6 @@ async def run_report(
             if odd is None:
                 # registra anomalia por lado (quando havia algo preenchido)
                 raw_odd = e.odd_final if e.odd_final is not None else e.odd_decision
-                side0 = str(e.exec_side or "").strip().lower()
                 if raw_odd is not None and side0 in ("back", "lay"):
                     blk = perf.get("odd_anomalies", {}).get(side0, {})
                     try:
@@ -684,13 +726,13 @@ async def run_report(
                         pass
                 continue
 
-            side = str(e.exec_side or "").strip()
-            if side.lower() == "back":
-                perf["back"]["n"] += 1
+            side = str(e.exec_side or "").strip().lower()
+            if side == "back":
+                perf["back"]["n_cov"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
-                perf["back"]["stake_sum"] += float(stake)
+                perf["back"]["stake_sum_cov"] += float(stake)
                 perf["back"]["pnl_sum"] += float(pnl)
                 if mult > 0:
                     if mult == 0.5:
@@ -729,16 +771,16 @@ async def run_report(
                         comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": league if league else None})
                     except Exception:
                         pass
-            elif side.lower() == "lay":
-                perf["lay"]["n"] += 1
+            elif side == "lay":
+                perf["lay"]["n_cov"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 liab = stake * max(0.0, float(odd) - 1.0)
-                perf["lay"]["stake_sum"] += float(stake)
+                perf["lay"]["stake_sum_cov"] += float(stake)
                 roi_liab = _roi_lay_pct_per_liability(float(odd), float(mult))
                 if roi_liab is None:
                     continue
                 pnl = liab * float(roi_liab) / 100.0
-                perf["lay"]["liability_sum"] += float(liab)
+                perf["lay"]["liability_sum_cov"] += float(liab)
                 perf["lay"]["pnl_sum"] += float(pnl)
                 # outcome invertido vs Back
                 if mult > 0:
@@ -788,11 +830,11 @@ async def run_report(
                         pass
 
         # ROIs agregados
-        back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum"]) * 100.0) if perf["back"]["stake_sum"] else None
-        lay_roi = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["liability_sum"]) * 100.0) if perf["lay"]["liability_sum"] else None
+        back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum_cov"]) * 100.0) if perf["back"]["stake_sum_cov"] else None
+        lay_roi = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["liability_sum_cov"]) * 100.0) if perf["lay"]["liability_sum_cov"] else None
         perf["back"]["roi_pct"] = back_roi
         perf["lay"]["roi_pct_per_liability"] = lay_roi
-        perf["lay_roi_pct_per_stake"] = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["stake_sum"]) * 100.0) if perf["lay"]["stake_sum"] else None
+        perf["lay_roi_pct_per_stake"] = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["stake_sum_cov"]) * 100.0) if perf["lay"]["stake_sum_cov"] else None
 
         # slippage agregada
         if slip_raw_back:
