@@ -68,6 +68,9 @@ class BridgeConfig:
     use_wf_budget: bool = False
     # Contagem de sinais (para signals_sqrt/linear): janela curta (best-effort)
     signals_lookback_h: float = 36.0
+    # Override manual do risk_mode do WF (mantém daily estável).
+    # Valores: fixed|signals_sqrt|signals_linear
+    wf_risk_mode_override: Optional[str] = None
     # Guardrail adicional: cap por jogo como fração da banca (0=off). Back em stake; Lay em liability.
     cap_event_back_frac: float = 0.0
     cap_event_lay_frac: float = 0.0
@@ -757,6 +760,10 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         bud_lay_frac = float(wf.get("budget_lay_frac") or 0.0)
                         cap_sig_frac = float(wf.get("budget_cap_signal_frac") or 0.0)
                         risk_mode = str(wf.get("budget_risk_mode") or "fixed").strip() or "fixed"
+                        if cfg.wf_risk_mode_override:
+                            rm = str(cfg.wf_risk_mode_override or "").strip()
+                            if rm in ("fixed", "signals_sqrt", "signals_linear"):
+                                risk_mode = rm
 
                         ev_id = str(row.get("event_id") or "").strip()
                         match_key = ev_id  # proxy robusto: event_id identifica o jogo
@@ -977,6 +984,11 @@ def main() -> int:
     )
     ap.add_argument("--bankroll-reload-sec", type=float, default=float(os.getenv("BRIDGE_BANKROLL_RELOAD_SEC", "30.0")))
     ap.add_argument("--signals-lookback-h", type=float, default=float(os.getenv("BRIDGE_SIGNALS_LOOKBACK_H", "36.0")))
+    ap.add_argument(
+        "--wf-risk-mode-override",
+        default=os.getenv("BRIDGE_WF_RISK_MODE_OVERRIDE", "").strip() or None,
+        help="Override manual do wf.budget_risk_mode: fixed|signals_sqrt|signals_linear",
+    )
     ap.add_argument("--cap-event-back-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_BACK_FRAC", "0.0")))
     ap.add_argument("--cap-event-lay-frac", type=float, default=float(os.getenv("BRIDGE_CAP_EVENT_LAY_FRAC", "0.0")))
     args = ap.parse_args()
@@ -1001,6 +1013,7 @@ def main() -> int:
         bankroll_json=(str(args.bankroll_json) if args.bankroll_json else None),
         bankroll_reload_sec=float(args.bankroll_reload_sec),
         signals_lookback_h=float(args.signals_lookback_h),
+        wf_risk_mode_override=(str(args.wf_risk_mode_override) if args.wf_risk_mode_override else None),
         cap_event_back_frac=float(args.cap_event_back_frac),
         cap_event_lay_frac=float(args.cap_event_lay_frac),
     )
