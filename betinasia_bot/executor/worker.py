@@ -115,8 +115,18 @@ class ExecutorWorker:
                 f"min_wait={self._api.PMM_MIN_WAIT}s idle={self._api.PMM_IDLE_TIMEOUT}s"
             )
 
-        await page.goto(self.football_url)
-        await page.wait_for_load_state("domcontentloaded")
+        # `page.goto()` por padrão espera o evento "load", que pode nunca ocorrer sob proxy/recursos pesados.
+        # Para robustez operacional, usamos `domcontentloaded` e timeout configurável.
+        wait_until = os.getenv("EXECUTOR_GOTO_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
+        timeout_ms = int(float(os.getenv("EXECUTOR_GOTO_TIMEOUT_MS", "45000") or 45000))
+        try:
+            await page.goto(self.football_url, wait_until=wait_until, timeout=timeout_ms)
+        except Exception as e:
+            # fallback: tenta domcontentloaded explicitamente
+            try:
+                await page.goto(self.football_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception:
+                raise
         await page.wait_for_timeout(4000)
         self._running = True
         logger.info(
@@ -419,8 +429,9 @@ class ExecutorWorker:
             if ok:
                 try:
                     page = self._scraper._page
-                    await page.goto(self.football_url)
-                    await page.wait_for_load_state("domcontentloaded")
+                    wait_until = os.getenv("EXECUTOR_GOTO_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
+                    timeout_ms = int(float(os.getenv("EXECUTOR_GOTO_TIMEOUT_MS", "45000") or 45000))
+                    await page.goto(self.football_url, wait_until=wait_until, timeout=timeout_ms)
                     await page.wait_for_timeout(1500)
                 except Exception:
                     pass
