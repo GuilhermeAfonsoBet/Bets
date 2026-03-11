@@ -981,6 +981,16 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                 odd_hint=odd_hint,
                                 stake_fallback=float(cfg.stake),
                             )
+                        # Se estamos em modo budget e não há limit/finance, não queremos ficar travados no stake fixo.
+                        # Nesse caso, deixe o budget governar diretamente (cap_signal).
+                        if (
+                            (base_why == "fallback_stake")
+                            and (cfg.exec_side == ExecSide.BACK)
+                            and (cap_signal is not None)
+                            and float(cap_signal) > 0
+                        ):
+                            base_exp = float(cap_signal)
+                            base_why = "fallback_cap_signal"
                         if base_exp is None or float(base_exp) <= 0:
                             # sem limit e sem finance: deixa o budget governar diretamente
                             base_exp = float(cap_signal)
