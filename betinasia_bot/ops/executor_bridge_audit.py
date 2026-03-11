@@ -197,6 +197,57 @@ def _finance_snapshot(details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return fin if isinstance(fin, dict) else None
 
 
+def _limit_from_finance(details: Dict[str, Any], *, exec_side: ExecSide) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Retorna (available_limit, odd) a partir de hypothesis_details.finance, se existir.
+    Para Back: usa finance.back.available_limit e finance.back.odd
+    Para Lay: usa finance.lay.available_limit e finance.lay.odd
+    """
+    fin = _finance_snapshot(details) or {}
+    try:
+        if exec_side == ExecSide.BACK:
+            blk = fin.get("back") if isinstance(fin.get("back"), dict) else {}
+        else:
+            blk = fin.get("lay") if isinstance(fin.get("lay"), dict) else {}
+        lim = _safe_float((blk or {}).get("available_limit"))
+        odd = _safe_float((blk or {}).get("odd"))
+        return (float(lim) if lim is not None else None, float(odd) if odd is not None else None)
+    except Exception:
+        return None, None
+
+
+def _stake_from_limit(*, limit_value: float, stake_pct_of_limit: float, stake_cap_abs: float) -> float:
+    st = max(0.0, float(limit_value)) * max(0.0, float(stake_pct_of_limit))
+    if stake_cap_abs and float(stake_cap_abs) > 0:
+        st = min(float(st), float(stake_cap_abs))
+    return float(st)
+
+
+def _base_exposure_from_limit(
+    *,
+    exec_side: ExecSide,
+    limit_value: Optional[float],
+    odd: Optional[float],
+    stake_pct_of_limit: float,
+    stake_cap_abs: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Usa limit_value + stake_pct_of_limit para definir base exposure:
+      - Back: exposure = stake
+      - Lay: exposure = liability = stake*(odd-1)
+    """
+    if limit_value is None or float(limit_value) <= 0:
+        return None, "no_limit"
+    st = _stake_from_limit(limit_value=float(limit_value), stake_pct_of_limit=float(stake_pct_of_limit), stake_cap_abs=float(stake_cap_abs))
+    if st <= 0:
+        return None, "stake_from_limit<=0"
+    if exec_side == ExecSide.BACK:
+        return float(st), "limit"
+    if odd is None or float(odd) <= 1.0:
+        return None, "no_odd_for_lay"
+    return float(st) * max(0.0, float(odd) - 1.0), "limit_x_(odd-1)"
+
+
 def _base_exposure_from_finance(
     *,
     exec_side: ExecSide,
@@ -889,25 +940,40 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         rem = max(0.0, float(bud_match) - float(spent_before))
 
                         # base exposure por oportunidade:
-                        # preferimos usar betslip_limit (liquidez real) quando disponível; fallback para finance snapshot; e por fim cap_signal.
+                        # 1) preferimos usar `finance.*.available_limit` (do auditor) para o lado correto (Back/Lay)
+                        #    e aplicar stake_pct_of_limit manual (risk_params_json).
+                        # 2) fallback: betslip_limit (coluna) quando existir.
+                        # 3) fallback: finance snapshot (suggested_stake/liability_if_lose) / stake fixo.
+                        # 4) fallback final: cap_signal (deixa o budget governar diretamente).
                         details = _parse_details(row)
                         odd_hint = _safe_float(row.get("betslip_odd")) or _safe_float(row.get("websocket_odd"))
-                        lim_hint = _safe_float(row.get("betslip_limit"))
                         stake_pct_of_limit = float(_rp_float(risk_params, "stake_pct_of_limit") or 1.0)
                         stake_cap_abs = float(_rp_float(risk_params, "stake_cap_abs") or 0.0)
                         base_exp = None
                         base_why = None
-                        if lim_hint is not None and float(lim_hint) > 0 and stake_pct_of_limit > 0:
-                            st_lim = float(lim_hint) * float(stake_pct_of_limit)
-                            if stake_cap_abs > 0:
-                                st_lim = min(float(st_lim), float(stake_cap_abs))
-                            if cfg.exec_side == ExecSide.BACK:
-                                base_exp = float(st_lim)
-                                base_why = "betslip_limit"
-                            else:
-                                if odd_hint is not None and float(odd_hint) > 1.0:
-                                    base_exp = float(st_lim) * max(0.0, float(odd_hint) - 1.0)
-                                    base_why = "betslip_limit_x_(odd-1)"
+                        # 1) finance.available_limit (lado correto)
+                        lim_fin, odd_fin = _limit_from_finance(details, exec_side=cfg.exec_side)
+                        base_exp, base_why = _base_exposure_from_limit(
+                            exec_side=cfg.exec_side,
+                            limit_value=lim_fin,
+                            odd=(odd_fin if odd_fin is not None else odd_hint),
+                            stake_pct_of_limit=stake_pct_of_limit,
+                            stake_cap_abs=stake_cap_abs,
+                        )
+                        if base_exp is not None and base_why:
+                            base_why = f"finance.{base_why}"
+                        # 2) betslip_limit (coluna)
+                        if base_exp is None or float(base_exp) <= 0:
+                            lim_hint = _safe_float(row.get("betslip_limit"))
+                            base_exp, base_why2 = _base_exposure_from_limit(
+                                exec_side=cfg.exec_side,
+                                limit_value=lim_hint,
+                                odd=odd_hint,
+                                stake_pct_of_limit=stake_pct_of_limit,
+                                stake_cap_abs=stake_cap_abs,
+                            )
+                            if base_exp is not None:
+                                base_why = f"betslip_limit.{base_why2}"
                         if base_exp is None or float(base_exp) <= 0:
                             base_exp, base_why = _base_exposure_from_finance(
                                 exec_side=cfg.exec_side,
