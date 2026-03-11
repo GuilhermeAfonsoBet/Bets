@@ -521,6 +521,7 @@ async def _signals_count_estimate(
     hyp: str,
     exec_side: ExecSide,
     lookback_h: float,
+    prematch_only: bool,
 ) -> int:
     """
     Estimativa do total de sinais para este jogo (event_id) numa janela curta.
@@ -534,6 +535,7 @@ async def _signals_count_estimate(
       AND r.event_id = :event_id
       AND r.hypothesis_type = :hyp
       AND r.is_valid_opportunity = TRUE
+      AND (:prematch_only = FALSE OR r.is_live IS NULL OR r.is_live = FALSE)
       AND (
         r.hypothesis_details IS NULL
         OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
@@ -548,6 +550,7 @@ async def _signals_count_estimate(
                 "event_id": str(event_id),
                 "hyp": str(hyp),
                 "exec_side_hint": str(exec_side.value),
+                "prematch_only": bool(prematch_only),
             },
         )
         row = r.fetchone()
@@ -849,6 +852,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             hyp=str(cfg.only_hypothesis),
                             exec_side=cfg.exec_side,
                             lookback_h=float(_rp_float(risk_params, "signals_lookback_h") or cfg.signals_lookback_h),
+                            prematch_only=bool(cfg.only_prematch),
                         )
                         bud_match = float(bud_base)
                         if risk_mode == "signals_sqrt":
@@ -890,9 +894,13 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             await _unreserve_seen_key(db, src_key=skey, action=action)
                             continue
 
-                        exp_use = min(float(base_exp), float(rem), float(cap_signal))
+                        # hard cap total por jogo (cap_event): limita o rem adicionalmente
+                        rem_event = None
                         if cap_event is not None:
-                            exp_use = min(float(exp_use), float(cap_event))
+                            rem_event = max(0.0, float(cap_event) - float(spent_before))
+                            rem = min(float(rem), float(rem_event))
+
+                        exp_use = min(float(base_exp), float(rem), float(cap_signal))
                         if exp_use <= 0:
                             await _mark_seen(
                                 db,
@@ -909,6 +917,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                     "cap_event": cap_event,
                                     "spent_before": spent_before,
                                     "rem": rem,
+                                    "rem_event": rem_event,
                                     "n_signals_est": n_sig,
                                     "risk_mode": risk_mode,
                                 },
