@@ -117,16 +117,23 @@ class ExecutorWorker:
 
         # `page.goto()` por padrão espera o evento "load", que pode nunca ocorrer sob proxy/recursos pesados.
         # Para robustez operacional, usamos `domcontentloaded` e timeout configurável.
+        #
+        # Observação: mesmo que o goto falhe, muitas rotas (API /v1 + sessão) seguem funcionando.
+        # Em produção, prefira manter `EXECUTOR_GOTO_STRICT=1` para falhar cedo, se quiser.
         wait_until = os.getenv("EXECUTOR_GOTO_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
         timeout_ms = int(float(os.getenv("EXECUTOR_GOTO_TIMEOUT_MS", "45000") or 45000))
+        strict = os.getenv("EXECUTOR_GOTO_STRICT", "0").strip() in ("1", "true", "True", "yes", "YES")
         try:
             await page.goto(self.football_url, wait_until=wait_until, timeout=timeout_ms)
         except Exception as e:
             # fallback: tenta domcontentloaded explicitamente
             try:
                 await page.goto(self.football_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except Exception:
-                raise
+            except Exception as e2:
+                msg = str(e2)[:220]
+                logger.warning(f"[executor:{self.name}] goto football_url failed (continuing) wait_until={wait_until} timeout_ms={timeout_ms} err={msg}")
+                if strict:
+                    raise
         await page.wait_for_timeout(4000)
         self._running = True
         logger.info(
