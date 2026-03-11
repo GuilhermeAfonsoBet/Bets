@@ -276,6 +276,19 @@ def _rp_float(rp: Dict[str, Any], key: str) -> Optional[float]:
         return None
 
 
+def _rp_str(rp: Dict[str, Any], key: str) -> Optional[str]:
+    try:
+        if not rp or key not in rp:
+            return None
+        v = rp.get(key)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+    except Exception:
+        return None
+
+
 def _event_key(row: Dict[str, Any], cfg: BridgeConfig) -> str:
     event_id = str(row.get("event_id") or "").strip()
     market = str(row.get("market_type") or "AH").strip().upper()
@@ -875,14 +888,37 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         )
                         rem = max(0.0, float(bud_match) - float(spent_before))
 
+                        # base exposure por oportunidade:
+                        # preferimos usar betslip_limit (liquidez real) quando disponível; fallback para finance snapshot; e por fim cap_signal.
                         details = _parse_details(row)
                         odd_hint = _safe_float(row.get("betslip_odd")) or _safe_float(row.get("websocket_odd"))
-                        base_exp, base_why = _base_exposure_from_finance(
-                            exec_side=cfg.exec_side,
-                            details=details,
-                            odd_hint=odd_hint,
-                            stake_fallback=float(cfg.stake),
-                        )
+                        lim_hint = _safe_float(row.get("betslip_limit"))
+                        stake_pct_of_limit = float(_rp_float(risk_params, "stake_pct_of_limit") or 1.0)
+                        stake_cap_abs = float(_rp_float(risk_params, "stake_cap_abs") or 0.0)
+                        base_exp = None
+                        base_why = None
+                        if lim_hint is not None and float(lim_hint) > 0 and stake_pct_of_limit > 0:
+                            st_lim = float(lim_hint) * float(stake_pct_of_limit)
+                            if stake_cap_abs > 0:
+                                st_lim = min(float(st_lim), float(stake_cap_abs))
+                            if cfg.exec_side == ExecSide.BACK:
+                                base_exp = float(st_lim)
+                                base_why = "betslip_limit"
+                            else:
+                                if odd_hint is not None and float(odd_hint) > 1.0:
+                                    base_exp = float(st_lim) * max(0.0, float(odd_hint) - 1.0)
+                                    base_why = "betslip_limit_x_(odd-1)"
+                        if base_exp is None or float(base_exp) <= 0:
+                            base_exp, base_why = _base_exposure_from_finance(
+                                exec_side=cfg.exec_side,
+                                details=details,
+                                odd_hint=odd_hint,
+                                stake_fallback=float(cfg.stake),
+                            )
+                        if base_exp is None or float(base_exp) <= 0:
+                            # sem limit e sem finance: deixa o budget governar diretamente
+                            base_exp = float(cap_signal)
+                            base_why = "fallback_cap_signal"
                         if base_exp is None or float(base_exp) <= 0:
                             await _mark_seen(
                                 db,
