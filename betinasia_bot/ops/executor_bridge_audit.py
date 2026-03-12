@@ -947,7 +947,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 if policy and active_keys is not None:
                     comb = _combo_key_from_row(row, cfg, policy)
                     ok = False
-                    if cfg.policy_use_base and active_keys_base is not None and active_keys_base:
+                    # Alinhamento com OOS: quando enforcing, nunca colapsa a key por liga (não usa active_keys_base)
+                    use_base = bool(cfg.policy_use_base) and (not bool(cfg.enforce_wf_filters))
+                    if use_base and active_keys_base is not None and active_keys_base:
                         ok = str(comb).split("__", 1)[0] in active_keys_base
                     else:
                         ok = comb in active_keys
@@ -957,7 +959,14 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             src_id=src_id,
                             action=action,
                             execution_id=None,
-                            meta={"skipped": True, "reason": "not_active", "combo": comb},
+                            meta={
+                                "skipped": True,
+                                "reason": "not_active",
+                                "combo": comb,
+                                "policy_use_base_cfg": bool(cfg.policy_use_base),
+                                "policy_use_base_eff": bool(use_base),
+                                "enforce_wf_filters": bool(cfg.enforce_wf_filters),
+                            },
                         )
                         continue
 
