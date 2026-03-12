@@ -89,6 +89,69 @@ class BridgeConfig:
     cap_event_lay_frac: float = 0.0
     # Guardrails simples
     min_limit: float = 0.0
+    # Alinhamento OOS vs bridge: quando True (default), aplica filtros/limiares do WF (policy_json.wf)
+    # no bridge, evitando divergência com o OOS.
+    enforce_wf_filters: bool = True
+
+
+def _wf_float(wf: Dict[str, Any], *keys: str) -> Optional[float]:
+    for k in keys:
+        if not k:
+            continue
+        if k in wf and wf.get(k) is not None:
+            try:
+                return float(wf.get(k))
+            except Exception:
+                continue
+    return None
+
+
+def _wf_str(wf: Dict[str, Any], *keys: str, default: str = "") -> str:
+    for k in keys:
+        if not k:
+            continue
+        if k in wf and wf.get(k) is not None:
+            try:
+                s = str(wf.get(k)).strip()
+                if s:
+                    return s
+            except Exception:
+                continue
+    return default
+
+
+def _wf_effective_min_limit(cfg: BridgeConfig, wf: Dict[str, Any]) -> float:
+    wf_min = _wf_float(wf, "liquidity_min_limit", "liquidity_min", "min_limit")
+    if cfg.enforce_wf_filters and wf_min is not None:
+        return float(max(0.0, float(wf_min)))
+    # compat: se não estiver enforcing, preserva guardrail local (pode ser mais restritivo)
+    try:
+        wf_min2 = float(wf_min) if wf_min is not None else 0.0
+    except Exception:
+        wf_min2 = 0.0
+    return float(max(0.0, float(cfg.min_limit or 0.0), float(wf_min2)))
+
+
+def _wf_apply_scope(scope: str, *, is_live: bool) -> bool:
+    sc = (scope or "").strip().lower() or "pre"
+    if sc == "all":
+        return True
+    if sc == "in":
+        return bool(is_live)
+    # default/pre
+    return not bool(is_live)
+
+
+def _wf_filters_summary(cfg: BridgeConfig, wf: Dict[str, Any]) -> str:
+    try:
+        thr = _wf_float(wf, "ah_max_abs_line")
+        scope = _wf_str(wf, "ah_scope", default="pre")
+        key_by_league = bool(wf.get("key_by_league"))
+        key_scope = _wf_str(wf, "key_by_league_scope", default="pre")
+        mlim = _wf_effective_min_limit(cfg, wf)
+        return f"enforce={int(bool(cfg.enforce_wf_filters))} ah_max_abs_line={thr if thr is not None else '-'} ah_scope={scope} key_by_league={int(key_by_league)} key_scope={key_scope} min_limit_eff={mlim:.4g}"
+    except Exception:
+        return f"enforce={int(bool(cfg.enforce_wf_filters))}"
 
 
 DDL_SEEN = """
@@ -745,7 +808,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
         f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
         f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
-        f"min_limit={cfg.min_limit}"
+        f"min_limit={cfg.min_limit} enforce_wf_filters={int(bool(cfg.enforce_wf_filters))}"
     )
 
     while True:
@@ -770,6 +833,12 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                 f"[bridge] policy reloaded mtime={policy_mtime:.0f} "
                                 f"active_keys={len(active_keys)} active_base={len(active_keys_base)}"
                             )
+                        try:
+                            wf = pol.get("wf") if isinstance(pol.get("wf"), dict) else {}
+                            if isinstance(wf, dict) and wf:
+                                logger.info(f"[bridge] wf filters: {_wf_filters_summary(cfg, wf)}")
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning(f"[bridge] policy reload failed: {e}")
 
@@ -813,15 +882,64 @@ async def run_bridge(cfg: BridgeConfig) -> int:
             src_id = int(row.get("id") or 0)
             action = f"{cfg.mode}:{cfg.exec_side.value}"
             try:
+                wf = policy.get("wf") if (policy and isinstance(policy.get("wf"), dict)) else {}
+                if not isinstance(wf, dict):
+                    wf = {}
+
+                # -----------------------------
+                # Filtros do WF/OOS (alinhamento)
+                # -----------------------------
+                # 1) AH gate por abs(line)
+                try:
+                    thr = _wf_float(wf, "ah_max_abs_line")
+                    scope = _wf_str(wf, "ah_scope", default="pre")
+                    if thr is not None and float(thr) > 0:
+                        is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                        if _wf_apply_scope(scope, is_live=is_live):
+                            ln = str(row.get("line") or "").strip()
+                            if ln:
+                                try:
+                                    x = abs(float(_norm_line(ln)))
+                                except Exception:
+                                    x = None
+                                if x is not None and float(x) > float(thr):
+                                    await _mark_seen(
+                                        db,
+                                        src_id=src_id,
+                                        action=action,
+                                        execution_id=None,
+                                        meta={
+                                            "skipped": True,
+                                            "reason": "wf_ah_max_abs_line",
+                                            "line": ln,
+                                            "abs_line": float(x),
+                                            "thr": float(thr),
+                                            "scope": scope,
+                                            "is_live": bool(is_live),
+                                        },
+                                    )
+                                    continue
+                except Exception:
+                    pass
+
                 # guardrail: limit mínimo
                 lim = _safe_float(row.get("betslip_limit"))
-                if cfg.min_limit and lim is not None and float(lim) < float(cfg.min_limit):
+                min_lim_eff = _wf_effective_min_limit(cfg, wf)
+                if min_lim_eff and lim is not None and float(lim) < float(min_lim_eff):
                     await _mark_seen(
                         db,
                         src_id=src_id,
                         action=action,
                         execution_id=None,
-                        meta={"skipped": True, "reason": "min_limit", "betslip_limit": lim, "min_limit": cfg.min_limit},
+                        meta={
+                            "skipped": True,
+                            "reason": "min_limit",
+                            "betslip_limit": lim,
+                            "min_limit_eff": float(min_lim_eff),
+                            "min_limit_cfg": float(cfg.min_limit or 0.0),
+                            "min_limit_wf": _wf_float(wf, "liquidity_min_limit", "liquidity_min", "min_limit"),
+                            "enforce_wf_filters": bool(cfg.enforce_wf_filters),
+                        },
                     )
                     continue
 
@@ -868,7 +986,6 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 # -----------------------------
                 sizing_meta: Dict[str, Any] = {}
                 try:
-                    wf = policy.get("wf") if (policy and isinstance(policy.get("wf"), dict)) else {}
                     use_budget = (
                         bool(cfg.use_wf_budget)
                         and bool(wf.get("match_budget"))
@@ -1165,6 +1282,12 @@ def main() -> int:
     )
     ap.add_argument("--min-limit", type=float, default=float(os.getenv("BRIDGE_MIN_LIMIT", "0.0")), help="Se >0, exige betslip_limit >= este mínimo.")
     ap.add_argument(
+        "--enforce-wf-filters",
+        action="store_true",
+        default=(os.getenv("BRIDGE_ENFORCE_WF_FILTERS", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Se true (default), aplica filtros/limiares do WF (policy_json.wf) no bridge para alinhar com OOS.",
+    )
+    ap.add_argument(
         "--use-wf-budget",
         action="store_true",
         default=(os.getenv("BRIDGE_USE_WF_BUDGET", "0").strip() in ("1", "true", "True", "yes", "YES")),
@@ -1213,6 +1336,7 @@ def main() -> int:
         policy_reload_sec=float(args.policy_reload_sec),
         policy_use_base=bool(args.policy_use_base),
         min_limit=float(args.min_limit),
+        enforce_wf_filters=bool(args.enforce_wf_filters),
         use_wf_budget=bool(args.use_wf_budget),
         bankroll_ref=(float(args.bankroll_ref) if args.bankroll_ref is not None else None),
         bankroll_json=(str(args.bankroll_json) if args.bankroll_json else None),

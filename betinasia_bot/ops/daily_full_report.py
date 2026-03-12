@@ -1104,6 +1104,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             for k in [
                 "EXECUTOR_ALLOW_LIVE",
                 "BRIDGE_USE_WF_BUDGET",
+                "BRIDGE_ENFORCE_WF_FILTERS",
                 "BRIDGE_WF_RISK_MODE_OVERRIDE",
                 "BRIDGE_BANKROLL_REF",
                 "BRIDGE_BANKROLL_JSON",
