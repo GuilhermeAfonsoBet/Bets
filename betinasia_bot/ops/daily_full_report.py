@@ -411,6 +411,102 @@ def _executor_gaps_summary(lines: list[str]) -> Dict[str, Any]:
     }
 
 
+def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
+
+    Observação: como o JSONL é escrito apenas quando há requisição/resposta, não é um heartbeat.
+    Então isso mede "silêncio" do pipeline (executor sem tráfego, audit/bridge parados, ou executor down).
+    Para aproximar "tempo em silêncio", somamos (gap - 900s) para gaps>15min (proxy de downtime acima do limiar).
+    """
+    until = until_utc or datetime.now(timezone.utc)
+    ts_all: list[datetime] = []
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        dt = _parse_iso_dt(str(res.get("created_at") or req.get("created_at") or ""))
+        if dt:
+            ts_all.append(dt)
+    ts_all.sort()
+    if not ts_all:
+        return {
+            "since_utc": since_utc.isoformat(),
+            "until_utc": until.isoformat(),
+            "n": 0,
+            "first_ts": None,
+            "last_ts": None,
+            "max_gap_s": None,
+            "gaps_gt_300s": 0,
+            "gaps_gt_900s": 0,
+            "silence_over_15m_s": 0.0,
+            "silence_over_15m_pct": None,
+        }
+    # inclui 1 ponto anterior ao since (se existir) para captar gap cruzando a borda da janela
+    prev = None
+    for dt in reversed(ts_all):
+        if dt < since_utc:
+            prev = dt
+            break
+    tsw = [dt for dt in ts_all if since_utc <= dt <= until]
+    if prev:
+        tsw = [prev] + tsw
+    tsw.sort()
+    if len(tsw) < 2:
+        return {
+            "since_utc": since_utc.isoformat(),
+            "until_utc": until.isoformat(),
+            "n": int(len(tsw)),
+            "first_ts": tsw[0].isoformat() if tsw else None,
+            "last_ts": tsw[-1].isoformat() if tsw else None,
+            "max_gap_s": None,
+            "gaps_gt_300s": 0,
+            "gaps_gt_900s": 0,
+            "silence_over_15m_s": 0.0,
+            "silence_over_15m_pct": None,
+        }
+    gaps = [(tsw[i] - tsw[i - 1]).total_seconds() for i in range(1, len(tsw))]
+    over_15 = [g for g in gaps if g > 900.0]
+    silence_over = float(sum((g - 900.0) for g in over_15)) if over_15 else 0.0
+    win_s = max(1.0, (until - since_utc).total_seconds())
+    return {
+        "since_utc": since_utc.isoformat(),
+        "until_utc": until.isoformat(),
+        "n": int(len(tsw)),
+        "first_ts": tsw[0].isoformat(),
+        "last_ts": tsw[-1].isoformat(),
+        "max_gap_s": float(max(gaps)) if gaps else None,
+        "gaps_gt_300s": int(sum(1 for g in gaps if g > 300.0)),
+        "gaps_gt_900s": int(sum(1 for g in gaps if g > 900.0)),
+        "silence_over_15m_s": float(silence_over),
+        "silence_over_15m_pct": float(silence_over / win_s * 100.0) if win_s > 0 else None,
+    }
+
+
+def _mem_available_mib() -> Optional[float]:
+    try:
+        p = Path("/proc/meminfo")
+        if not p.exists():
+            return None
+        mem_av = None
+        for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.startswith("MemAvailable:"):
+                parts = ln.split()
+                if len(parts) >= 2:
+                    mem_av = float(parts[1])  # kB
+                    break
+        if mem_av is None:
+            return None
+        return float(mem_av / 1024.0)
+    except Exception:
+        return None
+
+
 def _parse_iso_dt_best(s: Any) -> Optional[datetime]:
     try:
         if s is None:
@@ -915,6 +1011,29 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # gaps em janela fixa (24h) para prontidão LIVE
+    gaps24 = None
+    try:
+        since24 = _utcnow() - timedelta(hours=24.0)
+        gaps24 = _executor_gaps_summary_window(exec_lines, since_utc=since24)
+        if isinstance(gaps24, dict) and gaps24.get("n"):
+            s0.append("\n**Saúde do executor (últimas 24h; proxy por gaps no JSONL)**\n\n")
+            s0.append(f"- Janela: `{gaps24.get('since_utc')}` → `{gaps24.get('until_utc')}` (n={gaps24.get('n')})\n")
+            s0.append(
+                f"- Maior gap: `{_fmt_num(gaps24.get('max_gap_s'),1)}s` | gaps>15min: `{gaps24.get('gaps_gt_900s')}` | "
+                f"silêncio>15min (est.): `{_fmt_num(gaps24.get('silence_over_15m_s'),0)}s` ({_fmt_num(gaps24.get('silence_over_15m_pct'),2)}%)\n"
+            )
+    except Exception:
+        gaps24 = None
+
+    # snapshot simples de memória (ajuda a explicar latência/timeouts)
+    try:
+        mav = _mem_available_mib()
+        if mav is not None:
+            s0.append(f"\n**Recursos da VPS (snapshot)**\n\n- MemAvailable: `{_fmt_num(mav,0)} MiB`\n")
+    except Exception:
+        pass
+
     # Se o JSONL está stale, a seção "Execução por dia" vai aparecer zerada mesmo que o bridge/audit estejam rodando.
     try:
         exec_last_ts = _parse_iso_dt_best((gaps or {}).get("last_ts"))
@@ -958,14 +1077,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # latência p90 (somente sucessos)
     p90_call = None
+    p50_call = None
     try:
-        p90_call = int(((kpi_ok.get("timing_ms") or {}).get("call_to_done") or {}).get("p90") or 0) or None
+        blk = ((kpi_ok.get("timing_ms") or {}).get("call_to_done") or {})
+        p90_call = int(blk.get("p90") or 0) or None
+        p50_call = int(blk.get("p50") or 0) or None
     except Exception:
         p90_call = None
+        p50_call = None
 
     gaps15 = None
     try:
-        gaps15 = int(gaps.get("gaps_gt_900s")) if isinstance(gaps, dict) and gaps.get("gaps_gt_900s") is not None else None
+        src = gaps24 if isinstance(gaps24, dict) else gaps
+        gaps15 = int(src.get("gaps_gt_900s")) if isinstance(src, dict) and src.get("gaps_gt_900s") is not None else None
     except Exception:
         gaps15 = None
 
@@ -987,6 +1111,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
     s0.append(f"| `too_many_open_betslips` (24h, DB) | {int(err_open)} | ≤{int(thr_open_betslips)} | **{_fmt_status(chk_open)}** |\n")
     s0.append(f"| Latência p90 `call_to_done_ms` (sucessos) | {_fmt_num(p90_call,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n")
+    s0.append(f"| Latência p50 `call_to_done_ms` (sucessos) | {_fmt_num(p50_call,0)}ms | — | — |\n")
     s0.append(f"| Gaps >15min no executor_jsonl (proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
     s0.append("\n")
 
