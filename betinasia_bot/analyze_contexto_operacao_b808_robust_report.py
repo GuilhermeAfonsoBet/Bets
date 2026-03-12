@@ -5366,6 +5366,10 @@ async def main() -> int:
                 daily_pnl_exp_in = {}
                 daily_pnl_exp_back = {}
                 daily_pnl_exp_lay = {}
+                # marginal por combinação (key): séries para projeção 30d (OOS)
+                key_daily_turn: Dict[str, Dict[str, float]] = {}
+                key_daily_pnl_obs: Dict[str, Dict[str, float]] = {}
+                key_daily_pnl_exp: Dict[str, Dict[str, float]] = {}
                 # exposições para banca/liquidez (todas elegíveis)
                 oos_back_stakes_all: List[float] = []
                 oos_lay_liab_all: List[float] = []
@@ -6050,6 +6054,141 @@ async def main() -> int:
                         pnl_exp_lay = float(pnl_obs_pre_lay) * float(scale_lay_pre) + float(pnl_obs_in_lay) * float(scale_lay_in)
                         pnl_exp = float(pnl_exp_pre) + float(pnl_exp_in)
 
+                    # --- marginal por key (combinação) neste step ---
+                    # acumula por key com a mesma lógica (turnover sempre; pnl_obs apenas com ROI; pnl_exp com scaling por key)
+                    key_turn: Dict[str, float] = {}
+                    key_turn_pre: Dict[str, float] = {}
+                    key_turn_in: Dict[str, float] = {}
+                    # exposições "all" e "roi" por bucket para scaling
+                    k_back_pre_all: Dict[str, float] = {}
+                    k_back_pre_roi: Dict[str, float] = {}
+                    k_lay_pre_all: Dict[str, float] = {}
+                    k_lay_pre_roi: Dict[str, float] = {}
+                    k_back_in_all: Dict[str, float] = {}
+                    k_back_in_roi: Dict[str, float] = {}
+                    k_lay_in_all: Dict[str, float] = {}
+                    k_lay_in_roi: Dict[str, float] = {}
+                    k_pnl_obs_pre_back: Dict[str, float] = {}
+                    k_pnl_obs_pre_lay: Dict[str, float] = {}
+                    k_pnl_obs_in_back: Dict[str, float] = {}
+                    k_pnl_obs_in_lay: Dict[str, float] = {}
+                    # Repassa test_elig já dedupado e pós-budget (mesmo loop acima fez budget e contou turn_all).
+                    # Aqui reusamos as mesmas regras básicas para estimar marginal por key; custo é pequeno (N de eventos por step é moderado).
+                    spent_back_k: Dict[int, float] = {}
+                    spent_lay_k: Dict[int, float] = {}
+                    # ROI do treino por combinação (necessário se wf_scheme_* = ROI_TRAIN)
+                    roi_train_map_local = None
+                    try:
+                        roi_train_map_local = {k: _safe_float((diag or {}).get(k, {}).get("roi_mean")) for k in active}
+                    except Exception:
+                        roi_train_map_local = None
+
+                    for ev in test_elig:
+                        kk = _key(ev)
+                        res_sz = _sizing_for_event(
+                            ev,
+                            roi_train_map=roi_train_map_local,
+                        )
+                        if isinstance(res_sz, tuple) and len(res_sz) == 2:
+                            st_eq, exp = res_sz
+                            _why = None
+                        else:
+                            st_eq, exp, _why = res_sz
+                        if st_eq is None or exp is None:
+                            continue
+                        # aplica budget por jogo igual ao loop principal (para que marginais batam com total)
+                        mid = int(ev.get("match_id") or 0)
+                        if ev.get("side") == "Back":
+                            bud_m = float(bud_back)
+                            if bud_risk_mode == "signals_sqrt":
+                                bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
+                            elif bud_risk_mode == "signals_linear":
+                                bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                            cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                            rem = max(0.0, float(bud_m) - float(spent_back_k.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                            if exp_use <= 0:
+                                continue
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_back_k[mid] = float(spent_back_k.get(mid, 0.0)) + float(exp_use)
+                        else:
+                            bud_m = float(bud_lay)
+                            if bud_risk_mode == "signals_sqrt":
+                                bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
+                            elif bud_risk_mode == "signals_linear":
+                                bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                            cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
+                            rem = max(0.0, float(bud_m) - float(spent_lay_k.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_m))
+                            if exp_use <= 0:
+                                continue
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_lay_k[mid] = float(spent_lay_k.get(mid, 0.0)) + float(exp_use)
+
+                        key_turn[kk] = key_turn.get(kk, 0.0) + float(st_eq)
+                        if ev.get("regime") == "Pre":
+                            key_turn_pre[kk] = key_turn_pre.get(kk, 0.0) + float(st_eq)
+                        else:
+                            key_turn_in[kk] = key_turn_in.get(kk, 0.0) + float(st_eq)
+
+                        # exposições para scaling (all vs roi)
+                        if ev.get("regime") == "Pre":
+                            if ev.get("side") == "Back":
+                                k_back_pre_all[kk] = k_back_pre_all.get(kk, 0.0) + float(exp)
+                            else:
+                                k_lay_pre_all[kk] = k_lay_pre_all.get(kk, 0.0) + float(exp)
+                        else:
+                            if ev.get("side") == "Back":
+                                k_back_in_all[kk] = k_back_in_all.get(kk, 0.0) + float(exp)
+                            else:
+                                k_lay_in_all[kk] = k_lay_in_all.get(kk, 0.0) + float(exp)
+
+                        if ev.get("roi") is None:
+                            continue
+                        roi_pct = float(ev.get("roi"))
+                        p = float(exp) * float(roi_pct) / 100.0
+                        if ev.get("regime") == "Pre":
+                            if ev.get("side") == "Back":
+                                k_back_pre_roi[kk] = k_back_pre_roi.get(kk, 0.0) + float(exp)
+                                k_pnl_obs_pre_back[kk] = k_pnl_obs_pre_back.get(kk, 0.0) + float(p)
+                            else:
+                                k_lay_pre_roi[kk] = k_lay_pre_roi.get(kk, 0.0) + float(exp)
+                                k_pnl_obs_pre_lay[kk] = k_pnl_obs_pre_lay.get(kk, 0.0) + float(p)
+                        else:
+                            if ev.get("side") == "Back":
+                                k_back_in_roi[kk] = k_back_in_roi.get(kk, 0.0) + float(exp)
+                                k_pnl_obs_in_back[kk] = k_pnl_obs_in_back.get(kk, 0.0) + float(p)
+                            else:
+                                k_lay_in_roi[kk] = k_lay_in_roi.get(kk, 0.0) + float(exp)
+                                k_pnl_obs_in_lay[kk] = k_pnl_obs_in_lay.get(kk, 0.0) + float(p)
+
+                    # aplica expansão missing ROI por key (regime×lado)
+                    key_pnl_obs_step: Dict[str, float] = {}
+                    key_pnl_exp_step: Dict[str, float] = {}
+                    for kk in key_turn.keys():
+                        pb_pre = float(k_pnl_obs_pre_back.get(kk, 0.0))
+                        pl_pre = float(k_pnl_obs_pre_lay.get(kk, 0.0))
+                        pb_in = float(k_pnl_obs_in_back.get(kk, 0.0))
+                        pl_in = float(k_pnl_obs_in_lay.get(kk, 0.0))
+                        obs = pb_pre + pl_pre + pb_in + pl_in
+                        key_pnl_obs_step[kk] = obs
+                        expv = obs
+                        if wf_expand:
+                            sb_pre = (float(k_back_pre_all.get(kk, 0.0)) / float(k_back_pre_roi.get(kk, 0.0))) if float(k_back_pre_roi.get(kk, 0.0)) > 0 else 1.0
+                            sl_pre = (float(k_lay_pre_all.get(kk, 0.0)) / float(k_lay_pre_roi.get(kk, 0.0))) if float(k_lay_pre_roi.get(kk, 0.0)) > 0 else 1.0
+                            sb_in = (float(k_back_in_all.get(kk, 0.0)) / float(k_back_in_roi.get(kk, 0.0))) if float(k_back_in_roi.get(kk, 0.0)) > 0 else 1.0
+                            sl_in = (float(k_lay_in_all.get(kk, 0.0)) / float(k_lay_in_roi.get(kk, 0.0))) if float(k_lay_in_roi.get(kk, 0.0)) > 0 else 1.0
+                            expv = pb_pre * sb_pre + pl_pre * sl_pre + pb_in * sb_in + pl_in * sl_in
+                        key_pnl_exp_step[kk] = float(expv)
+
                     # acumula séries diárias (test pode ter vários dias)
                     for dday in test_days:
                         daily_turn[dday] = daily_turn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
@@ -6067,6 +6206,15 @@ async def main() -> int:
                         daily_pnl_obs_lay[dday] = daily_pnl_obs_lay.get(dday, 0.0) + float(pnl_obs_lay) / max(1, len(test_days))
                         daily_pnl_exp_back[dday] = daily_pnl_exp_back.get(dday, 0.0) + float(pnl_exp_back) / max(1, len(test_days))
                         daily_pnl_exp_lay[dday] = daily_pnl_exp_lay.get(dday, 0.0) + float(pnl_exp_lay) / max(1, len(test_days))
+                        for kk, v in key_turn.items():
+                            key_daily_turn.setdefault(kk, {})
+                            key_daily_turn[kk][dday] = key_daily_turn[kk].get(dday, 0.0) + float(v) / max(1, len(test_days))
+                        for kk, v in key_pnl_obs_step.items():
+                            key_daily_pnl_obs.setdefault(kk, {})
+                            key_daily_pnl_obs[kk][dday] = key_daily_pnl_obs[kk].get(dday, 0.0) + float(v) / max(1, len(test_days))
+                        for kk, v in key_pnl_exp_step.items():
+                            key_daily_pnl_exp.setdefault(kk, {})
+                            key_daily_pnl_exp[kk][dday] = key_daily_pnl_exp[kk].get(dday, 0.0) + float(v) / max(1, len(test_days))
 
                     if back_st_all > 0:
                         oos_back_stakes_all.append(float(back_st_all))
@@ -6514,6 +6662,39 @@ async def main() -> int:
                 lines.append(f"| Back | {_fmt_num(turn_back_30d,2)} | {_fmt_num(profit_exp_back_30d,2)} | {_fmt_num(roi_turn_back,2)}% |\n")
                 lines.append(f"| Lay | {_fmt_num(turn_lay_30d,2)} | {_fmt_num(profit_exp_lay_30d,2)} | {_fmt_num(roi_turn_lay,2)}% |\n")
                 lines.append("\n")
+
+                # Marginal por combinação (key): turnover share + lucro marginal (projeção 30d)
+                try:
+                    if key_daily_turn:
+                        lines.append("**Marginal por combinação (OOS): turnover share e lucro 30d (exp.) por key**\n\n")
+                        lines.append(
+                            "| Combinação (key) | Turnover 30d | Share turnover | Lucro 30d (exp.) | Share lucro | ROI/turnover 30d |\n"
+                        )
+                        lines.append("|---|---:|---:|---:|---:|---:|\n")
+                        rows = []
+                        for kk, mp in key_daily_turn.items():
+                            if not isinstance(mp, dict):
+                                continue
+                            turn_k = float(sum(float(v or 0.0) for v in mp.values())) if mp else 0.0
+                            pnl_k = float(sum(float(v or 0.0) for v in (key_daily_pnl_exp.get(kk) or {}).values())) if isinstance(key_daily_pnl_exp.get(kk), dict) else 0.0
+                            # projeta 30d no mesmo critério do total (calendário)
+                            turn30_k = float(turn_k) * float(scale) if scale is not None else None
+                            prof30_k = float(pnl_k) * float(scale) if scale is not None else None
+                            if (turn30_k is None and prof30_k is None) or (turn30_k is not None and float(turn30_k) <= 0 and (prof30_k is None or float(prof30_k) == 0)):
+                                continue
+                            share_t = (float(turn30_k) / float(turn_30d)) if (turn30_k is not None and turn_30d and float(turn_30d) > 0) else None
+                            share_p = (float(prof30_k) / float(profit_exp_30d)) if (prof30_k is not None and profit_exp_30d and float(profit_exp_30d) != 0) else None
+                            roi_t = (float(prof30_k) / float(turn30_k) * 100.0) if (prof30_k is not None and turn30_k and float(turn30_k) > 0) else None
+                            rows.append((float(abs(share_t or 0.0)), kk, turn30_k, share_t, prof30_k, share_p, roi_t))
+                        rows.sort(key=lambda x: x[0], reverse=True)
+                        for _, kk, turn30_k, share_t, prof30_k, share_p, roi_t in rows[:60]:
+                            lines.append(
+                                f"| {kk} | {_fmt_num(turn30_k,2)} | {_fmt_num((share_t or 0.0)*100.0,2)}% | {_fmt_num(prof30_k,2)} | "
+                                f"{_fmt_num((share_p or 0.0)*100.0,2)}% | {_fmt_num(roi_t,2)}% |\n"
+                            )
+                        lines.append("\n")
+                except Exception:
+                    pass
 
                 # ------------------------------------------------------------
                 # 12.2 Governança por jogo (budget por match_id) — sensibilidade

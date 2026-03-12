@@ -507,6 +507,41 @@ def _mem_available_mib() -> Optional[float]:
         return None
 
 
+def _load_wf_policy_last_step(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        d = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return None
+        steps = d.get("steps") if isinstance(d.get("steps"), list) else []
+        last = steps[-1] if steps and isinstance(steps[-1], dict) else None
+        return last if isinstance(last, dict) else None
+    except Exception:
+        return None
+
+
+def _pick_prev_policy_file(policy_dir: Path, *, cur_day: str) -> Optional[Path]:
+    try:
+        if not policy_dir.exists():
+            return None
+        xs = sorted([p for p in policy_dir.glob("wf_policy_*.json") if p.is_file()])
+        if not xs:
+            return None
+        # usa o nome YYYYMMDD dentro do filename para ordenar por data
+        def _k(p: Path) -> str:
+            s = p.name.replace("wf_policy_", "").replace(".json", "")
+            return s
+        xs2 = sorted(xs, key=_k)
+        prev = None
+        for p in xs2:
+            if _k(p) < str(cur_day):
+                prev = p
+        return prev
+    except Exception:
+        return None
+
+
 def _parse_iso_dt_best(s: Any) -> Optional[datetime]:
     try:
         if s is None:
@@ -1150,6 +1185,152 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
         "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
     )
+
+    # ------------------------------------------------------------
+    # Carteira (active_keys): delta vs policy anterior + marginais OOS por key
+    # ------------------------------------------------------------
+    try:
+        cur_step = policy_last_step if isinstance(policy_last_step, dict) else None
+        cur_keys = set(cur_step.get("active_keys") or []) if cur_step else set()
+        prev_pol = _pick_prev_policy_file(cfg.wf_policy_history_dir, cur_day=str(day))
+        prev_step = _load_wf_policy_last_step(prev_pol) if prev_pol else None
+        prev_keys = set(prev_step.get("active_keys") or []) if prev_step else set()
+        if cur_keys and prev_keys:
+            entered = sorted(list(cur_keys - prev_keys))
+            exited = sorted(list(prev_keys - cur_keys))
+            s0.append("\n**Carteira (policy current): keys que entraram/sairam vs policy anterior**\n\n")
+            s0.append(f"- Policy anterior: `{prev_pol}`\n")
+            s0.append(f"- Δ keys: `{len(prev_keys)}` → `{len(cur_keys)}` (entraram `{len(entered)}`, saíram `{len(exited)}`)\n\n")
+            if entered:
+                s0.append("- **Entraram**:\n")
+                for k in entered[:40]:
+                    s0.append(f"  - `{k}`\n")
+                if len(entered) > 40:
+                    s0.append(f"  - … (+{len(entered)-40})\n")
+                s0.append("\n")
+            if exited:
+                s0.append("- **Saíram**:\n")
+                for k in exited[:40]:
+                    s0.append(f"  - `{k}`\n")
+                if len(exited) > 40:
+                    s0.append(f"  - … (+{len(exited)-40})\n")
+                s0.append("\n")
+
+            # Marginal por key (OOS): extraído do texto OOS atual (base_md)
+            if oos_txt and isinstance(oos_txt, str):
+                tbl_md, rows = _extract_md_table(oos_txt, header_startswith="| Combinação (key) | Turnover 30d |")
+                hdr = _md_table_header_cols(tbl_md)
+                if rows and hdr:
+                    idx = {c: i for i, c in enumerate(hdr)}
+
+                    def _f(x: str) -> Optional[float]:
+                        try:
+                            t = str(x).strip().replace(".", "").replace(",", ".")
+                            t = t.replace("%", "")
+                            return float(t)
+                        except Exception:
+                            return None
+
+                    mp: Dict[str, Dict[str, Any]] = {}
+                    for cols in rows:
+                        if not cols or len(cols) < len(hdr):
+                            continue
+                        k0 = str(cols[idx.get("Combinação (key)", 0)]).strip()
+                        if not k0 or k0.lower().startswith("combina"):
+                            continue
+                        mp[k0] = {
+                            "turn_30d": _f(cols[idx.get("Turnover 30d", 1)]) if "Turnover 30d" in idx else None,
+                            "share_turn_pct": _f(cols[idx.get("Share turnover", 2)]) if "Share turnover" in idx else None,
+                            "profit_30d": _f(cols[idx.get("Lucro 30d (exp.)", 3)]) if "Lucro 30d (exp.)" in idx else None,
+                            "share_profit_pct": _f(cols[idx.get("Share lucro", 4)]) if "Share lucro" in idx else None,
+                            "roi_turn_pct": _f(cols[idx.get("ROI/turnover 30d", 5)]) if "ROI/turnover 30d" in idx else None,
+                        }
+
+                    if mp and (entered or exited):
+                        s0.append("**OOS marginal por key (30d exp.) — entraram/sairam**\n\n")
+                        s0.append("| Key | Status | Turnover 30d | Share turn | Lucro 30d (exp.) | Share lucro | ROI/turn |\n")
+                        s0.append("|---|---|---:|---:|---:|---:|---:|\n")
+                        for k in entered:
+                            v = mp.get(k) or {}
+                            s0.append(
+                                f"| `{k}` | entrou | {_fmt_num(v.get('turn_30d'),2)} | {_fmt_num(v.get('share_turn_pct'),2)}% | {_fmt_num(v.get('profit_30d'),2)} | {_fmt_num(v.get('share_profit_pct'),2)}% | {_fmt_num(v.get('roi_turn_pct'),2)}% |\n"
+                            )
+                        for k in exited:
+                            v = mp.get(k) or {}
+                            s0.append(
+                                f"| `{k}` | saiu | {_fmt_num(v.get('turn_30d'),2)} | {_fmt_num(v.get('share_turn_pct'),2)}% | {_fmt_num(v.get('profit_30d'),2)} | {_fmt_num(v.get('share_profit_pct'),2)}% | {_fmt_num(v.get('roi_turn_pct'),2)}% |\n"
+                            )
+                        s0.append("\n")
+
+                        # shares top para contexto
+                        try:
+                            xs = []
+                            for k, v in mp.items():
+                                st = _f(str(v.get("share_turn_pct") or "")) if isinstance(v, dict) else None
+                                sp = _f(str(v.get("share_profit_pct") or "")) if isinstance(v, dict) else None
+                                xs.append((k, st, sp))
+                            top_turn = sorted([x for x in xs if x[1] is not None], key=lambda x: float(x[1]), reverse=True)[:10]
+                            top_prof = sorted([x for x in xs if x[2] is not None], key=lambda x: float(x[2]), reverse=True)[:10]
+                            if top_turn:
+                                s0.append("- **Top 10 por share de turnover (OOS 30d exp.)**: " + ", ".join([f"`{k}`({float(st):.2f}%)" for k, st, _ in top_turn]) + "\n")
+                            if top_prof:
+                                s0.append("- **Top 10 por share de lucro (OOS 30d exp.)**: " + ", ".join([f"`{k}`({float(sp):.2f}%)" for k, _, sp in top_prof]) + "\n")
+                            s0.append("\n")
+                        except Exception:
+                            pass
+
+            # Proxy do efeito na sensibilidade de banca: Δ da tabela 12.2b vs report_base do dia anterior (se existir)
+            try:
+                prev_day = (ts - timedelta(days=1)).astimezone(timezone.utc).strftime("%Y%m%d")
+                prev_base = cfg.out_dir / prev_day / "report_base.md"
+                if prev_base.exists() and oos_txt:
+                    prev_txt = prev_base.read_text(encoding="utf-8", errors="ignore")
+                    cur_blk = _extract_md_block(oos_txt, start="### 12.2b Sensibilidade por banca", until_any=["### 12.2c", "### 12.2d", "### 12.3", "## 10)", "## 11)"])
+                    prev_blk = _extract_md_block(prev_txt, start="### 12.2b Sensibilidade por banca", until_any=["### 12.2c", "### 12.2d", "### 12.3", "## 10)", "## 11)"])
+
+                    def _parse_sens(bl: str) -> Dict[float, Dict[str, Any]]:
+                        out = {}
+                        for ln in (bl or "").splitlines():
+                            if not ln.startswith("|") or ln.strip().startswith("|---"):
+                                continue
+                            cols = [c.strip() for c in ln.strip().strip("|").split("|")]
+                            if len(cols) < 6 or cols[0].lower().startswith("banca"):
+                                continue
+                            def _f2(s: str) -> Optional[float]:
+                                try:
+                                    t = str(s).strip().replace(".", "").replace(",", ".")
+                                    t = t.replace("%", "")
+                                    return float(t)
+                                except Exception:
+                                    return None
+                            bank = _f2(cols[0])
+                            turn = _f2(cols[1])
+                            prof = _f2(cols[2])
+                            roi = _f2(cols[4])
+                            if bank is None:
+                                continue
+                            out[float(bank)] = {"turn": turn, "profit": prof, "roi": roi}
+                        return out
+
+                    curm = _parse_sens(cur_blk)
+                    prevm = _parse_sens(prev_blk)
+                    inter = sorted(set(curm.keys()) & set(prevm.keys()))
+                    if inter:
+                        s0.append("**Efeito na sensibilidade de banca (proxy): Δ 12.2b vs dia anterior**\n\n")
+                        s0.append(f"- Base anterior: `{prev_base}`\n\n")
+                        s0.append("| Banca(ref) | Δ Turnover 30d | Δ Lucro 30d (exp.) | Δ ROI/banca 30d |\n")
+                        s0.append("|---:|---:|---:|---:|\n")
+                        for b in inter[:12]:
+                            s0.append(
+                                f"| {int(b)} | {_fmt_num((curm[b].get('turn') or 0.0)-(prevm[b].get('turn') or 0.0),2)} | "
+                                f"{_fmt_num((curm[b].get('profit') or 0.0)-(prevm[b].get('profit') or 0.0),2)} | "
+                                f"{_fmt_num((curm[b].get('roi') or 0.0)-(prevm[b].get('roi') or 0.0),2)}% |\n"
+                            )
+                        s0.append("\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # --- Seção 1: Resultados reais (shadow/live) ---
     s1 = []
