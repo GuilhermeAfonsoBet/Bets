@@ -742,8 +742,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             pass
 
     # 4) Relatórios auxiliares para seção 0/1 e apêndices (99.x)
-    adh_json = day_dir / "oos_adherence.json"
-    adh: Optional[Dict[str, Any]] = None
+    # Adherence: (a) curto para tabelas diárias; (b) longo/acumulado para slippage/combos/contrafactuais
+    adh_short_json = day_dir / "oos_adherence_short.json"
+    adh_long_json = day_dir / "oos_adherence_long.json"
+    adh_short: Optional[Dict[str, Any]] = None
+    adh_long: Optional[Dict[str, Any]] = None
     try:
         subprocess.run(
             [
@@ -757,16 +760,40 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "--tz",
                 "UTC",
                 "--days",
-                str(os.getenv("DAILY_ADHERENCE_DAYS", "7")),
+                str(os.getenv("DAILY_ADHERENCE_DAYS_TABLE", os.getenv("DAILY_ADHERENCE_DAYS", "7"))),
                 "--out",
-                str(adh_json),
+                str(adh_short_json),
             ],
             check=False,
             cwd=str(Path(__file__).resolve().parent.parent),
         )
-        adh = _read_json(adh_json)
+        adh_short = _read_json(adh_short_json)
     except Exception:
-        adh = None
+        adh_short = None
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.oos_adherence_report",
+                "--policy-json",
+                str(cfg.wf_policy_current),
+                "--executor-jsonl",
+                str(cfg.executor_jsonl),
+                "--tz",
+                "UTC",
+                "--days",
+                str(os.getenv("DAILY_ADHERENCE_DAYS_SLIPPAGE", "0")),
+                "--no-per-day",
+                "--out",
+                str(adh_long_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        adh_long = _read_json(adh_long_json)
+    except Exception:
+        adh_long = None
 
     audit_json = day_dir / "audit_status_kpis.json"
     audit_rep: Optional[Dict[str, Any]] = None
@@ -799,7 +826,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             base_txt = ""
     insample_txt, oos_txt = _split_base_into_insample_and_oos(base_txt)
-    if oos_txt:
+    oos_as_annex = (os.getenv("DAILY_OOS_AS_ANNEX", "1").strip() not in ("0", "false", "False", "no", "NO"))
+    if oos_txt and (not oos_as_annex):
         oos_txt = (
             oos_txt.replace("## 12) OOS walk-forward", "## 2) OOS walk-forward")
             .replace("## 1) OOS walk-forward", "## 2) OOS walk-forward")
@@ -1025,6 +1053,74 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             s1.append(f"| {d} | {_fmt_num(pnls.get(d), 2)} |\n")
         s1.append("\n")
 
+        # Transparência: regras efetivas de seleção e sizing (operacional)
+        try:
+            s1.append("**Regras efetivas (seleção + sizing) — aplicadas na execução**\n\n")
+
+            # Policy WF (do daily) — define universo/combos e filtros de mercado
+            wf = policy_wf if isinstance(policy_wf, dict) else {}
+            if wf:
+                s1.append("| Policy (WF) | Valor |\n|---|---|\n")
+                for k in [
+                    "train_days",
+                    "test_days",
+                    "step_days",
+                    "min_matches",
+                    "key_by_league",
+                    "key_by_league_scope",
+                    "ah_max_abs_line",
+                    "ah_scope",
+                    "liquidity_mode",
+                    "liquidity_scope",
+                    "liquidity_min_limit",
+                ]:
+                    if k in wf:
+                        s1.append(f"| {k} | `{wf.get(k)}` |\n")
+                s1.append("\n")
+            if isinstance(policy_last_step, dict):
+                s1.append(f"- Último step (janelas): `train={policy_last_step.get('train')}` | `test={policy_last_step.get('test')}`\n")
+                s1.append(f"- Ativas: `keys={len(list(policy_last_step.get('active_keys') or []))}` | `base={len(list(policy_last_step.get('active_keys_base') or []))}`\n\n")
+
+            # Risk params (manual) — governa budget/caps por jogo e sizing base
+            rp_path = os.getenv("BRIDGE_RISK_PARAMS_JSON", "").strip()
+            rp = _read_json(Path(rp_path)) if rp_path else None
+            if isinstance(rp, dict) and rp:
+                s1.append("| Risk params (manual) | Valor |\n|---|---|\n")
+                for k in [
+                    "budget_back_frac",
+                    "budget_lay_frac",
+                    "cap_signal_frac",
+                    "cap_event_back_frac",
+                    "cap_event_lay_frac",
+                    "stake_pct_of_limit",
+                    "stake_cap_abs",
+                ]:
+                    if k in rp:
+                        s1.append(f"| {k} | `{rp.get(k)}` |\n")
+                s1.append("\n")
+
+            # Bridge/executor: modo e fontes principais
+            s1.append("| Runtime | Valor |\n|---|---|\n")
+            for k in [
+                "EXECUTOR_ALLOW_LIVE",
+                "BRIDGE_USE_WF_BUDGET",
+                "BRIDGE_WF_RISK_MODE_OVERRIDE",
+                "BRIDGE_BANKROLL_REF",
+                "BRIDGE_BANKROLL_JSON",
+                "BRIDGE_POLICY_JSON",
+                "BRIDGE_RISK_PARAMS_JSON",
+            ]:
+                v = os.getenv(k, "")
+                if v:
+                    s1.append(f"| {k} | `{v}` |\n")
+            s1.append("\n")
+
+            s1.append(
+                "_Nota: filtro **AH** é por **|linha|** (ex.: `ah_max_abs_line=2.0` significa |line|≤2.0), não por odds; odds médias >2 podem ocorrer mesmo com AH válido._\n\n"
+            )
+        except Exception:
+            pass
+
         # drawdown e sharpe (curto, usando a própria janela da série)
         dd = _max_drawdown({k: float(v) for k, v in pnls.items()})
         dd_w = _max_drawdown(_agg_by_week({k: float(v) for k, v in pnls.items()}))
@@ -1091,14 +1187,17 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     else:
         s1.append("_Sem série de accounting disponível para métricas diárias/Sharpe/DD (ver 99.1)._ \n\n")
 
-    # execução (contagens + stake médio) via aderência (7 dias)
-    if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
+    adh_day = adh_short if isinstance(adh_short, dict) else None
+    adh_slip = adh_long if isinstance(adh_long, dict) else (adh_day if isinstance(adh_day, dict) else None)
+
+    # execução (contagens + stake médio) via aderência (janela curta)
+    if isinstance(adh_day, dict) and isinstance(adh_day.get("per_day"), list) and adh_day.get("per_day"):
         s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
         s1.append(
             "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | P&L total (acct) | P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
         )
         s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-        for it in adh.get("per_day") or []:
+        for it in adh_day.get("per_day") or []:
             if not isinstance(it, dict):
                 continue
             ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
@@ -1139,11 +1238,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         s1.append("\n")
 
         # slippage x ROI (3 buckets raw com sinal) — acumulado na janela (não só um dia)
-        raw_total = adh.get("slippage_vs_roi_raw_total_ctx") if isinstance(adh.get("slippage_vs_roi_raw_total_ctx"), dict) else (
-            adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
-        )
+        raw_total = {}
+        if isinstance(adh_slip, dict):
+            raw_total = adh_slip.get("slippage_vs_roi_raw_total_ctx") if isinstance(adh_slip.get("slippage_vs_roi_raw_total_ctx"), dict) else (
+                adh_slip.get("slippage_vs_roi_raw_total") if isinstance(adh_slip.get("slippage_vs_roi_raw_total"), dict) else {}
+            )
         if isinstance(raw_total, dict) and raw_total:
-            s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (últimos `{int(adh.get('range', {}).get('days') or 0)}` dias)**\n\n")
+            try:
+                rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                s1.append(
+                    f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`)**\n\n"
+                )
+            except Exception:
+                s1.append("**Slippage × ROI por bucket (raw, com sinal) — acumulado**\n\n")
             for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
                 b = raw_total.get(side_key) if isinstance(raw_total.get(side_key), dict) else {}
                 buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
@@ -1158,7 +1265,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     )
                 s1.append("\n")
             # Lay também em ROI por stake (bounded; sanity-check)
-            lay_stake_blk = adh.get("slippage_vs_roi_raw_total_ctx_lay_stake") if isinstance(adh.get("slippage_vs_roi_raw_total_ctx_lay_stake"), dict) else {}
+            lay_stake_blk = adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake"), dict)) else {}
             b2 = lay_stake_blk.get("lay") if isinstance(lay_stake_blk.get("lay"), dict) else {}
             buckets02 = b2.get("buckets") if isinstance(b2.get("buckets"), list) else []
             buckets2 = _slip_raw_3bucket_rows(buckets02)
@@ -1168,8 +1275,48 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 for row in buckets2:
                     s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n")
                 s1.append("\n")
+
+            # Contrafactual: filtro de slippage (placar) — não apostar se Back raw<=-2% e Lay raw>2%
+            try:
+                cf = adh_slip.get("slippage_filter_counterfactual") if isinstance(adh_slip, dict) else None
+                if isinstance(cf, dict) and isinstance(cf.get("rule"), dict):
+                    b = cf.get("back") if isinstance(cf.get("back"), dict) else {}
+                    l = cf.get("lay") if isinstance(cf.get("lay"), dict) else {}
+                    if (int(b.get("n") or 0) + int(l.get("n") or 0)) > 0:
+                        s1.append("**Contrafactual (placar): aplicar filtro de slippage**\n\n")
+                        s1.append("- Regra: **Back** pula `slippage_raw_pct <= -2%`; **Lay** pula `slippage_raw_pct > 2%`.\n")
+                        s1.append("- Observação: usa somente execuções com ROI via placar; não é o P&L do accounting.\n\n")
+                        s1.append("| Lado | n (base) | P&L (base) | Exposição (base) | n (após filtro) | P&L (após) | Exposição (após) |\n")
+                        s1.append("|---|---:|---:|---:|---:|---:|---:|\n")
+                        s1.append(f"| Back | {int(b.get('n') or 0)} | {_fmt_num(b.get('pnl'),2)} | {_fmt_num(b.get('stake'),2)} | {int(b.get('n_filtered') or 0)} | {_fmt_num(b.get('pnl_filtered'),2)} | {_fmt_num(b.get('stake_filtered'),2)} |\n")
+                        s1.append(f"| Lay (liab) | {int(l.get('n') or 0)} | {_fmt_num(l.get('pnl'),2)} | {_fmt_num(l.get('liability'),2)} | {int(l.get('n_filtered') or 0)} | {_fmt_num(l.get('pnl_filtered'),2)} | {_fmt_num(l.get('liability_filtered'),2)} |\n")
+                        try:
+                            pnl0 = float(b.get("pnl") or 0.0) + float(l.get("pnl") or 0.0)
+                            pnl1 = float(b.get("pnl_filtered") or 0.0) + float(l.get("pnl_filtered") or 0.0)
+                            s1.append(f"| **Total** | — | {_fmt_num(pnl0,2)} | — | — | {_fmt_num(pnl1,2)} | — |\n")
+                        except Exception:
+                            pass
+                        s1.append("\n")
+            except Exception:
+                pass
+
+            # Diagnóstico AH (linha) observado na execução
+            try:
+                ah = adh_slip.get("observed_ah_line_abs") if isinstance(adh_slip, dict) else None
+                if isinstance(ah, dict):
+                    thr = ah.get("threshold")
+                    scope = ah.get("scope")
+                    allx = ah.get("all_exec") if isinstance(ah.get("all_exec"), dict) else {}
+                    covx = ah.get("cov_placar") if isinstance(ah.get("cov_placar"), dict) else {}
+                    if int(allx.get("n") or 0) > 0:
+                        s1.append("**Diagnóstico AH (linha) observado na execução**\n\n")
+                        s1.append(f"- Policy: `ah_max_abs_line={thr}` | `ah_scope={scope}`\n")
+                        s1.append(f"- Execuções (todas): `n={int(allx.get('n') or 0)}` | `max|line|={_fmt_num(allx.get('max_abs_line'),2)}` | `n_over={int(allx.get('n_over') or 0)}`\n")
+                        s1.append(f"- Execuções com placar/ROI: `n={int(covx.get('n') or 0)}` | `max|line|={_fmt_num(covx.get('max_abs_line'),2)}` | `n_over={int(covx.get('n_over') or 0)}`\n\n")
+            except Exception:
+                pass
             # Por combinação (top por volume)
-            rows = adh.get("slippage_vs_roi_raw_by_combo_top") if isinstance(adh.get("slippage_vs_roi_raw_by_combo_top"), list) else []
+            rows = adh_slip.get("slippage_vs_roi_raw_by_combo_top") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_by_combo_top"), list)) else []
             if rows:
                 try:
                     back_rows = [r for r in rows if isinstance(r, dict) and str(r.get("side")) == "Back"]
@@ -1204,7 +1351,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     pass
         else:
             # fallback: último dia com dados
-            last = _pick_last_day_with_slippage_vs_roi_raw(list(adh.get("per_day") or []))
+            last = _pick_last_day_with_slippage_vs_roi_raw(list(adh_day.get("per_day") or [])) if isinstance(adh_day, dict) else None
             if isinstance(last, dict):
                 ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
                 rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
@@ -1708,15 +1855,17 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # 99.4 Aderência OOS (policy por dia × execução)
     try:
-        if isinstance(adh, dict) and isinstance(adh.get("per_day"), list) and adh.get("per_day"):
+        if isinstance(adh_day, dict) and isinstance(adh_day.get("per_day"), list) and adh_day.get("per_day"):
             extra.append("\n### 99.4 Aderência OOS (portfolio por dia × execução)\n\n")
-            extra.append(f"- Arquivo: `{adh_json}`\n")
+            extra.append(f"- Arquivo (curto): `{adh_short_json}`\n")
+            if adh_long_json:
+                extra.append(f"- Arquivo (acumulado/slippage): `{adh_long_json}`\n")
             extra.append(f"- Policy current: `{cfg.wf_policy_current}`\n\n")
 
             extra.append("**Resumo (últimos dias)**\n\n")
             extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | P&L total |\n")
             extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-            for it in adh.get("per_day") or []:
+            for it in adh_day.get("per_day") or []:
                 if not isinstance(it, dict):
                     continue
                 pol = it.get("policy") if isinstance(it.get("policy"), dict) else {}
@@ -1790,7 +1939,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 if best:
                     # share observado (últimos dias) para decompor back/lay como estimativa
                     pnl_b = pnl_l = 0.0
-                    for it in adh.get("per_day") or []:
+                    for it in adh_day.get("per_day") or []:
                         ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
                         back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
                         lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
@@ -1810,9 +1959,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 pass
 
             # Slippage × ROI (com sinal): acumulado na janela (para análise estatística)
-            raw_total = adh.get("slippage_vs_roi_raw_total") if isinstance(adh.get("slippage_vs_roi_raw_total"), dict) else {}
+            raw_total = adh_slip.get("slippage_vs_roi_raw_total") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_total"), dict)) else {}
             if isinstance(raw_total, dict) and raw_total:
-                extra.append(f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (últimos `{int(adh.get('range', {}).get('days') or 0)}` dias)**\n\n")
+                try:
+                    rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                    extra.append(
+                        f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`)**\n\n"
+                    )
+                except Exception:
+                    extra.append("**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado**\n\n")
                 for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
                     blk = raw_total.get(side_key) if isinstance(raw_total.get(side_key), dict) else {}
                     buckets0 = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
@@ -1914,8 +2069,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     if insample_txt.strip():
         insample_wrapped = "## 3) In-sample (detalhe)\n\n" + _demote_h2_to_h3(insample_txt.strip() + "\n")
 
-    combined_core = "".join(s0) + "".join(s1) + (oos_txt.strip() + "\n\n" if oos_txt.strip() else "") + insample_wrapped
-    combined_md.write_text(combined_core + "".join(extra), encoding="utf-8")
+    oos_annex = ""
+    if oos_as_annex and oos_txt.strip():
+        oos_annex = "## Anexo A) OOS walk-forward (Seção 12)\n\n" + _demote_h2_to_h3(oos_txt.strip() + "\n")
+    combined_core = "".join(s0) + "".join(s1) + insample_wrapped
+    combined_md.write_text(combined_core + "".join(extra) + oos_annex, encoding="utf-8")
 
     # 5) PDF
     pdf = day_dir / "report_daily.pdf"

@@ -564,7 +564,8 @@ async def run_report(
     tz_name: str,
     days: int,
     include_today: bool,
-    out_json: Optional[Path],
+    no_per_day: bool = False,
+    out_json: Optional[Path] = None,
 ) -> Dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
     # intervalo de dias (por timezone do report)
@@ -577,7 +578,6 @@ async def run_report(
         tz = timezone.utc
     now_local = now_utc.astimezone(tz)
     end_day = now_local.date() if include_today else (now_local.date() - timedelta(days=1))
-    start_day = end_day - timedelta(days=max(0, int(days) - 1))
 
     policy = _load_json(policy_json) or {}
     active_by_day = _active_keys_by_day_from_policy(policy, tz_name=tz_name)
@@ -585,6 +585,18 @@ async def run_report(
     last_step = steps[-1] if steps and isinstance(steps[-1], dict) else None
 
     exec_rows = _parse_executor_jsonl(executor_jsonl)
+
+    # days<=0 => período completo (desde o primeiro evento presente no jsonl)
+    if int(days) <= 0:
+        if exec_rows:
+            try:
+                start_day = min(e.created_at.astimezone(tz).date() for e in exec_rows)
+            except Exception:
+                start_day = end_day
+        else:
+            start_day = end_day
+    else:
+        start_day = end_day - timedelta(days=max(0, int(days) - 1))
     db = Database()
     await db.connect()
 
@@ -601,6 +613,214 @@ async def run_report(
     total_rows_ctx_back: List[Dict[str, Any]] = []
     total_rows_ctx_lay: List[Dict[str, Any]] = []
     total_rows_ctx_lay_stake: List[Dict[str, Any]] = []
+    # contrafactual: filtro de slippage (apenas execuções com ROI via placar)
+    cf = {
+        "rule": {"back_skip_raw_pct_le": -2.0, "lay_skip_raw_pct_gt": 2.0},
+        "note": "Contrafactual baseado apenas nas execuções com ROI via placar (audit+scores+odd). Não é P&L accounting.",
+        "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
+        "lay": {"n": 0, "pnl": 0.0, "liability": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "liability_filtered": 0.0},
+    }
+
+    # Diagnóstico AH (linha): o filtro do WF é por |line|, não por odds.
+    wf_cfg = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
+    ah_thr = None
+    try:
+        ah_thr = float(wf_cfg.get("ah_max_abs_line")) if wf_cfg.get("ah_max_abs_line") is not None else None
+    except Exception:
+        ah_thr = None
+    ah_scope = str(wf_cfg.get("ah_scope") or "pre").strip().lower()  # pre|all|in
+    ah_obs = {
+        "threshold": ah_thr,
+        "scope": ah_scope,
+        "all_exec": {"n": 0, "n_over": 0, "max_abs_line": None},
+        "cov_placar": {"n": 0, "n_over": 0, "max_abs_line": None},
+    }
+
+    def _ah_apply_for_regime(regime: str) -> bool:
+        r = str(regime).strip().lower()
+        if ah_scope == "all":
+            return True
+        if ah_scope == "in":
+            return r == "in"
+        return r == "pre"
+
+    def _ah_track(bucket: str, *, line: Optional[str], regime: str) -> None:
+        if not line:
+            return
+        try:
+            x = abs(float(str(line).strip()))
+        except Exception:
+            return
+        blk = ah_obs.get(bucket) if isinstance(ah_obs.get(bucket), dict) else None
+        if not blk:
+            return
+        blk["n"] = int(blk.get("n") or 0) + 1
+        try:
+            mx = blk.get("max_abs_line")
+            blk["max_abs_line"] = float(x) if mx is None else max(float(mx), float(x))
+        except Exception:
+            pass
+        if ah_thr is not None and _ah_apply_for_regime(regime) and float(x) > float(ah_thr):
+            blk["n_over"] = int(blk.get("n_over") or 0) + 1
+    # Modo "totais apenas": evita loop por dia e reduz queries.
+    if bool(no_per_day):
+        start_utc0, _ = _local_day_bounds_utc(day=start_day, tz_name=tz_name)
+        _, end_utc0 = _local_day_bounds_utc(day=end_day, tz_name=tz_name)
+        xs = [e for e in exec_rows if start_utc0 <= e.created_at < end_utc0]
+        audit_ids = sorted({int(e.audit_id) for e in xs if e.audit_id is not None})
+        audit_map = await _fetch_audit_rows_for_ids(db, audit_ids)
+
+        for e in xs:
+            # diagnóstico AH em todas as execuções (com ou sem placar)
+            try:
+                _ah_track("all_exec", line=e.line, regime=("In" if bool(e.is_live) else "Pre"))
+            except Exception:
+                pass
+            a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
+            if not a:
+                continue
+            try:
+                _ah_track("cov_placar", line=str(a.get("line") or e.line or ""), regime=("In" if bool(e.is_live) else "Pre"))
+            except Exception:
+                pass
+            mult = _mult_back_from_scores(a.get("line") or e.line, a.get("side") or (e.side or ""), a.get("home_score"), a.get("away_score"))
+            if mult is None:
+                continue
+            odd = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+            if odd is None:
+                continue
+            side = str(e.exec_side or "").strip().lower()
+            raw_pct = _slip_raw_pct(odd_dec=e.odd_decision, odd_fin=e.odd_final)
+            cost_pct = _slip_cost_pct(exec_side=side, odd_dec=e.odd_decision, odd_fin=e.odd_final)
+
+            if side == "back":
+                stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
+                roi = _roi_back_pct(float(odd), float(mult))
+                pnl = stake * roi / 100.0
+                if cost_pct is not None:
+                    total_pairs_cost_back.append((float(cost_pct), float(roi)))
+                if raw_pct is not None:
+                    total_pairs_raw_back.append((float(raw_pct), float(roi)))
+                    total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                    try:
+                        regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                        comb = f"Back_{regime}_Any"
+                        comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi)))
+                        comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": None})
+                    except Exception:
+                        pass
+                cf["back"]["n"] += 1
+                cf["back"]["pnl"] += float(pnl)
+                cf["back"]["stake"] += float(stake)
+                skip = (raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                if not skip:
+                    cf["back"]["n_filtered"] += 1
+                    cf["back"]["pnl_filtered"] += float(pnl)
+                    cf["back"]["stake_filtered"] += float(stake)
+            elif side == "lay":
+                stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
+                liab = stake * max(0.0, float(odd) - 1.0)
+                roi_liab = _roi_lay_pct_per_liability(float(odd), float(mult))
+                if roi_liab is None:
+                    continue
+                pnl = liab * float(roi_liab) / 100.0
+                if cost_pct is not None:
+                    total_pairs_cost_lay.append((float(cost_pct), float(roi_liab)))
+                if raw_pct is not None:
+                    total_pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
+                    total_rows_ctx_lay.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_liab), "odd": float(odd), "exposure": float(liab)})
+                    try:
+                        roi_st = (float(pnl) / float(stake) * 100.0) if stake > 0 else None
+                    except Exception:
+                        roi_st = None
+                    if roi_st is not None:
+                        total_rows_ctx_lay_stake.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_st), "odd": float(odd), "exposure": float(stake)})
+                    try:
+                        regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                        rev = _combo_rev_yes_no(a)
+                        comb = f"Lay_{regime}_{rev}"
+                        comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi_liab)))
+                        comb_meta.setdefault(comb, {"side": "Lay", "regime": regime, "reversal": rev, "league": None})
+                    except Exception:
+                        pass
+                cf["lay"]["n"] += 1
+                cf["lay"]["pnl"] += float(pnl)
+                cf["lay"]["liability"] += float(liab)
+                skip = (raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                if not skip:
+                    cf["lay"]["n_filtered"] += 1
+                    cf["lay"]["pnl_filtered"] += float(pnl)
+                    cf["lay"]["liability_filtered"] += float(liab)
+
+        # carry-forward do último step se existir (mesma lógica do modo per_day)
+        if last_step and isinstance(last_step, dict):
+            # sem per_day, não há o que preencher aqui
+            pass
+
+        # build output (per_day vazio)
+        out = {
+            "ts_utc": now_utc.isoformat(),
+            "tz": tz_name,
+            "policy_json": str(policy_json),
+            "executor_jsonl": str(executor_jsonl),
+            "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
+            "policy_days": active_by_day,
+            "per_day": [],
+            "observed_ah_line_abs": ah_obs,
+            "slippage_filter_counterfactual": cf,
+            "slippage_vs_roi_raw_total": {
+                "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
+                "lay": {"buckets": _bucketize_3way_raw(total_pairs_raw_lay)},
+            },
+            "slippage_vs_roi_raw_total_ctx": {
+                "back": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back)},
+                "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay)},
+            },
+            "slippage_vs_roi_raw_total_ctx_lay_stake": {
+                "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay_stake)},
+            },
+            "slippage_vs_roi_total": {
+                "back": {
+                    "n": int(len(total_pairs_cost_back)),
+                    "corr_cost_pct_vs_roi": _pearson([c for c, _ in total_pairs_cost_back], [r for _, r in total_pairs_cost_back]) if total_pairs_cost_back else None,
+                },
+                "lay": {
+                    "n": int(len(total_pairs_cost_lay)),
+                    "corr_cost_pct_vs_roi": _pearson([c for c, _ in total_pairs_cost_lay], [r for _, r in total_pairs_cost_lay]) if total_pairs_cost_lay else None,
+                },
+            },
+        }
+        # combos (já sem liga)
+        try:
+            rows = []
+            for comb, pairs in (comb_pairs_raw or {}).items():
+                if not pairs:
+                    continue
+                meta = comb_meta.get(comb) or {}
+                buckets = _bucketize_3way_raw(pairs)
+                corr = _pearson([s for s, _ in pairs], [r for _, r in pairs]) if len(pairs) >= 5 else None
+                rows.append(
+                    {
+                        "comb": comb,
+                        "n": int(len(pairs)),
+                        "side": meta.get("side"),
+                        "regime": meta.get("regime"),
+                        "reversal": meta.get("reversal"),
+                        "league": None,
+                        "corr_raw_pct_vs_roi": corr,
+                        "buckets": buckets,
+                    }
+                )
+            rows.sort(key=lambda r: int(r.get("n") or 0), reverse=True)
+            out["slippage_vs_roi_raw_by_combo_top"] = rows[:40]
+        except Exception:
+            pass
+        out = _json_safe(out)
+        if out_json:
+            out_json.parent.mkdir(parents=True, exist_ok=True)
+            out_json.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
 
@@ -609,6 +829,12 @@ async def run_report(
 
         # executions in that window
         xs = [e for e in exec_rows if start_utc <= e.created_at < end_utc]
+        # diagnóstico AH (all exec)
+        for e in xs:
+            try:
+                _ah_track("all_exec", line=e.line, regime=("In" if bool(e.is_live) else "Pre"))
+            except Exception:
+                continue
         # fetch audits for ROI
         audit_ids = sorted({int(e.audit_id) for e in xs if e.audit_id is not None})
         audit_map = await _fetch_audit_rows_for_ids(db, audit_ids)
@@ -708,6 +934,10 @@ async def run_report(
             a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
             if not a:
                 continue
+            try:
+                _ah_track("cov_placar", line=str(a.get("line") or e.line or ""), regime=("In" if bool(e.is_live) else "Pre"))
+            except Exception:
+                pass
             mult = _mult_back_from_scores(a.get("line") or e.line, a.get("side") or (e.side or ""), a.get("home_score"), a.get("away_score"))
             if mult is None:
                 continue
@@ -757,20 +987,26 @@ async def run_report(
                 if raw_pct is not None:
                     pairs_raw_back.append((float(raw_pct), float(roi)))
                     total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
-                    # por combinação (alinha com chave do WF quando key_by_league está ativo)
+                    # por combinação (sem quebra por liga): Back/Lay × Pre/In × Yes/No/Any
                     try:
-                        wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
-                        key_by_league = bool(wf.get("key_by_league"))
-                        scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
                         regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
-                        league = str(a.get("league") or "").strip()
                         comb = f"Back_{regime}_Any"
-                        if key_by_league and (scope == "all" or regime == "Pre") and league:
-                            comb = f"{comb}__{league}"
                         comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi)))
-                        comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": league if league else None})
+                        comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": None})
                     except Exception:
                         pass
+                # contrafactual slippage filter (Back): pula raw<=-2%
+                try:
+                    cf["back"]["n"] += 1
+                    cf["back"]["pnl"] += float(pnl)
+                    cf["back"]["stake"] += float(stake)
+                    skip = (raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                    if not skip:
+                        cf["back"]["n_filtered"] += 1
+                        cf["back"]["pnl_filtered"] += float(pnl)
+                        cf["back"]["stake_filtered"] += float(stake)
+                except Exception:
+                    pass
             elif side == "lay":
                 perf["lay"]["n_cov"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
@@ -815,19 +1051,25 @@ async def run_report(
                         # reusa o mesmo bucketizador (slip_raw_pct vs ROI), mas com exposure=stake
                         total_rows_ctx_lay_stake.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_st), "odd": float(odd), "exposure": float(stake)})
                     try:
-                        wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
-                        key_by_league = bool(wf.get("key_by_league"))
-                        scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
                         regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
-                        league = str(a.get("league") or "").strip()
                         rev = _combo_rev_yes_no(a)
                         comb = f"Lay_{regime}_{rev}"
-                        if key_by_league and (scope == "all" or regime == "Pre") and league:
-                            comb = f"{comb}__{league}"
                         comb_pairs_raw.setdefault(comb, []).append((float(raw_pct), float(roi_liab)))
-                        comb_meta.setdefault(comb, {"side": "Lay", "regime": regime, "reversal": rev, "league": league if league else None})
+                        comb_meta.setdefault(comb, {"side": "Lay", "regime": regime, "reversal": rev, "league": None})
                     except Exception:
                         pass
+                # contrafactual slippage filter (Lay): pula raw>2%
+                try:
+                    cf["lay"]["n"] += 1
+                    cf["lay"]["pnl"] += float(pnl)
+                    cf["lay"]["liability"] += float(liab)
+                    skip = (raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                    if not skip:
+                        cf["lay"]["n_filtered"] += 1
+                        cf["lay"]["pnl_filtered"] += float(pnl)
+                        cf["lay"]["liability_filtered"] += float(liab)
+                except Exception:
+                    pass
 
         # ROIs agregados
         back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum_cov"]) * 100.0) if perf["back"]["stake_sum_cov"] else None
@@ -905,6 +1147,8 @@ async def run_report(
         "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
         "policy_days": active_by_day,
         "per_day": per_day,
+        "observed_ah_line_abs": ah_obs,
+        "slippage_filter_counterfactual": cf,
         # Estatística acumulada na janela
         "slippage_vs_roi_raw_total": {
             "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
@@ -968,6 +1212,7 @@ def main() -> int:
     ap.add_argument("--tz", default=os.getenv("REPORT_TZ", "America/Sao_Paulo"))
     ap.add_argument("--days", type=int, default=int(os.getenv("OOS_ADHERENCE_DAYS", "7")))
     ap.add_argument("--include-today", action="store_true", default=(os.getenv("OOS_ADHERENCE_INCLUDE_TODAY", "1").strip() not in ("0", "false", "False", "no", "NO")))
+    ap.add_argument("--no-per-day", action="store_true", default=(os.getenv("OOS_ADHERENCE_NO_PER_DAY", "0").strip() in ("1", "true", "True", "yes", "YES")))
     ap.add_argument("--out", default=os.getenv("OOS_ADHERENCE_OUT", "").strip() or None)
     args = ap.parse_args()
 
@@ -987,6 +1232,7 @@ def main() -> int:
             tz_name=str(args.tz),
             days=int(args.days),
             include_today=bool(args.include_today),
+            no_per_day=bool(args.no_per_day),
             out_json=outp,
         )
     )
