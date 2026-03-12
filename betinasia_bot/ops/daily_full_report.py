@@ -694,7 +694,7 @@ class DailyReportCfg:
     # Escala de banca/sizing (manter “10k etc.”)
     kelly_bankroll: str = os.getenv("DAILY_KELLY_BANKROLL", "10000")
     # Grid default para sempre gerar sensibilidade (pequeno o bastante para ser barato).
-    wf_bankroll_grid: str = os.getenv("DAILY_WF_BANKROLL_GRID", "10000,50000,100000,500000").strip()
+    wf_bankroll_grid: str = os.getenv("DAILY_WF_BANKROLL_GRID", "10000,50000,100000,500000,1000000,1500000,3000000,5000000").strip()
     executor_jsonl: Path = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     exec_kpi_last: int = int(os.getenv("DAILY_EXEC_KPI_LAST", "50000"))
     send_telegram: bool = (os.getenv("DAILY_REPORT_TELEGRAM", "1").strip() not in ("0", "false", "False", "no", "NO"))

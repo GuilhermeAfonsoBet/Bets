@@ -6967,7 +6967,7 @@ async def main() -> int:
                         bank_ref: float,
                         *,
                         roi_train_map: Optional[Dict[str, float]] = None,
-                    ) -> Tuple[Optional[float], Optional[float]]:
+                    ) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
                         """
                         Sizing do evento no OOS para uma banca explícita `bank_ref`.
                         Mantém os mesmos caps (BACK_CAP_FRAC/LAY_CAP_FRAC) e caps por evento (limit).
@@ -6975,10 +6975,11 @@ async def main() -> int:
                         aid = int(ev.get("audit_id"))
                         d0 = audit_by_id.get(aid)
                         if not d0:
-                            return (None, None)
+                            return (None, None, {"cap_reason": "none"})
                         sc = _scheme_for_event(ev)
 
                         if ev.get("side") == "Back":
+                            meta: Dict[str, Any] = {"cap_reason": "none"}
                             if sc == "FLAT":
                                 st = float(wf_flat_stake_back)
                             elif sc == "PROXY":
@@ -6987,81 +6988,107 @@ async def main() -> int:
                                 k = _key(ev)
                                 roi_hat = _safe_float((roi_train_map or {}).get(k))
                                 if roi_hat is None:
-                                    return (None, None)
+                                    return (None, None, {"cap_reason": "none"})
                                 f = max(0.0, float(roi_hat)) / 100.0
                                 cap = BACK_CAP_FRAC * max(1e-9, float(bank_ref))
-                                st = min(f * float(bank_ref), cap)
-                                st = min(float(st), float(_max_back_stake_event(d0)))
+                                st_uncap = f * float(bank_ref)
+                                st_bank = min(float(st_uncap), float(cap))
+                                if float(st_bank) + 1e-12 < float(st_uncap):
+                                    meta["cap_reason"] = "bank_cap"
+                                st = float(st_bank)
+                                mx = float(_max_back_stake_event(d0))
+                                if mx > 0 and float(mx) + 1e-12 < float(st):
+                                    meta["cap_reason"] = "event_limit"
+                                st = min(float(st), float(mx))
                             elif str(sc).startswith("KELLY"):
                                 # Kelly só pre-match
                                 if d0.get("is_live") is True:
-                                    return (None, None)
+                                    return (None, None, {"cap_reason": "none"})
                                 try:
                                     frac = float(str(sc).split("_")[1])
                                 except Exception:
-                                    return (None, None)
+                                    return (None, None, {"cap_reason": "none"})
                                 entry_odd = _safe_float(ev.get("entry_odd"))
                                 if entry_odd is None:
                                     entry_odd = _safe_float(d0.get("bs_odd"))
                                 f0 = _kelly_back_frac(entry_odd, d0.get("closing_odd"))
                                 if f0 is None:
-                                    return (None, None)
+                                    return (None, None, {"cap_reason": "none"})
                                 f = max(0.0, float(f0)) * float(frac)
                                 cap = BACK_CAP_FRAC * max(1e-9, float(bank_ref))
-                                st = min(f * float(bank_ref), cap)
-                                st = min(float(st), float(_max_back_stake_event(d0)))
+                                st_uncap = f * float(bank_ref)
+                                st_bank = min(float(st_uncap), float(cap))
+                                if float(st_bank) + 1e-12 < float(st_uncap):
+                                    meta["cap_reason"] = "bank_cap"
+                                st = float(st_bank)
+                                mx = float(_max_back_stake_event(d0))
+                                if mx > 0 and float(mx) + 1e-12 < float(st):
+                                    meta["cap_reason"] = "event_limit"
+                                st = min(float(st), float(mx))
                             else:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             if st is None or float(st) <= 0:
-                                return (None, None)
-                            return (float(st), float(st))
+                                return (None, None, {"cap_reason": "none"})
+                            return (float(st), float(st), meta)
 
                         # Lay: exposure = liability; turnover = stake equivalente
+                        meta = {"cap_reason": "none"}
                         lay_odd = _safe_float(ev.get("entry_odd"))
                         if lay_odd is None:
                             h = d0.get("hypothesis_details") or {}
                             lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
                         if lay_odd is None or float(lay_odd) <= 1.0:
-                            return (None, None)
+                            return (None, None, {"cap_reason": "none"})
 
                         if sc == "FLAT":
                             liab = float(wf_flat_liab_lay)
                         elif sc == "PROXY":
                             sized = _sizing_lay_liab(d0, "PROXY", bank_ref=float(lay_bank_ref))
                             if not sized:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             liab = float(sized[0])
                         elif str(sc).upper() == "ROI_TRAIN":
                             k = _key(ev)
                             roi_hat = _safe_float((roi_train_map or {}).get(k))
                             if roi_hat is None:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             f = max(0.0, float(roi_hat)) / 100.0
                             cap = LAY_CAP_FRAC * max(1e-9, float(bank_ref))
-                            liab = min(f * float(bank_ref), cap)
+                            liab_uncap = f * float(bank_ref)
+                            liab_bank = min(float(liab_uncap), float(cap))
+                            if float(liab_bank) + 1e-12 < float(liab_uncap):
+                                meta["cap_reason"] = "bank_cap"
+                            liab = float(liab_bank)
                         elif str(sc).startswith("KELLY"):
                             if d0.get("is_live") is True:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             try:
                                 frac = float(str(sc).split("_")[1])
                             except Exception:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             f0 = _kelly_lay_liab_frac(float(lay_odd), d0.get("closing_odd"))
                             if f0 is None:
-                                return (None, None)
+                                return (None, None, {"cap_reason": "none"})
                             f = max(0.0, float(f0)) * float(frac)
                             cap = LAY_CAP_FRAC * max(1e-9, float(bank_ref))
-                            liab = min(f * float(bank_ref), cap)
+                            liab_uncap = f * float(bank_ref)
+                            liab_bank = min(float(liab_uncap), float(cap))
+                            if float(liab_bank) + 1e-12 < float(liab_uncap):
+                                meta["cap_reason"] = "bank_cap"
+                            liab = float(liab_bank)
                         else:
-                            return (None, None)
+                            return (None, None, {"cap_reason": "none"})
 
                         # cap por evento via limit (stake max -> liab max)
                         max_st = _max_lay_stake_event(d0)
-                        liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                        liab_mx = float(max_st) * max(0.0, float(lay_odd) - 1.0)
+                        if liab_mx > 0 and float(liab_mx) + 1e-12 < float(liab):
+                            meta["cap_reason"] = "event_limit"
+                        liab = min(float(liab), float(liab_mx))
                         if liab is None or float(liab) <= 0:
-                            return (None, None)
+                            return (None, None, {"cap_reason": "none"})
                         stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
-                        return (float(stake_eq), float(liab))
+                        return (float(stake_eq), float(liab), meta)
 
                     def _simulate_with_bankroll(
                         *,
@@ -7086,6 +7113,23 @@ async def main() -> int:
                         back_exps: List[float] = []
                         lay_exps: List[float] = []
                         jobs: List[Tuple[datetime, datetime, float]] = []
+                        # limit-hit / cap binding stats
+                        n_considered = 0
+                        n_sized = 0
+                        n_after_budget = 0
+                        n_skip_rem0 = 0
+                        n_bind_base = 0
+                        n_bind_cap_signal = 0
+                        n_bind_match_budget = 0
+                        n_bind_both = 0
+                        n_bind_event_limit_final = 0
+                        n_bind_bank_cap_final = 0
+
+                        def _eq(a: float, b: float) -> bool:
+                            try:
+                                return abs(float(a) - float(b)) <= max(1e-9, 1e-6 * max(abs(float(a)), abs(float(b)), 1.0))
+                            except Exception:
+                                return False
 
                         for st in steps:
                             test_days = set(st.get("test_days") or [])
@@ -7117,13 +7161,21 @@ async def main() -> int:
                             spent_lay: Dict[int, float] = {}
 
                             for ev in test_elig:
-                                st_eq, exp = _sizing_for_event_bankroll(
+                                n_considered += 1
+                                st_eq, exp, meta_sz = _sizing_for_event_bankroll(
                                     ev,
                                     float(bank_ref),
                                     roi_train_map={k: _safe_float((st.get("diag") or {}).get(k, {}).get("roi_mean")) for k in active_keys},
                                 )
                                 if st_eq is None or exp is None:
                                     continue
+                                n_sized += 1
+                                base_exp = float(exp)
+                                cap_reason = None
+                                try:
+                                    cap_reason = str((meta_sz or {}).get("cap_reason") or "none")
+                                except Exception:
+                                    cap_reason = "none"
 
                                 mid = int(ev.get("match_id"))
                                 if ev.get("side") == "Back":
@@ -7135,6 +7187,7 @@ async def main() -> int:
                                     cap_sig_m = float(csf) * float(bud_m)
                                     rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                                     if rem <= 0:
+                                        n_skip_rem0 += 1
                                         continue
                                     exp_use = min(float(exp), float(rem), float(cap_sig_m))
                                     if exp_use <= 0:
@@ -7155,6 +7208,7 @@ async def main() -> int:
                                     cap_sig_m = float(csf) * float(bud_m)
                                     rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                                     if rem <= 0:
+                                        n_skip_rem0 += 1
                                         continue
                                     exp_use = min(float(exp), float(rem), float(cap_sig_m))
                                     if exp_use <= 0:
@@ -7166,6 +7220,37 @@ async def main() -> int:
                                     lay_all += float(exp)
                                     if ev.get("roi") is not None:
                                         lay_roi += float(exp)
+
+                                # binding stats (após budget)
+                                n_after_budget += 1
+                                # qual min venceu?
+                                try:
+                                    exp_use2 = float(exp)
+                                    rem2 = float(rem)
+                                    cap2 = float(cap_sig_m)
+                                    base2 = float(base_exp)
+                                    is_base = _eq(exp_use2, base2)
+                                    is_rem = _eq(exp_use2, rem2)
+                                    is_cap = _eq(exp_use2, cap2)
+                                    if is_base:
+                                        n_bind_base += 1
+                                        # se budget não cortou, cap_reason é efetivo
+                                        if cap_reason == "event_limit":
+                                            n_bind_event_limit_final += 1
+                                        elif cap_reason == "bank_cap":
+                                            n_bind_bank_cap_final += 1
+                                    else:
+                                        if is_rem and is_cap:
+                                            n_bind_both += 1
+                                        elif is_rem:
+                                            n_bind_match_budget += 1
+                                        elif is_cap:
+                                            n_bind_cap_signal += 1
+                                        else:
+                                            # fallback: considera como budget-binding genérico
+                                            n_bind_cap_signal += 1
+                                except Exception:
+                                    pass
 
                                 turn_all += float(st_eq)
                                 _append_job(ev, float(exp))
@@ -7223,6 +7308,18 @@ async def main() -> int:
                             "roi_bank_30d": roi_bank2,
                             "dd_p95": dd_p95,
                             "days": n_days2,
+                            "limit_hits": {
+                                "n_considered": int(n_considered),
+                                "n_sized": int(n_sized),
+                                "n_after_budget": int(n_after_budget),
+                                "n_skip_rem0": int(n_skip_rem0),
+                                "bind_base": int(n_bind_base),
+                                "bind_cap_signal": int(n_bind_cap_signal),
+                                "bind_match_budget": int(n_bind_match_budget),
+                                "bind_both": int(n_bind_both),
+                                "bind_event_limit_final": int(n_bind_event_limit_final),
+                                "bind_bank_cap_final": int(n_bind_bank_cap_final),
+                            },
                         }
 
                     if grid and len(grid) >= 2:
@@ -7241,13 +7338,36 @@ async def main() -> int:
                         )
                         lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
                         lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        rs = []
                         for b in grid:
                             r = _simulate_with_bankroll(bank_ref=float(b))
+                            rs.append(r)
                             lines.append(
                                 f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                             )
                         lines.append("\n")
+
+                        # Limit-hit rates (por banca): budget/caps vs limite do evento
+                        try:
+                            lines.append("**Limit-hit rate (por banca; qual cap está sendo binding)**\n\n")
+                            lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
+                            lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                            for r in rs:
+                                h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                                n = float(h.get("n_after_budget") or 0)
+                                def _pct(k: str) -> str:
+                                    try:
+                                        v = float(h.get(k) or 0)
+                                        return f"{(v/max(1.0,n))*100.0:.1f}%" if n > 0 else "—"
+                                    except Exception:
+                                        return "—"
+                                lines.append(
+                                    f"| {_fmt_num(r.get('bank_ref'),2)} | {int(n)} | {_pct('bind_event_limit_final')} | {_pct('bind_bank_cap_final')} | {_pct('bind_cap_signal')} | {_pct('bind_match_budget')} | {_pct('bind_both')} | {int(h.get('n_skip_rem0') or 0)} |\n"
+                                )
+                            lines.append("\n")
+                        except Exception:
+                            pass
 
                         # cenário solicitado: Risk(signals_sqrt) + EQ 4%/4% cap50%
                         lines.append("### 12.2c Sensibilidade por banca — RISK(signals_sqrt) + BUDGET_EQ_4.00%/4.00% cap50%\n")
@@ -7257,6 +7377,7 @@ async def main() -> int:
                         )
                         lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
                         lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        rs = []
                         for b in grid:
                             r = _simulate_with_bankroll(
                                 bank_ref=float(b),
@@ -7265,11 +7386,31 @@ async def main() -> int:
                                 cap_signal_frac_use=0.50,
                                 risk_mode="signals_sqrt",
                             )
+                            rs.append(r)
                             lines.append(
                                 f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                             )
                         lines.append("\n")
+                        try:
+                            lines.append("**Limit-hit rate (por banca; EQ 4%/4% cap50%, signals_sqrt)**\n\n")
+                            lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
+                            lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                            for r in rs:
+                                h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                                n = float(h.get("n_after_budget") or 0)
+                                def _pct(k: str) -> str:
+                                    try:
+                                        v = float(h.get(k) or 0)
+                                        return f"{(v/max(1.0,n))*100.0:.1f}%" if n > 0 else "—"
+                                    except Exception:
+                                        return "—"
+                                lines.append(
+                                    f"| {_fmt_num(r.get('bank_ref'),2)} | {int(n)} | {_pct('bind_event_limit_final')} | {_pct('bind_bank_cap_final')} | {_pct('bind_cap_signal')} | {_pct('bind_match_budget')} | {_pct('bind_both')} | {int(h.get('n_skip_rem0') or 0)} |\n"
+                                )
+                            lines.append("\n")
+                        except Exception:
+                            pass
 
                         # sensibilidade adicional: Risk(signals_sqrt) + EQ 2%/2% cap33%
                         lines.append("### 12.2d Sensibilidade por banca — RISK(signals_sqrt) + BUDGET_EQ_2.00%/2.00% cap33%\n")
@@ -7279,6 +7420,7 @@ async def main() -> int:
                         )
                         lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
                         lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        rs = []
                         for b in grid:
                             r = _simulate_with_bankroll(
                                 bank_ref=float(b),
@@ -7287,11 +7429,31 @@ async def main() -> int:
                                 cap_signal_frac_use=0.33,
                                 risk_mode="signals_sqrt",
                             )
+                            rs.append(r)
                             lines.append(
                                 f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                             )
                         lines.append("\n")
+                        try:
+                            lines.append("**Limit-hit rate (por banca; EQ 2%/2% cap33%, signals_sqrt)**\n\n")
+                            lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
+                            lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                            for r in rs:
+                                h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                                n = float(h.get("n_after_budget") or 0)
+                                def _pct(k: str) -> str:
+                                    try:
+                                        v = float(h.get(k) or 0)
+                                        return f"{(v/max(1.0,n))*100.0:.1f}%" if n > 0 else "—"
+                                    except Exception:
+                                        return "—"
+                                lines.append(
+                                    f"| {_fmt_num(r.get('bank_ref'),2)} | {int(n)} | {_pct('bind_event_limit_final')} | {_pct('bind_bank_cap_final')} | {_pct('bind_cap_signal')} | {_pct('bind_match_budget')} | {_pct('bind_both')} | {int(h.get('n_skip_rem0') or 0)} |\n"
+                                )
+                            lines.append("\n")
+                        except Exception:
+                            pass
 
                     # ------------------------------------------------------------
                     # 12.3 Liquidez por linha AH — sensibilidade OOS e política
