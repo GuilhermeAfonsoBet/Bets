@@ -260,6 +260,9 @@ class ExecutorWorker:
             except Exception:
                 return False
 
+        allow_live = os.getenv("EXECUTOR_ALLOW_LIVE", "0").strip() in ("1", "true", "True", "yes", "YES")
+        will_place_live = bool(allow_live) and bool(req.is_live)
+
         try:
             cached_id = None
             if self._betslip_cache is not None:
@@ -283,6 +286,22 @@ class ExecutorWorker:
 
             # 403 too_many_open_betslips: tenta fechar UI e re-tenta 1 vez (sem usar cache).
             if _is_too_many_open(api_result):
+                # best-effort: tenta fechar betslips cacheados antes de limpar o cache
+                try:
+                    if self._betslip_cache is not None and self._api is not None:
+                        bids = []
+                        try:
+                            bids = [str(x) for x in list(self._betslip_cache.values()) if str(x)]
+                        except Exception:
+                            bids = []
+                        # limita para não travar no cleanup
+                        for bid0 in list(dict.fromkeys(bids))[: int(os.getenv("EXECUTOR_TOO_MANY_OPEN_CLEANUP_MAX", "12"))]:
+                            try:
+                                await asyncio.wait_for(self._api.close_betslip(bid0), timeout=float(os.getenv("EXECUTOR_TOO_MANY_OPEN_CLOSE_TIMEOUT_SEC", "1.2")))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 try:
                     if self._betslip_cache is not None:
                         self._betslip_cache.clear()
@@ -364,14 +383,15 @@ class ExecutorWorker:
         }
 
         # Cleanup: no shadow/dryrun, tenta reduzir "open betslips" no servidor.
-        # Em LIVE, precisamos manter o betslip aberto para o place_order().
+        # Em LIVE (quando for realmente colocar ordem), precisamos manter o betslip aberto até o place_order().
         try:
             bid = str(getattr(api_result, "betslip_id", "") or "")
-            if bid and (not bool(req.is_live)):
+            if bid and (not bool(will_place_live)):
+                # se cache está desligado: fecha sempre
                 if self._betslip_cache is None:
                     await self._api.close_betslip(bid)
                 else:
-                    # eviction LRU: fecha os expulsos
+                    # eviction LRU: fecha os expulsos (vale para Pre e In)
                     while self._betslip_cache_max_keys > 0 and len(self._betslip_cache) > self._betslip_cache_max_keys:
                         _, old_bid = self._betslip_cache.popitem(last=False)
                         try:
@@ -644,7 +664,12 @@ class ExecutorWorker:
                 )
                 post_ms = _ms(max(0.0, time.time() - t_place1))
 
-        # 4) Montar resultado LIVE
+        # 4) Montar resultado LIVE + cleanup do betslip (evita too_many_open_betslips)
+        try:
+            await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+        except Exception:
+            pass
+
         if place.success:
             dry.status = ExecStatus.LIVE_OK
             dry.http_status = int(place.http_status or 0) or 200
