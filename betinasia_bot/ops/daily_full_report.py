@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -411,6 +411,30 @@ def _executor_gaps_summary(lines: list[str]) -> Dict[str, Any]:
     }
 
 
+def _filter_executor_jsonl_lines_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> list[str]:
+    """
+    Filtra linhas do executor_jsonl por timestamp (created_at/finished_at) para aproximar "últimas 24h".
+    Observação: JSONL não é heartbeat; se o pipeline ficou sem tráfego, a janela pode retornar N baixo.
+    """
+    until = until_utc or datetime.now(timezone.utc)
+    out: list[str] = []
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        dt = _parse_iso_dt(str(res.get("created_at") or res.get("finished_at") or req.get("created_at") or ""))
+        if not dt:
+            continue
+        if since_utc <= dt <= until:
+            out.append(ln)
+    return out
+
+
 def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
@@ -762,6 +786,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     (day_dir / "execution_kpis_all.json").write_text(json.dumps(kpi_all, ensure_ascii=False, indent=2), encoding="utf-8")
     (day_dir / "execution_kpis_ok.json").write_text(json.dumps(kpi_ok, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # recorte 24h (para prontidão LIVE): gaps/latência devem ser comparáveis a thresholds (≤8 gaps, p90≤8s, etc.)
+    exec_lines_24h: list[str] = []
+    try:
+        since24 = _utcnow() - timedelta(hours=24.0)
+        exec_lines_24h = _filter_executor_jsonl_lines_window(exec_lines, since_utc=since24)
+    except Exception:
+        exec_lines_24h = []
+    kpi_ok_24h = compute_kpis_from_lines(exec_lines_24h, path=str(cfg.executor_jsonl), only_status=["LIVE_OK", "DRY_OK"])
+    (day_dir / "execution_kpis_ok_24h.json").write_text(json.dumps(kpi_ok_24h, ensure_ascii=False, indent=2), encoding="utf-8")
+
     # 3) Rodar OOS (walk-forward) e exportar policy
     base_md = day_dir / "report_base.md"
     policy_hist = cfg.wf_policy_history_dir / f"wf_policy_{day}.json"
@@ -1038,10 +1072,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     try:
         gaps = _executor_gaps_summary(exec_lines)
         if gaps.get("n") and gaps.get("max_gap_s") is not None:
-            s0.append("\n**Saúde do executor (proxy por gaps no JSONL)**\n\n")
+            s0.append("\n**Saúde do executor (amostra lida do JSONL; não é 24h)**\n\n")
             s0.append(f"- Janela: `{gaps.get('first_ts')}` → `{gaps.get('last_ts')}` (n={gaps.get('n')})\n")
             s0.append(
-                f"- Maior gap: `{_fmt_num(gaps.get('max_gap_s'),1)}s` | gaps>5min: `{gaps.get('gaps_gt_300s')}` | gaps>15min: `{gaps.get('gaps_gt_900s')}`\n"
+                f"- Maior gap: `{_fmt_num(gaps.get('max_gap_s'),1)}s` | gaps>5min: `{gaps.get('gaps_gt_300s')}`\n"
             )
     except Exception:
         pass
@@ -1110,9 +1144,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     api_failed_pct = (100.0 * api_failed24 / tot24) if tot24 > 0 else None
     stale_pct = (100.0 * stale24 / tot24) if tot24 > 0 else None
 
-    # latência p90 (somente sucessos)
+    # latência p90 (somente sucessos) — recorte 24h (do JSONL) para ser comparável ao checklist de LIVE
     p90_call = None
     p50_call = None
+    p90_call_24h = None
+    p50_call_24h = None
+    n_succ_24h = None
     try:
         blk = ((kpi_ok.get("timing_ms") or {}).get("call_to_done") or {})
         p90_call = int(blk.get("p90") or 0) or None
@@ -1120,10 +1157,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         p90_call = None
         p50_call = None
+    try:
+        blk24 = ((kpi_ok_24h.get("timing_ms") or {}).get("call_to_done") or {}) if isinstance(kpi_ok_24h, dict) else {}
+        p90_call_24h = int(blk24.get("p90") or 0) or None
+        p50_call_24h = int(blk24.get("p50") or 0) or None
+        n_succ_24h = int(blk24.get("n") or 0) if blk24.get("n") is not None else None
+    except Exception:
+        p90_call_24h = None
+        p50_call_24h = None
+        n_succ_24h = None
 
     gaps15 = None
     try:
-        src = gaps24 if isinstance(gaps24, dict) else gaps
+        # força janela 24h; se não houver amostra, deixa None (não compara com threshold).
+        src = gaps24 if isinstance(gaps24, dict) else None
         gaps15 = int(src.get("gaps_gt_900s")) if isinstance(src, dict) and src.get("gaps_gt_900s") is not None else None
     except Exception:
         gaps15 = None
@@ -1134,7 +1181,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     chk_api = (api_failed_pct is not None and float(api_failed_pct) <= float(thr_api_failed_pct))
     chk_stale = (stale_pct is not None and float(stale_pct) <= float(thr_stale_pct))
     chk_gap = (gaps15 is None) or (int(gaps15) <= int(thr_gaps_15m))
-    chk_p90 = (p90_call is None) or (int(p90_call) <= int(thr_p90_ms))
+    chk_p90 = (p90_call_24h is None) or (int(p90_call_24h) <= int(thr_p90_ms))
     chk_open = int(err_open) <= int(thr_open_betslips)
     chk_pmms = int(err_pmms) <= int(thr_no_pmms)
 
@@ -1145,9 +1192,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| STALE_QUEUE_WAIT/total (24h, DB) | {_fmt_num(stale_pct,1)}% | ≤{_fmt_num(thr_stale_pct,1)}% | **{_fmt_status(chk_stale)}** |\n")
     s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
     s0.append(f"| `too_many_open_betslips` (24h, DB) | {int(err_open)} | ≤{int(thr_open_betslips)} | **{_fmt_status(chk_open)}** |\n")
-    s0.append(f"| Latência p90 `call_to_done_ms` (sucessos) | {_fmt_num(p90_call,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n")
-    s0.append(f"| Latência p50 `call_to_done_ms` (sucessos) | {_fmt_num(p50_call,0)}ms | — | — |\n")
-    s0.append(f"| Gaps >15min no executor_jsonl (proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
+    s0.append(
+        f"| Latência p90 `call_to_done_ms` (24h; sucessos) | {_fmt_num(p90_call_24h,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n"
+    )
+    s0.append(f"| Latência p50 `call_to_done_ms` (24h; sucessos) | {_fmt_num(p50_call_24h,0)}ms | — | — |\n")
+    s0.append(f"| n sucessos no JSONL (24h) | {n_succ_24h if n_succ_24h is not None else '—'} | — | — |\n")
+    s0.append(f"| Gaps >15min no executor_jsonl (24h; proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
     s0.append("\n")
 
     hard_fails = []
@@ -1976,7 +2026,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(f"| {k} | {v} |\n")
 
     extra.append("\n### 99.2 Execução (KPIs)\n\n")
-    extra.append(f"- Fonte: `{cfg.executor_jsonl}`\n\n")
+    extra.append(f"- Fonte: `{cfg.executor_jsonl}`\n")
+    extra.append("- Nota: métricas abaixo vêm do JSONL; se ele estiver **stale** ou incompleto, podem divergir do volume “24h, DB”.\n\n")
 
     # Status table
     extra.append("**Status (all)**\n\n")
@@ -2002,6 +2053,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     timing_ok = (kpi_ok.get("timing_ms") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append(_timing_table("Latência (somente LIVE_OK/DRY_OK) — ms", timing_ok))
+
+    # Recorte 24h (consistente com o checklist de prontidão LIVE)
+    try:
+        timing_ok24 = (kpi_ok_24h.get("timing_ms") or {}) if isinstance(kpi_ok_24h, dict) else {}
+        extra.append(_timing_table("Latência (últimas 24h; somente LIVE_OK/DRY_OK) — ms", timing_ok24))
+    except Exception:
+        pass
 
     slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
