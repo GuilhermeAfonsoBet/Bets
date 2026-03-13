@@ -308,7 +308,8 @@ def _fmt_pct(x: Optional[float], digits: int = 3) -> str:
 def _fmt_num(x: Optional[float], digits: int = 1) -> str:
     if x is None:
         return "—"
-    return f"{x:.{digits}f}"
+    # separador de milhar para leitura (ex.: 1,000,000.0)
+    return f"{x:,.{digits}f}"
 
 
 def _fmt_ci(ci: Optional[Tuple[float, float]], digits: int = 3, suffix: str = "%") -> str:

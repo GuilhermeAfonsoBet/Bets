@@ -66,7 +66,8 @@ def _fmt_num(x: Any, nd: int = 2) -> str:
     try:
         if x is None:
             return "—"
-        return f"{float(x):.{nd}f}"
+        # separador de milhar para leitura operacional (ex.: 1,000,000.00)
+        return f"{float(x):,.{nd}f}"
     except Exception:
         return "—"
 
@@ -1418,6 +1419,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             if wf:
                 s1.append("| Policy (WF) | Valor |\n|---|---|\n")
                 for k in [
+                    "train_mode",
                     "train_days",
                     "test_days",
                     "step_days",
@@ -1433,6 +1435,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     if k in wf:
                         s1.append(f"| {k} | `{wf.get(k)}` |\n")
                 s1.append("\n")
+                if str(wf.get("train_mode") or "").strip().lower() == "expanding":
+                    s1.append(
+                        "_Nota (WF expanding): `train_days/test_days/step_days` são parâmetros do calendário do walk-forward. "
+                        "O **intervalo real** do treino/teste do step vigente é o que aparece logo abaixo em `train=... | test=...`._\n\n"
+                    )
             if isinstance(policy_last_step, dict):
                 s1.append(f"- Último step (janelas): `train={policy_last_step.get('train')}` | `test={policy_last_step.get('test')}`\n")
                 s1.append(f"- Ativas: `keys={len(list(policy_last_step.get('active_keys') or []))}` | `base={len(list(policy_last_step.get('active_keys_base') or []))}`\n\n")
