@@ -3896,6 +3896,45 @@ async def main() -> int:
         MAX_STAKE_PCT_OF_LIMIT = max(0.0, float(getattr(args, "max_stake_pct_of_limit", 1.0)))
         MAX_STAKE_CAP = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
 
+        # ------------------------------------------------------------
+        # Diagnóstico + imputação de limit (betslip_limit)
+        # ------------------------------------------------------------
+        # Observação operacional: betslip_limit pode vir muito ausente/zerado dependendo do audit_version.
+        # Para evitar subestimar saturação por liquidez, imputamos limit ausente pela média dos limits positivos.
+        limit_pos: List[float] = []
+        try:
+            for d in ok_bs:
+                v = _safe_float(d.get("limit"))
+                if v is not None and math.isfinite(float(v)) and float(v) > 0:
+                    limit_pos.append(float(v))
+        except Exception:
+            limit_pos = []
+        limit_mean_pos = float(np.mean(limit_pos)) if limit_pos else None
+        limit_missing_pct = None
+        try:
+            n_lim = len(ok_bs)
+            n_miss = sum(1 for d in ok_bs if (_safe_float(d.get("limit")) is None) or ((_safe_float(d.get("limit")) or 0.0) <= 0))
+            limit_missing_pct = (100.0 * float(n_miss) / float(n_lim)) if n_lim > 0 else None
+        except Exception:
+            limit_missing_pct = None
+
+        # Diagnóstico por audit_version (para entender por que o limit está missing)
+        try:
+            by_ver: Dict[str, Dict[str, int]] = {}
+            for d in ok_bs:
+                ver = str(d.get("version") or "")
+                slot = by_ver.setdefault(ver, {"n": 0, "n_pos": 0, "n_miss": 0})
+                slot["n"] += 1
+                v = _safe_float(d.get("limit"))
+                if v is not None and float(v) > 0:
+                    slot["n_pos"] += 1
+                else:
+                    slot["n_miss"] += 1
+            # top versões por volume
+            limit_diag_versions = sorted(by_ver.items(), key=lambda kv: int(kv[1].get("n") or 0), reverse=True)[:12]
+        except Exception:
+            limit_diag_versions = []
+
         def _max_stake_from_limit(limit_value: float) -> float:
             # IMPORTANTE (robustez do turnover):
             # Em alguns períodos/versões o `limit` pode vir como 0.0 (não medido/indisponível),
@@ -3905,8 +3944,11 @@ async def main() -> int:
             except Exception:
                 lim = 0.0
             if lim <= 0:
-                # se houver cap absoluto, usa ele; senão retorna um teto alto para não limitar
-                return float(MAX_STAKE_CAP) if float(MAX_STAKE_CAP) > 0 else float(1e18)
+                # imputação: usa média dos limits positivos (se existir); senão, mantém fallback antigo (não limitar).
+                if limit_mean_pos is not None and float(limit_mean_pos) > 0:
+                    lim = float(limit_mean_pos)
+                else:
+                    return float(MAX_STAKE_CAP) if float(MAX_STAKE_CAP) > 0 else float(1e18)
             s = float(lim) * float(MAX_STAKE_PCT_OF_LIMIT)
             if MAX_STAKE_CAP > 0:
                 s = min(s, float(MAX_STAKE_CAP))
@@ -7631,6 +7673,29 @@ async def main() -> int:
                     lines.append(
                         "Este bloco é **opcional** e usa o proxy `betslip_limit`/`lay.available_limit` (capacidade por aposta) como outra visão de liquidez.\n\n"
                     )
+                    try:
+                        if limit_missing_pct is not None or limit_mean_pos is not None:
+                            lines.append("**Cobertura de `betslip_limit` (OK, betslip conf.)**\n\n")
+                            lines.append("| Métrica | Valor |\n|---|---:|\n")
+                            if limit_missing_pct is not None:
+                                lines.append(f"| missing/zero | {limit_missing_pct:.2f}% |\n")
+                            if limit_mean_pos is not None:
+                                lines.append(f"| média (positivos) | {_fmt_num(limit_mean_pos,2)} |\n")
+                                lines.append(
+                                    f"| imputação usada no OOS (quando missing/zero) | {_fmt_num(limit_mean_pos,2)} |\n"
+                                )
+                            lines.append("\n")
+                            if limit_diag_versions:
+                                lines.append("**Cobertura de `betslip_limit` por `audit_version` (OK, conf.)**\n\n")
+                                lines.append("| audit_version | N | %pos (limit>0) |\n|---|---:|---:|\n")
+                                for ver, st in limit_diag_versions:
+                                    n = float(st.get("n") or 0)
+                                    npos = float(st.get("n_pos") or 0)
+                                    pct = (100.0 * npos / n) if n > 0 else None
+                                    lines.append(f"| {ver or '—'} | {int(n)} | {pct:.2f}% |\n" if pct is not None else f"| {ver or '—'} | {int(n)} | — |\n")
+                                lines.append("\n")
+                    except Exception:
+                        pass
 
                     def _simulate_liq_sensitivity(*, mode: str, scope: str) -> Dict[str, Any]:
                         mode = str(mode or "none").strip().lower()
