@@ -6363,6 +6363,7 @@ async def main() -> int:
                             "versions": versions,
                             "walkforward": True,
                             "wf": {
+                                "train_mode": str(getattr(args, "wf_train_mode", "expanding") or "expanding"),
                                 "train_days": int(getattr(args, "wf_train_days", 2)),
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
@@ -7470,6 +7471,49 @@ async def main() -> int:
                         lines.append("\n")
                         try:
                             lines.append("**Limit-hit rate (por banca; EQ 4%/4% cap50%, signals_sqrt)**\n\n")
+                            lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
+                            lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                            for r in rs:
+                                h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                                n = float(h.get("n_after_budget") or 0)
+                                def _pct(k: str) -> str:
+                                    try:
+                                        v = float(h.get(k) or 0)
+                                        return f"{(v/max(1.0,n))*100.0:.1f}%" if n > 0 else "—"
+                                    except Exception:
+                                        return "—"
+                                lines.append(
+                                    f"| {_fmt_num(r.get('bank_ref'),2)} | {int(n)} | {_pct('bind_event_limit_final')} | {_pct('bind_bank_cap_final')} | {_pct('bind_cap_signal')} | {_pct('bind_match_budget')} | {_pct('bind_both')} | {int(h.get('n_skip_rem0') or 0)} |\n"
+                                )
+                            lines.append("\n")
+                        except Exception:
+                            pass
+
+                        # comparação direta: mesmo budget EQ 4%/4% cap50%, mas sem risk-adaptive (budget "puro")
+                        lines.append("### 12.2e Sensibilidade por banca — BUDGET_EQ_4.00%/4.00% cap50% (risk_mode=fixed)\n")
+                        lines.append(
+                            "Mesmo budget **EQ** (Back=4%, Lay=4%) e **cap por sinal=50%**, mas com **risk_mode=fixed** "
+                            "(ou seja, **não** divide o budget do jogo por √N sinais). Isso é o cenário “só Budget”.\n\n"
+                        )
+                        lines.append("| Banca (ref) | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                        lines.append("|---:|---:|---:|---:|---:|---:|\n")
+                        rs = []
+                        for b in grid:
+                            r = _simulate_with_bankroll(
+                                bank_ref=float(b),
+                                bud_back_frac_use=0.04,
+                                bud_lay_frac_use=0.04,
+                                cap_signal_frac_use=0.50,
+                                risk_mode="fixed",
+                            )
+                            rs.append(r)
+                            lines.append(
+                                f"| {_fmt_num(r.get('bank_ref'),2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
+                                f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                            )
+                        lines.append("\n")
+                        try:
+                            lines.append("**Limit-hit rate (por banca; EQ 4%/4% cap50%, fixed)**\n\n")
                             lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
                             lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
                             for r in rs:

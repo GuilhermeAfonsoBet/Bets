@@ -621,6 +621,14 @@ async def run_report(
         "lay": {"n": 0, "pnl": 0.0, "liability": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "liability_filtered": 0.0},
     }
 
+    def _cf_init() -> Dict[str, Any]:
+        return {
+            "rule": dict(cf.get("rule") or {}),
+            "note": str(cf.get("note") or ""),
+            "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
+            "lay": {"n": 0, "pnl": 0.0, "liability": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "liability_filtered": 0.0},
+        }
+
     # Diagnóstico AH (linha): o filtro do WF é por |line|, não por odds.
     wf_cfg = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
     ah_thr = None
@@ -823,6 +831,7 @@ async def run_report(
 
     for d in _iter_dates(start_day, end_day):
         start_utc, end_utc = _local_day_bounds_utc(day=d, tz_name=tz_name)
+        cf_day = _cf_init()
 
         # bridge adherence
         bridge_stats = await _fetch_bridge_stats(db, start_utc=start_utc, end_utc=end_utc)
@@ -1007,6 +1016,17 @@ async def run_report(
                         cf["back"]["stake_filtered"] += float(stake)
                 except Exception:
                     pass
+                try:
+                    cf_day["back"]["n"] += 1
+                    cf_day["back"]["pnl"] += float(pnl)
+                    cf_day["back"]["stake"] += float(stake)
+                    skip = (raw_pct is not None and float(raw_pct) <= float(cf_day["rule"]["back_skip_raw_pct_le"]))
+                    if not skip:
+                        cf_day["back"]["n_filtered"] += 1
+                        cf_day["back"]["pnl_filtered"] += float(pnl)
+                        cf_day["back"]["stake_filtered"] += float(stake)
+                except Exception:
+                    pass
             elif side == "lay":
                 perf["lay"]["n_cov"] += 1
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
@@ -1070,6 +1090,17 @@ async def run_report(
                         cf["lay"]["liability_filtered"] += float(liab)
                 except Exception:
                     pass
+                try:
+                    cf_day["lay"]["n"] += 1
+                    cf_day["lay"]["pnl"] += float(pnl)
+                    cf_day["lay"]["liability"] += float(liab)
+                    skip = (raw_pct is not None and float(raw_pct) > float(cf_day["rule"]["lay_skip_raw_pct_gt"]))
+                    if not skip:
+                        cf_day["lay"]["n_filtered"] += 1
+                        cf_day["lay"]["pnl_filtered"] += float(pnl)
+                        cf_day["lay"]["liability_filtered"] += float(liab)
+                except Exception:
+                    pass
 
         # ROIs agregados
         back_roi = (float(perf["back"]["pnl_sum"]) / float(perf["back"]["stake_sum_cov"]) * 100.0) if perf["back"]["stake_sum_cov"] else None
@@ -1119,6 +1150,7 @@ async def run_report(
                 "policy": active_by_day.get("days", {}).get(d.isoformat()),
                 "bridge": bridge_stats,
                 "execution": perf,
+                "slippage_filter_counterfactual": cf_day,
             }
         )
 

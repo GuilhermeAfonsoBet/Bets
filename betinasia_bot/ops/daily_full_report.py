@@ -2177,6 +2177,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     ]:
         extra.append(f"| {k} | `{_env(k)}` |\n")
     extra.append("\n")
+    extra.append(
+        "_Nota (Back vs Lay): o `AUDIT_MODE` acima costuma refletir o serviço principal (ex.: `ws_gate_lay`). "
+        "Em operação real, o **Back** pode vir de um serviço separado (ex.: `betinasia-audit-api-back`, `audit_version=v5.2-api-back`) "
+        "ou de uma variante `ws_gate_back` (dependendo do deploy). Para confirmar o que rodou nas últimas 24h, veja `99.5 Auditoria (DB)`._\n\n"
+    )
 
     # Interpretação operacional (audit/entrada) para reduzir ambiguidade
     extra.append("**Interpretação operacional (timing de entrada)**\n\n")
@@ -2235,8 +2240,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             extra.append(f"- Policy current: `{cfg.wf_policy_current}`\n\n")
 
             extra.append("**Resumo (últimos dias)**\n\n")
-            extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | P&L total |\n")
-            extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            extra.append("| Dia | Ativas (keys) | Bridge rows | Skipped(not_active) | Exec rows | LIVE_OK | DRY_OK | Back bloqueadas (slip<=-2%; cov) | Lay bloqueadas (slip>2%; cov) | ΔP&L cf (placar; cov) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | P&L total |\n")
+            extra.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             for it in adh_day.get("per_day") or []:
                 if not isinstance(it, dict):
                     continue
@@ -2256,9 +2261,26 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
                 pnl_b = float(back.get("pnl_sum") or 0.0)
                 pnl_l = float(lay.get("pnl_sum") or 0.0)
+                # contrafactual slippage gate (por dia; somente cobertos por placar+odd)
+                cf = it.get("slippage_filter_counterfactual") if isinstance(it.get("slippage_filter_counterfactual"), dict) else {}
+                cfb = cf.get("back") if isinstance(cf.get("back"), dict) else {}
+                cfl = cf.get("lay") if isinstance(cf.get("lay"), dict) else {}
+                nblock_back = None
+                nblock_lay = None
+                dpnl_cf = None
+                try:
+                    nblock_back = int(cfb.get("n") or 0) - int(cfb.get("n_filtered") or 0)
+                    nblock_lay = int(cfl.get("n") or 0) - int(cfl.get("n_filtered") or 0)
+                    pnl_cf = float(cfb.get("pnl_filtered") or 0.0) + float(cfl.get("pnl_filtered") or 0.0)
+                    pnl_base = float(cfb.get("pnl") or 0.0) + float(cfl.get("pnl") or 0.0)
+                    dpnl_cf = float(pnl_cf - pnl_base)
+                except Exception:
+                    nblock_back = None
+                    nblock_lay = None
+                    dpnl_cf = None
                 extra.append(
                     f"| {it.get('day')} | {nkeys if nkeys is not None else '—'} | {bridge_rows} | {skipped_na} | "
-                    f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {_fmt_num(pnl_b,2)} | {_fmt_pct(back.get('roi_pct'))} | "
+                    f"{int(ex.get('n_exec_rows') or 0)} | {live_ok} | {dry_ok} | {nblock_back if nblock_back is not None else '—'} | {nblock_lay if nblock_lay is not None else '—'} | {_fmt_num(dpnl_cf,2)} | {_fmt_num(pnl_b,2)} | {_fmt_pct(back.get('roi_pct'))} | "
                     f"{_fmt_num(pnl_l,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_num(pnl_b + pnl_l,2)} |\n"
                 )
             extra.append("\n")
@@ -2372,6 +2394,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "- **OK valid**: subset de OK em que `is_valid_opportunity=true` (passou o critério operacional de “oportunidade executável”).\n"
                 "  - Na prática, o `is_valid_opportunity` tende a cair quando `difference_pct` está fora do range aceito (edge muito pequeno <2% ou mismatch >10%) ou quando campos essenciais do ticket estão ausentes.\n\n"
             )
+            extra.append("**Glossário rápido (`audit_version`)**\n\n")
+            extra.append("| padrão | significado |\n|---|---|\n")
+            extra.append("| `v5.2-api-back` | Back via API (serviço back-only); tende a abrir betslip e medir limites/odds. |\n")
+            extra.append("| `v5.1-ws-gate-lay` | Lay via WS gate (queda em 5s); só abre ticket quando o gate passa. |\n")
+            extra.append("| `v5.4-ws-reversal-lay` | Lay no pós-reversal; volume baixo pode ser “evento raro” (depende de reversões). |\n")
+            extra.append("| `v5.3-ws-gate-back` | Back via WS gate; se `OK` é baixo, costuma indicar gate muito restritivo, parse/click falhando, ou credenciais/sessão instável. |\n")
+            extra.append("| `v4.*` / `v1.*` | versões antigas/legadas do pipeline (API/WS), úteis para comparação histórica. |\n")
+            extra.append("\n")
             extra.append("| audit_version | total | OK | OK com betslip_odd | OK valid | top no-OK |\n")
             extra.append("|---|---:|---:|---:|---:|---|\n")
             for v in rep.get("by_version") or []:
