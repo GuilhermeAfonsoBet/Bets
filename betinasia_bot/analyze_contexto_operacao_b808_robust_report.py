@@ -3901,41 +3901,74 @@ async def main() -> int:
         # ------------------------------------------------------------
         # Observação operacional: betslip_limit pode vir muito ausente/zerado dependendo do audit_version.
         # Para evitar subestimar saturação por liquidez, imputamos limit ausente pela média dos limits positivos.
-        limit_pos: List[float] = []
+        def _limit_back_value(d: dict) -> Optional[float]:
+            return _safe_float(d.get("limit"))
+
+        def _limit_lay_value(d: dict) -> Optional[float]:
+            h = d.get("hypothesis_details") or {}
+            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+            if lay_lim is None:
+                lay_lim = _safe_float(d.get("limit"))
+            return lay_lim
+
+        back_pos: List[float] = []
+        lay_pos: List[float] = []
+        back_missing_pct = None
+        lay_missing_pct = None
         try:
-            for d in ok_bs:
-                v = _safe_float(d.get("limit"))
+            back_all = [d for d in ok_bs if str(d.get("side") or "") == "Back"]
+            lay_all = [d for d in ok_bs if str(d.get("side") or "") != "Back"]
+            for d in back_all:
+                v = _limit_back_value(d)
                 if v is not None and math.isfinite(float(v)) and float(v) > 0:
-                    limit_pos.append(float(v))
+                    back_pos.append(float(v))
+            for d in lay_all:
+                v = _limit_lay_value(d)
+                if v is not None and math.isfinite(float(v)) and float(v) > 0:
+                    lay_pos.append(float(v))
+            if back_all:
+                n_miss = sum(1 for d in back_all if (_limit_back_value(d) is None) or ((_limit_back_value(d) or 0.0) <= 0))
+                back_missing_pct = 100.0 * float(n_miss) / float(len(back_all))
+            if lay_all:
+                n_miss = sum(1 for d in lay_all if (_limit_lay_value(d) is None) or ((_limit_lay_value(d) or 0.0) <= 0))
+                lay_missing_pct = 100.0 * float(n_miss) / float(len(lay_all))
         except Exception:
-            limit_pos = []
-        limit_mean_pos = float(np.mean(limit_pos)) if limit_pos else None
-        limit_missing_pct = None
-        try:
-            n_lim = len(ok_bs)
-            n_miss = sum(1 for d in ok_bs if (_safe_float(d.get("limit")) is None) or ((_safe_float(d.get("limit")) or 0.0) <= 0))
-            limit_missing_pct = (100.0 * float(n_miss) / float(n_lim)) if n_lim > 0 else None
-        except Exception:
-            limit_missing_pct = None
+            back_pos = []
+            lay_pos = []
+            back_missing_pct = None
+            lay_missing_pct = None
+
+        back_limit_mean_pos = float(np.mean(back_pos)) if back_pos else None
+        lay_limit_mean_pos = float(np.mean(lay_pos)) if lay_pos else None
 
         # Diagnóstico por audit_version (para entender por que o limit está missing)
         try:
             by_ver: Dict[str, Dict[str, int]] = {}
             for d in ok_bs:
                 ver = str(d.get("version") or "")
-                slot = by_ver.setdefault(ver, {"n": 0, "n_pos": 0, "n_miss": 0})
+                slot = by_ver.setdefault(ver, {"n": 0, "n_pos": 0, "n_miss": 0, "n_back": 0, "n_back_pos": 0, "n_lay": 0, "n_lay_pos": 0})
                 slot["n"] += 1
                 v = _safe_float(d.get("limit"))
                 if v is not None and float(v) > 0:
                     slot["n_pos"] += 1
                 else:
                     slot["n_miss"] += 1
+                if str(d.get("side") or "") == "Back":
+                    slot["n_back"] += 1
+                    vb = _limit_back_value(d)
+                    if vb is not None and float(vb) > 0:
+                        slot["n_back_pos"] += 1
+                else:
+                    slot["n_lay"] += 1
+                    vl = _limit_lay_value(d)
+                    if vl is not None and float(vl) > 0:
+                        slot["n_lay_pos"] += 1
             # top versões por volume
             limit_diag_versions = sorted(by_ver.items(), key=lambda kv: int(kv[1].get("n") or 0), reverse=True)[:12]
         except Exception:
             limit_diag_versions = []
 
-        def _max_stake_from_limit(limit_value: float) -> float:
+        def _max_stake_from_limit(limit_value: float, *, mean_fallback: Optional[float]) -> float:
             # IMPORTANTE (robustez do turnover):
             # Em alguns períodos/versões o `limit` pode vir como 0.0 (não medido/indisponível),
             # o que não deve "matar" o sizing no OOS (especialmente em KELLY, que já é capado por fração da banca).
@@ -3945,8 +3978,8 @@ async def main() -> int:
                 lim = 0.0
             if lim <= 0:
                 # imputação: usa média dos limits positivos (se existir); senão, mantém fallback antigo (não limitar).
-                if limit_mean_pos is not None and float(limit_mean_pos) > 0:
-                    lim = float(limit_mean_pos)
+                if mean_fallback is not None and float(mean_fallback) > 0:
+                    lim = float(mean_fallback)
                 else:
                     return float(MAX_STAKE_CAP) if float(MAX_STAKE_CAP) > 0 else float(1e18)
             s = float(lim) * float(MAX_STAKE_PCT_OF_LIMIT)
@@ -3955,14 +3988,14 @@ async def main() -> int:
             return float(s)
 
         def _max_back_stake_event(d: dict) -> float:
-            return _max_stake_from_limit(float(d.get("limit") or 0.0))
+            return _max_stake_from_limit(float(d.get("limit") or 0.0), mean_fallback=back_limit_mean_pos)
 
         def _max_lay_stake_event(d: dict) -> float:
             h = d.get("hypothesis_details") or {}
             lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
             if lay_lim is None:
                 lay_lim = _safe_float(d.get("limit"))
-            return _max_stake_from_limit(float(lay_lim or 0.0))
+            return _max_stake_from_limit(float(lay_lim or 0.0), mean_fallback=lay_limit_mean_pos)
 
         def _sizing_back(d: dict, scheme: str, *, bank_ref: float) -> Optional[float]:
             """
@@ -7674,25 +7707,36 @@ async def main() -> int:
                         "Este bloco é **opcional** e usa o proxy `betslip_limit`/`lay.available_limit` (capacidade por aposta) como outra visão de liquidez.\n\n"
                     )
                     try:
-                        if limit_missing_pct is not None or limit_mean_pos is not None:
+                        if back_missing_pct is not None or lay_missing_pct is not None or back_limit_mean_pos is not None or lay_limit_mean_pos is not None:
                             lines.append("**Cobertura de `betslip_limit` (OK, betslip conf.)**\n\n")
                             lines.append("| Métrica | Valor |\n|---|---:|\n")
-                            if limit_missing_pct is not None:
-                                lines.append(f"| missing/zero | {limit_missing_pct:.2f}% |\n")
-                            if limit_mean_pos is not None:
-                                lines.append(f"| média (positivos) | {_fmt_num(limit_mean_pos,2)} |\n")
-                                lines.append(
-                                    f"| imputação usada no OOS (quando missing/zero) | {_fmt_num(limit_mean_pos,2)} |\n"
-                                )
+                            if back_missing_pct is not None:
+                                lines.append(f"| Back missing/zero | {back_missing_pct:.2f}% |\n")
+                            if lay_missing_pct is not None:
+                                lines.append(f"| Lay missing/zero | {lay_missing_pct:.2f}% |\n")
+                            if back_limit_mean_pos is not None:
+                                lines.append(f"| média Back (positivos) | {_fmt_num(back_limit_mean_pos,2)} |\n")
+                                lines.append(f"| imputação Back (quando missing/zero) | {_fmt_num(back_limit_mean_pos,2)} |\n")
+                            if lay_limit_mean_pos is not None:
+                                lines.append(f"| média Lay (positivos) | {_fmt_num(lay_limit_mean_pos,2)} |\n")
+                                lines.append(f"| imputação Lay (quando missing/zero) | {_fmt_num(lay_limit_mean_pos,2)} |\n")
                             lines.append("\n")
                             if limit_diag_versions:
                                 lines.append("**Cobertura de `betslip_limit` por `audit_version` (OK, conf.)**\n\n")
-                                lines.append("| audit_version | N | %pos (limit>0) |\n|---|---:|---:|\n")
+                                lines.append("| audit_version | N | %pos (limit>0) | %pos Back | %pos Lay |\n|---|---:|---:|---:|---:|\n")
                                 for ver, st in limit_diag_versions:
                                     n = float(st.get("n") or 0)
                                     npos = float(st.get("n_pos") or 0)
                                     pct = (100.0 * npos / n) if n > 0 else None
-                                    lines.append(f"| {ver or '—'} | {int(n)} | {pct:.2f}% |\n" if pct is not None else f"| {ver or '—'} | {int(n)} | — |\n")
+                                    nb = float(st.get("n_back") or 0)
+                                    nbl = float(st.get("n_lay") or 0)
+                                    pctb = (100.0 * float(st.get("n_back_pos") or 0) / nb) if nb > 0 else None
+                                    pctl = (100.0 * float(st.get("n_lay_pos") or 0) / nbl) if nbl > 0 else None
+                                    lines.append(
+                                        f"| {ver or '—'} | {int(n)} | {pct:.2f}% | {pctb:.2f}% | {pctl:.2f}% |\n"
+                                        if (pct is not None and pctb is not None and pctl is not None)
+                                        else f"| {ver or '—'} | {int(n)} | {_fmt_num(pct,2)} | {_fmt_num(pctb,2)} | {_fmt_num(pctl,2)} |\n"
+                                    )
                                 lines.append("\n")
                     except Exception:
                         pass
