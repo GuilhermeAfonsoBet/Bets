@@ -716,6 +716,17 @@ class DailyReportCfg:
     wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
+    wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
+    # Sizing no WF (útil para simular in-match governado por budget/caps, sem trocar policy do robô)
+    wf_scheme_pre: str = os.getenv("DAILY_WF_SCHEME_PRE", "").strip()
+    wf_scheme_in: str = os.getenv("DAILY_WF_SCHEME_IN", "").strip()
+    wf_flat_stake_back: str = os.getenv("DAILY_WF_FLAT_STAKE_BACK", "").strip()
+    wf_flat_liab_lay: str = os.getenv("DAILY_WF_FLAT_LIAB_LAY", "").strip()
+    # Budget por match_id no WF (permite rodar manual com EQ 4%/4% cap33% sem mexer no agendado das 19h)
+    wf_budget_back_frac: str = os.getenv("DAILY_WF_BUDGET_BACK_FRAC", "").strip()
+    wf_budget_lay_frac: str = os.getenv("DAILY_WF_BUDGET_LAY_FRAC", "").strip()
+    wf_budget_cap_signal_frac: str = os.getenv("DAILY_WF_BUDGET_CAP_SIGNAL_FRAC", "").strip()
+    wf_budget_risk_mode: str = os.getenv("DAILY_WF_BUDGET_RISK_MODE", "").strip()
     # Escala de banca/sizing (manter “10k etc.”)
     kelly_bankroll: str = os.getenv("DAILY_KELLY_BANKROLL", "10000")
     # Grid default para sempre gerar sensibilidade (pequeno o bastante para ser barato).
@@ -736,6 +747,16 @@ class DailyReportCfg:
         self.wf_policy_history_dir = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", str(self.wf_policy_history_dir)))
         self.wf_policy_history_jsonl = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", str(self.wf_policy_history_jsonl)))
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
+        self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
+        self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
+        self.wf_scheme_pre = os.getenv("DAILY_WF_SCHEME_PRE", self.wf_scheme_pre).strip()
+        self.wf_scheme_in = os.getenv("DAILY_WF_SCHEME_IN", self.wf_scheme_in).strip()
+        self.wf_flat_stake_back = os.getenv("DAILY_WF_FLAT_STAKE_BACK", self.wf_flat_stake_back).strip()
+        self.wf_flat_liab_lay = os.getenv("DAILY_WF_FLAT_LIAB_LAY", self.wf_flat_liab_lay).strip()
+        self.wf_budget_back_frac = os.getenv("DAILY_WF_BUDGET_BACK_FRAC", self.wf_budget_back_frac).strip()
+        self.wf_budget_lay_frac = os.getenv("DAILY_WF_BUDGET_LAY_FRAC", self.wf_budget_lay_frac).strip()
+        self.wf_budget_cap_signal_frac = os.getenv("DAILY_WF_BUDGET_CAP_SIGNAL_FRAC", self.wf_budget_cap_signal_frac).strip()
+        self.wf_budget_risk_mode = os.getenv("DAILY_WF_BUDGET_RISK_MODE", self.wf_budget_risk_mode).strip()
         try:
             self.exec_kpi_last = int(os.getenv("DAILY_EXEC_KPI_LAST", str(self.exec_kpi_last)))
         except Exception:
@@ -851,6 +872,26 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-shrinkage"]
     if str(cfg.wf_exclude_exec_buckets_back).strip():
         args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
+    if str(cfg.wf_exclude_exec_buckets_lay).strip():
+        args += ["--wf-exclude-exec-buckets-lay", str(cfg.wf_exclude_exec_buckets_lay).strip()]
+
+    # Overrides opcionais (rodagem manual): sizing/budget do WF
+    if str(cfg.wf_scheme_pre).strip():
+        args += ["--wf-scheme-pre", str(cfg.wf_scheme_pre).strip()]
+    if str(cfg.wf_scheme_in).strip():
+        args += ["--wf-scheme-in", str(cfg.wf_scheme_in).strip()]
+    if str(cfg.wf_flat_stake_back).strip():
+        args += ["--wf-flat-stake-back", str(cfg.wf_flat_stake_back).strip()]
+    if str(cfg.wf_flat_liab_lay).strip():
+        args += ["--wf-flat-liab-lay", str(cfg.wf_flat_liab_lay).strip()]
+    if str(cfg.wf_budget_back_frac).strip():
+        args += ["--wf-budget-back-frac", str(cfg.wf_budget_back_frac).strip()]
+    if str(cfg.wf_budget_lay_frac).strip():
+        args += ["--wf-budget-lay-frac", str(cfg.wf_budget_lay_frac).strip()]
+    if str(cfg.wf_budget_cap_signal_frac).strip():
+        args += ["--wf-budget-cap-signal-frac", str(cfg.wf_budget_cap_signal_frac).strip()]
+    if str(cfg.wf_budget_risk_mode).strip():
+        args += ["--wf-budget-risk-mode", str(cfg.wf_budget_risk_mode).strip()]
 
     oos_run = {"skipped": False, "ok": True, "returncode": 0, "error": None, "log": str(day_dir / "oos_run.log")}
     if cfg.skip_oos:
