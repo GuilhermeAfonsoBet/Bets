@@ -3916,8 +3916,12 @@ async def main() -> int:
         back_missing_pct = None
         lay_missing_pct = None
         try:
-            back_all = [d for d in ok_bs if str(d.get("side") or "") == "Back"]
-            lay_all = [d for d in ok_bs if str(d.get("side") or "") != "Back"]
+            # Preferimos usar `with_bs` (linhas em que houve betslip_odd), pois é o universo em que faz mais sentido falar de `betslip_limit`.
+            # `ok_bs` pode excluir muitos eventos e enviesar a média quando a cobertura de limit é baixa.
+            limit_src = with_bs if ("with_bs" in locals() and isinstance(with_bs, list) and with_bs) else ok_bs
+            limit_src_label = "with_bs (betslip_odd presente)" if (limit_src is with_bs) else "ok_bs (OK + betslip conf.)"
+            back_all = [d for d in limit_src if str(d.get("side") or "") == "Back"]
+            lay_all = [d for d in limit_src if str(d.get("side") or "") != "Back"]
             for d in back_all:
                 v = _limit_back_value(d)
                 if v is not None and math.isfinite(float(v)) and float(v) > 0:
@@ -3937,9 +3941,13 @@ async def main() -> int:
             lay_pos = []
             back_missing_pct = None
             lay_missing_pct = None
+            limit_src_label = "—"
 
         back_limit_mean_pos = float(np.mean(back_pos)) if back_pos else None
         lay_limit_mean_pos = float(np.mean(lay_pos)) if lay_pos else None
+        # fallback geral (se uma das pontas não tiver nenhum limit>0)
+        limit_all_pos = back_pos + lay_pos
+        limit_mean_pos_all = float(np.mean(limit_all_pos)) if limit_all_pos else None
 
         # Diagnóstico por audit_version (para entender por que o limit está missing)
         try:
@@ -3988,14 +3996,16 @@ async def main() -> int:
             return float(s)
 
         def _max_back_stake_event(d: dict) -> float:
-            return _max_stake_from_limit(float(d.get("limit") or 0.0), mean_fallback=back_limit_mean_pos)
+            mean_fb = back_limit_mean_pos if (back_limit_mean_pos is not None and back_limit_mean_pos > 0) else limit_mean_pos_all
+            return _max_stake_from_limit(float(d.get("limit") or 0.0), mean_fallback=mean_fb)
 
         def _max_lay_stake_event(d: dict) -> float:
             h = d.get("hypothesis_details") or {}
             lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
             if lay_lim is None:
                 lay_lim = _safe_float(d.get("limit"))
-            return _max_stake_from_limit(float(lay_lim or 0.0), mean_fallback=lay_limit_mean_pos)
+            mean_fb = lay_limit_mean_pos if (lay_limit_mean_pos is not None and lay_limit_mean_pos > 0) else limit_mean_pos_all
+            return _max_stake_from_limit(float(lay_lim or 0.0), mean_fallback=mean_fb)
 
         def _sizing_back(d: dict, scheme: str, *, bank_ref: float) -> Optional[float]:
             """
@@ -7754,6 +7764,11 @@ async def main() -> int:
                         if back_missing_pct is not None or lay_missing_pct is not None or back_limit_mean_pos is not None or lay_limit_mean_pos is not None:
                             lines.append("**Cobertura de `betslip_limit` (OK, betslip conf.)**\n\n")
                             lines.append("| Métrica | Valor |\n|---|---:|\n")
+                            try:
+                                if "limit_src_label" in locals() and limit_src_label:
+                                    lines.append(f"| amostra usada p/ média | {limit_src_label} |\n")
+                            except Exception:
+                                pass
                             if back_missing_pct is not None:
                                 lines.append(f"| Back missing/zero | {back_missing_pct:.2f}% |\n")
                             if lay_missing_pct is not None:
@@ -7764,6 +7779,8 @@ async def main() -> int:
                             if lay_limit_mean_pos is not None:
                                 lines.append(f"| média Lay (positivos) | {_fmt_num(lay_limit_mean_pos,2)} |\n")
                                 lines.append(f"| imputação Lay (quando missing/zero) | {_fmt_num(lay_limit_mean_pos,2)} |\n")
+                            if limit_mean_pos_all is not None:
+                                lines.append(f"| média geral (positivos; fallback) | {_fmt_num(limit_mean_pos_all,2)} |\n")
                             lines.append("\n")
                             if limit_diag_versions:
                                 lines.append("**Cobertura de `betslip_limit` por `audit_version` (OK, conf.)**\n\n")
