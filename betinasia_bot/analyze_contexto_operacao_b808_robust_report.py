@@ -3899,55 +3899,18 @@ async def main() -> int:
         # ------------------------------------------------------------
         # Diagnóstico + imputação de limit (betslip_limit)
         # ------------------------------------------------------------
-        # Observação operacional: betslip_limit pode vir muito ausente/zerado dependendo do audit_version.
-        # Para evitar subestimar saturação por liquidez, imputamos limit ausente pela média dos limits positivos.
-        def _limit_back_value(d: dict) -> Optional[float]:
-            return _safe_float(d.get("limit"))
-
-        def _limit_lay_value(d: dict) -> Optional[float]:
-            h = d.get("hypothesis_details") or {}
-            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
-            if lay_lim is None:
-                lay_lim = _safe_float(d.get("limit"))
-            return lay_lim
-
-        back_pos: List[float] = []
-        lay_pos: List[float] = []
-        back_missing_pct = None
-        lay_missing_pct = None
-        try:
-            # Preferimos usar `with_bs` (linhas em que houve betslip_odd), pois é o universo em que faz mais sentido falar de `betslip_limit`.
-            # `ok_bs` pode excluir muitos eventos e enviesar a média quando a cobertura de limit é baixa.
-            limit_src = with_bs if ("with_bs" in locals() and isinstance(with_bs, list) and with_bs) else ok_bs
-            limit_src_label = "with_bs (betslip_odd presente)" if (limit_src is with_bs) else "ok_bs (OK + betslip conf.)"
-            back_all = [d for d in limit_src if str(d.get("side") or "") == "Back"]
-            lay_all = [d for d in limit_src if str(d.get("side") or "") != "Back"]
-            for d in back_all:
-                v = _limit_back_value(d)
-                if v is not None and math.isfinite(float(v)) and float(v) > 0:
-                    back_pos.append(float(v))
-            for d in lay_all:
-                v = _limit_lay_value(d)
-                if v is not None and math.isfinite(float(v)) and float(v) > 0:
-                    lay_pos.append(float(v))
-            if back_all:
-                n_miss = sum(1 for d in back_all if (_limit_back_value(d) is None) or ((_limit_back_value(d) or 0.0) <= 0))
-                back_missing_pct = 100.0 * float(n_miss) / float(len(back_all))
-            if lay_all:
-                n_miss = sum(1 for d in lay_all if (_limit_lay_value(d) is None) or ((_limit_lay_value(d) or 0.0) <= 0))
-                lay_missing_pct = 100.0 * float(n_miss) / float(len(lay_all))
-        except Exception:
-            back_pos = []
-            lay_pos = []
-            back_missing_pct = None
-            lay_missing_pct = None
-            limit_src_label = "—"
-
-        back_limit_mean_pos = float(np.mean(back_pos)) if back_pos else None
-        lay_limit_mean_pos = float(np.mean(lay_pos)) if lay_pos else None
-        # fallback geral (se uma das pontas não tiver nenhum limit>0)
-        limit_all_pos = back_pos + lay_pos
-        limit_mean_pos_all = float(np.mean(limit_all_pos)) if limit_all_pos else None
+        # Observação operacional: `betslip_limit` pode vir muito ausente/zerado dependendo do audit_version/mode.
+        # Para evitar subestimar saturação por liquidez nas sensibilidades (12.2x), imputamos limit ausente pela média
+        # dos limits positivos *por lado operacional* (Back/Lay).
+        #
+        # IMPORTANTE: `d["side"]` no audit é o lado do mercado (home/away), não Back/Lay. Por isso, a média por lado
+        # deve ser calculada a partir das **oportunidades OOS** (`combo_events`, que já têm side=Back/Lay e liq_limit).
+        back_limit_mean_pos: Optional[float] = None
+        lay_limit_mean_pos: Optional[float] = None
+        limit_mean_pos_all: Optional[float] = None
+        back_missing_pct: Optional[float] = None
+        lay_missing_pct: Optional[float] = None
+        limit_src_label: str = "combo_events (liq_limit; oportunidades OOS)"
 
         # Diagnóstico por audit_version (para entender por que o limit está missing)
         try:
@@ -5127,6 +5090,25 @@ async def main() -> int:
                         "diff_pct": float(diff),
                     }
                 )
+
+            # ------------------------------------------------------------
+            # (Após montar `combo_events`) estatística de liquidez por lado (Back/Lay)
+            # ------------------------------------------------------------
+            try:
+                bxs = [e for e in combo_events if str(e.get("side")) == "Back"]
+                lxs = [e for e in combo_events if str(e.get("side")) == "Lay"]
+                blim = [float(e.get("liq_limit")) for e in bxs if _safe_float(e.get("liq_limit")) is not None and float(e.get("liq_limit")) > 0]
+                llim = [float(e.get("liq_limit")) for e in lxs if _safe_float(e.get("liq_limit")) is not None and float(e.get("liq_limit")) > 0]
+                back_limit_mean_pos = float(np.mean(blim)) if blim else None
+                lay_limit_mean_pos = float(np.mean(llim)) if llim else None
+                all_pos = list(blim) + list(llim)
+                limit_mean_pos_all = float(np.mean(all_pos)) if all_pos else None
+                if bxs:
+                    back_missing_pct = 100.0 * float(sum(1 for e in bxs if not (_safe_float(e.get("liq_limit")) or 0.0) > 0)) / float(len(bxs))
+                if lxs:
+                    lay_missing_pct = 100.0 * float(sum(1 for e in lxs if not (_safe_float(e.get("liq_limit")) or 0.0) > 0)) / float(len(lxs))
+            except Exception:
+                pass
 
             # Calendário do walk-forward: usar os dias com dados carregados no recorte (mesmo que não haja eventos OK/edge),
             # para não “sumir” dias recentes (ex.: 17/18) na tabela OOS.
