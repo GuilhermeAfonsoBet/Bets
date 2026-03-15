@@ -587,6 +587,12 @@ async def main() -> int:
         action="store_true",
         help="Gera somente a seção OOS walk-forward (mais rápido). Ignora in-sample e blocos pesados.",
     )
+    parser.add_argument(
+        "--only-stake-sweep",
+        action="store_true",
+        help="Gera somente OOS walk-forward + curva rápida de 'stake médio' (caps absolutos por aposta). "
+        "Útil para achar ponto ótimo sem rodar o relatório completo/PDF.",
+    )
     parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
     parser.add_argument(
         "--pdf",
@@ -709,6 +715,30 @@ async def main() -> int:
         type=float,
         default=float(os.getenv("WF_FLAT_LIAB_LAY", "1.0")),
         help="Liability constante quando o scheme do Lay for FLAT (em unidades monetárias do relatório). Default=1.0.",
+    )
+    # Sweep rápido de stakes (caps absolutos por aposta): não usa %% de banca.
+    parser.add_argument(
+        "--wf-sweep-stakes",
+        action="store_true",
+        default=(os.getenv("WF_SWEEP_STAKES", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Adiciona um bloco extra no OOS com curva rápida de lucro/turnover variando caps absolutos por aposta "
+        "(Back=stake; Lay=liability), por regime Pre/In. Não roda PDF; só escreve no markdown.",
+    )
+    parser.add_argument(
+        "--wf-sweep-back-caps",
+        default=os.getenv("WF_SWEEP_BACK_CAPS", "0,5,10,20,30,50,75,100,150,200").strip(),
+        help="CSV de caps absolutos (stake) para Back no sweep. Ex.: '0,5,10,20,30,50,75,100,150,200'.",
+    )
+    parser.add_argument(
+        "--wf-sweep-lay-caps",
+        default=os.getenv("WF_SWEEP_LAY_CAPS", "0,10,20,30,50,75,100,150,200,300").strip(),
+        help="CSV de caps absolutos (liability) para Lay no sweep. Ex.: '0,10,20,30,50,75,100,150,200,300'.",
+    )
+    parser.add_argument(
+        "--wf-sweep-grid-in",
+        action="store_true",
+        default=(os.getenv("WF_SWEEP_GRID_IN", "1").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Se ligado, gera também um grid 2D (Back_In × Lay_In) com caps absolutos. Default=on.",
     )
     parser.add_argument(
         "--wf-ws-proxy-offset-sec",
@@ -6803,6 +6833,267 @@ async def main() -> int:
                         if thr is None or float(thr) <= 0 or not math.isfinite(float(thr)):
                             return True
                         return float(lim) >= float(thr)
+
+                    # ------------------------------------------------------------
+                    # 12.2f Sweep rápido: caps absolutos por aposta (stake médio)
+                    # ------------------------------------------------------------
+                    try:
+                        sweep_on = bool(getattr(args, "wf_sweep_stakes", False)) or bool(getattr(args, "only_stake_sweep", False))
+                    except Exception:
+                        sweep_on = False
+
+                    def _parse_csv_floats(s: str) -> List[float]:
+                        out: List[float] = []
+                        if not s:
+                            return out
+                        for it in str(s).split(","):
+                            t = str(it).strip()
+                            if not t:
+                                continue
+                            try:
+                                out.append(float(t))
+                            except Exception:
+                                continue
+                        # dedup preserve order
+                        seen = set()
+                        out2 = []
+                        for x in out:
+                            k = float(x)
+                            if k in seen:
+                                continue
+                            seen.add(k)
+                            out2.append(float(k))
+                        return out2
+
+                    def _lay_entry_odd(d0: dict, ev: dict) -> Optional[float]:
+                        try:
+                            lay_odd = _safe_float(ev.get("entry_odd"))
+                            if lay_odd is None:
+                                h = d0.get("hypothesis_details") or {}
+                                lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
+                            if lay_odd is None or float(lay_odd) <= 1.0:
+                                return None
+                            return float(lay_odd)
+                        except Exception:
+                            return None
+
+                    def _simulate_with_abs_caps_fast(
+                        *,
+                        cap_back_pre: float,
+                        cap_back_in: float,
+                        cap_lay_pre: float,
+                        cap_lay_in: float,
+                    ) -> Dict[str, Any]:
+                        """
+                        Simula 30d com caps ABSOLUTOS por aposta (por regime Pre/In).
+                        - Back cap em stake; Lay cap em liability.
+                        - Aplica limit por evento (betslip_limit/liq_limit via helpers existentes).
+                        - Não aplica budget por match_id aqui (o objetivo é ver o efeito do "stake médio").
+                        """
+                        dturn: Dict[str, float] = {}
+                        dpnl_obs: Dict[str, float] = {}
+                        dpnl_exp: Dict[str, float] = {}
+                        n_ev_sized = 0
+                        n_ev_roi = 0
+
+                        for st in steps:
+                            test_days = set(st.get("test_days") or [])
+                            active_keys = set(st.get("active_keys") or [])
+                            if not test_days or not active_keys:
+                                continue
+                            # elegíveis no teste (inclui sem ROI)
+                            test_elig = [e for e in combo_events if e.get("day") in test_days and _key(e) in active_keys and _liq_ok_policy(e, st)]
+
+                            # ordena por tempo (consistência com o resto do WF)
+                            def _ts_ev(ev: dict) -> float:
+                                d0 = audit_by_id.get(int(ev.get("audit_id")))
+                                ts = d0.get("audited_at") if d0 else None
+                                if isinstance(ts, datetime):
+                                    return ts.timestamp()
+                                return 0.0
+
+                            test_elig.sort(key=_ts_ev)
+
+                            back_all = back_roi = 0.0
+                            lay_all = lay_roi = 0.0
+                            pnl_obs = 0.0
+                            turn_all = 0.0
+
+                            for ev in test_elig:
+                                try:
+                                    aid = int(ev.get("audit_id"))
+                                except Exception:
+                                    continue
+                                d0 = audit_by_id.get(aid)
+                                if not d0:
+                                    continue
+                                is_pre = (str(ev.get("regime")) == "Pre")
+                                side = str(ev.get("side") or "")
+                                cap = None
+                                if side == "Back":
+                                    cap = float(cap_back_pre if is_pre else cap_back_in)
+                                    if cap <= 0:
+                                        continue
+                                    # cap por evento
+                                    try:
+                                        cap = min(float(cap), float(_max_back_stake_event(d0)))
+                                    except Exception:
+                                        pass
+                                    if cap <= 0:
+                                        continue
+                                    exp = float(cap)  # exposure = stake
+                                    st_eq = float(exp)  # turnover equivalente
+                                else:
+                                    cap = float(cap_lay_pre if is_pre else cap_lay_in)
+                                    if cap <= 0:
+                                        continue
+                                    lay_odd = _lay_entry_odd(d0, ev)
+                                    if lay_odd is None:
+                                        continue
+                                    # cap por evento: max_stake_event * (odd-1) -> liab
+                                    try:
+                                        max_st = float(_max_lay_stake_event(d0))
+                                        cap = min(float(cap), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                                    except Exception:
+                                        pass
+                                    if cap <= 0:
+                                        continue
+                                    exp = float(cap)  # exposure = liability
+                                    st_eq = float(exp) / max(1e-9, (float(lay_odd) - 1.0))
+
+                                n_ev_sized += 1
+                                turn_all += float(st_eq)
+                                if side == "Back":
+                                    back_all += float(exp)
+                                else:
+                                    lay_all += float(exp)
+
+                                if ev.get("roi") is None:
+                                    continue
+                                n_ev_roi += 1
+                                pnl_obs += float(exp) * float(ev.get("roi")) / 100.0
+                                if side == "Back":
+                                    back_roi += float(exp)
+                                else:
+                                    lay_roi += float(exp)
+
+                            pnl_exp = pnl_obs
+                            if wf_expand:
+                                scale_back = (back_all / back_roi) if back_roi > 0 else 1.0
+                                scale_lay = (lay_all / lay_roi) if lay_roi > 0 else 1.0
+                                if back_roi > 0 and lay_roi > 0:
+                                    w_back = back_roi / (back_roi + lay_roi)
+                                    w_lay = 1.0 - w_back
+                                    pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                                elif back_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_back)
+                                elif lay_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_lay)
+
+                            for dday in test_days:
+                                dturn[dday] = dturn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                                dpnl_obs[dday] = dpnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
+                                dpnl_exp[dday] = dpnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+
+                        oos_days2 = sorted(dturn.keys())
+                        n_days2 = len(oos_days2) if oos_days2 else 0
+                        scale2 = (30.0 / float(n_days2)) if n_days2 > 0 else None
+                        turn_30 = float(sum(dturn.values())) * float(scale2) if scale2 is not None else None
+                        prof_exp_30 = float(sum(dpnl_exp.values())) * float(scale2) if scale2 is not None else None
+                        roi_turn = (float(prof_exp_30) / float(turn_30) * 100.0) if (prof_exp_30 is not None and turn_30 and float(turn_30) > 0) else None
+                        return {
+                            "turn_30d": turn_30,
+                            "profit_30d_exp": prof_exp_30,
+                            "roi_turn_30d": roi_turn,
+                            "days": n_days2,
+                            "n_ev_sized": int(n_ev_sized),
+                            "n_ev_roi": int(n_ev_roi),
+                        }
+
+                    if sweep_on:
+                        back_caps = _parse_csv_floats(str(getattr(args, "wf_sweep_back_caps", "") or ""))
+                        lay_caps = _parse_csv_floats(str(getattr(args, "wf_sweep_lay_caps", "") or ""))
+                        if not back_caps:
+                            back_caps = [0.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0]
+                        if not lay_caps:
+                            lay_caps = [0.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0]
+
+                        lines.append("### 12.2f Sweep de stake médio (caps absolutos por aposta; rápido)\n")
+                        lines.append(
+                            "Objetivo: ao invés de parametrizar exposição como **% da banca**, varremos **caps absolutos por aposta** "
+                            "(Back em **stake**; Lay em **liability**) e medimos o lucro/turnover OOS projetado em 30 dias.\n\n"
+                            "Notas:\n"
+                            "- Este sweep **não** aplica budget por `match_id` (é uma curva de stake médio por aposta).\n"
+                            "- Continua aplicando **limit por evento** (quando disponível; com imputação quando missing/zero).\n"
+                            "- Usa a mesma seleção walk-forward (keys ativas por step) e o mesmo gating (AH/liquidez, se ligados).\n\n"
+                        )
+
+                        # Sweep 1D por segmento (isolando os demais como 0)
+                        lines.append("**Sweep 1D (isolando segmentos: os demais caps = 0)**\n\n")
+                        lines.append("| Segmento | Cap (abs) | Turnover 30d | Lucro 30d (exp.) | ROI/turn 30d | n_ev_sized | dias |\n")
+                        lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+
+                        def _row(seg: str, cap: float, r: Dict[str, Any]) -> None:
+                            lines.append(
+                                f"| {seg} | {_fmt_num(cap,2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
+                                f"{_fmt_num(r.get('roi_turn_30d'),2)}% | {int(r.get('n_ev_sized') or 0)} | {int(r.get('days') or 0)} |\n"
+                            )
+
+                        for cap in back_caps:
+                            r = _simulate_with_abs_caps_fast(cap_back_pre=float(cap), cap_back_in=0.0, cap_lay_pre=0.0, cap_lay_in=0.0)
+                            _row("Back_Pre", float(cap), r)
+                        for cap in back_caps:
+                            r = _simulate_with_abs_caps_fast(cap_back_pre=0.0, cap_back_in=float(cap), cap_lay_pre=0.0, cap_lay_in=0.0)
+                            _row("Back_In", float(cap), r)
+                        for cap in lay_caps:
+                            r = _simulate_with_abs_caps_fast(cap_back_pre=0.0, cap_back_in=0.0, cap_lay_pre=float(cap), cap_lay_in=0.0)
+                            _row("Lay_Pre", float(cap), r)
+                        for cap in lay_caps:
+                            r = _simulate_with_abs_caps_fast(cap_back_pre=0.0, cap_back_in=0.0, cap_lay_pre=0.0, cap_lay_in=float(cap))
+                            _row("Lay_In", float(cap), r)
+                        lines.append("\n")
+
+                        # Grid 2D no In-match (Back_In × Lay_In), que costuma dominar o turnover
+                        if bool(getattr(args, "wf_sweep_grid_in", True)):
+                            # limita tamanho por segurança
+                            bxs = back_caps[:14]
+                            lxs = lay_caps[:14]
+                            lines.append("**Grid 2D (in-match): cap Back_In × cap Lay_In (Pre fixo em 0)**\n\n")
+                            lines.append("| cap_back_in | cap_lay_in | Turnover 30d | Lucro 30d (exp.) | ROI/turn 30d |\n")
+                            lines.append("|---:|---:|---:|---:|---:|\n")
+                            best = None
+                            for cb in bxs:
+                                for cl in lxs:
+                                    r = _simulate_with_abs_caps_fast(cap_back_pre=0.0, cap_back_in=float(cb), cap_lay_pre=0.0, cap_lay_in=float(cl))
+                                    turn30 = _safe_float(r.get("turn_30d"))
+                                    prof30 = _safe_float(r.get("profit_30d_exp"))
+                                    roi_t = _safe_float(r.get("roi_turn_30d"))
+                                    lines.append(
+                                        f"| {_fmt_num(cb,2)} | {_fmt_num(cl,2)} | {_fmt_num(turn30,2)} | {_fmt_num(prof30,2)} | {_fmt_num(roi_t,2)}% |\n"
+                                    )
+                                    try:
+                                        if prof30 is not None:
+                                            if best is None or float(prof30) > float(best[0]):
+                                                best = (float(prof30), float(cb), float(cl), float(turn30 or 0.0), float(roi_t or 0.0))
+                                    except Exception:
+                                        pass
+                            lines.append("\n")
+                            if best is not None:
+                                lines.append(
+                                    f"Melhor (por **Lucro 30d (exp.)**) no grid acima: lucro={_fmt_num(best[0],2)} "
+                                    f"com cap_back_in={_fmt_num(best[1],2)} e cap_lay_in={_fmt_num(best[2],2)} "
+                                    f"(turn_30d={_fmt_num(best[3],2)}, ROI/turn={_fmt_num(best[4],2)}%).\n\n"
+                                )
+
+                        # Modo ultra-rápido: encerra após o sweep (sem rodar as sensibilidades 12.2/12.2b+ e sem PDF)
+                        if bool(getattr(args, "only_stake_sweep", False)):
+                            try:
+                                out_path.parent.mkdir(parents=True, exist_ok=True)
+                                out_path.write_text("".join(lines), encoding="utf-8")
+                                print(f"Relatório gerado em: {out_path}")
+                            except Exception as e:
+                                print(f"[WARN] Falha ao escrever saída only-stake-sweep: {e}")
+                            return 0
 
                     def _simulate_with_budget(
                         *,
