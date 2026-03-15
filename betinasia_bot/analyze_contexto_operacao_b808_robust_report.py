@@ -883,6 +883,20 @@ async def main() -> int:
     )
     args = parser.parse_args()
 
+    # UX/segurança: modos "only" implicam walk-forward.
+    # É muito comum esquecer `--walkforward` e acabar com um documento sem OOS (logo sem sweep).
+    try:
+        if bool(getattr(args, "only_oos", False)) or bool(getattr(args, "only_stake_sweep", False)):
+            setattr(args, "walkforward", True)
+    except Exception:
+        pass
+    # Modo stake-sweep deve produzir um arquivo curto (OOS-only), senão fica difícil encontrar a curva.
+    try:
+        if bool(getattr(args, "only_stake_sweep", False)):
+            setattr(args, "only_oos", True)
+    except Exception:
+        pass
+
     # Reprodutibilidade: `end_utc` controla o "as-of" do recorte (audited_at e kickoff_time).
     def _parse_end_utc(s: str) -> datetime:
         s = (s or "").strip()
@@ -6466,7 +6480,8 @@ async def main() -> int:
 
                 # Modo rápido: para diagnosticar o colapso do turnover (ex.: 22-02), não precisamos das projeções 12.1/12.2+.
                 # Aqui encerramos o relatório após as tabelas essenciais e escrevemos somente o bloco OOS.
-                if bool(getattr(args, "only_oos", False)):
+                # EXCEÇÃO: `--only-stake-sweep` precisa continuar para montar a curva (12.2f).
+                if bool(getattr(args, "only_oos", False)) and (not bool(getattr(args, "only_stake_sweep", False))):
                     try:
                         def _extract_oos_block(doc_lines: List[str]) -> List[str]:
                             i0 = None
@@ -7089,7 +7104,34 @@ async def main() -> int:
                         if bool(getattr(args, "only_stake_sweep", False)):
                             try:
                                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                                out_path.write_text("".join(lines), encoding="utf-8")
+                                # Se `only_oos` estiver ligado, grava apenas o bloco OOS (para facilitar grep/leitura).
+                                if bool(getattr(args, "only_oos", False)):
+                                    try:
+                                        def _extract_oos_only(doc_lines: List[str]) -> List[str]:
+                                            i0 = None
+                                            for ii, ln in enumerate(doc_lines):
+                                                if str(ln).startswith("## 12) OOS walk-forward"):
+                                                    i0 = ii
+                                                    break
+                                            if i0 is None:
+                                                return doc_lines
+                                            j0 = len(doc_lines)
+                                            for jj in range(i0 + 1, len(doc_lines)):
+                                                ln = str(doc_lines[jj] or "")
+                                                if ln.startswith("## ") and (not ln.startswith("## 12) OOS walk-forward")):
+                                                    j0 = jj
+                                                    break
+                                            hdr = [
+                                                "## OOS (extraído) — modo `--only-stake-sweep`\n\n",
+                                                "_Este arquivo contém o bloco de walk-forward + a curva rápida de stake médio (caps absolutos)._ \n\n",
+                                            ]
+                                            return hdr + doc_lines[i0:j0]
+
+                                        out_path.write_text("".join(_extract_oos_only(lines)), encoding="utf-8")
+                                    except Exception:
+                                        out_path.write_text("".join(lines), encoding="utf-8")
+                                else:
+                                    out_path.write_text("".join(lines), encoding="utf-8")
                                 print(f"Relatório gerado em: {out_path}")
                             except Exception as e:
                                 print(f"[WARN] Falha ao escrever saída only-stake-sweep: {e}")
