@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
 from loguru import logger
 from sqlalchemy import text
 
@@ -19,6 +20,138 @@ sys.path.insert(0, ".")
 from storage.database import Database
 from executor.client import submit_execution
 from executor.contracts import ExecSide, ExecutionRequest, MarketType
+
+
+def _safe_float_money(x: Any) -> Optional[float]:
+    """
+    Similar a _safe_float, mas tolera strings com separadores (ex.: "1,234.56" ou "1.234,56").
+    """
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if not isinstance(x, str):
+            return float(x)  # type: ignore[arg-type]
+        s = x.strip()
+        if not s:
+            return None
+        # heurística simples:
+        # - se tiver "," e ".", assume "," = milhares e remove ","
+        # - senão, troca "," por "."
+        if "," in s and "." in s:
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+        # remove símbolos comuns
+        for ch in ["$", "€", "£", "R$", "USD", "USDT"]:
+            s = s.replace(ch, "")
+        s = s.strip()
+        return float(s)
+    except Exception:
+        return None
+
+
+async def _fetch_executor_account(*, unix_socket: Optional[str], http_base: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Consulta o endpoint /account do executor (mesma sessão do browser), retornando JSON.
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        if unix_socket:
+            conn = aiohttp.UnixConnector(path=str(unix_socket))
+            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
+                async with sess.get("http://localhost/account") as resp:
+                    data = await resp.json()
+                    if isinstance(data, dict):
+                        data["_http_status"] = int(resp.status)
+                    return (data if isinstance(data, dict) else {"_http_status": int(resp.status), "data": data}), None
+        base = (http_base or "http://127.0.0.1:8089").rstrip("/")
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(f"{base}/account") as resp:
+                data = await resp.json()
+                if isinstance(data, dict):
+                    data["_http_status"] = int(resp.status)
+                return (data if isinstance(data, dict) else {"_http_status": int(resp.status), "data": data}), None
+    except Exception as e:
+        return None, str(e)[:250]
+
+
+def _extract_balance_current_usd_from_executor_account(payload: Dict[str, Any]) -> Optional[float]:
+    """
+    Best-effort: tenta extrair um número de saldo disponível/atual (USD) do JSON retornado por /account.
+    O formato varia conforme endpoint descoberto pelo scraper.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    bal = payload.get("balance")
+    # get_balance_any() retorna {"path": ..., "resp": ..., "attempts": [...]}
+    if isinstance(bal, dict) and "resp" in bal:
+        bal = bal.get("resp")
+
+    candidates: List[Tuple[int, str, float]] = []  # (score, path, value)
+
+    def _score(path: str) -> int:
+        p = path.lower()
+        sc = 0
+        if "available" in p or "free" in p:
+            sc += 100
+        if "balance" in p:
+            sc += 60
+        if "amount" in p:
+            sc += 20
+        # penaliza coisas que não são saldo
+        if "limit" in p or "stake" in p or "liabil" in p or "pnl" in p:
+            sc -= 40
+        return sc
+
+    def _walk(obj: Any, path: str) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kp = f"{path}.{k}" if path else str(k)
+                # candidato numérico direto
+                fv = _safe_float_money(v)
+                if fv is not None and 0 <= float(fv) <= 50_000_000:
+                    candidates.append((_score(kp), kp, float(fv)))
+                # recursão
+                if isinstance(v, (dict, list)):
+                    _walk(v, kp)
+            return
+        if isinstance(obj, list):
+            for i, v in enumerate(obj[:200]):
+                kp = f"{path}[{i}]"
+                fv = _safe_float_money(v)
+                if fv is not None and 0 <= float(fv) <= 50_000_000:
+                    candidates.append((_score(kp), kp, float(fv)))
+                if isinstance(v, (dict, list)):
+                    _walk(v, kp)
+            return
+
+    _walk(bal, "balance")
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
+    best = candidates[0]
+    if best[0] <= 0:
+        return None
+    return float(best[2])
+
+
+def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
+    try:
+        from urllib.parse import urlencode
+        from urllib.request import Request, urlopen
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urlencode({"chat_id": chat_id, "text": text_msg}).encode("utf-8")
+        req = Request(url, data=data, method="POST")
+        with urlopen(req, timeout=10) as resp:
+            return 200 <= int(resp.status) < 300
+    except Exception:
+        return False
 
 
 def _utcnow() -> datetime:
@@ -820,6 +953,16 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     risk_last_check = 0.0
     risk_params: Dict[str, Any] = {}
 
+    # Monitoramento de saldo (guardrail operacional)
+    bal_last_check = 0.0
+    bal_payload: Optional[Dict[str, Any]] = None
+    bal_current: Optional[float] = None
+    bal_http: Optional[int] = None
+    bal_err: Optional[str] = None
+    tg_last_alert_ts = 0.0
+    tg_token = str(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    tg_chat = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
@@ -1032,7 +1175,113 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 except Exception:
                     pass
 
+                # --------------------------------
+                # Guardrail de saldo (LIVE): alerta < 500 (não bloqueia); bloqueia novas apostas quando <= 50
+                # --------------------------------
+                try:
+                    # defaults alinhados ao pedido operacional
+                    min_alert = _rp_float(risk_params, "min_balance_alert_usd")
+                    if min_alert is None:
+                        min_alert = _safe_float_money(os.getenv("BRIDGE_MIN_BALANCE_ALERT_USD", "500"))
+                    min_block = _rp_float(risk_params, "min_balance_block_usd")
+                    if min_block is None:
+                        min_block = _safe_float_money(os.getenv("BRIDGE_MIN_BALANCE_BLOCK_USD", "50"))
+                    bal_check_sec = _rp_float(risk_params, "balance_check_sec")
+                    if bal_check_sec is None:
+                        bal_check_sec = _safe_float_money(os.getenv("BRIDGE_BALANCE_CHECK_SEC", "20"))
+                    tg_cooldown = _rp_float(risk_params, "balance_alert_cooldown_sec")
+                    if tg_cooldown is None:
+                        tg_cooldown = _safe_float_money(os.getenv("BRIDGE_BALANCE_ALERT_COOLDOWN_SEC", "1800"))
+                    guard_shadow = _rp_bool(risk_params, "balance_guard_in_shadow")
+                    if guard_shadow is None:
+                        guard_shadow = os.getenv("BRIDGE_BALANCE_GUARD_IN_SHADOW", "0").strip() in ("1", "true", "True", "yes", "YES")
+                    tg_enable = _rp_bool(risk_params, "balance_alert_telegram")
+                    if tg_enable is None:
+                        tg_enable = os.getenv("BRIDGE_BALANCE_ALERT_TELEGRAM", "1").strip() in ("1", "true", "True", "yes", "YES")
+
+                    guard_active = (str(cfg.mode).lower() == "live") or bool(guard_shadow)
+                    if guard_active and (bal_check_sec is not None and float(bal_check_sec) > 0):
+                        now = time.time()
+                        if (now - float(bal_last_check)) >= float(bal_check_sec):
+                            bal_last_check = now
+                            bal_payload, bal_err = await _fetch_executor_account(
+                                unix_socket=str(cfg.unix_socket or "").strip() or None,
+                                http_base=(str(cfg.http_url).strip() if cfg.http_url else None),
+                            )
+                            bal_http = int(bal_payload.get("_http_status") or 0) if isinstance(bal_payload, dict) else None
+                            bal_current = (
+                                _extract_balance_current_usd_from_executor_account(bal_payload) if isinstance(bal_payload, dict) else None
+                            )
+                            if bal_current is None and bal_err:
+                                logger.warning(f"[bridge] balance check failed err={bal_err}")
+                            elif bal_current is not None:
+                                logger.info(f"[bridge] balance_current≈{bal_current:.2f}USD (http={bal_http or 0})")
+
+                        # anexa ao request para auditoria (mesmo em shadow, quando disponível)
+                        try:
+                            if bal_current is not None:
+                                # meta é JSONB: mantém pequeno
+                                row.setdefault("_bridge_balance_current", float(bal_current))  # debug local
+                        except Exception:
+                            pass
+
+                        # bloqueio duro (somente quando temos saldo numérico)
+                        if (
+                            bal_current is not None
+                            and min_block is not None
+                            and float(min_block) > 0
+                            and float(bal_current) <= float(min_block)
+                        ):
+                            await _mark_seen(
+                                db,
+                                src_id=src_id,
+                                action=action,
+                                execution_id=None,
+                                meta={
+                                    "skipped": True,
+                                    "reason": "low_balance_block",
+                                    "balance_current_usd": float(bal_current),
+                                    "min_balance_block_usd": float(min_block),
+                                    "min_balance_alert_usd": (float(min_alert) if min_alert is not None else None),
+                                    "balance_http": int(bal_http or 0),
+                                },
+                            )
+                            await _unreserve_seen_key(db, src_key=skey, action=action)
+                            continue
+
+                        # alerta telegram (não bloqueia)
+                        if (
+                            tg_enable
+                            and tg_token
+                            and tg_chat
+                            and bal_current is not None
+                            and min_alert is not None
+                            and float(min_alert) > 0
+                            and float(bal_current) < float(min_alert)
+                            and (tg_cooldown is not None and float(tg_cooldown) >= 0)
+                        ):
+                            if (now - float(tg_last_alert_ts)) >= float(tg_cooldown):
+                                tg_last_alert_ts = now
+                                txt = (
+                                    f"[betinasia] ALERTA: banca baixa (≈{float(bal_current):.2f} USD) < {float(min_alert):.2f}.\n"
+                                    f"Modo={cfg.mode} side={cfg.exec_side.value}. "
+                                    f"Bloqueio só em <= {float(min_block or 0):.2f}."
+                                )
+                                ok = await asyncio.to_thread(_telegram_send, tg_token, tg_chat, txt)
+                                logger.info(f"[bridge] telegram low-balance sent={ok}")
+                except Exception:
+                    pass
+
                 req = _build_request(row, cfg)
+                try:
+                    # adiciona snapshot simples para auditoria, sem inflar DB
+                    if bal_current is not None:
+                        req.meta.setdefault("balance", {})
+                        req.meta["balance"]["balance_current_usd"] = float(bal_current)
+                        req.meta["balance"]["http"] = int(bal_http or 0) if bal_http is not None else None
+                        req.meta["balance"]["ts"] = _utcnow().isoformat()
+                except Exception:
+                    pass
 
                 # -----------------------------
                 # Engine dinâmico (WF budget)
