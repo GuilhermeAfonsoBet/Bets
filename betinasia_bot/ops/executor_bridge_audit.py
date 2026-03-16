@@ -197,6 +197,9 @@ class BridgeConfig:
     bankroll_ref: Optional[float] = None
     bankroll_json: Optional[str] = None  # ex.: logs/accounting_daily_report.json
     bankroll_reload_sec: float = 30.0
+    # Saldo (guardrail operacional) — separado do bankroll_ref (sizing)
+    balance_json: Optional[str] = None  # ex.: logs/accounting_daily_report.json
+    balance_reload_sec: float = 30.0
     # Engine de budget por jogo (match_budget do WF)
     use_wf_budget: bool = False
     # Contagem de sinais (para signals_sqrt/linear): janela curta (best-effort)
@@ -949,6 +952,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     bankroll_mtime: Optional[float] = None
     bankroll_last_check = 0.0
     bankroll_ref: Optional[float] = cfg.bankroll_ref
+    balance_mtime: Optional[float] = None
+    balance_last_check = 0.0
+    balance_current_json: Optional[float] = None
     risk_mtime: Optional[float] = None
     risk_last_check = 0.0
     risk_params: Dict[str, Any] = {}
@@ -1019,6 +1025,27 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         logger.info(f"[bridge] bankroll reloaded mtime={bankroll_mtime:.0f} bankroll_ref={bankroll_ref:.2f}")
             except Exception as e:
                 logger.warning(f"[bridge] bankroll reload failed: {e}")
+
+        # reload balance (guardrail) — separado do bankroll_ref
+        # Se BRIDGE_BALANCE_JSON não estiver setado, usamos BRIDGE_BANKROLL_JSON como fallback (compat).
+        balance_path = cfg.balance_json or cfg.bankroll_json
+        balance_reload = cfg.balance_reload_sec if cfg.balance_json else cfg.bankroll_reload_sec
+        if balance_path and (time.time() - balance_last_check) >= float(balance_reload):
+            balance_last_check = time.time()
+            try:
+                p = Path(str(balance_path))
+                mtime = p.stat().st_mtime if p.exists() else None
+                if mtime and (balance_mtime is None or float(mtime) > float(balance_mtime)):
+                    b = _load_bankroll_from_json(str(balance_path))
+                    if b is not None and b >= 0:
+                        balance_current_json = float(b)
+                        balance_mtime = float(mtime)
+                        logger.info(
+                            f"[bridge] balance reloaded mtime={balance_mtime:.0f} balance_current≈{balance_current_json:.2f} "
+                            f"src={'balance_json' if cfg.balance_json else 'bankroll_json'}"
+                        )
+            except Exception as e:
+                logger.warning(f"[bridge] balance reload failed: {e}")
 
         # reload risk params (overrides manuais)
         if cfg.risk_params_json and (time.time() - risk_last_check) >= float(cfg.risk_params_reload_sec):
@@ -1223,14 +1250,12 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         bal_eff = bal_current
                         bal_eff_src = bal_source
                         try:
-                            if (
-                                bal_eff is None
-                                and cfg.bankroll_json
-                                and (bankroll_mtime is not None)
-                                and (bankroll_ref is not None and float(bankroll_ref) > 0)
-                            ):
-                                bal_eff = float(bankroll_ref)
-                                bal_eff_src = f"bankroll_json:{cfg.bankroll_json}"
+                            if bal_eff is None and balance_current_json is not None:
+                                bal_eff = float(balance_current_json)
+                                if cfg.balance_json:
+                                    bal_eff_src = f"balance_json:{cfg.balance_json}"
+                                elif cfg.bankroll_json:
+                                    bal_eff_src = f"bankroll_json:{cfg.bankroll_json}"
                         except Exception:
                             pass
 
@@ -1688,6 +1713,12 @@ def main() -> int:
         help="JSON com balance_current (ex.: logs/accounting_daily_report.json).",
     )
     ap.add_argument("--bankroll-reload-sec", type=float, default=float(os.getenv("BRIDGE_BANKROLL_RELOAD_SEC", "30.0")))
+    ap.add_argument(
+        "--balance-json",
+        default=os.getenv("BRIDGE_BALANCE_JSON", "").strip() or None,
+        help="JSON com balance_current para guardrail de saldo (ex.: logs/accounting_daily_report.json). Não afeta bankroll_ref (sizing).",
+    )
+    ap.add_argument("--balance-reload-sec", type=float, default=float(os.getenv("BRIDGE_BALANCE_RELOAD_SEC", "30.0")))
     ap.add_argument("--signals-lookback-h", type=float, default=float(os.getenv("BRIDGE_SIGNALS_LOOKBACK_H", "36.0")))
     ap.add_argument(
         "--wf-risk-mode-override",
@@ -1724,6 +1755,8 @@ def main() -> int:
         bankroll_ref=(float(args.bankroll_ref) if args.bankroll_ref is not None else None),
         bankroll_json=(str(args.bankroll_json) if args.bankroll_json else None),
         bankroll_reload_sec=float(args.bankroll_reload_sec),
+        balance_json=(str(args.balance_json) if args.balance_json else None),
+        balance_reload_sec=float(args.balance_reload_sec),
         signals_lookback_h=float(args.signals_lookback_h),
         wf_risk_mode_override=(str(args.wf_risk_mode_override) if args.wf_risk_mode_override else None),
         risk_params_json=(str(args.risk_params_json) if args.risk_params_json else None),
