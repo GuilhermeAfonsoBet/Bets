@@ -127,17 +127,28 @@ def compute_pnl_report(csv_path: Path, *, tz: timezone) -> Report:
         pnl_by_month_f: Dict[str, float] = defaultdict(float)
         by_type: Dict[str, float] = defaultdict(float)
         balance_current: Optional[float] = None
+        balance_current_dt: Optional[datetime] = None
         n = 0
         for row in reader:
             n += 1
             if not isinstance(row, dict):
                 continue
-            pnl = _safe_float(row.get(pnl_col)) if pnl_col else None
-            if pnl is None:
-                continue
             dt = _parse_dt_any(str(row.get(dt_col) or "")) if dt_col else None
             if dt is None:
                 # sem data: ignora do agregado temporal
+                continue
+            # Para balance ledger, o CSV frequentemente vem "desc" (mais recente primeiro).
+            # Então, para saldo atual, pegamos o registro com maior dt (não o "último" da iteração).
+            if kind == "balance_ledger" and balance_col:
+                b = _safe_float(row.get(balance_col))
+                if b is not None:
+                    if balance_current_dt is None or dt > balance_current_dt:
+                        balance_current_dt = dt
+                        balance_current = float(b)
+
+            pnl = _safe_float(row.get(pnl_col)) if pnl_col else None
+            if pnl is None:
+                # sem amount/pnl: ainda pode ter atualizado balance_current acima
                 continue
             d = _to_date(dt, tz)
             dayk = d.isoformat()
@@ -149,10 +160,6 @@ def compute_pnl_report(csv_path: Path, *, tz: timezone) -> Report:
                 typ = str(row.get(type_col) or "").strip() if type_col else ""
                 if typ:
                     by_type[typ] += float(pnl)
-                if balance_col:
-                    b = _safe_float(row.get(balance_col))
-                    if b is not None:
-                        balance_current = float(b)
 
                 # filtro “P&L-like”: exclui movimentações que não são resultado de aposta
                 tl = typ.lower()
