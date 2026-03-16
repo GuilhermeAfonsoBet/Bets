@@ -7047,8 +7047,20 @@ async def main() -> int:
                         lines.append("**Sweep 1D (isolando segmentos: os demais caps = 0)**\n\n")
                         lines.append("| Segmento | Cap (abs) | Turnover 30d | Lucro 30d (exp.) | ROI/turn 30d | n_ev_sized | dias |\n")
                         lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+                        # Também gera CSVs para abrir no Excel (útil quando o output não é renderizado como Markdown).
+                        sweep1d_csv_rows: List[str] = ["segment,cap_abs,turnover_30d,profit_30d_exp,roi_turn_30d_pct,n_ev_sized,days\n"]
+                        grid_csv_rows: List[str] = ["cap_back_in,cap_lay_in,turnover_30d,profit_30d_exp,roi_turn_30d_pct\n"]
 
                         def _row(seg: str, cap: float, r: Dict[str, Any]) -> None:
+                            try:
+                                sweep1d_csv_rows.append(
+                                    f"{seg},{float(cap):.2f},{_fmt_num(r.get('turn_30d'),2).replace(',','')},"
+                                    f"{_fmt_num(r.get('profit_30d_exp'),2).replace(',','')},"
+                                    f"{_fmt_num(r.get('roi_turn_30d'),2).replace(',','')},"
+                                    f"{int(r.get('n_ev_sized') or 0)},{int(r.get('days') or 0)}\n"
+                                )
+                            except Exception:
+                                pass
                             lines.append(
                                 f"| {seg} | {_fmt_num(cap,2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
                                 f"{_fmt_num(r.get('roi_turn_30d'),2)}% | {int(r.get('n_ev_sized') or 0)} | {int(r.get('days') or 0)} |\n"
@@ -7083,6 +7095,13 @@ async def main() -> int:
                                     turn30 = _safe_float(r.get("turn_30d"))
                                     prof30 = _safe_float(r.get("profit_30d_exp"))
                                     roi_t = _safe_float(r.get("roi_turn_30d"))
+                                    try:
+                                        grid_csv_rows.append(
+                                            f"{float(cb):.2f},{float(cl):.2f},{_fmt_num(turn30,2).replace(',','')},"
+                                            f"{_fmt_num(prof30,2).replace(',','')},{_fmt_num(roi_t,2).replace(',','')}\n"
+                                        )
+                                    except Exception:
+                                        pass
                                     lines.append(
                                         f"| {_fmt_num(cb,2)} | {_fmt_num(cl,2)} | {_fmt_num(turn30,2)} | {_fmt_num(prof30,2)} | {_fmt_num(roi_t,2)}% |\n"
                                     )
@@ -7099,6 +7118,26 @@ async def main() -> int:
                                     f"com cap_back_in={_fmt_num(best[1],2)} e cap_lay_in={_fmt_num(best[2],2)} "
                                     f"(turn_30d={_fmt_num(best[3],2)}, ROI/turn={_fmt_num(best[4],2)}%).\n\n"
                                 )
+
+                        # Salva CSVs junto do markdown (mesmo em only-stake-sweep, isso facilita baixar e abrir no Excel).
+                        try:
+                            base = str(out_path)
+                            if base.lower().endswith(".md"):
+                                base = base[:-3]
+                            p1 = Path(base + "_sweep1d.csv")
+                            p2 = Path(base + "_grid_in.csv")
+                            try:
+                                p1.write_text("".join(sweep1d_csv_rows), encoding="utf-8")
+                                lines.append(f"[INFO] CSV sweep1d: `{p1}`\n\n")
+                            except Exception:
+                                pass
+                            try:
+                                p2.write_text("".join(grid_csv_rows), encoding="utf-8")
+                                lines.append(f"[INFO] CSV grid_in: `{p2}`\n\n")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
 
                         # Modo ultra-rápido: encerra após o sweep (sem rodar as sensibilidades 12.2/12.2b+ e sem PDF)
                         if bool(getattr(args, "only_stake_sweep", False)):
