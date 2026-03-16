@@ -403,6 +403,25 @@ def _rp_str(rp: Dict[str, Any], key: str) -> Optional[str]:
         return None
 
 
+def _rp_bool(rp: Dict[str, Any], key: str) -> Optional[bool]:
+    try:
+        if not rp or key not in rp:
+            return None
+        v = rp.get(key)
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return bool(v)
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+        return None
+    except Exception:
+        return None
+
+
 def _event_key(row: Dict[str, Any], cfg: BridgeConfig) -> str:
     event_id = str(row.get("event_id") or "").strip()
     market = str(row.get("market_type") or "AH").strip().upper()
@@ -988,6 +1007,31 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     )
                     continue
 
+                # Kill-switch por lado (controle manual via risk_params_json)
+                try:
+                    if cfg.exec_side == ExecSide.BACK and bool(_rp_bool(risk_params, "disable_back")):
+                        await _mark_seen(
+                            db,
+                            src_id=src_id,
+                            action=action,
+                            execution_id=None,
+                            meta={"skipped": True, "reason": "disabled_back", "risk_params_json": cfg.risk_params_json},
+                        )
+                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                        continue
+                    if cfg.exec_side == ExecSide.LAY and bool(_rp_bool(risk_params, "disable_lay")):
+                        await _mark_seen(
+                            db,
+                            src_id=src_id,
+                            action=action,
+                            execution_id=None,
+                            meta={"skipped": True, "reason": "disabled_lay", "risk_params_json": cfg.risk_params_json},
+                        )
+                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                        continue
+                except Exception:
+                    pass
+
                 req = _build_request(row, cfg)
 
                 # -----------------------------
@@ -1051,6 +1095,45 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             bud_match = float(bud_base) / max(1.0, float(n_sig))
 
                         cap_signal = float(cap_sig_frac) * float(bud_match) if cap_sig_frac > 0 else float(bud_match)
+
+                        # Caps absolutos por aposta (por regime) — útil para operar em valores fixos (stake médio)
+                        cap_abs = None
+                        try:
+                            is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                            if cfg.exec_side == ExecSide.BACK:
+                                cap_abs = _rp_float(risk_params, "cap_back_in_abs" if is_live else "cap_back_pre_abs")
+                            else:
+                                cap_abs = _rp_float(risk_params, "cap_lay_in_abs" if is_live else "cap_lay_pre_abs")
+                        except Exception:
+                            cap_abs = None
+                        if cap_abs is not None:
+                            try:
+                                cap_abs = float(cap_abs)
+                            except Exception:
+                                cap_abs = None
+                        if cap_abs is not None:
+                            if float(cap_abs) <= 0:
+                                # interpretamos cap_abs<=0 como bloqueio
+                                await _mark_seen(
+                                    db,
+                                    src_id=src_id,
+                                    action=action,
+                                    execution_id=None,
+                                    meta={
+                                        "skipped": True,
+                                        "reason": "abs_cap_blocked",
+                                        "cap_abs": cap_abs,
+                                        "is_live": bool(row.get("is_live")) if row.get("is_live") is not None else False,
+                                        "exec_side": cfg.exec_side.value,
+                                    },
+                                )
+                                await _unreserve_seen_key(db, src_key=skey, action=action)
+                                continue
+                            # cap por sinal (e base) é limitado pelo cap absoluto
+                            try:
+                                cap_signal = min(float(cap_signal), float(cap_abs))
+                            except Exception:
+                                pass
 
                         cap_event = None
                         cap_back = float(_rp_float(risk_params, "cap_event_back_frac") or cfg.cap_event_back_frac)
@@ -1132,6 +1215,13 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             await _unreserve_seen_key(db, src_key=skey, action=action)
                             continue
 
+                        # aplica cap absoluto também em base_exp (garante que exp_use não exceda)
+                        if cap_abs is not None and float(cap_abs) > 0:
+                            try:
+                                base_exp = min(float(base_exp), float(cap_abs))
+                            except Exception:
+                                pass
+
                         # hard cap total por jogo (cap_event): limita o rem adicionalmente
                         rem_event = None
                         if cap_event is not None:
@@ -1185,6 +1275,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             "budget_base": bud_base,
                             "budget_match": bud_match,
                             "cap_signal": cap_signal,
+                            "cap_abs": cap_abs,
                             "cap_event": cap_event,
                             "spent_before": spent_before,
                             "spent_after": float(spent_before) + float(exp_use),
@@ -1203,6 +1294,19 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 except Exception as e:
                     # não derruba o bridge: fallback para stake fixo
                     logger.warning(f"[bridge] wf_budget engine failed src_id={src_id}: {e}")
+
+                # Gate de slippage (enforced no executor antes do LIVE): Lay + in-match, delta_pct > limiar
+                try:
+                    if cfg.exec_side == ExecSide.LAY:
+                        is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                        thr = _rp_float(risk_params, "slippage_gate_lay_in_delta_pct_gt")
+                        if is_live and thr is not None and float(thr) > 0:
+                            req.meta.setdefault("slippage_gate", {})
+                            req.meta["slippage_gate"]["lay_in_max_delta_pct"] = float(thr)
+                            # debug: aponta que o gate está ativo para este request
+                            req.meta["slippage_gate"]["enabled"] = True
+                except Exception:
+                    pass
 
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
                 eid = str(res.get("execution_id") or "")

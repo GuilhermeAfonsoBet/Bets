@@ -633,7 +633,36 @@ class ExecutorWorker:
             dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
             return dry
 
-        # Nota: sem bloqueio por slippage nesta fase (telemetria apenas).
+        # Gate de slippage (opcional): bloqueia LIVE se odds piorarem além do limiar.
+        # Caso de uso: Lay in-match, bloquear se delta_pct > 2% (ou outro threshold).
+        try:
+            thr = None
+            gate = req.meta.get("slippage_gate") if isinstance(req.meta, dict) else None
+            if isinstance(gate, dict):
+                thr = _safe_float(gate.get("lay_in_max_delta_pct") or gate.get("max_pct"))
+            if thr is None:
+                thr = _safe_float(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_MAX_PCT", "0"))
+            if (
+                thr is not None
+                and float(thr) > 0
+                and req.exec_side == ExecSide.LAY
+                and bool(req.is_live)
+                and dry.delta_pct is not None
+                and float(dry.delta_pct) > float(thr)
+            ):
+                # best-effort: fecha betslip antes de sair (evita too_many_open_betslips)
+                try:
+                    await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+                except Exception:
+                    pass
+                dry.status = ExecStatus.CAP_BLOCKED
+                dry.http_status = 200
+                dry.error = f"SLIPPAGE_GATE_LAY_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr):.2f}"
+                dry.raw = dict(dry.raw or {})
+                dry.raw["slippage_gate"] = {"enabled": True, "lay_in_max_delta_pct": float(thr), "delta_pct": float(dry.delta_pct)}
+                return dry
+        except Exception:
+            pass
 
         # 3) Place order (com 1 retry via relogin se 401)
         assert self._api is not None
