@@ -956,9 +956,10 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     # Monitoramento de saldo (guardrail operacional)
     bal_last_check = 0.0
     bal_payload: Optional[Dict[str, Any]] = None
-    bal_current: Optional[float] = None
+    bal_current: Optional[float] = None  # saldo via /account (executor)
     bal_http: Optional[int] = None
     bal_err: Optional[str] = None
+    bal_source: Optional[str] = None
     tg_last_alert_ts = 0.0
     tg_token = str(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
     tg_chat = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
@@ -1212,25 +1213,41 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             bal_current = (
                                 _extract_balance_current_usd_from_executor_account(bal_payload) if isinstance(bal_payload, dict) else None
                             )
+                            bal_source = "executor_account" if bal_current is not None else None
                             if bal_current is None and bal_err:
                                 logger.warning(f"[bridge] balance check failed err={bal_err}")
                             elif bal_current is not None:
-                                logger.info(f"[bridge] balance_current≈{bal_current:.2f}USD (http={bal_http or 0})")
+                                logger.info(f"[bridge] balance_current≈{bal_current:.2f}USD (http={bal_http or 0}) src=executor_account")
+
+                        # fallback: usar bankroll_ref carregado do accounting JSON (BRIDGE_BANKROLL_JSON)
+                        bal_eff = bal_current
+                        bal_eff_src = bal_source
+                        try:
+                            if (
+                                bal_eff is None
+                                and cfg.bankroll_json
+                                and (bankroll_mtime is not None)
+                                and (bankroll_ref is not None and float(bankroll_ref) > 0)
+                            ):
+                                bal_eff = float(bankroll_ref)
+                                bal_eff_src = f"bankroll_json:{cfg.bankroll_json}"
+                        except Exception:
+                            pass
 
                         # anexa ao request para auditoria (mesmo em shadow, quando disponível)
                         try:
-                            if bal_current is not None:
+                            if bal_eff is not None:
                                 # meta é JSONB: mantém pequeno
-                                row.setdefault("_bridge_balance_current", float(bal_current))  # debug local
+                                row.setdefault("_bridge_balance_current", float(bal_eff))  # debug local
                         except Exception:
                             pass
 
                         # bloqueio duro (somente quando temos saldo numérico)
                         if (
-                            bal_current is not None
+                            bal_eff is not None
                             and min_block is not None
                             and float(min_block) > 0
-                            and float(bal_current) <= float(min_block)
+                            and float(bal_eff) <= float(min_block)
                         ):
                             await _mark_seen(
                                 db,
@@ -1240,7 +1257,8 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                 meta={
                                     "skipped": True,
                                     "reason": "low_balance_block",
-                                    "balance_current_usd": float(bal_current),
+                                    "balance_current_usd": float(bal_eff),
+                                    "balance_source": bal_eff_src,
                                     "min_balance_block_usd": float(min_block),
                                     "min_balance_alert_usd": (float(min_alert) if min_alert is not None else None),
                                     "balance_http": int(bal_http or 0),
@@ -1254,19 +1272,21 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             tg_enable
                             and tg_token
                             and tg_chat
-                            and bal_current is not None
+                            and bal_eff is not None
                             and min_alert is not None
                             and float(min_alert) > 0
-                            and float(bal_current) < float(min_alert)
+                            and float(bal_eff) < float(min_alert)
                             and (tg_cooldown is not None and float(tg_cooldown) >= 0)
                         ):
                             if (now - float(tg_last_alert_ts)) >= float(tg_cooldown):
                                 tg_last_alert_ts = now
                                 txt = (
-                                    f"[betinasia] ALERTA: banca baixa (≈{float(bal_current):.2f} USD) < {float(min_alert):.2f}.\n"
+                                    f"[betinasia] ALERTA: banca baixa (≈{float(bal_eff):.2f} USD) < {float(min_alert):.2f}.\n"
                                     f"Modo={cfg.mode} side={cfg.exec_side.value}. "
                                     f"Bloqueio só em <= {float(min_block or 0):.2f}."
                                 )
+                                if bal_eff_src:
+                                    txt += f"\nFonte={bal_eff_src}"
                                 ok = await asyncio.to_thread(_telegram_send, tg_token, tg_chat, txt)
                                 logger.info(f"[bridge] telegram low-balance sent={ok}")
                 except Exception:
@@ -1275,9 +1295,10 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 req = _build_request(row, cfg)
                 try:
                     # adiciona snapshot simples para auditoria, sem inflar DB
-                    if bal_current is not None:
+                    if "bal_eff" in locals() and bal_eff is not None:
                         req.meta.setdefault("balance", {})
-                        req.meta["balance"]["balance_current_usd"] = float(bal_current)
+                        req.meta["balance"]["balance_current_usd"] = float(bal_eff)
+                        req.meta["balance"]["source"] = (bal_eff_src if "bal_eff_src" in locals() else None)
                         req.meta["balance"]["http"] = int(bal_http or 0) if bal_http is not None else None
                         req.meta["balance"]["ts"] = _utcnow().isoformat()
                 except Exception:
