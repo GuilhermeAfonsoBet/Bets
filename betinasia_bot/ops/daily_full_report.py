@@ -721,12 +721,19 @@ class DailyReportCfg:
     wf_scheme_pre: str = os.getenv("DAILY_WF_SCHEME_PRE", "").strip()
     wf_scheme_in: str = os.getenv("DAILY_WF_SCHEME_IN", "").strip()
     wf_flat_stake_back: str = os.getenv("DAILY_WF_FLAT_STAKE_BACK", "").strip()
-    wf_flat_liab_lay: str = os.getenv("DAILY_WF_FLAT_LIAB_LAY", "").strip()
+    # Importante: o default do analyzer é 1.0; para sensibilidade de banca (Lay in-match FLAT),
+    # isso pode "saturar" lucro/turnover. Por default operacional, usamos 50.0 (override via env).
+    wf_flat_liab_lay: str = os.getenv("DAILY_WF_FLAT_LIAB_LAY", "50").strip()
     # Budget por match_id no WF (permite rodar manual com EQ 4%/4% cap33% sem mexer no agendado das 19h)
     wf_budget_back_frac: str = os.getenv("DAILY_WF_BUDGET_BACK_FRAC", "").strip()
     wf_budget_lay_frac: str = os.getenv("DAILY_WF_BUDGET_LAY_FRAC", "").strip()
     wf_budget_cap_signal_frac: str = os.getenv("DAILY_WF_BUDGET_CAP_SIGNAL_FRAC", "").strip()
     wf_budget_risk_mode: str = os.getenv("DAILY_WF_BUDGET_RISK_MODE", "").strip()
+    # Estudo rápido: sweep de caps absolutos (stake médio) no OOS, para curva lucro×cap (1D + grid 2D).
+    wf_sweep_stakes: bool = (os.getenv("DAILY_WF_SWEEP_STAKES", "0").strip() in ("1", "true", "True", "yes", "YES"))
+    wf_sweep_back_caps: str = os.getenv("DAILY_WF_SWEEP_BACK_CAPS", "").strip()
+    wf_sweep_lay_caps: str = os.getenv("DAILY_WF_SWEEP_LAY_CAPS", "").strip()
+    wf_sweep_grid_in: bool = (os.getenv("DAILY_WF_SWEEP_GRID_IN", "1").strip() in ("1", "true", "True", "yes", "YES"))
     # Escala de banca/sizing (manter “10k etc.”)
     kelly_bankroll: str = os.getenv("DAILY_KELLY_BANKROLL", "10000")
     # Grid default para sempre gerar sensibilidade (pequeno o bastante para ser barato).
@@ -757,6 +764,10 @@ class DailyReportCfg:
         self.wf_budget_lay_frac = os.getenv("DAILY_WF_BUDGET_LAY_FRAC", self.wf_budget_lay_frac).strip()
         self.wf_budget_cap_signal_frac = os.getenv("DAILY_WF_BUDGET_CAP_SIGNAL_FRAC", self.wf_budget_cap_signal_frac).strip()
         self.wf_budget_risk_mode = os.getenv("DAILY_WF_BUDGET_RISK_MODE", self.wf_budget_risk_mode).strip()
+        self.wf_sweep_stakes = (os.getenv("DAILY_WF_SWEEP_STAKES", "1" if self.wf_sweep_stakes else "0").strip() in ("1", "true", "True", "yes", "YES"))
+        self.wf_sweep_back_caps = os.getenv("DAILY_WF_SWEEP_BACK_CAPS", self.wf_sweep_back_caps).strip()
+        self.wf_sweep_lay_caps = os.getenv("DAILY_WF_SWEEP_LAY_CAPS", self.wf_sweep_lay_caps).strip()
+        self.wf_sweep_grid_in = (os.getenv("DAILY_WF_SWEEP_GRID_IN", "1" if self.wf_sweep_grid_in else "0").strip() in ("1", "true", "True", "yes", "YES"))
         try:
             self.exec_kpi_last = int(os.getenv("DAILY_EXEC_KPI_LAST", str(self.exec_kpi_last)))
         except Exception:
@@ -892,6 +903,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-budget-cap-signal-frac", str(cfg.wf_budget_cap_signal_frac).strip()]
     if str(cfg.wf_budget_risk_mode).strip():
         args += ["--wf-budget-risk-mode", str(cfg.wf_budget_risk_mode).strip()]
+
+    # Sweep de caps absolutos no OOS (nova seção no PDF)
+    if bool(cfg.wf_sweep_stakes):
+        args += ["--wf-sweep-stakes"]
+        if str(cfg.wf_sweep_back_caps).strip():
+            args += ["--wf-sweep-back-caps", str(cfg.wf_sweep_back_caps).strip()]
+        if str(cfg.wf_sweep_lay_caps).strip():
+            args += ["--wf-sweep-lay-caps", str(cfg.wf_sweep_lay_caps).strip()]
+        if bool(cfg.wf_sweep_grid_in):
+            args += ["--wf-sweep-grid-in"]
 
     oos_run = {"skipped": False, "ok": True, "returncode": 0, "error": None, "log": str(day_dir / "oos_run.log")}
     if cfg.skip_oos:
