@@ -368,6 +368,15 @@ class Row:
         return None
 
 
+@dataclass(frozen=True)
+class Event:
+    day_utc: str  # YYYY-MM-DD
+    limit_stake: float
+    odd_entry: float
+    roi_liab_pct: float
+    diff_entry_pct: float
+
+
 async def _fetch_rows(
     *,
     db: Database,
@@ -482,6 +491,38 @@ def _assign_bin(x: float, bins: List[Tuple[float, float]]) -> Optional[int]:
     return None
 
 
+def _assign_bin_clamped(x: float, bins: List[Tuple[float, float]]) -> Optional[int]:
+    if not bins:
+        return None
+    idx = _assign_bin(x, bins)
+    if idx is not None:
+        return idx
+    # se cair fora (buracos por quantis com empates), clampa para o bin mais próximo
+    try:
+        if float(x) < float(bins[0][0]):
+            return 0
+        if float(x) > float(bins[-1][1]):
+            return len(bins) - 1
+    except Exception:
+        return None
+    best_i = None
+    best_d = None
+    for i, (lo, hi) in enumerate(bins):
+        try:
+            if float(x) < float(lo):
+                d = float(lo) - float(x)
+            elif float(x) > float(hi):
+                d = float(x) - float(hi)
+            else:
+                d = 0.0
+        except Exception:
+            continue
+        if best_d is None or d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
 def _profit_for_cap(rows: Iterable[Tuple[float, float, float]], cap_liab: float) -> float:
     """
     rows: (limit_stake, odd_entry, roi_liab_pct)
@@ -500,6 +541,191 @@ def _liab_used_for_cap(rows: Iterable[Tuple[float, float, float]], cap_liab: flo
         liab_lim = float(lim_st) * max(0.0, float(odd) - 1.0)
         used += min(float(cap_liab), float(liab_lim))
     return float(used)
+
+
+def _pnl_used_for_cap(events: Iterable[Event], *, cap_liab: float, cap_by_bin: Optional[Dict[int, float]] = None, bins: Optional[List[Tuple[float, float]]] = None) -> Tuple[float, float]:
+    pnl = 0.0
+    used = 0.0
+    for e in events:
+        try:
+            liab_lim = float(e.limit_stake) * max(0.0, float(e.odd_entry) - 1.0)
+        except Exception:
+            continue
+        cap_eff = float(cap_liab)
+        if cap_by_bin is not None and bins is not None:
+            bi = _assign_bin_clamped(float(e.limit_stake), bins)
+            if bi is not None and int(bi) in cap_by_bin:
+                cap_eff = min(float(cap_eff), float(cap_by_bin[int(bi)]))
+        exp = min(float(cap_eff), float(liab_lim)) if cap_eff > 0 else 0.0
+        used += float(exp)
+        pnl += float(exp) * float(e.roi_liab_pct) / 100.0
+    return float(pnl), float(used)
+
+
+def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, args: argparse.Namespace) -> None:
+    """
+    Walk-forward simples por dias (sem lookahead):
+    - bins de limit e decisão de cap/drop são aprendidos no TREINO e aplicados no TESTE.
+    - objetivo: maximizar P&L absoluto no teste sob guardrails de ROI/liab mínimo no bin.
+    """
+    from datetime import date
+
+    def _parse_day(s: str) -> Optional[date]:
+        try:
+            y, m, d = str(s).split("-", 2)
+            return date(int(y), int(m), int(d))
+        except Exception:
+            return None
+
+    by_day: Dict[str, List[Event]] = {}
+    for e in events:
+        by_day.setdefault(str(e.day_utc), []).append(e)
+
+    ds = sorted({_parse_day(d) for d in by_day.keys() if _parse_day(d) is not None})
+    if not ds:
+        print("[wf] Sem dias válidos.")
+        return
+    d0 = min(ds)
+    d1 = max(ds)
+    # calendário contínuo (evita “pular” dias sem eventos)
+    cal: List[date] = []
+    cur = d0
+    while cur <= d1:
+        cal.append(cur)
+        cur = cur + timedelta(days=1)
+
+    train_days = int(getattr(args, "wf_train_days", 14) or 14)
+    test_days = int(getattr(args, "wf_test_days", 7) or 7)
+    step_days = int(getattr(args, "wf_step_days", test_days) or test_days)
+    base_cap = float(getattr(args, "wf_base_cap", 50.0) or 50.0)
+    max_cap = float(getattr(args, "wf_max_cap", 100.0) or 100.0)
+    min_roi_base = float(getattr(args, "wf_min_roi_base_cap_pct", 0.0) or 0.0)
+    min_roi_marg = float(getattr(args, "wf_min_roi_marg_pct", 5.0) or 5.0)
+    min_n_bin = int(getattr(args, "wf_min_n_bin", 8) or 8)
+
+    # indices de início do teste
+    starts = []
+    for i in range(len(cal)):
+        t0 = cal[i]
+        t1 = t0 + timedelta(days=test_days - 1)
+        tr0 = t0 - timedelta(days=train_days)
+        tr1 = t0 - timedelta(days=1)
+        if tr0 < d0:
+            continue
+        if t1 > d1:
+            break
+        starts.append(i)
+    if not starts:
+        print("[wf] Janela insuficiente para walk-forward (verifique lookback/train/test).")
+        return
+
+    print("\n### Walk-forward (treino→teste) — política por bins de limit\n")
+    print(f"- Treino: {train_days}d | Teste: {test_days}d | Step: {step_days}d")
+    print(f"- Caps: base={base_cap:.2f} max={max_cap:.2f}")
+    print(f"- Guardrails: ROI@base >= {min_roi_base:.2f}% ; ROI_marg(base→max) >= {min_roi_marg:.2f}% ; min_n_bin={min_n_bin}\n")
+
+    hdr = (
+        "| step | train (UTC) | test (UTC) | n_train | n_test | pnl_policy | pnl_cap50 | pnl_cap100 | ROI_policy | ROI_cap50 | ROI_cap100 | drop_bins | expand_bins |\n"
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
+    print(hdr)
+
+    # agregados
+    agg = {"p_pol": 0.0, "u_pol": 0.0, "p50": 0.0, "u50": 0.0, "p100": 0.0, "u100": 0.0, "steps": 0}
+
+    step_idx = 0
+    i = 0
+    while i < len(cal):
+        if i not in starts:
+            i += 1
+            continue
+        t0 = cal[i]
+        tr0 = t0 - timedelta(days=train_days)
+        tr1 = t0 - timedelta(days=1)
+        te0 = t0
+        te1 = t0 + timedelta(days=test_days - 1)
+
+        # coleta eventos
+        train_events: List[Event] = []
+        test_events: List[Event] = []
+        cur = tr0
+        while cur <= tr1:
+            train_events.extend(by_day.get(cur.isoformat(), []))
+            cur = cur + timedelta(days=1)
+        cur = te0
+        while cur <= te1:
+            test_events.extend(by_day.get(cur.isoformat(), []))
+            cur = cur + timedelta(days=1)
+
+        if not train_events or not test_events:
+            i += step_days
+            continue
+
+        # bins aprendidos no treino
+        train_lims = [float(e.limit_stake) for e in train_events if float(e.limit_stake) > 0]
+        bins = _quantile_bins(train_lims, ntiles=int(args.limit_ntiles))
+        cap_by_bin: Dict[int, float] = {}
+        drop_bins = 0
+        expand_bins = 0
+        if bins:
+            for bi, (lo, hi) in enumerate(bins):
+                sub = [e for e in train_events if (float(lo) <= float(e.limit_stake) <= float(hi))]
+                if len(sub) < min_n_bin:
+                    cap_by_bin[int(bi)] = float(base_cap)
+                    continue
+                p_base, u_base = _pnl_used_for_cap(sub, cap_liab=float(base_cap))
+                roi_base = (p_base / u_base * 100.0) if u_base > 1e-12 else None
+                p_max, u_max = _pnl_used_for_cap(sub, cap_liab=float(max_cap))
+                roi_marg = ((p_max - p_base) / (u_max - u_base) * 100.0) if (u_max - u_base) > 1e-12 else None
+
+                if roi_base is not None and float(roi_base) < float(min_roi_base):
+                    cap_by_bin[int(bi)] = 0.0
+                    drop_bins += 1
+                elif roi_marg is not None and float(roi_marg) >= float(min_roi_marg):
+                    cap_by_bin[int(bi)] = float(max_cap)
+                    expand_bins += 1
+                else:
+                    cap_by_bin[int(bi)] = float(base_cap)
+
+        # avaliação no teste
+        pnl_pol, used_pol = _pnl_used_for_cap(test_events, cap_liab=float(max_cap), cap_by_bin=cap_by_bin, bins=bins)
+        pnl_50, used_50 = _pnl_used_for_cap(test_events, cap_liab=float(base_cap))
+        pnl_100, used_100 = _pnl_used_for_cap(test_events, cap_liab=float(max_cap))
+
+        roi_pol = (pnl_pol / used_pol * 100.0) if used_pol > 1e-12 else None
+        roi50 = (pnl_50 / used_50 * 100.0) if used_50 > 1e-12 else None
+        roi100 = (pnl_100 / used_100 * 100.0) if used_100 > 1e-12 else None
+
+        print(
+            f"| {step_idx+1} | {tr0.isoformat()}→{tr1.isoformat()} | {te0.isoformat()}→{te1.isoformat()} | {len(train_events)} | {len(test_events)} | "
+            f"{_num(pnl_pol,2)} | {_num(pnl_50,2)} | {_num(pnl_100,2)} | {_pct(roi_pol,2)} | {_pct(roi50,2)} | {_pct(roi100,2)} | {drop_bins} | {expand_bins} |"
+        )
+
+        agg["p_pol"] += float(pnl_pol)
+        agg["u_pol"] += float(used_pol)
+        agg["p50"] += float(pnl_50)
+        agg["u50"] += float(used_50)
+        agg["p100"] += float(pnl_100)
+        agg["u100"] += float(used_100)
+        agg["steps"] += 1
+
+        step_idx += 1
+        i += step_days
+
+    if agg["steps"] <= 0:
+        print("\n[wf] Nenhum step válido (train/test sem eventos).")
+        return
+
+    roi_pol = (agg["p_pol"] / agg["u_pol"] * 100.0) if agg["u_pol"] > 1e-12 else None
+    roi50 = (agg["p50"] / agg["u50"] * 100.0) if agg["u50"] > 1e-12 else None
+    roi100 = (agg["p100"] / agg["u100"] * 100.0) if agg["u100"] > 1e-12 else None
+    print("\n**Resumo WF (agregado nos testes)**")
+    print("| cenário | P&L | liab_usada | ROI/liab |")
+    print("|---|---:|---:|---:|")
+    print(f"| policy (bins) | {_num(agg['p_pol'],2)} | {_num(agg['u_pol'],2)} | {_pct(roi_pol,2)} |")
+    print(f"| baseline cap{_num(base_cap,0)} | {_num(agg['p50'],2)} | {_num(agg['u50'],2)} | {_pct(roi50,2)} |")
+    print(f"| baseline cap{_num(max_cap,0)} | {_num(agg['p100'],2)} | {_num(agg['u100'],2)} | {_pct(roi100,2)} |")
+    print()
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -525,8 +751,7 @@ async def _run(args: argparse.Namespace) -> int:
             pass
 
     # Filtro: Lay + In (ou conforme args)
-    keep: List[Tuple[float, float, float, float]] = []
-    # (limit_stake, odd_entry, roi_liab_pct, diff_entry_pct)
+    keep: List[Event] = []
     for r in rows:
         if args.regime != "all":
             want_live = True if args.regime == "in" else False
@@ -564,7 +789,15 @@ async def _run(args: argparse.Namespace) -> int:
         roi_liab = _roi_lay_pct_per_liability(lay_odd=odd, mult_back=mult)
         if roi_liab is None:
             continue
-        keep.append((float(lim), float(odd), float(roi_liab), float(diff)))
+        keep.append(
+            Event(
+                day_utc=r.audited_at_utc.date().isoformat(),
+                limit_stake=float(lim),
+                odd_entry=float(odd),
+                roi_liab_pct=float(roi_liab),
+                diff_entry_pct=float(diff),
+            )
+        )
 
     if not keep:
         print("[study] Sem eventos após filtros (verifique lookback/status/direction).")
@@ -575,7 +808,7 @@ async def _run(args: argparse.Namespace) -> int:
         caps = [0.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0]
 
     # bins por limit (stake) — por padrão em decis
-    lims = [x[0] for x in keep if x[0] > 0]
+    lims = [x.limit_stake for x in keep if x.limit_stake > 0]
     bins = _quantile_bins(lims, ntiles=int(args.limit_ntiles))
 
     print("\n### Estudo rápido: Lay — ROI vs limit (proxy) (DB)\n")
@@ -584,7 +817,7 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"- Eventos usados: {len(keep)} (com placar, odd e limit)\n")
 
     # curva global (efeito do cap)
-    base_rows = [(lim, odd, roi) for (lim, odd, roi, _diff) in keep]
+    base_rows = [(e.limit_stake, e.odd_entry, e.roi_liab_pct) for e in keep]
     print("**Curva global (lucro total na janela; cap em *liability*)**")
     print("| cap_liab | lucro | ROI/liab (pnl / liab_usado) |")
     print("|---:|---:|---:|")
@@ -629,13 +862,13 @@ async def _run(args: argparse.Namespace) -> int:
         # 1) tabela principal por bin
         bin_stats: List[Dict[str, Any]] = []
         for i, (lo, hi) in enumerate(bins):
-            sub = [t for t in keep if (t[0] is not None and float(lo) <= float(t[0]) <= float(hi))]
+            sub = [t for t in keep if (t.limit_stake is not None and float(lo) <= float(t.limit_stake) <= float(hi))]
             if not sub:
                 continue
-            rois = [t[2] for t in sub]
+            rois = [t.roi_liab_pct for t in sub]
             mean_roi = float(sum(rois) / len(rois)) if rois else None
             med_roi = _median(rois)
-            rows3 = [(t[0], t[1], t[2]) for t in sub]
+            rows3 = [(t.limit_stake, t.odd_entry, t.roi_liab_pct) for t in sub]
             p30 = _profit_for_cap(rows3, 30.0)
             p50 = _profit_for_cap(rows3, 50.0)
             p100 = _profit_for_cap(rows3, 100.0)
@@ -690,6 +923,10 @@ async def _run(args: argparse.Namespace) -> int:
     print("Leitura recomendada:")
     print("- Se o lucro **cai** quando o cap aumenta, isso sugere que a massa de eventos que ainda não está saturada pelo `event_limit` (i.e., limit alto) tem **ROI médio pior/negativo**.")
     print("- Para confirmar (sem proxy), rode este estudo também com `entry_odd` mais fiel (pós-reversal) — hoje este script usa um modo rápido (betslip_odd).")
+
+    if bool(getattr(args, "wf", False)):
+        _run_walk_forward(keep, since=since, until=now, args=args)
+
     return 0
 
 
@@ -719,6 +956,15 @@ def main() -> int:
     p.add_argument("--lay-diff-max", type=float, default=float(os.getenv("STUDY_LAY_DIFF_MAX", "-2.0")), help="Corte de edge Lay (diff <= este valor).")
     p.add_argument("--caps-liab", default=os.getenv("STUDY_CAPS_LIAB", "0,10,20,30,50,75,100"), help="CSV de caps (liability) para a curva global.")
     p.add_argument("--limit-ntiles", type=int, default=int(os.getenv("STUDY_LIMIT_NTILES", "10")), help="Número de faixas (quantis) de limit para sumarizar.")
+    p.add_argument("--wf", action="store_true", default=(os.getenv("STUDY_WF", "0").strip() in ("1", "true", "True", "yes", "YES")), help="Roda walk-forward (treino→teste) e compara política por bins vs baselines.")
+    p.add_argument("--wf-train-days", type=int, default=int(os.getenv("STUDY_WF_TRAIN_DAYS", "14")), help="Dias de treino por step (WF).")
+    p.add_argument("--wf-test-days", type=int, default=int(os.getenv("STUDY_WF_TEST_DAYS", "7")), help="Dias de teste por step (WF).")
+    p.add_argument("--wf-step-days", type=int, default=int(os.getenv("STUDY_WF_STEP_DAYS", "7")), help="Avanço do step em dias (WF).")
+    p.add_argument("--wf-base-cap", type=float, default=float(os.getenv("STUDY_WF_BASE_CAP", "50")), help="Cap base (liability) usado como 'mínimo' por bin (WF).")
+    p.add_argument("--wf-max-cap", type=float, default=float(os.getenv("STUDY_WF_MAX_CAP", "100")), help="Cap máximo (liability) permitido quando o bin passa no guardrail marginal (WF).")
+    p.add_argument("--wf-min-roi-base-cap-pct", type=float, default=float(os.getenv("STUDY_WF_MIN_ROI_BASE_CAP_PCT", "0")), help="Guardrail: ROI/liab mínimo no bin @cap_base para manter o bin (WF).")
+    p.add_argument("--wf-min-roi-marg-pct", type=float, default=float(os.getenv("STUDY_WF_MIN_ROI_MARG_PCT", "5")), help="Guardrail: ROI marginal mínimo (base→max) para permitir expandir cap no bin (WF).")
+    p.add_argument("--wf-min-n-bin", type=int, default=int(os.getenv("STUDY_WF_MIN_N_BIN", "8")), help="Mínimo de eventos no treino por bin para decidir (senão mantém cap_base).")
     args = p.parse_args()
     if isinstance(args.direction, str) and not args.direction.strip():
         args.direction = None
