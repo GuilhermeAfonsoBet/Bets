@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import String, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from storage.database import Database
 
@@ -211,6 +212,9 @@ async def _fetch_rows(
     only = [str(s).upper() for s in (only_status or []) if str(s).strip()]
     if not only:
         only = ["OK"]
+    # Nota (asyncpg): `(:direction IS NULL OR a.reversal_direction = :direction)` pode gerar
+    # AmbiguousParameterError se `reversal_direction` for enum/domínio. Para robustez, comparamos
+    # via cast do lado da coluna.
     q = text(
         """
         SELECT
@@ -235,13 +239,13 @@ async def _fetch_rows(
           AND a.audited_at >= :since_utc
           AND a.audited_at < :until_utc
           AND upper(a.status) = ANY(:only_status)
-          AND (:direction IS NULL OR a.reversal_direction = :direction)
+          AND (:direction IS NULL OR a.reversal_direction::text = :direction)
         """
     ).bindparams(
         bindparam("since_utc"),
         bindparam("until_utc"),
-        bindparam("direction"),
-        bindparam("only_status"),
+        bindparam("direction", type_=String()),
+        bindparam("only_status", type_=ARRAY(String())),
     )
     out: List[Row] = []
     async with db.async_session() as session:
