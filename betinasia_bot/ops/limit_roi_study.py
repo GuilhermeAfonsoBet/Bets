@@ -60,6 +60,130 @@ def _to_utc(ts: Any) -> Optional[datetime]:
     return None
 
 
+def _get_path(d: Any, path: List[Any]) -> Any:
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _extract_ws_series(hypothesis_details: dict) -> List[dict]:
+    """
+    Normaliza `hypothesis_details.ws_series` (WS-only) para pontos {t, odd}.
+    Observação: os pontos podem vir com `t_target_s` e `t_actual_s`; preferimos `t_actual_s`.
+    """
+    try:
+        arr = hypothesis_details.get("ws_series")
+        if not isinstance(arr, list):
+            return []
+        out: List[dict] = []
+        for e in arr:
+            if not isinstance(e, dict):
+                continue
+            t = _safe_float(e.get("t_actual_s"))
+            if t is None:
+                t = _safe_float(e.get("t_target_s"))
+            odd = _safe_float(e.get("ws_odd"))
+            if t is None or odd is None or odd <= 0:
+                continue
+            out.append({"t": float(t), "odd": float(odd)})
+        out.sort(key=lambda x: x["t"])
+        return out
+    except Exception:
+        return []
+
+
+def _build_lay_series(*, ws0: float, hypothesis_details: dict, lay0: Optional[float]) -> List[dict]:
+    """
+    Série temporal do Lay (proxy) para achar vale e reversão.
+    Preferimos `lay_temporal` quando existir; caso contrário usamos `ws_series`.
+    """
+    if ws0 <= 0:
+        return []
+    ws_series = _extract_ws_series(hypothesis_details)
+    series: List[dict] = []
+
+    if lay0 is not None and lay0 > 0:
+        series.append({"t": 0.0, "odd": float(lay0), "diff_pct": float((float(lay0) - ws0) / ws0 * 100.0)})
+    elif ws_series:
+        o0 = _safe_float(ws_series[0].get("odd"))
+        if o0 is None or o0 <= 0:
+            return []
+        series.append({"t": 0.0, "odd": float(o0), "diff_pct": float((float(o0) - ws0) / ws0 * 100.0)})
+    else:
+        return []
+
+    arr = hypothesis_details.get("lay_temporal")
+    if isinstance(arr, list) and len(arr) > 0:
+        for e in arr:
+            if not isinstance(e, dict):
+                continue
+            t = _safe_float(e.get("t"))
+            odd = _safe_float(e.get("lay_odd"))
+            if odd is None:
+                odd = _safe_float(e.get("ws_odd"))
+            if t is None or odd is None or odd <= 0:
+                continue
+            if float(t) <= 0.0005:
+                continue
+            series.append({"t": float(t), "odd": float(odd), "diff_pct": float((float(odd) - ws0) / ws0 * 100.0)})
+    else:
+        for p in ws_series:
+            t = _safe_float(p.get("t"))
+            odd = _safe_float(p.get("odd"))
+            if t is None or odd is None or odd <= 0:
+                continue
+            if float(t) <= 0.0005:
+                continue
+            series.append({"t": float(t), "odd": float(odd), "diff_pct": float((float(odd) - ws0) / ws0 * 100.0)})
+
+    series.sort(key=lambda x: float(x.get("t") or 0.0))
+    return series
+
+
+def _analyze_vale_reversao(series: List[dict], *, eps_rev: float = 0.5) -> dict:
+    """
+    Para Lay: vale = min(diff_pct). Reversão = após o vale, diff_pct subir >= eps_rev p.p.
+    """
+    if not series:
+        return {"n": 0}
+    diffs = [float(p.get("diff_pct") or 0.0) for p in series]
+    idx_ext = min(range(len(diffs)), key=lambda i: diffs[i])
+    ext = series[idx_ext]
+    last = series[-1]
+    had_rev = False
+    t_rev = None
+    odd_rev = None
+    diff_rev = None
+    if idx_ext + 1 < len(series):
+        threshold = float(ext.get("diff_pct") or 0.0) + float(eps_rev)
+        for p in series[idx_ext + 1 :]:
+            try:
+                if float(p.get("diff_pct") or 0.0) >= threshold:
+                    had_rev = True
+                    t_rev = float(p.get("t") or 0.0)
+                    odd_rev = _safe_float(p.get("odd"))
+                    diff_rev = float(p.get("diff_pct") or 0.0)
+                    break
+            except Exception:
+                continue
+    return {
+        "n": len(series),
+        "t_ext": float(ext.get("t") or 0.0),
+        "diff_ext": float(ext.get("diff_pct") or 0.0),
+        "odd_ext": float(ext.get("odd") or 0.0),
+        "t_last": float(last.get("t") or 0.0),
+        "diff_last": float(last.get("diff_pct") or 0.0),
+        "odd_last": float(last.get("odd") or 0.0),
+        "had_reversal": bool(had_rev),
+        "t_reversal": t_rev,
+        "odd_reversal": odd_rev,
+        "diff_reversal": diff_rev,
+    }
+
+
 def _is_live_eff(is_live: Any, *, audited_at: Optional[datetime], kickoff_time: Optional[datetime]) -> Optional[bool]:
     try:
         if is_live is True:
@@ -185,13 +309,56 @@ class Row:
     betslip_limit: Optional[float]
     lay_available_limit: Optional[float]
     lay_odd_hint: Optional[float]
+    hypothesis_details: Dict[str, Any]
 
-    def entry_odd(self) -> Optional[float]:
-        # Modo rápido: assume entrada ~ betslip_odd (quando existe). Fallbacks ajudam a não "matar" a amostra.
-        for v in (self.betslip_odd, self.lay_odd_hint, self.websocket_odd):
-            if v is not None and float(v) > 1e-9:
-                return float(v)
-        return None
+    def entry_odd(self, *, mode: str, wf_lay_end_sec: float, wf_lay_end_max_gap_sec: float, eps_rev: float) -> Optional[float]:
+        """
+        mode:
+        - 'betslip': usa betslip_odd (rápido; útil para sanity-check)
+        - 'lay_policy': replica a regra do relatório robusto: se há reversão, entra após reversão; senão entra ~t+end_sec (ou último ponto)
+        """
+        if str(mode) == "betslip":
+            for v in (self.betslip_odd, self.lay_odd_hint, self.websocket_odd):
+                if v is not None and float(v) > 1e-9:
+                    return float(v)
+            return None
+
+        # lay_policy (mais fiel ao Sweep do PDF)
+        ws0 = self.websocket_odd
+        if ws0 is None or float(ws0) <= 0:
+            ws_series = _extract_ws_series(self.hypothesis_details or {})
+            if ws_series:
+                ws0 = _safe_float(ws_series[0].get("odd"))
+        if ws0 is None or float(ws0) <= 0:
+            return None
+
+        h = self.hypothesis_details or {}
+        lay0 = _safe_float(_get_path(h, ["lay", "odd"]))
+        series = _build_lay_series(ws0=float(ws0), hypothesis_details=h, lay0=lay0)
+        if not series:
+            return None
+        a = _analyze_vale_reversao(series, eps_rev=float(eps_rev))
+        if int(a.get("n") or 0) <= 0:
+            return None
+
+        odd_rev = _safe_float(a.get("odd_reversal"))
+        if bool(a.get("had_reversal")) and odd_rev is not None and float(odd_rev) > 0:
+            return float(odd_rev)
+
+        # sem reversão: pega ponto mais próximo de t=end_sec (se dentro do gap); senão último
+        target = float(wf_lay_end_sec)
+        max_gap = float(wf_lay_end_max_gap_sec)
+        p_end = series[-1]
+        try:
+            p0 = min(series, key=lambda p: abs(float(p.get("t") or 0.0) - target))
+            if abs(float(p0.get("t") or 0.0) - target) <= max_gap:
+                p_end = p0
+        except Exception:
+            p_end = series[-1]
+        odd_end = _safe_float(p_end.get("odd"))
+        if odd_end is None or float(odd_end) <= 0:
+            return None
+        return float(odd_end)
 
     def limit_stake(self) -> Optional[float]:
         # Para Lay, preferimos `available_limit` (stake max); senão usa betslip_limit.
@@ -283,6 +450,7 @@ async def _fetch_rows(
                     betslip_limit=_safe_float(getattr(r, "betslip_limit", None)),
                     lay_available_limit=_safe_float(lay.get("available_limit")),
                     lay_odd_hint=_safe_float(lay.get("odd")),
+                    hypothesis_details=h,
                 )
             )
     return out
@@ -359,7 +527,12 @@ async def _run(args: argparse.Namespace) -> int:
             if bool(r.is_live_eff) is not bool(want_live):
                 continue
 
-        odd = r.entry_odd()
+        odd = r.entry_odd(
+            mode=str(args.entry_mode),
+            wf_lay_end_sec=float(args.wf_lay_end_sec),
+            wf_lay_end_max_gap_sec=float(args.wf_lay_end_max_gap_sec),
+            eps_rev=float(args.eps_rev),
+        )
         lim = r.limit_stake()
         if odd is None or lim is None:
             continue
@@ -466,6 +639,20 @@ def main() -> int:
     p.add_argument("--direction", default=os.getenv("STUDY_DIRECTION", "up"), help="reversal_direction (ex.: up). Use '' para não filtrar.")
     p.add_argument("--only-status", default=os.getenv("STUDY_ONLY_STATUS", "OK"), help="CSV de status (ex.: OK,GATE_NOT_ELIGIBLE). Default OK.")
     p.add_argument("--regime", choices=["in", "pre", "all"], default=os.getenv("STUDY_REGIME", "in"), help="Filtra Pre/In (via is_live/kickoff).")
+    p.add_argument(
+        "--entry-mode",
+        choices=["betslip", "lay_policy"],
+        default=os.getenv("STUDY_ENTRY_MODE", "betslip").strip() or "betslip",
+        help="Como escolher odd de entrada do Lay. 'lay_policy' replica a regra do Sweep (pós-reversal / ~t+end_sec).",
+    )
+    p.add_argument("--wf-lay-end-sec", type=float, default=float(os.getenv("WF_LAY_END_SEC", "30.0")), help="(entry-mode=lay_policy) alvo t+end (segundos).")
+    p.add_argument(
+        "--wf-lay-end-max-gap-sec",
+        type=float,
+        default=float(os.getenv("WF_LAY_END_MAX_GAP_SEC", "12.0")),
+        help="(entry-mode=lay_policy) tolerância máxima vs t+end (segundos).",
+    )
+    p.add_argument("--eps-rev", type=float, default=float(os.getenv("STUDY_EPS_REV", "0.5")), help="(entry-mode=lay_policy) threshold de reversão em p.p. de diff.")
     p.add_argument("--diff-min", type=float, default=float(os.getenv("STUDY_DIFF_MIN", "-10.0")), help="Filtro de qualidade diff (min).")
     p.add_argument("--diff-max", type=float, default=float(os.getenv("STUDY_DIFF_MAX", "10.0")), help="Filtro de qualidade diff (max).")
     p.add_argument("--lay-diff-max", type=float, default=float(os.getenv("STUDY_LAY_DIFF_MAX", "-2.0")), help="Corte de edge Lay (diff <= este valor).")
