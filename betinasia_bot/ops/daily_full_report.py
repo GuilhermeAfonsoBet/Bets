@@ -1656,14 +1656,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     continue
                 s1.append(
                     f"| {k.replace('_', ' ')} | {int(r.get('n_bets') or 0)} | {_fmt_num(r.get('amount_risk_sum'), 2)} | {_fmt_num(r.get('amount_risk_avg'), 2)} | "
-                    f"{_fmt_num(r.get('stake_sum'), 2)} | {int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_sum_settled'), 2)} | "
+                    f"{_fmt_num(r.get('stake_sum'), 2)} | {int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_real_sum_settled') or r.get('pnl_sum_settled'), 2)} | "
                     f"{_fmt_pct(r.get('roi_pct_settled'))} |\n"
                 )
             tot = exec_min.get("total") if isinstance(exec_min.get("total"), dict) else {}
             if isinstance(tot, dict) and tot:
                 s1.append(
                     f"| **TOTAL** | **{int(tot.get('n_bets') or 0)}** | **{_fmt_num(tot.get('amount_risk_sum'), 2)}** | **{_fmt_num(tot.get('amount_risk_avg'), 2)}** | "
-                    f"**{_fmt_num(tot.get('stake_sum'), 2)}** | **{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_sum_settled'), 2)}** | "
+                    f"**{_fmt_num(tot.get('stake_sum'), 2)}** | **{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_real_sum_settled') or tot.get('pnl_sum_settled'), 2)}** | "
                     f"**{_fmt_pct(tot.get('roi_pct_settled'))}** |\n"
                 )
             s1.append("\n")

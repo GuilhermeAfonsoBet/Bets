@@ -19,6 +19,37 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _extract_order_id(order_resp: Any) -> Optional[str]:
+    """
+    Extrai um identificador estável da resposta de /v1/orders/.
+    Mantém robustez: a API pode retornar `id`, `order_id`, `uuid` ou aninhado.
+    """
+    try:
+        if not order_resp:
+            return None
+        if isinstance(order_resp, str):
+            s = order_resp.strip()
+            return s or None
+        if isinstance(order_resp, dict):
+            for k in ("id", "order_id", "orderId", "uuid", "uid"):
+                v = order_resp.get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+            # tenta 1 nível de aninhamento comum
+            for k in ("data", "order", "result"):
+                v = order_resp.get(k)
+                if isinstance(v, dict):
+                    r = _extract_order_id(v)
+                    if r:
+                        return r
+        return None
+    except Exception:
+        return None
+
+
 def _ms(dt_s: float) -> int:
     return int(round(dt_s * 1000.0))
 
@@ -525,6 +556,7 @@ class ExecutorWorker:
                 "pnl_realized_sum": None,
                 "stake_open_sum": None,
                 "stake_total_sum": None,
+                "orders": None,
             }
             if orders and orders.data is not None:
                 raw = orders.data
@@ -532,6 +564,11 @@ class ExecutorWorker:
                     raw = raw.get("data")
                 lst = _extract_orders_list(raw)
                 pnl["n"] = int(len(lst))
+                # expõe lista (até page_size) para agregações no relatório (P&L por tipo)
+                try:
+                    pnl["orders"] = lst[: int(page_size)]
+                except Exception:
+                    pnl["orders"] = lst
                 pnl_real = 0.0
                 pnl_have = 0
                 stake_open = 0.0
@@ -704,10 +741,12 @@ class ExecutorWorker:
             dry.http_status = int(place.http_status or 0) or 200
             dry.timing.post_ms = post_ms
             dry.raw = dict(dry.raw or {})
+            oid = _extract_order_id(place.response)
             dry.raw.update(
                 {
                     "live": True,
                     "order_resp": place.response,
+                    "order_id": oid,
                     "order_http": int(place.http_status or 0),
                     "order_ms": int(place.request_time_ms or 0),
                     "order_text_prefix": (place.text_prefix or "")[:300],
@@ -721,9 +760,11 @@ class ExecutorWorker:
         dry.error = f"LIVE_PLACE_FAILED: {place.error or 'unknown'}"
         dry.timing.post_ms = post_ms
         dry.raw = dict(dry.raw or {})
+        oid = _extract_order_id(place.response)
         dry.raw.update(
             {
                 "live": True,
+                "order_id": oid,
                 "order_http": int(place.http_status or 0),
                 "order_ms": int(place.request_time_ms or 0),
                 "order_text_prefix": (place.text_prefix or "")[:300],
