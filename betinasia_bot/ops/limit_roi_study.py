@@ -597,6 +597,9 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
     train_days = int(getattr(args, "wf_train_days", 14) or 14)
     test_days = int(getattr(args, "wf_test_days", 7) or 7)
     step_days = int(getattr(args, "wf_step_days", test_days) or test_days)
+    wf_ntiles = int(getattr(args, "wf_limit_ntiles", 0) or 0)
+    if wf_ntiles <= 0:
+        wf_ntiles = int(getattr(args, "limit_ntiles", 10) or 10)
     base_cap = float(getattr(args, "wf_base_cap", 50.0) or 50.0)
     max_cap = float(getattr(args, "wf_max_cap", 100.0) or 100.0)
     min_roi_base = float(getattr(args, "wf_min_roi_base_cap_pct", 0.0) or 0.0)
@@ -621,6 +624,7 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
 
     print("\n### Walk-forward (treino→teste) — política por bins de limit\n")
     print(f"- Treino: {train_days}d | Teste: {test_days}d | Step: {step_days}d")
+    print(f"- Bins (limit_ntiles no treino): {wf_ntiles}")
     print(f"- Caps: base={base_cap:.2f} max={max_cap:.2f}")
     print(f"- Guardrails: ROI@base >= {min_roi_base:.2f}% ; ROI_marg(base→max) >= {min_roi_marg:.2f}% ; min_n_bin={min_n_bin}\n")
 
@@ -663,11 +667,25 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
 
         # bins aprendidos no treino
         train_lims = [float(e.limit_stake) for e in train_events if float(e.limit_stake) > 0]
-        bins = _quantile_bins(train_lims, ntiles=int(args.limit_ntiles))
+        bins = _quantile_bins(train_lims, ntiles=int(wf_ntiles))
         cap_by_bin: Dict[int, float] = {}
         drop_bins = 0
         expand_bins = 0
         if bins:
+            # alerta de parametrização: se min_n_bin é alto demais, a policy tende a não fazer nada (cap_base em tudo)
+            try:
+                approx = float(len(train_events)) / max(1.0, float(len(bins)))
+                if float(min_n_bin) > approx + 1e-9:
+                    print(
+                        f"| {step_idx+1} | {tr0.isoformat()}→{tr1.isoformat()} | {te0.isoformat()}→{te1.isoformat()} | {len(train_events)} | {len(test_events)} | "
+                        f"— | — | — | — | — | — | — | — |"
+                    )
+                    print(
+                        f"[wf][warn] step {step_idx+1}: n_train={len(train_events)} com {len(bins)} bins ⇒ ~{approx:.1f}/bin < min_n_bin={min_n_bin}. "
+                        f"Considere `--wf-limit-ntiles 4|5` e/ou `--wf-min-n-bin 2|3`.\n"
+                    )
+            except Exception:
+                pass
             for bi, (lo, hi) in enumerate(bins):
                 sub = [e for e in train_events if (float(lo) <= float(e.limit_stake) <= float(hi))]
                 if len(sub) < min_n_bin:
@@ -960,6 +978,7 @@ def main() -> int:
     p.add_argument("--wf-train-days", type=int, default=int(os.getenv("STUDY_WF_TRAIN_DAYS", "14")), help="Dias de treino por step (WF).")
     p.add_argument("--wf-test-days", type=int, default=int(os.getenv("STUDY_WF_TEST_DAYS", "7")), help="Dias de teste por step (WF).")
     p.add_argument("--wf-step-days", type=int, default=int(os.getenv("STUDY_WF_STEP_DAYS", "7")), help="Avanço do step em dias (WF).")
+    p.add_argument("--wf-limit-ntiles", type=int, default=int(os.getenv("STUDY_WF_LIMIT_NTILES", "0")), help="Número de bins de limit usados no treino (WF). 0 = usa --limit-ntiles.")
     p.add_argument("--wf-base-cap", type=float, default=float(os.getenv("STUDY_WF_BASE_CAP", "50")), help="Cap base (liability) usado como 'mínimo' por bin (WF).")
     p.add_argument("--wf-max-cap", type=float, default=float(os.getenv("STUDY_WF_MAX_CAP", "100")), help="Cap máximo (liability) permitido quando o bin passa no guardrail marginal (WF).")
     p.add_argument("--wf-min-roi-base-cap-pct", type=float, default=float(os.getenv("STUDY_WF_MIN_ROI_BASE_CAP_PCT", "0")), help="Guardrail: ROI/liab mínimo no bin @cap_base para manter o bin (WF).")
