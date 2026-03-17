@@ -494,6 +494,14 @@ def _profit_for_cap(rows: Iterable[Tuple[float, float, float]], cap_liab: float)
     return float(pnl)
 
 
+def _liab_used_for_cap(rows: Iterable[Tuple[float, float, float]], cap_liab: float) -> float:
+    used = 0.0
+    for lim_st, odd, _roi in rows:
+        liab_lim = float(lim_st) * max(0.0, float(odd) - 1.0)
+        used += min(float(cap_liab), float(liab_lim))
+    return float(used)
+
+
 async def _run(args: argparse.Namespace) -> int:
     _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
 
@@ -580,19 +588,31 @@ async def _run(args: argparse.Namespace) -> int:
     print("**Curva global (lucro total na janela; cap em *liability*)**")
     print("| cap_liab | lucro | ROI/liab (pnl / liab_usado) |")
     print("|---:|---:|---:|")
+    cap_stats: List[Tuple[float, float, float]] = []  # (cap, pnl, used)
     for cap in caps:
         if float(cap) <= 0:
             # cap 0 => lucro 0
             print(f"| {_num(cap,2)} | {_num(0.0,2)} | — |")
+            cap_stats.append((float(cap), 0.0, 0.0))
             continue
         pnl = _profit_for_cap(base_rows, float(cap))
-        liab_used = 0.0
-        for lim, odd, roi in base_rows:
-            liab_lim = float(lim) * max(0.0, float(odd) - 1.0)
-            liab_used += min(float(cap), float(liab_lim))
+        liab_used = _liab_used_for_cap(base_rows, float(cap))
         roi_w = (float(pnl) / float(liab_used) * 100.0) if liab_used > 0 else None
         print(f"| {_num(cap,2)} | {_num(pnl,2)} | {_pct(roi_w,2)} |")
+        cap_stats.append((float(cap), float(pnl), float(liab_used)))
     print()
+
+    # ROI marginal (incremental) por aumento do cap
+    if len(cap_stats) >= 2:
+        print("**ROI marginal por aumento do cap (incremental)**")
+        print("| de cap | para cap | Δlucro | Δliab_usada | ROI_marg (Δpnl/Δliab) |")
+        print("|---:|---:|---:|---:|---:|")
+        for (c0, p0, u0), (c1, p1, u1) in zip(cap_stats, cap_stats[1:]):
+            dp = float(p1) - float(p0)
+            du = float(u1) - float(u0)
+            r = (dp / du * 100.0) if du > 1e-12 else None
+            print(f"| {_num(c0,2)} | {_num(c1,2)} | {_num(dp,2)} | {_num(du,2)} | {_pct(r,2)} |")
+        print()
 
     # por bin de limit: média de ROI e contribuição marginal (cap alto pesa bins altos)
     if bins:
@@ -610,6 +630,11 @@ async def _run(args: argparse.Namespace) -> int:
                 return float(ys[m])
             return 0.5 * (float(ys[m - 1]) + float(ys[m]))
 
+        # Para facilitar decisão prática, também imprimimos ROI marginal por bin (30→50 e 50→100).
+        print("\n**ROI marginal por bin (cap30→50 e cap50→100)**")
+        print("| bin | limit_stake (lo-hi) | N | ROI_marg_30_50 | ROI_marg_50_100 |")
+        print("|---:|---:|---:|---:|---:|")
+
         for i, (lo, hi) in enumerate(bins):
             sub = [t for t in keep if (t[0] is not None and float(lo) <= float(t[0]) <= float(hi))]
             rois = [t[2] for t in sub]
@@ -624,6 +649,13 @@ async def _run(args: argparse.Namespace) -> int:
             print(
                 f"| {i+1} | {_num(lo,2)}–{_num(hi,2)} | {len(sub)} | {_pct(mean_roi,2)} | {_pct(med_roi,2)} | {_num(p30,2)} | {_num(p50,2)} | {_num(p100,2)} |"
             )
+            # marginais
+            u30 = _liab_used_for_cap(rows3, 30.0)
+            u50 = _liab_used_for_cap(rows3, 50.0)
+            u100 = _liab_used_for_cap(rows3, 100.0)
+            r3050 = ((p50 - p30) / (u50 - u30) * 100.0) if (u50 - u30) > 1e-12 else None
+            r50100 = ((p100 - p50) / (u100 - u50) * 100.0) if (u100 - u50) > 1e-12 else None
+            print(f"| {i+1} | {_num(lo,2)}–{_num(hi,2)} | {len(sub)} | {_pct(r3050,2)} | {_pct(r50100,2)} |")
         print()
 
     print("Leitura recomendada:")
