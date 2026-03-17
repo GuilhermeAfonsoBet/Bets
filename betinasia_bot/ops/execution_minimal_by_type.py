@@ -19,6 +19,35 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _load_env_file(path: Path) -> None:
+    """
+    Loader simples de .env para permitir rodar este módulo isoladamente (sem depender do shell exportar vars).
+    - Não sobrescreve variáveis já presentes no ambiente.
+    - Ignora comentários e linhas inválidas.
+    """
+    try:
+        if not path.exists():
+            return
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = str(ln).strip()
+            if not s or s.startswith("#"):
+                continue
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k = k.strip()
+            if not k:
+                continue
+            v = v.strip()
+            if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in ("'", '"')):
+                v = v[1:-1]
+            if k in os.environ and str(os.environ.get(k) or "").strip():
+                continue
+            os.environ[k] = v
+    except Exception:
+        return
+
+
 def _parse_iso(s: str) -> Optional[datetime]:
     try:
         t = str(s or "").strip()
@@ -506,6 +535,9 @@ async def compute_minimal_by_type(
 
 
 def main() -> int:
+    # garante .env (para EXECUTOR_UNIX_SOCKET, etc.)
+    _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
+
     ap = argparse.ArgumentParser(description="Métricas mínimas de execução por tipo (Back/Lay × Pre/In).")
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--hours", type=float, default=float(os.getenv("DAILY_EXEC_MIN_BY_TYPE_HOURS", "24")))
