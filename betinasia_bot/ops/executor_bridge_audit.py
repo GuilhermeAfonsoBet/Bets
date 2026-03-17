@@ -563,10 +563,49 @@ def _event_key(row: Dict[str, Any], cfg: BridgeConfig) -> str:
     market = str(row.get("market_type") or "AH").strip().upper()
     line = _norm_line(str(row.get("line") or ""))
     side = str(row.get("side") or "").strip().lower()
-    is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
     hyp = str(row.get("hypothesis_type") or "").strip().upper()
-    regime = "in" if is_live else "pre"
+    # Para deduplicação, preservamos o comportamento atual: NULL => pre.
+    is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+    regime = "in" if bool(is_live) else "pre"
     return f"{event_id}|{market}|{line}|{side}|{cfg.exec_side.value}|{cfg.mode}|{regime}|{hyp}"
+
+
+def _row_is_live(row: Dict[str, Any], *, unknown_as_live: bool = False) -> bool:
+    """
+    Decide regime Pre/In para aplicar caps por regime (ex.: cap_lay_in_abs vs cap_lay_pre_abs).
+    Problema observado em operação: `betslip_audit_results.is_live` pode vir NULL em algumas versões,
+    o que fazia o bridge aplicar cap de Pre (ex.: 50) em oportunidades LIVE/in-match (deveria ser 30).
+
+    Estratégia:
+    1) usa r.is_live quando não-NULL
+    2) tenta inferir via hypothesis_details["is_live"] quando existir
+    3) tenta inferir via kickoff_time (matches) vs audited_at
+    4) fallback: unknown_as_live (para segurança, em Lay preferimos tratar NULL como In)
+    """
+    try:
+        if row.get("is_live") is not None:
+            return bool(row.get("is_live"))
+    except Exception:
+        pass
+    try:
+        details = _parse_details(row)
+        if isinstance(details, dict) and "is_live" in details and details.get("is_live") is not None:
+            return bool(details.get("is_live"))
+    except Exception:
+        pass
+    try:
+        ko = row.get("kickoff_time")
+        au = row.get("audited_at")
+        # ambos podem vir como datetime ou string
+        if isinstance(ko, str):
+            ko = _parse_iso(ko)
+        if isinstance(au, str):
+            au = _parse_iso(au)
+        if isinstance(ko, datetime) and isinstance(au, datetime):
+            return bool(au >= ko)
+    except Exception:
+        pass
+    return bool(unknown_as_live)
 
 
 async def _reserve_seen_key(
@@ -699,8 +738,11 @@ async def _fetch_candidates(
       r.league,
       r.reversal_direction,
       r.hypothesis_details,
-      r.audited_at
+      r.audited_at,
+      m.kickoff_time
     FROM betslip_audit_results r
+    LEFT JOIN matches m
+      ON m.external_id = r.event_id
     LEFT JOIN executor_bridge_seen s
       ON s.src_table='betslip_audit_results' AND s.src_id=r.id AND s.action=:action
     WHERE r.audited_at >= :since
@@ -1084,7 +1126,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     thr = _wf_float(wf, "ah_max_abs_line")
                     scope = _wf_str(wf, "ah_scope", default="pre")
                     if thr is not None and float(thr) > 0:
-                        is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                        is_live = _row_is_live(row)
                         if _wf_apply_scope(scope, is_live=is_live):
                             ln = str(row.get("line") or "").strip()
                             if ln:
@@ -1394,7 +1436,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         # Caps absolutos por aposta (por regime) — útil para operar em valores fixos (stake médio)
                         cap_abs = None
                         try:
-                            is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                            # Segurança: se `is_live` vier NULL, preferimos tratar como In para Lay
+                            # (evita aplicar cap_pre_abs em oportunidades in-match).
+                            is_live = _row_is_live(row, unknown_as_live=(cfg.exec_side == ExecSide.LAY))
                             if cfg.exec_side == ExecSide.BACK:
                                 cap_abs = _rp_float(risk_params, "cap_back_in_abs" if is_live else "cap_back_pre_abs")
                             else:
@@ -1418,7 +1462,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                         "skipped": True,
                                         "reason": "abs_cap_blocked",
                                         "cap_abs": cap_abs,
-                                        "is_live": bool(row.get("is_live")) if row.get("is_live") is not None else False,
+                                        "is_live": bool(is_live),
                                         "exec_side": cfg.exec_side.value,
                                     },
                                 )
@@ -1593,7 +1637,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 # Gate de slippage (enforced no executor antes do LIVE): Lay + in-match, delta_pct > limiar
                 try:
                     if cfg.exec_side == ExecSide.LAY:
-                        is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                        is_live = _row_is_live(row, unknown_as_live=True)
                         thr = _rp_float(risk_params, "slippage_gate_lay_in_delta_pct_gt")
                         if is_live and thr is not None and float(thr) > 0:
                             req.meta.setdefault("slippage_gate", {})
