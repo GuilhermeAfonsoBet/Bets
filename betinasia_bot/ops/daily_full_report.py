@@ -1646,7 +1646,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         try:
             s1.append("**Execução — métricas mínimas por tipo (Back/Lay × Pre/In; janela curta)**\n\n")
             s1.append(
-                "| Tipo | #apostas | Valor apostado (stake, $) | Ticket médio ($) | #liq | #pend | P&L (liq, $) | ROI% (liq / stake) | ROI% Lay (liq / liab) |\n"
+                "| Tipo | #apostas | Valor em risco ($) | Ticket médio ($) | Stake total ($) | #liq | #pend | P&L (liq, $) | ROI% (liq) |\n"
             )
             s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             order = ["Back_Pre", "Back_In", "Lay_Pre", "Lay_In"]
@@ -1655,16 +1655,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 if not isinstance(r, dict):
                     continue
                 s1.append(
-                    f"| {k.replace('_', ' ')} | {int(r.get('n_bets') or 0)} | {_fmt_num(r.get('stake_sum'), 2)} | {_fmt_num(r.get('stake_avg'), 2)} | "
-                    f"{int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_sum_settled'), 2)} | {_fmt_pct(r.get('roi_pct_settled_per_stake'))} | "
-                    f"{_fmt_pct(r.get('roi_pct_settled_per_liability'))} |\n"
+                    f"| {k.replace('_', ' ')} | {int(r.get('n_bets') or 0)} | {_fmt_num(r.get('amount_risk_sum'), 2)} | {_fmt_num(r.get('amount_risk_avg'), 2)} | "
+                    f"{_fmt_num(r.get('stake_sum'), 2)} | {int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_sum_settled'), 2)} | "
+                    f"{_fmt_pct(r.get('roi_pct_settled'))} |\n"
                 )
             tot = exec_min.get("total") if isinstance(exec_min.get("total"), dict) else {}
             if isinstance(tot, dict) and tot:
                 s1.append(
-                    f"| **TOTAL** | **{int(tot.get('n_bets') or 0)}** | **{_fmt_num(tot.get('stake_sum'), 2)}** | **{_fmt_num(tot.get('stake_avg'), 2)}** | "
-                    f"**{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_sum_settled'), 2)}** | "
-                    f"**{_fmt_pct(tot.get('roi_pct_settled_per_stake'))}** | — |\n"
+                    f"| **TOTAL** | **{int(tot.get('n_bets') or 0)}** | **{_fmt_num(tot.get('amount_risk_sum'), 2)}** | **{_fmt_num(tot.get('amount_risk_avg'), 2)}** | "
+                    f"**{_fmt_num(tot.get('stake_sum'), 2)}** | **{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_sum_settled'), 2)}** | "
+                    f"**{_fmt_pct(tot.get('roi_pct_settled'))}** |\n"
                 )
             s1.append("\n")
         except Exception:
