@@ -616,10 +616,6 @@ async def _run(args: argparse.Namespace) -> int:
 
     # por bin de limit: média de ROI e contribuição marginal (cap alto pesa bins altos)
     if bins:
-        print(f"**Por faixa de limit (stake) — ntiles={int(args.limit_ntiles)}**")
-        print("| bin | limit_stake (lo-hi) | N | ROI/liab mean | ROI/liab p50 | lucro@cap30 | lucro@cap50 | lucro@cap100 |")
-        print("|---:|---:|---:|---:|---:|---:|---:|---:|")
-
         # helper para mediana
         def _median(xs: List[float]) -> Optional[float]:
             if not xs:
@@ -630,32 +626,65 @@ async def _run(args: argparse.Namespace) -> int:
                 return float(ys[m])
             return 0.5 * (float(ys[m - 1]) + float(ys[m]))
 
-        # Para facilitar decisão prática, também imprimimos ROI marginal por bin (30→50 e 50→100).
-        print("\n**ROI marginal por bin (cap30→50 e cap50→100)**")
-        print("| bin | limit_stake (lo-hi) | N | ROI_marg_30_50 | ROI_marg_50_100 |")
-        print("|---:|---:|---:|---:|---:|")
-
+        # 1) tabela principal por bin
+        bin_stats: List[Dict[str, Any]] = []
         for i, (lo, hi) in enumerate(bins):
             sub = [t for t in keep if (t[0] is not None and float(lo) <= float(t[0]) <= float(hi))]
-            rois = [t[2] for t in sub]
             if not sub:
                 continue
+            rois = [t[2] for t in sub]
             mean_roi = float(sum(rois) / len(rois)) if rois else None
             med_roi = _median(rois)
             rows3 = [(t[0], t[1], t[2]) for t in sub]
             p30 = _profit_for_cap(rows3, 30.0)
             p50 = _profit_for_cap(rows3, 50.0)
             p100 = _profit_for_cap(rows3, 100.0)
-            print(
-                f"| {i+1} | {_num(lo,2)}–{_num(hi,2)} | {len(sub)} | {_pct(mean_roi,2)} | {_pct(med_roi,2)} | {_num(p30,2)} | {_num(p50,2)} | {_num(p100,2)} |"
-            )
-            # marginais
             u30 = _liab_used_for_cap(rows3, 30.0)
             u50 = _liab_used_for_cap(rows3, 50.0)
             u100 = _liab_used_for_cap(rows3, 100.0)
+            roi30 = (p30 / u30 * 100.0) if u30 > 1e-12 else None
+            roi50 = (p50 / u50 * 100.0) if u50 > 1e-12 else None
+            roi100 = (p100 / u100 * 100.0) if u100 > 1e-12 else None
             r3050 = ((p50 - p30) / (u50 - u30) * 100.0) if (u50 - u30) > 1e-12 else None
             r50100 = ((p100 - p50) / (u100 - u50) * 100.0) if (u100 - u50) > 1e-12 else None
-            print(f"| {i+1} | {_num(lo,2)}–{_num(hi,2)} | {len(sub)} | {_pct(r3050,2)} | {_pct(r50100,2)} |")
+            bin_stats.append(
+                {
+                    "bin": int(i + 1),
+                    "lo": float(lo),
+                    "hi": float(hi),
+                    "n": int(len(sub)),
+                    "roi_mean": mean_roi,
+                    "roi_p50": med_roi,
+                    "p30": p30,
+                    "p50": p50,
+                    "p100": p100,
+                    "roi30": roi30,
+                    "roi50": roi50,
+                    "roi100": roi100,
+                    "r3050": r3050,
+                    "r50100": r50100,
+                }
+            )
+
+        print(f"**Por faixa de limit (stake) — ntiles={int(args.limit_ntiles)}**")
+        print("| bin | limit_stake (lo-hi) | N | ROI/liab mean | ROI/liab p50 | ROI@cap30 | ROI@cap50 | ROI@cap100 | lucro@cap30 | lucro@cap50 | lucro@cap100 |")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for s in bin_stats:
+            print(
+                f"| {s['bin']} | {_num(s['lo'],2)}–{_num(s['hi'],2)} | {s['n']} | {_pct(s.get('roi_mean'),2)} | {_pct(s.get('roi_p50'),2)} | "
+                f"{_pct(s.get('roi30'),2)} | {_pct(s.get('roi50'),2)} | {_pct(s.get('roi100'),2)} | "
+                f"{_num(s.get('p30'),2)} | {_num(s.get('p50'),2)} | {_num(s.get('p100'),2)} |"
+            )
+        print()
+
+        # 2) marginais por bin (separado, sem poluir a tabela acima)
+        print("**ROI marginal por bin (cap30→50 e cap50→100)**")
+        print("| bin | limit_stake (lo-hi) | N | ROI_marg_30_50 | ROI_marg_50_100 |")
+        print("|---:|---:|---:|---:|---:|")
+        for s in bin_stats:
+            print(
+                f"| {s['bin']} | {_num(s['lo'],2)}–{_num(s['hi'],2)} | {s['n']} | {_pct(s.get('r3050'),2)} | {_pct(s.get('r50100'),2)} |"
+            )
         print()
 
     print("Leitura recomendada:")
