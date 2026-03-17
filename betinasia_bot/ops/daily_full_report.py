@@ -973,8 +973,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # Adherence: (a) curto para tabelas diárias; (b) longo/acumulado para slippage/combos/contrafactuais
     adh_short_json = day_dir / "oos_adherence_short.json"
     adh_long_json = day_dir / "oos_adherence_long.json"
+    exec_min_json = day_dir / "execution_minimal_by_type_24h.json"
     adh_short: Optional[Dict[str, Any]] = None
     adh_long: Optional[Dict[str, Any]] = None
+    exec_min: Optional[Dict[str, Any]] = None
     try:
         subprocess.run(
             [
@@ -1022,6 +1024,29 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         adh_long = _read_json(adh_long_json)
     except Exception:
         adh_long = None
+
+    # Execução: métricas mínimas por tipo (Back/Lay × Pre/In) — janela curta (horas)
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ops.execution_minimal_by_type",
+                "--executor-jsonl",
+                str(cfg.executor_jsonl),
+                "--hours",
+                str(os.getenv("DAILY_EXEC_MIN_BY_TYPE_HOURS", "24")),
+                "--only-status",
+                str(os.getenv("DAILY_EXEC_MIN_BY_TYPE_ONLY_STATUS", "LIVE_OK")),
+                "--out",
+                str(exec_min_json),
+            ],
+            check=False,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        exec_min = _read_json(exec_min_json)
+    except Exception:
+        exec_min = None
 
     audit_json = day_dir / "audit_status_kpis.json"
     audit_rep: Optional[Dict[str, Any]] = None
@@ -1617,6 +1642,34 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     adh_slip = adh_long if isinstance(adh_long, dict) else (adh_day if isinstance(adh_day, dict) else None)
 
     # execução (contagens + stake médio) via aderência (janela curta)
+    if isinstance(exec_min, dict) and isinstance(exec_min.get("by_type"), dict):
+        try:
+            s1.append("**Execução — métricas mínimas por tipo (Back/Lay × Pre/In; janela curta)**\n\n")
+            s1.append(
+                "| Tipo | #apostas | Valor apostado (stake, $) | Ticket médio ($) | #liq | #pend | P&L (liq, $) | ROI% (liq / stake) | ROI% Lay (liq / liab) |\n"
+            )
+            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            order = ["Back_Pre", "Back_In", "Lay_Pre", "Lay_In"]
+            for k in order:
+                r = exec_min.get("by_type", {}).get(k) if isinstance(exec_min.get("by_type"), dict) else None
+                if not isinstance(r, dict):
+                    continue
+                s1.append(
+                    f"| {k.replace('_', ' ')} | {int(r.get('n_bets') or 0)} | {_fmt_num(r.get('stake_sum'), 2)} | {_fmt_num(r.get('stake_avg'), 2)} | "
+                    f"{int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_sum_settled'), 2)} | {_fmt_pct(r.get('roi_pct_settled_per_stake'))} | "
+                    f"{_fmt_pct(r.get('roi_pct_settled_per_liability'))} |\n"
+                )
+            tot = exec_min.get("total") if isinstance(exec_min.get("total"), dict) else {}
+            if isinstance(tot, dict) and tot:
+                s1.append(
+                    f"| **TOTAL** | **{int(tot.get('n_bets') or 0)}** | **{_fmt_num(tot.get('stake_sum'), 2)}** | **{_fmt_num(tot.get('stake_avg'), 2)}** | "
+                    f"**{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_sum_settled'), 2)}** | "
+                    f"**{_fmt_pct(tot.get('roi_pct_settled_per_stake'))}** | — |\n"
+                )
+            s1.append("\n")
+        except Exception:
+            pass
+
     if isinstance(adh_day, dict) and isinstance(adh_day.get("per_day"), list) and adh_day.get("per_day"):
         s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
         s1.append(
