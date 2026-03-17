@@ -67,6 +67,9 @@ def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
+        # formatos comuns do BetinAsia: ["USD", -10.58]
+        if isinstance(x, (list, tuple)) and len(x) >= 2:
+            return float(x[1])
         return float(x)
     except Exception:
         return None
@@ -408,7 +411,7 @@ async def compute_minimal_by_type(
     # Orders (P&L real) via executor /account (unix socket)
     orders_by_id: Dict[str, Dict[str, Any]] = {}
     orders_meta: Dict[str, Any] = {"enabled": False, "n_orders": 0, "error": None}
-    unix_socket = os.getenv("EXECUTOR_UNIX_SOCKET", "").strip()
+    unix_socket = os.getenv("EXECUTOR_UNIX_SOCKET", "").strip() or "/tmp/betinasia-exec.sock"
     orders_pnl = os.getenv("DAILY_EXEC_MIN_BY_TYPE_ORDERS_PNL", "1").strip() not in ("0", "false", "False", "no", "NO")
     try:
         page_size = int(os.getenv("DAILY_EXEC_MIN_BY_TYPE_ORDERS_PAGE_SIZE", "200") or 200)
@@ -430,11 +433,11 @@ async def compute_minimal_by_type(
                     if oid is None:
                         continue
                     orders_by_id[str(oid)] = o
-                orders_meta = {"enabled": True, "n_orders": int(len(lst)), "error": None}
+                orders_meta = {"enabled": True, "n_orders": int(len(lst)), "unix_socket": str(unix_socket), "error": None}
             else:
-                orders_meta = {"enabled": True, "n_orders": 0, "error": "NO_ORDERS_LIST_IN_ACCOUNT_SNAPSHOT"}
+                orders_meta = {"enabled": True, "n_orders": 0, "unix_socket": str(unix_socket), "error": "NO_ORDERS_LIST_IN_ACCOUNT_SNAPSHOT"}
         except Exception as e:
-            orders_meta = {"enabled": True, "n_orders": 0, "error": str(e)[:200]}
+            orders_meta = {"enabled": True, "n_orders": 0, "unix_socket": str(unix_socket), "error": str(e)[:200]}
 
     for e in xs:
         a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
@@ -466,25 +469,34 @@ async def compute_minimal_by_type(
         # settled (REAL, independente de placar): usa orders.profit_loss quando disponível
         if e.order_id and str(e.order_id) in orders_by_id:
             o = orders_by_id.get(str(e.order_id)) or {}
-            closed = bool(o.get("closed")) if o.get("closed") is not None else (str(o.get("status") or "").lower() in ("closed", "settled"))
-            if closed:
-                pl = _safe_float(o.get("profit_loss"))
-                if pl is not None:
-                    row["n_settled"] += 1
-                    row["stake_sum_settled"] += float(stake)
-                    if not is_lay:
-                        row["amount_risk_sum_settled"] += float(stake)
+            # profit_loss pode vir no nível do order ou dentro de bets[]
+            pl = _safe_float(o.get("profit_loss"))
+            if pl is None:
+                try:
+                    bets = o.get("bets") if isinstance(o.get("bets"), list) else []
+                    pls = [_safe_float(b.get("profit_loss")) for b in bets if isinstance(b, dict)]
+                    pls = [x for x in pls if x is not None]
+                    if pls:
+                        pl = float(sum(pls))
+                except Exception:
+                    pl = None
+            # consideramos “liquidada” apenas quando existe P&L (aderente ao accounting/UI)
+            if pl is not None:
+                row["n_settled"] += 1
+                row["stake_sum_settled"] += float(stake)
+                if not is_lay:
+                    row["amount_risk_sum_settled"] += float(stake)
+                else:
+                    liab2 = None
+                    if odd is not None:
+                        liab2 = float(stake) * max(0.0, float(odd) - 1.0)
+                    elif e.liability_req is not None:
+                        liab2 = float(e.liability_req)
                     else:
-                        liab2 = None
-                        if odd is not None:
-                            liab2 = float(stake) * max(0.0, float(odd) - 1.0)
-                        elif e.liability_req is not None:
-                            liab2 = float(e.liability_req)
-                        else:
-                            liab2 = 0.0
-                        row["liability_sum_settled"] += float(liab2)
-                        row["amount_risk_sum_settled"] += float(liab2)
-                    row["pnl_real_sum_settled"] += float(pl)
+                        liab2 = 0.0
+                    row["liability_sum_settled"] += float(liab2)
+                    row["amount_risk_sum_settled"] += float(liab2)
+                row["pnl_real_sum_settled"] += float(pl)
 
     # post-process
     for k, r in by_type.items():
