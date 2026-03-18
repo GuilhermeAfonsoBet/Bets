@@ -795,6 +795,43 @@ async def main() -> int:
         "Por segurança operacional, deve ficar OFF no relatório diário (19h) e só ser usado em rodadas manuais.",
     )
     parser.add_argument(
+        "--wf-weekday-sizer",
+        choices=["off", "budget_mult"],
+        default=os.getenv("WF_WEEKDAY_SIZER", "off").strip() or "off",
+        help="(Exploratório) Sizing por dia da semana no WF. "
+        "'budget_mult' aprende multiplicadores por weekday no treino e aplica como multiplicador nos budgets/caps do teste. Default: off.",
+    )
+    parser.add_argument(
+        "--wf-weekday-strength",
+        type=float,
+        default=float(os.getenv("WF_WEEKDAY_STRENGTH", "0.25")),
+        help="Força do efeito do weekday (0=desliga). Usado como amplitude do multiplicador. Default=0.25.",
+    )
+    parser.add_argument(
+        "--wf-weekday-scale-pct",
+        type=float,
+        default=float(os.getenv("WF_WEEKDAY_SCALE_PCT", "5.0")),
+        help="Escala (em pontos percentuais de ROI) para mapear delta_ROI -> multiplicador via tanh. Default=5.0.",
+    )
+    parser.add_argument(
+        "--wf-weekday-min-mult",
+        type=float,
+        default=float(os.getenv("WF_WEEKDAY_MIN_MULT", "0.75")),
+        help="Mínimo multiplicador permitido para weekday sizing. Default=0.75.",
+    )
+    parser.add_argument(
+        "--wf-weekday-max-mult",
+        type=float,
+        default=float(os.getenv("WF_WEEKDAY_MAX_MULT", "1.25")),
+        help="Máximo multiplicador permitido para weekday sizing. Default=1.25.",
+    )
+    parser.add_argument(
+        "--wf-weekday-apply-scope",
+        choices=["all", "pre", "in"],
+        default=os.getenv("WF_WEEKDAY_APPLY_SCOPE", "in").strip() or "in",
+        help="Escopo de aplicação do weekday sizing: all/pre/in. Default: in (foco no in-match).",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -957,6 +994,10 @@ async def main() -> int:
     oos_back_stakes_all: List[float] = []
     oos_lay_liab_all: List[float] = []
     oos_jobs: List[Tuple[datetime, datetime, float]] = []
+    # Weekday sizing (exploratório): agregados para reportar multiplicadores médios no 12.1
+    weekday_mult_sum: Dict[str, float] = {}
+    weekday_mult_cnt: Dict[str, int] = {}
+    weekday_sizer_meta: Dict[str, Any] = {}
 
     # Export opcional de curvas de sensibilidade (por banca) para consumo no daily.
     # Observação: este export não altera o markdown; apenas serializa os números já calculados.
@@ -6080,6 +6121,143 @@ async def main() -> int:
                     fail_sizing_in: Counter[str] = Counter()
                     fail_sizing_side_pre: Counter[str] = Counter()
                     fail_sizing_side_in: Counter[str] = Counter()
+
+                    # Weekday sizing (exploratório): aprende no treino, aplica no teste como multiplicador de budget/cap por match.
+                    weekday_mode = str(getattr(args, "wf_weekday_sizer", "off") or "off").strip().lower()
+                    weekday_strength = float(getattr(args, "wf_weekday_strength", 0.0) or 0.0)
+                    weekday_scale_pct = float(getattr(args, "wf_weekday_scale_pct", 5.0) or 5.0)
+                    weekday_min_mult = float(getattr(args, "wf_weekday_min_mult", 0.75) or 0.75)
+                    weekday_max_mult = float(getattr(args, "wf_weekday_max_mult", 1.25) or 1.25)
+                    weekday_apply_scope = str(getattr(args, "wf_weekday_apply_scope", "in") or "in").strip().lower()
+
+                    def _weekday_name_ymd(s: Any) -> str:
+                        try:
+                            if not s:
+                                return "NA"
+                            dt0 = datetime.strptime(str(s), "%Y-%m-%d")
+                            return ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"][dt0.weekday()]
+                        except Exception:
+                            return "NA"
+
+                    def _scope_ok(regime: str, scope: str) -> bool:
+                        r = str(regime or "")
+                        sc = str(scope or "all").lower()
+                        if sc == "all":
+                            return True
+                        if sc == "pre":
+                            return r == "Pre"
+                        if sc == "in":
+                            return r != "Pre"
+                        return True
+
+                    weekday_mult: Dict[str, float] = {}
+                    if weekday_mode == "budget_mult" and weekday_strength > 0:
+                        try:
+                            weekday_scale_pct = max(1e-6, float(weekday_scale_pct))
+                            # aprende no treino somente no escopo escolhido (default: in-match)
+                            train_wd_raw = [
+                                e
+                                for e in combo_events
+                                if (e.get("day") in train_days)
+                                and (_key(e) in set(active))
+                                and _liq_ok(e, thr=thr_use)
+                                and _ah_ok(e)
+                                and (e.get("roi") is not None)
+                                and _scope_ok(str(e.get("regime")), weekday_apply_scope)
+                            ]
+                            train_wd = _dedup_match_key(train_wd_raw)
+                            train_wd.sort(key=_ts_ev)
+                            # orçamento no treino (baseline, sem weekday mult) para refletir caps/budgets reais
+                            spent_back_tr: Dict[int, float] = {}
+                            spent_lay_tr: Dict[int, float] = {}
+                            cnt_back_tr = Counter(int(ev.get("match_id")) for ev in train_wd if ev.get("side") == "Back")
+                            cnt_lay_tr = Counter(int(ev.get("match_id")) for ev in train_wd if ev.get("side") != "Back")
+                            exp_by_wd: Dict[str, float] = {}
+                            pnl_by_wd: Dict[str, float] = {}
+                            exp_tot = 0.0
+                            pnl_tot = 0.0
+                            for ev0 in train_wd:
+                                res_sz0 = _sizing_for_event(ev0)
+                                if isinstance(res_sz0, tuple) and len(res_sz0) == 2:
+                                    st_eq0, exp0 = res_sz0
+                                else:
+                                    st_eq0, exp0, _ = res_sz0
+                                if st_eq0 is None or exp0 is None:
+                                    continue
+                                mid0 = int(ev0.get("match_id"))
+                                if ev0.get("side") == "Back":
+                                    budm0 = float(bud_back)
+                                    if bud_risk_mode == "signals_sqrt":
+                                        budm0 = float(bud_back) / max(1.0, math.sqrt(float(cnt_back_tr.get(mid0, 1))))
+                                    elif bud_risk_mode == "signals_linear":
+                                        budm0 = float(bud_back) / max(1.0, float(cnt_back_tr.get(mid0, 1)))
+                                    capm0 = float(bud_cap_sig_frac) * float(budm0)
+                                    rem0 = max(0.0, float(budm0) - float(spent_back_tr.get(mid0, 0.0)))
+                                    if rem0 <= 0:
+                                        continue
+                                    exp_use0 = min(float(exp0), float(rem0), float(capm0))
+                                    if exp_use0 <= 0:
+                                        continue
+                                    ratio0 = exp_use0 / max(1e-9, float(exp0))
+                                    exp0 = exp_use0
+                                    st_eq0 = float(st_eq0) * float(ratio0)
+                                    spent_back_tr[mid0] = float(spent_back_tr.get(mid0, 0.0)) + float(exp_use0)
+                                else:
+                                    budm0 = float(bud_lay)
+                                    if bud_risk_mode == "signals_sqrt":
+                                        budm0 = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay_tr.get(mid0, 1))))
+                                    elif bud_risk_mode == "signals_linear":
+                                        budm0 = float(bud_lay) / max(1.0, float(cnt_lay_tr.get(mid0, 1)))
+                                    capm0 = float(bud_cap_sig_frac) * float(budm0)
+                                    rem0 = max(0.0, float(budm0) - float(spent_lay_tr.get(mid0, 0.0)))
+                                    if rem0 <= 0:
+                                        continue
+                                    exp_use0 = min(float(exp0), float(rem0), float(capm0))
+                                    if exp_use0 <= 0:
+                                        continue
+                                    ratio0 = exp_use0 / max(1e-9, float(exp0))
+                                    exp0 = exp_use0
+                                    st_eq0 = float(st_eq0) * float(ratio0)
+                                    spent_lay_tr[mid0] = float(spent_lay_tr.get(mid0, 0.0)) + float(exp_use0)
+                                roi_pct0 = float(ev0.get("roi") or 0.0)
+                                pnl0 = float(exp0) * float(roi_pct0) / 100.0
+                                wd0 = _weekday_name_ymd(ev0.get("day"))
+                                exp_by_wd[wd0] = float(exp_by_wd.get(wd0, 0.0)) + float(exp0)
+                                pnl_by_wd[wd0] = float(pnl_by_wd.get(wd0, 0.0)) + float(pnl0)
+                                exp_tot += float(exp0)
+                                pnl_tot += float(pnl0)
+                            roi_glb = (float(pnl_tot) / float(exp_tot) * 100.0) if exp_tot > 0 else 0.0
+                            # converte ROI relativo -> multiplicador suave
+                            for wd in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]:
+                                ewd = float(exp_by_wd.get(wd, 0.0))
+                                if ewd <= 0:
+                                    weekday_mult[wd] = 1.0
+                                    continue
+                                rwd = float(pnl_by_wd.get(wd, 0.0)) / float(ewd) * 100.0
+                                delta = float(rwd) - float(roi_glb)
+                                mult = 1.0 + float(weekday_strength) * math.tanh(float(delta) / float(weekday_scale_pct))
+                                mult = float(min(float(weekday_max_mult), max(float(weekday_min_mult), mult)))
+                                weekday_mult[wd] = float(mult)
+                            # acumula para resumo (média simples por step)
+                            for wd, mv in weekday_mult.items():
+                                if wd not in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]:
+                                    continue
+                                weekday_mult_sum[wd] = float(weekday_mult_sum.get(wd, 0.0)) + float(mv)
+                                weekday_mult_cnt[wd] = int(weekday_mult_cnt.get(wd, 0)) + 1
+                            if not weekday_sizer_meta:
+                                weekday_sizer_meta.update(
+                                    {
+                                        "mode": weekday_mode,
+                                        "apply_scope": weekday_apply_scope,
+                                        "strength": float(weekday_strength),
+                                        "scale_pct": float(weekday_scale_pct),
+                                        "min_mult": float(weekday_min_mult),
+                                        "max_mult": float(weekday_max_mult),
+                                    }
+                                )
+                        except Exception:
+                            weekday_mult = {}
+
                     for ev in test_elig:
                         res_sz = _sizing_for_event(ev)
                         if isinstance(res_sz, tuple) and len(res_sz) == 2:
@@ -6110,6 +6288,9 @@ async def main() -> int:
                                 bud_m = float(bud_back) / max(1.0, math.sqrt(float(cnt_back.get(mid, 1))))
                             elif bud_risk_mode == "signals_linear":
                                 bud_m = float(bud_back) / max(1.0, float(cnt_back.get(mid, 1)))
+                            # weekday sizing (multiplica budget/cap no escopo configurado)
+                            if weekday_mode == "budget_mult" and weekday_mult and _scope_ok(str(ev.get("regime")), weekday_apply_scope):
+                                bud_m = float(bud_m) * float(weekday_mult.get(_weekday_name_ymd(ev.get("day")), 1.0))
                             cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
                             rem = max(0.0, float(bud_m) - float(spent_back.get(mid, 0.0)))
                             if rem <= 0:
@@ -6128,6 +6309,8 @@ async def main() -> int:
                                 bud_m = float(bud_lay) / max(1.0, math.sqrt(float(cnt_lay.get(mid, 1))))
                             elif bud_risk_mode == "signals_linear":
                                 bud_m = float(bud_lay) / max(1.0, float(cnt_lay.get(mid, 1)))
+                            if weekday_mode == "budget_mult" and weekday_mult and _scope_ok(str(ev.get("regime")), weekday_apply_scope):
+                                bud_m = float(bud_m) * float(weekday_mult.get(_weekday_name_ymd(ev.get("day")), 1.0))
                             cap_sig_m = float(bud_cap_sig_frac) * float(bud_m)
                             rem = max(0.0, float(bud_m) - float(spent_lay.get(mid, 0.0)))
                             if rem <= 0:
@@ -6834,6 +7017,28 @@ async def main() -> int:
                 lines.append(f"| Train mode (OOS) | `{wf_train_mode}` |\n")
                 lines.append(f"| Scheme pre-match (OOS) | `{wf_scheme_pre}` |\n")
                 lines.append(f"| Scheme in-match (OOS) | `{wf_scheme_in}` |\n")
+                # Weekday sizing (se usado em qualquer step)
+                try:
+                    if weekday_sizer_meta:
+                        avgs = {}
+                        for wd in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]:
+                            c = int(weekday_mult_cnt.get(wd, 0))
+                            if c > 0:
+                                avgs[wd] = float(weekday_mult_sum.get(wd, 0.0)) / float(c)
+                        rng = None
+                        if avgs:
+                            rng = (min(avgs.values()), max(avgs.values()))
+                        meta_s = (
+                            f"{weekday_sizer_meta.get('mode')} (apply={weekday_sizer_meta.get('apply_scope')}; "
+                            f"strength={_fmt_num(weekday_sizer_meta.get('strength'),2)}; "
+                            f"range_avg={_fmt_num(rng[0],2)}..{_fmt_num(rng[1],2)}; "
+                            f"clip={_fmt_num(weekday_sizer_meta.get('min_mult'),2)}..{_fmt_num(weekday_sizer_meta.get('max_mult'),2)})"
+                            if rng is not None
+                            else f"{weekday_sizer_meta.get('mode')} (apply={weekday_sizer_meta.get('apply_scope')}; strength={_fmt_num(weekday_sizer_meta.get('strength'),2)})"
+                        )
+                        lines.append(f"| Weekday sizing (OOS; exploratório) | `{meta_s}` |\n")
+                except Exception:
+                    pass
                 lines.append(f"| Expansão missing ROI | {'ON' if wf_expand else 'OFF'} |\n")
                 lines.append(f"| Dias OOS (calendário de teste) | {n_oos_days} |\n")
                 lines.append(f"| Dias OOS com OK (>=1 evento OK/conf) | {n_oos_days_ok} |\n")
