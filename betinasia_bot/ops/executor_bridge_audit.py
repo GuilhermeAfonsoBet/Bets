@@ -89,6 +89,15 @@ def _extract_balance_current_usd_from_executor_account(payload: Dict[str, Any]) 
     # get_balance_any() retorna {"path": ..., "resp": ..., "attempts": [...]}
     if isinstance(bal, dict) and "resp" in bal:
         bal = bal.get("resp")
+    # Quando o scraper não encontra endpoint de balance, ele costuma retornar apenas attempts/status.
+    # Nesses casos, qualquer "404" dentro de attempts NÃO é saldo e não deve ser interpretado como tal.
+    if isinstance(bal, dict) and ("attempts" in bal) and ("resp" not in bal):
+        return None
+    try:
+        if payload.get("balance_ok") is False and (bal is None or isinstance(bal, dict) and ("attempts" in bal) and ("resp" not in bal)):
+            return None
+    except Exception:
+        pass
 
     candidates: List[Tuple[int, str, float]] = []  # (score, path, value)
 
@@ -104,6 +113,9 @@ def _extract_balance_current_usd_from_executor_account(payload: Dict[str, Any]) 
         # penaliza coisas que não são saldo
         if "limit" in p or "stake" in p or "liabil" in p or "pnl" in p:
             sc -= 40
+        # penaliza fortemente metadados/erros/HTTP attempts
+        if "attempt" in p or ".status" in p or "http" in p or "error" in p or "code" in p or "path" in p:
+            sc -= 200
         return sc
 
     def _walk(obj: Any, path: str) -> None:
@@ -113,7 +125,11 @@ def _extract_balance_current_usd_from_executor_account(payload: Dict[str, Any]) 
             for k, v in obj.items():
                 kp = f"{path}.{k}" if path else str(k)
                 # candidato numérico direto
-                fv = _safe_float_money(v)
+                # ignora números que claramente são metadados de attempts/status
+                if any(x in kp.lower() for x in ("attempt", ".status", "http", "error", "code", "path")):
+                    fv = None
+                else:
+                    fv = _safe_float_money(v)
                 if fv is not None and 0 <= float(fv) <= 50_000_000:
                     candidates.append((_score(kp), kp, float(fv)))
                 # recursão
@@ -123,7 +139,10 @@ def _extract_balance_current_usd_from_executor_account(payload: Dict[str, Any]) 
         if isinstance(obj, list):
             for i, v in enumerate(obj[:200]):
                 kp = f"{path}[{i}]"
-                fv = _safe_float_money(v)
+                if any(x in kp.lower() for x in ("attempt", ".status", "http", "error", "code", "path")):
+                    fv = None
+                else:
+                    fv = _safe_float_money(v)
                 if fv is not None and 0 <= float(fv) <= 50_000_000:
                     candidates.append((_score(kp), kp, float(fv)))
                 if isinstance(v, (dict, list)):
