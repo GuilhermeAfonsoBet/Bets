@@ -881,6 +881,11 @@ async def main() -> int:
         default=os.getenv("WF_EXPORT_POLICY_JSON", "").strip(),
         help="Se definido (path), exporta um JSON com os steps do walk-forward (inclui active_keys/diag) para uso operacional (Decision Engine).",
     )
+    parser.add_argument(
+        "--wf-export-bank-sensitivity-json",
+        default=os.getenv("WF_EXPORT_BANK_SENSITIVITY_JSON", "").strip(),
+        help="Se definido (path), exporta um JSON com as curvas de sensibilidade por banca do OOS (12.2b/c/d/e), para uso no daily/reportes.",
+    )
     args = parser.parse_args()
 
     # UX/segurança: modos "only" implicam walk-forward.
@@ -945,6 +950,23 @@ async def main() -> int:
     oos_back_stakes_all: List[float] = []
     oos_lay_liab_all: List[float] = []
     oos_jobs: List[Tuple[datetime, datetime, float]] = []
+
+    # Export opcional de curvas de sensibilidade (por banca) para consumo no daily.
+    # Observação: este export não altera o markdown; apenas serializa os números já calculados.
+    bank_sens_export_path = str(getattr(args, "wf_export_bank_sensitivity_json", "") or "").strip()
+    bank_sens_export: Dict[str, Any] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "direction": str(getattr(args, "direction", "") or ""),
+        "versions": list(versions),
+        "lookback_days": int(getattr(args, "lookback_days", 0) or 0) if getattr(args, "lookback_days", None) is not None else None,
+        "scenarios": {},
+    }
+
+    def _sens_add(name: str, *, grid: List[float], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+        if not bank_sens_export_path:
+            return
+        bank_sens_export["grid"] = [float(x) for x in grid]
+        bank_sens_export["scenarios"][str(name)] = {"meta": dict(meta or {}), "rows": list(rows or [])}
 
     def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
         """
@@ -7788,6 +7810,20 @@ async def main() -> int:
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                             )
                         lines.append("\n")
+                        try:
+                            _sens_add(
+                                "12.2b_base",
+                                grid=grid,
+                                rows=rs,
+                                meta={
+                                    "bud_back_frac": float(bud_back_frac),
+                                    "bud_lay_frac": float(bud_lay_frac),
+                                    "cap_signal_frac": float(bud_cap_sig_frac),
+                                    "risk_mode": "fixed",
+                                },
+                            )
+                        except Exception:
+                            pass
 
                         # Limit-hit rates (por banca): budget/caps vs limite do evento
                         try:
@@ -7834,6 +7870,15 @@ async def main() -> int:
                             )
                         lines.append("\n")
                         try:
+                            _sens_add(
+                                "12.2c_eq4_signals_sqrt",
+                                grid=grid,
+                                rows=rs,
+                                meta={"bud_back_frac": 0.04, "bud_lay_frac": 0.04, "cap_signal_frac": 0.50, "risk_mode": "signals_sqrt"},
+                            )
+                        except Exception:
+                            pass
+                        try:
                             lines.append("**Limit-hit rate (por banca; EQ 4%/4% cap50%, signals_sqrt)**\n\n")
                             lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
                             lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
@@ -7877,6 +7922,15 @@ async def main() -> int:
                             )
                         lines.append("\n")
                         try:
+                            _sens_add(
+                                "12.2e_eq4_fixed",
+                                grid=grid,
+                                rows=rs,
+                                meta={"bud_back_frac": 0.04, "bud_lay_frac": 0.04, "cap_signal_frac": 0.50, "risk_mode": "fixed"},
+                            )
+                        except Exception:
+                            pass
+                        try:
                             lines.append("**Limit-hit rate (por banca; EQ 4%/4% cap50%, fixed)**\n\n")
                             lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
                             lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
@@ -7919,6 +7973,15 @@ async def main() -> int:
                                 f"{_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
                             )
                         lines.append("\n")
+                        try:
+                            _sens_add(
+                                "12.2d_eq2_signals_sqrt",
+                                grid=grid,
+                                rows=rs,
+                                meta={"bud_back_frac": 0.02, "bud_lay_frac": 0.02, "cap_signal_frac": 0.33, "risk_mode": "signals_sqrt"},
+                            )
+                        except Exception:
+                            pass
                         try:
                             lines.append("**Limit-hit rate (por banca; EQ 2%/2% cap33%, signals_sqrt)**\n\n")
                             lines.append("| Banca(ref) | n_after_budget | %bind event_limit | %bind bank_cap | %bind cap_signal | %bind match_budget | %bind both | skips(rem<=0) |\n")
@@ -8588,6 +8651,18 @@ async def main() -> int:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("".join(lines), encoding="utf-8")
+
+        # Export opcional: curvas de sensibilidade por banca (OOS)
+        try:
+            if bank_sens_export_path and isinstance(bank_sens_export.get("scenarios"), dict) and bank_sens_export["scenarios"]:
+                p = Path(str(bank_sens_export_path)).expanduser()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(bank_sens_export, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            try:
+                print(f"[WARN] Falha ao exportar bank_sensitivity_json: {str(e)[:200]}")
+            except Exception:
+                pass
 
         print(f"Relatório gerado em: {out_path}")
 

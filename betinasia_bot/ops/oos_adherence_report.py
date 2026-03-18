@@ -618,7 +618,17 @@ async def run_report(
         "rule": {"back_skip_raw_pct_le": -2.0, "lay_skip_raw_pct_gt": 2.0},
         "note": "Contrafactual baseado apenas nas execuções com ROI via placar (audit+scores+odd). Não é P&L accounting.",
         "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
-        "lay": {"n": 0, "pnl": 0.0, "liability": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "liability_filtered": 0.0},
+        # Lay: além de liability, guardamos stake para permitir ajuste de turnover (capacidade) em tabelas de sensibilidade
+        "lay": {
+            "n": 0,
+            "pnl": 0.0,
+            "stake": 0.0,
+            "liability": 0.0,
+            "n_filtered": 0,
+            "pnl_filtered": 0.0,
+            "stake_filtered": 0.0,
+            "liability_filtered": 0.0,
+        },
     }
 
     def _cf_init() -> Dict[str, Any]:
@@ -626,7 +636,16 @@ async def run_report(
             "rule": dict(cf.get("rule") or {}),
             "note": str(cf.get("note") or ""),
             "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
-            "lay": {"n": 0, "pnl": 0.0, "liability": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "liability_filtered": 0.0},
+            "lay": {
+                "n": 0,
+                "pnl": 0.0,
+                "stake": 0.0,
+                "liability": 0.0,
+                "n_filtered": 0,
+                "pnl_filtered": 0.0,
+                "stake_filtered": 0.0,
+                "liability_filtered": 0.0,
+            },
         }
 
     # Diagnóstico AH (linha): o filtro do WF é por |line|, não por odds.
@@ -753,11 +772,13 @@ async def run_report(
                         pass
                 cf["lay"]["n"] += 1
                 cf["lay"]["pnl"] += float(pnl)
+                cf["lay"]["stake"] += float(stake)
                 cf["lay"]["liability"] += float(liab)
                 skip = (raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
                 if not skip:
                     cf["lay"]["n_filtered"] += 1
                     cf["lay"]["pnl_filtered"] += float(pnl)
+                    cf["lay"]["stake_filtered"] += float(stake)
                     cf["lay"]["liability_filtered"] += float(liab)
 
         # carry-forward do último step se existir (mesma lógica do modo per_day)

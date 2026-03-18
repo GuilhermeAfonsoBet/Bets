@@ -543,6 +543,17 @@ def _vcpu_count() -> Optional[int]:
         return None
 
 
+def _safe_div(a: Any, b: Any) -> Optional[float]:
+    try:
+        aa = float(a)
+        bb = float(b)
+        if bb == 0:
+            return None
+        return float(aa / bb)
+    except Exception:
+        return None
+
+
 def _load_wf_policy_last_step(path: Path) -> Optional[Dict[str, Any]]:
     try:
         if not path.exists():
@@ -843,6 +854,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # 3) Rodar OOS (walk-forward) e exportar policy
     base_md = day_dir / "report_base.md"
     policy_hist = cfg.wf_policy_history_dir / f"wf_policy_{day}.json"
+    bank_sens_json = day_dir / "wf_bank_sensitivity.json"
     cfg.wf_policy_history_dir.mkdir(parents=True, exist_ok=True)
 
     args = [
@@ -859,6 +871,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "--walkforward",
         "--wf-export-policy-json",
         str(policy_hist),
+        "--wf-export-bank-sensitivity-json",
+        str(bank_sens_json),
     ]
     if bool(cfg.no_auto_exclude_days):
         args += ["--no-auto-exclude-days"]
@@ -2686,6 +2700,88 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     oos_annex = ""
     if oos_as_annex and oos_txt.strip():
         oos_annex = "## Anexo A) OOS walk-forward (Seção 12)\n\n" + _demote_h2_to_h3(oos_txt.strip() + "\n")
+
+    # Ajuste adicional (capacidade): sensibilidade por banca com efeito do gate de slippage.
+    # Usa (a) curvas base exportadas pelo OOS (bank_sensitivity.json) e (b) contrafactual observado (execuções com placar).
+    try:
+        sens = _read_json(bank_sens_json) if "bank_sens_json" in locals() else None
+        cf_src = None
+        if isinstance(adh_long, dict) and isinstance(adh_long.get("slippage_filter_counterfactual"), dict):
+            cf_src = adh_long.get("slippage_filter_counterfactual")
+        elif isinstance(adh_short, dict) and isinstance(adh_short.get("slippage_filter_counterfactual"), dict):
+            cf_src = adh_short.get("slippage_filter_counterfactual")
+        if isinstance(sens, dict) and isinstance(sens.get("scenarios"), dict) and isinstance(cf_src, dict):
+            back = cf_src.get("back") if isinstance(cf_src.get("back"), dict) else {}
+            lay = cf_src.get("lay") if isinstance(cf_src.get("lay"), dict) else {}
+            # turnover (stake) e pnl do contrafactual (apenas cobertura com placar+odd)
+            turn_base = float(back.get("stake") or 0.0) + float(lay.get("stake") or 0.0)
+            turn_filt = float(back.get("stake_filtered") or 0.0) + float(lay.get("stake_filtered") or 0.0)
+            pnl_base = float(back.get("pnl") or 0.0) + float(lay.get("pnl") or 0.0)
+            pnl_filt = float(back.get("pnl_filtered") or 0.0) + float(lay.get("pnl_filtered") or 0.0)
+            n_base = int(back.get("n") or 0) + int(lay.get("n") or 0)
+            n_filt = int(back.get("n_filtered") or 0) + int(lay.get("n_filtered") or 0)
+            turn_factor = _safe_div(turn_filt, turn_base)
+            n_factor = _safe_div(n_filt, n_base)
+            roi_base = _safe_div(pnl_base, turn_base)
+            roi_filt = _safe_div(pnl_filt, turn_filt)
+            roi_factor = _safe_div(roi_filt, roi_base) if (roi_base is not None and roi_filt is not None and roi_base != 0) else None
+            profit_factor = (float(turn_factor) * float(roi_factor)) if (turn_factor is not None and roi_factor is not None) else None
+
+            # Só faz sentido se temos fatores numéricos
+            if turn_factor is not None and profit_factor is not None:
+                block = []
+                block.append("\n### Ajuste operacional: Sensibilidade por banca com gate de slippage (contrafactual)\n\n")
+                block.append(
+                    "_Leitura: aplica a regra `Back: pula slippage_raw_pct<=-2%` e `Lay: pula slippage_raw_pct>2%` "
+                    "como um ajuste de capacidade, usando a evidência contrafactual nas execuções cobertas por placar. "
+                    "Isso reduz N/turnover e pode aumentar ROI._\n\n"
+                )
+                block.append(
+                    f"- Fatores (da janela contrafactual): pass_turnover≈`{_fmt_num(turn_factor*100.0,2)}%`, "
+                    f"pass_N≈`{_fmt_num((n_factor*100.0) if n_factor is not None else None,2)}%`, "
+                    f"ROI_mult≈`{_fmt_num(roi_factor,3)}` ⇒ lucro_mult≈`{_fmt_num(profit_factor,3)}`.\n\n"
+                )
+
+                # para cada cenário exportado, imprime uma tabela paralela “com gate”
+                scen = sens.get("scenarios") if isinstance(sens.get("scenarios"), dict) else {}
+                for name, payload in scen.items():
+                    rows = payload.get("rows") if isinstance(payload, dict) else None
+                    if not isinstance(rows, list) or not rows:
+                        continue
+                    block.append(f"**{name} — com gate de slippage (ajuste)**\n\n")
+                    block.append("| Banca (ref) | Turnover 30d (adj) | Lucro 30d (adj) | ROI/banca 30d (adj) | n_after_budget (adj) |\n")
+                    block.append("|---:|---:|---:|---:|---:|\n")
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        br = r.get("bank_ref")
+                        t0 = _safe_float(r.get("turn_30d"))
+                        p0 = _safe_float(r.get("profit_30d_exp"))
+                        beff = _safe_float(r.get("bank_eff"))
+                        n0 = None
+                        try:
+                            h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                            n0 = int(h.get("n_after_budget")) if h.get("n_after_budget") is not None else None
+                        except Exception:
+                            n0 = None
+                        t1 = (float(t0) * float(turn_factor)) if t0 is not None else None
+                        p1 = (float(p0) * float(profit_factor)) if p0 is not None else None
+                        roi_bank = (float(p1) / float(beff) * 100.0) if (p1 is not None and beff is not None and beff > 0) else None
+                        n1 = int(round(float(n0) * float(n_factor))) if (n0 is not None and n_factor is not None) else None
+                        block.append(
+                            f"| {_fmt_num(br,2)} | {_fmt_num(t1,2)} | {_fmt_num(p1,2)} | {_fmt_num(roi_bank,2)}% | {n1 if n1 is not None else '—'} |\n"
+                        )
+                    block.append("\n")
+
+                # injeta no OOS (anexo por padrão). Se não houver anexo, cai no apêndice operacional (99).
+                add_txt = "".join(block)
+                if oos_as_annex and oos_annex:
+                    oos_annex = oos_annex + _demote_h2_to_h3(add_txt)
+                else:
+                    extra.append("\n\n## Anexo B) Ajuste operacional (slippage gate × capacidade)\n\n")
+                    extra.append(add_txt)
+    except Exception:
+        pass
     combined_core = "".join(s0) + "".join(s1) + insample_wrapped
     combined_md.write_text(combined_core + "".join(extra) + oos_annex, encoding="utf-8")
 
