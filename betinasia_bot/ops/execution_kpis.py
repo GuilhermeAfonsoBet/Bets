@@ -104,6 +104,8 @@ def compute_kpis_from_lines(
             continue
 
         st = str(res.get("status") or "")
+        if st == "HEARTBEAT":
+            continue
         if only_set and st not in only_set:
             continue
         if excl_set and st in excl_set:

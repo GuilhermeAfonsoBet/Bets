@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ class ExecutorService:
     _workers: list = None
     _store: ResultStore = None
     _start_task: Optional[asyncio.Task] = None
+    _heartbeat_task: Optional[asyncio.Task] = None
     _ready: bool = False
     _start_error: Optional[str] = None
 
@@ -64,7 +66,25 @@ class ExecutorService:
         self._ready = True
         logger.info(f"[executor] service started workers={len(self._workers)}")
 
+        # Heartbeat opcional no JSONL para medir "gaps" de forma mais realista no reporte.
+        # Sem isso, o JSONL só tem tráfego quando há /execute, então gaps podem significar apenas "sem apostas".
+        try:
+            hb_sec = float(os.getenv("EXECUTOR_JSONL_HEARTBEAT_SEC", "0") or 0.0)
+        except Exception:
+            hb_sec = 0.0
+        if hb_sec > 0 and getattr(self._store, "jsonl_path", None):
+            try:
+                self._heartbeat_task = asyncio.create_task(self._run_jsonl_heartbeat(hb_sec))
+                logger.info(f"[executor] jsonl heartbeat enabled every {hb_sec:.0f}s")
+            except Exception:
+                self._heartbeat_task = None
+
     async def close(self):
+        if self._heartbeat_task:
+            try:
+                self._heartbeat_task.cancel()
+            except Exception:
+                pass
         for t in self._worker_tasks or []:
             t.cancel()
         for w in self._workers or []:
@@ -74,6 +94,31 @@ class ExecutorService:
                 pass
         if self._store:
             await self._store.close()
+
+    async def _run_jsonl_heartbeat(self, hb_sec: float) -> None:
+        """
+        Escreve linhas leves no JSONL para servir como "heartbeat" operacional.
+        Essas linhas devem ser ignoradas por KPIs de execução (status=HEARTBEAT).
+        """
+        # aguarda store/jsonl_path
+        while True:
+            await asyncio.sleep(max(1.0, float(hb_sec)))
+            try:
+                p = getattr(self._store, "jsonl_path", None)
+                if not p:
+                    continue
+                now = _now_utc().isoformat()
+                payload = {
+                    "request": {"created_at": now},
+                    "result": {"created_at": now, "finished_at": now, "status": "HEARTBEAT", "timing": {}},
+                }
+                with p.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception as e:
+                try:
+                    logger.warning(f"[executor] heartbeat jsonl write failed: {str(e)[:200]}")
+                except Exception:
+                    pass
 
     async def _run_worker_loop(self, worker: ExecutorWorker):
         while True:
