@@ -532,6 +532,17 @@ def _mem_available_mib() -> Optional[float]:
         return None
 
 
+def _vcpu_count() -> Optional[int]:
+    try:
+        n = os.cpu_count()
+        if n is None:
+            return None
+        n2 = int(n)
+        return n2 if n2 > 0 else None
+    except Exception:
+        return None
+
+
 def _load_wf_policy_last_step(path: Path) -> Optional[Dict[str, Any]]:
     try:
         if not path.exists():
@@ -1121,6 +1132,35 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     else:
         s0.append("- **Accounting**: indisponível (ver apêndice 99.1)\n")
 
+    # lucro "esperado operacional" aproximado: aplica a regra do gate de slippage no subconjunto com placar (contrafactual)
+    try:
+        per_day = (adh_short or {}).get("per_day") if isinstance(adh_short, dict) else None
+        if isinstance(per_day, list) and per_day:
+            base = 0.0
+            filt = 0.0
+            n = 0
+            for it in per_day:
+                if not isinstance(it, dict):
+                    continue
+                cf = it.get("slippage_filter_counterfactual")
+                if not isinstance(cf, dict):
+                    continue
+                b = cf.get("back") if isinstance(cf.get("back"), dict) else {}
+                l = cf.get("lay") if isinstance(cf.get("lay"), dict) else {}
+                try:
+                    base += float(b.get("pnl") or 0.0) + float(l.get("pnl") or 0.0)
+                    filt += float(b.get("pnl_filtered") or 0.0) + float(l.get("pnl_filtered") or 0.0)
+                    n += int(b.get("n") or 0) + int(l.get("n") or 0)
+                except Exception:
+                    continue
+            if n > 0:
+                s0.append(
+                    f"- **Lucro esperado (com gate de slippage; exec c/ placar)**: `{_fmt_num(filt,2)}` "
+                    f"(base `{_fmt_num(base,2)}`, Δ `{_fmt_num(filt-base,2)}`)\n"
+                )
+    except Exception:
+        pass
+
     # risco/estabilidade operacional (últimas 24h) via audit_status_kpis
     top_errs = []
     try:
@@ -1187,7 +1227,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     try:
         mav = _mem_available_mib()
         if mav is not None:
-            s0.append(f"\n**Recursos da VPS (snapshot)**\n\n- MemAvailable: `{_fmt_num(mav,0)} MiB`\n")
+            s0.append("\n**Recursos da VPS (snapshot)**\n\n")
+            s0.append(f"- MemAvailable: `{_fmt_num(mav,0)} MiB`\n")
+            try:
+                vc = _vcpu_count()
+                if vc is not None:
+                    s0.append(f"- vCPUs (os.cpu_count): `{int(vc)}`\n")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1227,6 +1274,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     stale24 = _sum_status(audit_rep, "STALE_QUEUE_WAIT")
     err_open = _count_err_substr(audit_rep, "too_many_open_betslips")
     err_pmms = _count_err_substr(audit_rep, "no pmms received")
+    pmm_consults_24h = None
+    no_pmms_24h = None
+    no_pmms_rate_24h = None
+    try:
+        blk = (audit_rep or {}).get("pmm") if isinstance((audit_rep or {}).get("pmm"), dict) else {}
+        tot = blk.get("total") if isinstance(blk.get("total"), dict) else {}
+        pmm_consults_24h = int(tot.get("pmm_consults")) if tot.get("pmm_consults") is not None else None
+        no_pmms_24h = int(tot.get("no_pmms")) if tot.get("no_pmms") is not None else None
+        no_pmms_rate_24h = _safe_float(tot.get("no_pmms_rate_pct"))
+    except Exception:
+        pmm_consults_24h = None
+        no_pmms_24h = None
+        no_pmms_rate_24h = None
 
     ok_valid_pct = (100.0 * okv24 / tot24) if tot24 > 0 else None
     api_failed_pct = (100.0 * api_failed24 / tot24) if tot24 > 0 else None
@@ -1238,6 +1298,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     p90_call_24h = None
     p50_call_24h = None
     n_succ_24h = None
+    p50_queue_24h = None
+    p90_queue_24h = None
+    p50_queue_all = None
     try:
         blk = ((kpi_ok.get("timing_ms") or {}).get("call_to_done") or {})
         p90_call = int(blk.get("p90") or 0) or None
@@ -1245,6 +1308,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         p90_call = None
         p50_call = None
+    try:
+        blkq = ((kpi_ok.get("timing_ms") or {}).get("queue_delay") or {})
+        p50_queue_all = int(blkq.get("p50") or 0) or None
+    except Exception:
+        p50_queue_all = None
     try:
         blk24 = ((kpi_ok_24h.get("timing_ms") or {}).get("call_to_done") or {}) if isinstance(kpi_ok_24h, dict) else {}
         p90_call_24h = int(blk24.get("p90") or 0) or None
@@ -1254,6 +1322,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         p90_call_24h = None
         p50_call_24h = None
         n_succ_24h = None
+    try:
+        blkq24 = ((kpi_ok_24h.get("timing_ms") or {}).get("queue_delay") or {}) if isinstance(kpi_ok_24h, dict) else {}
+        p50_queue_24h = int(blkq24.get("p50") or 0) or None
+        p90_queue_24h = int(blkq24.get("p90") or 0) or None
+    except Exception:
+        p50_queue_24h = None
+        p90_queue_24h = None
 
     gaps15 = None
     try:
@@ -1279,6 +1354,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| API_FAILED/total (24h, DB) | {_fmt_num(api_failed_pct,1)}% | ≤{_fmt_num(thr_api_failed_pct,1)}% | **{_fmt_status(chk_api)}** |\n")
     s0.append(f"| STALE_QUEUE_WAIT/total (24h, DB) | {_fmt_num(stale_pct,1)}% | ≤{_fmt_num(thr_stale_pct,1)}% | **{_fmt_status(chk_stale)}** |\n")
     s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
+    if pmm_consults_24h is not None and no_pmms_24h is not None:
+        s0.append(
+            f"| `No PMMs` / `PMM-consults` (24h, DB) | {int(no_pmms_24h)}/{int(pmm_consults_24h)} ({_fmt_num(no_pmms_rate_24h,2)}%) | — | — |\n"
+        )
     s0.append(f"| `too_many_open_betslips` (24h, DB) | {int(err_open)} | ≤{int(thr_open_betslips)} | **{_fmt_status(chk_open)}** |\n")
     s0.append(
         f"| Latência p90 `call_to_done_ms` (24h; sucessos) | {_fmt_num(p90_call_24h,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n"
@@ -1287,6 +1366,22 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| n sucessos no JSONL (24h) | {n_succ_24h if n_succ_24h is not None else '—'} | — | — |\n")
     s0.append(f"| Gaps >15min no executor_jsonl (24h; proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
     s0.append("\n")
+
+    # Diagnóstico curto de causa (latência): quando p50 sobe, quase sempre é fila (queue_delay_ms) e/ou timeout de PMM/relógio.
+    try:
+        if p50_queue_24h is not None and int(p50_queue_24h) > 500:
+            s0.append(
+                f"**Diagnóstico (latência)**: p50 `queue_delay_ms` (24h) = `{int(p50_queue_24h)}ms` (p90 `{_fmt_num(p90_queue_24h,0)}ms`)"
+            )
+            if p50_queue_all is not None:
+                s0.append(f" vs baseline `{_fmt_num(p50_queue_all,0)}ms`.\n")
+            else:
+                s0.append(".\n")
+            s0.append(
+                "- Interpretação: há backlog na fila do executor (workers/concurrency insuficiente ou bursts). Mitigação típica: aumentar `EXECUTOR_WORKERS` e/ou reduzir bursts no bridge.\n\n"
+            )
+    except Exception:
+        pass
 
     hard_fails = []
     if not chk_allow:
@@ -1646,23 +1741,25 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         try:
             s1.append("**Execução — métricas mínimas por tipo (Back/Lay × Pre/In; janela curta)**\n\n")
             s1.append(
-                "| Tipo | #apostas | Valor em risco ($) | Ticket médio ($) | Stake total ($) | #liq | #pend | P&L (liq, $) | ROI% (liq) |\n"
+                "| Tipo | #ordens | #linhas | #jogos | Valor em risco ($) | Ticket médio ($/ordem) | Stake total ($) | #liq | #pend | P&L (liq, $) | ROI% (liq) |\n"
             )
-            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             order = ["Back_Pre", "Back_In", "Lay_Pre", "Lay_In"]
             for k in order:
                 r = exec_min.get("by_type", {}).get(k) if isinstance(exec_min.get("by_type"), dict) else None
                 if not isinstance(r, dict):
                     continue
                 s1.append(
-                    f"| {k.replace('_', ' ')} | {int(r.get('n_bets') or 0)} | {_fmt_num(r.get('amount_risk_sum'), 2)} | {_fmt_num(r.get('amount_risk_avg'), 2)} | "
+                    f"| {k.replace('_', ' ')} | {int(r.get('n_orders') or 0)} | {int(r.get('n_bets') or 0)} | {int(r.get('n_matches') or 0)} | "
+                    f"{_fmt_num(r.get('amount_risk_sum'), 2)} | {_fmt_num(r.get('amount_risk_avg_per_order'), 2)} | "
                     f"{_fmt_num(r.get('stake_sum'), 2)} | {int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_real_sum_settled') or r.get('pnl_sum_settled'), 2)} | "
                     f"{_fmt_pct(r.get('roi_pct_settled'))} |\n"
                 )
             tot = exec_min.get("total") if isinstance(exec_min.get("total"), dict) else {}
             if isinstance(tot, dict) and tot:
                 s1.append(
-                    f"| **TOTAL** | **{int(tot.get('n_bets') or 0)}** | **{_fmt_num(tot.get('amount_risk_sum'), 2)}** | **{_fmt_num(tot.get('amount_risk_avg'), 2)}** | "
+                    f"| **TOTAL** | **{int(tot.get('n_orders') or 0)}** | **{int(tot.get('n_bets') or 0)}** | **{int(tot.get('n_matches') or 0)}** | "
+                    f"**{_fmt_num(tot.get('amount_risk_sum'), 2)}** | **{_fmt_num(tot.get('amount_risk_avg_per_order'), 2)}** | "
                     f"**{_fmt_num(tot.get('stake_sum'), 2)}** | **{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_real_sum_settled') or tot.get('pnl_sum_settled'), 2)}** | "
                     f"**{_fmt_pct(tot.get('roi_pct_settled'))}** |\n"
                 )

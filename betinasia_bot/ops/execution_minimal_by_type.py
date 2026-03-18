@@ -307,6 +307,7 @@ async def _fetch_audits_for_ids(db: Database, ids: List[int]) -> Dict[int, Dict[
           a.side,
           a.is_live,
           a.audited_at,
+          m.id AS match_id,
           m.home_score,
           m.away_score,
           m.status AS match_status,
@@ -353,14 +354,22 @@ def _group_key(exec_side: str, inplay: bool) -> str:
 def _empty_row() -> Dict[str, Any]:
     return {
         "n_bets": 0,
+        # contagens deduplicadas (para não confundir "linhas" vs "apostas" fracionadas)
+        "n_orders": 0,  # unique order_id (quando disponível no jsonl)
+        "n_audits": 0,  # unique audit_id (proxy de oportunidades executadas)
+        "n_matches": 0,  # unique match_id (jogos)
+        "n_bet_lines_api": 0,  # soma de len(order.bets) (quando /account fornece)
+        "n_bet_lines_api_settled": 0,
         # stake (o que é enviado na ordem / “valor apostado” em Back)
         "stake_sum": 0.0,
         "stake_avg": None,
+        "stake_avg_per_order": None,
         # amount_risk = base de risco/“capital travado” por lado:
         # - Back: stake
         # - Lay : liability
         "amount_risk_sum": 0.0,
         "amount_risk_avg": None,
+        "amount_risk_avg_per_order": None,
         "n_settled": 0,
         "n_unsettled": 0,
         "stake_sum_settled": 0.0,
@@ -407,6 +416,7 @@ async def compute_minimal_by_type(
             pass
 
     by_type: Dict[str, Dict[str, Any]] = {k: _empty_row() for k in ("Back_Pre", "Back_In", "Lay_Pre", "Lay_In")}
+    uniq: Dict[str, Dict[str, set]] = {k: {"orders": set(), "audits": set(), "matches": set()} for k in by_type.keys()}
 
     # Orders (P&L real) via executor /account (unix socket)
     orders_by_id: Dict[str, Dict[str, Any]] = {}
@@ -444,6 +454,16 @@ async def compute_minimal_by_type(
         inplay = _audit_is_inplay(a) if isinstance(a, dict) else False
         g = _group_key(e.exec_side, bool(inplay))
         row = by_type.setdefault(g, _empty_row())
+        u = uniq.setdefault(g, {"orders": set(), "audits": set(), "matches": set()})
+        if e.order_id:
+            u["orders"].add(str(e.order_id))
+        if e.audit_id is not None:
+            u["audits"].add(int(e.audit_id))
+        if isinstance(a, dict) and a.get("match_id") is not None:
+            try:
+                u["matches"].add(int(a.get("match_id")))
+            except Exception:
+                pass
 
         stake = float(e.stake_sent) if e.stake_sent is not None else 0.0
         row["n_bets"] += 1
@@ -469,6 +489,11 @@ async def compute_minimal_by_type(
         # settled (REAL, independente de placar): usa orders.profit_loss quando disponível
         if e.order_id and str(e.order_id) in orders_by_id:
             o = orders_by_id.get(str(e.order_id)) or {}
+            try:
+                bets = o.get("bets") if isinstance(o.get("bets"), list) else []
+                row["n_bet_lines_api"] += int(len(bets))
+            except Exception:
+                pass
             # profit_loss pode vir no nível do order ou dentro de bets[]
             pl = _safe_float(o.get("profit_loss"))
             if pl is None:
@@ -483,6 +508,11 @@ async def compute_minimal_by_type(
             # consideramos “liquidada” apenas quando existe P&L (aderente ao accounting/UI)
             if pl is not None:
                 row["n_settled"] += 1
+                try:
+                    bets = o.get("bets") if isinstance(o.get("bets"), list) else []
+                    row["n_bet_lines_api_settled"] += int(len(bets))
+                except Exception:
+                    pass
                 row["stake_sum_settled"] += float(stake)
                 if not is_lay:
                     row["amount_risk_sum_settled"] += float(stake)
@@ -503,8 +533,24 @@ async def compute_minimal_by_type(
         n = int(r.get("n_bets") or 0)
         n_set = int(r.get("n_settled") or 0)
         r["n_unsettled"] = int(max(0, n - n_set))
+        try:
+            u = uniq.get(k) or {}
+            r["n_orders"] = int(len(u.get("orders") or []))
+            r["n_audits"] = int(len(u.get("audits") or []))
+            r["n_matches"] = int(len(u.get("matches") or []))
+        except Exception:
+            r["n_orders"] = 0
+            r["n_audits"] = 0
+            r["n_matches"] = 0
         r["stake_avg"] = (float(r["stake_sum"]) / float(n)) if n > 0 else None
         r["amount_risk_avg"] = (float(r["amount_risk_sum"]) / float(n)) if n > 0 else None
+        try:
+            n_orders = int(r.get("n_orders") or 0)
+            r["stake_avg_per_order"] = (float(r.get("stake_sum") or 0.0) / float(n_orders)) if n_orders > 0 else None
+            r["amount_risk_avg_per_order"] = (float(r.get("amount_risk_sum") or 0.0) / float(n_orders)) if n_orders > 0 else None
+        except Exception:
+            r["stake_avg_per_order"] = None
+            r["amount_risk_avg_per_order"] = None
         # ROI real por base de risco (Back: stake; Lay: liability), usando P&L real quando possível
         st_cov = float(r.get("amount_risk_sum_settled") or 0.0)
         if st_cov > 0:
@@ -513,6 +559,11 @@ async def compute_minimal_by_type(
     total = _empty_row()
     for r in by_type.values():
         total["n_bets"] += int(r.get("n_bets") or 0)
+        total["n_orders"] += int(r.get("n_orders") or 0)
+        total["n_audits"] += int(r.get("n_audits") or 0)
+        total["n_matches"] += int(r.get("n_matches") or 0)
+        total["n_bet_lines_api"] += int(r.get("n_bet_lines_api") or 0)
+        total["n_bet_lines_api_settled"] += int(r.get("n_bet_lines_api_settled") or 0)
         total["stake_sum"] += float(r.get("stake_sum") or 0.0)
         total["amount_risk_sum"] += float(r.get("amount_risk_sum") or 0.0)
         total["n_settled"] += int(r.get("n_settled") or 0)
@@ -524,6 +575,13 @@ async def compute_minimal_by_type(
     total["n_unsettled"] = int(max(0, int(total["n_bets"]) - int(total["n_settled"])))
     total["stake_avg"] = (float(total["stake_sum"]) / float(total["n_bets"])) if total["n_bets"] else None
     total["amount_risk_avg"] = (float(total["amount_risk_sum"]) / float(total["n_bets"])) if total["n_bets"] else None
+    try:
+        if int(total.get("n_orders") or 0) > 0:
+            total["stake_avg_per_order"] = float(total["stake_sum"]) / float(int(total.get("n_orders") or 0))
+            total["amount_risk_avg_per_order"] = float(total["amount_risk_sum"]) / float(int(total.get("n_orders") or 0))
+    except Exception:
+        total["stake_avg_per_order"] = None
+        total["amount_risk_avg_per_order"] = None
     if float(total["amount_risk_sum_settled"]) > 0:
         total["roi_pct_settled"] = float(total["pnl_real_sum_settled"]) / float(total["amount_risk_sum_settled"]) * 100.0
 
@@ -542,6 +600,7 @@ async def compute_minimal_by_type(
             "P&L/ROI aqui são calculados via `profit_loss` real do endpoint `/account` do executor (orders), sem depender de placar.",
             "Para Lay: 'valor em risco' é a liability (stake*(odd-1)); para Back: é o stake.",
             "ROI principal (roi_pct_settled) usa a base de risco por lado: Back por stake; Lay por liability.",
+            "Contagens: `n_bets` = linhas no executor_jsonl; `n_orders` = order_id únicos (quando presente); `n_bet_lines_api` = soma de bets[] no /account (quando disponível); `n_matches` = jogos (match_id) únicos via join com matches.",
         ],
     }
 
