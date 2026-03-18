@@ -130,50 +130,52 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         top_errors_by_version[ver] = xs[:8]
 
     # PMM consults (denominador) vs "No PMMs received" (numerador)
-    # Aproxima "consultou PMM" quando telemetry.parallel_fetch_ms > 0 (ou seja, abriu ticket e esperou PMMs).
-    q_pmm = text(
-        """
-        SELECT
-          audit_version,
-          COUNT(*) FILTER (
-            WHERE COALESCE(NULLIF((hypothesis_details->'telemetry'->>'parallel_fetch_ms')::text, '')::double precision, 0) > 0
-          )::bigint AS pmm_consults,
-          COUNT(*) FILTER (
-            WHERE COALESCE(NULLIF((hypothesis_details->'telemetry'->>'parallel_fetch_ms')::text, '')::double precision, 0) > 0
-              AND COALESCE(hypothesis_details->>'api_error', '') ILIKE '%No PMMs received%'
-          )::bigint AS no_pmms
-        FROM betslip_audit_results
-        WHERE hypothesis_type = :hyp
-          AND reversal_direction = :direction
-          AND audited_at >= :since
-          AND hypothesis_details IS NOT NULL
-        GROUP BY 1
-        ORDER BY pmm_consults DESC;
-        """
-    )
+    # Evita cast numérico frágil: conta "consult" quando existe telemetry.parallel_fetch_ms no JSON.
+    # Isso captura apenas os casos em que de fato houve tentativa de fetch (abre ticket / espera WS).
     pmm_by_version: List[Dict[str, Any]] = []
-    async with db.async_session() as session:
-        r = await session.execute(q_pmm, {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since})
-        for x in r.fetchall() or []:
-            d = _json_safe(dict(x._mapping))
-            # taxa (best-effort)
-            try:
-                denom = int(d.get("pmm_consults") or 0)
-                num = int(d.get("no_pmms") or 0)
-                d["no_pmms_rate_pct"] = float(num / denom * 100.0) if denom > 0 else None
-            except Exception:
-                d["no_pmms_rate_pct"] = None
-            pmm_by_version.append(d)
-    pmm_tot = {
-        "pmm_consults": int(sum(int(x.get("pmm_consults") or 0) for x in pmm_by_version)),
-        "no_pmms": int(sum(int(x.get("no_pmms") or 0) for x in pmm_by_version)),
-        "no_pmms_rate_pct": None,
-    }
+    pmm_tot = {"pmm_consults": 0, "no_pmms": 0, "no_pmms_rate_pct": None, "error": None}
     try:
+        q_pmm = text(
+            """
+            SELECT
+              audit_version,
+              COUNT(*) FILTER (
+                WHERE (hypothesis_details::jsonb ? 'telemetry')
+                  AND ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+              )::bigint AS pmm_consults,
+              COUNT(*) FILTER (
+                WHERE (hypothesis_details::jsonb ? 'telemetry')
+                  AND ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+                  AND COALESCE(hypothesis_details->>'api_error', '') ILIKE '%No PMMs received%'
+              )::bigint AS no_pmms
+            FROM betslip_audit_results
+            WHERE hypothesis_type = :hyp
+              AND reversal_direction = :direction
+              AND audited_at >= :since
+              AND hypothesis_details IS NOT NULL
+            GROUP BY 1
+            ORDER BY pmm_consults DESC;
+            """
+        )
+        async with db.async_session() as session:
+            r = await session.execute(q_pmm, {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since})
+            for x in r.fetchall() or []:
+                d = _json_safe(dict(x._mapping))
+                try:
+                    denom = int(d.get("pmm_consults") or 0)
+                    num = int(d.get("no_pmms") or 0)
+                    d["no_pmms_rate_pct"] = float(num / denom * 100.0) if denom > 0 else None
+                except Exception:
+                    d["no_pmms_rate_pct"] = None
+                pmm_by_version.append(d)
+        pmm_tot["pmm_consults"] = int(sum(int(x.get("pmm_consults") or 0) for x in pmm_by_version))
+        pmm_tot["no_pmms"] = int(sum(int(x.get("no_pmms") or 0) for x in pmm_by_version))
         if int(pmm_tot["pmm_consults"]) > 0:
             pmm_tot["no_pmms_rate_pct"] = float(int(pmm_tot["no_pmms"]) / int(pmm_tot["pmm_consults"]) * 100.0)
-    except Exception:
-        pmm_tot["no_pmms_rate_pct"] = None
+    except Exception as e:
+        # não falha o relatório inteiro por causa desse KPI; reporta erro para debug
+        pmm_tot["error"] = str(e)[:200]
+        pmm_by_version = []
 
     # pivot leve: por version
     by_version: Dict[str, Dict[str, Any]] = {}
