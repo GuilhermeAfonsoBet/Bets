@@ -602,6 +602,7 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
         wf_ntiles = int(getattr(args, "limit_ntiles", 10) or 10)
     base_cap = float(getattr(args, "wf_base_cap", 50.0) or 50.0)
     max_cap = float(getattr(args, "wf_max_cap", 100.0) or 100.0)
+    wf_mode = str(getattr(args, "wf_mode", "bin_policy") or "bin_policy").strip()
     # Guardrails:
     # - min_roi_base: requisito mínimo no ROI@cap_base para PERMITIR expansão (evita expandir em bins estruturalmente ruins)
     # - min_roi_marg: requisito mínimo no ROI marginal (base→max) para PERMITIR expansão
@@ -612,6 +613,34 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
     wf_policy = str(getattr(args, "wf_policy", "expand_only") or "expand_only").strip()
     drop_enabled = bool(getattr(args, "wf_drop_bins", False)) or (wf_policy == "drop_and_expand")
     drop_roi_thr = float(getattr(args, "wf_min_roi_drop_cap_pct", -10.0) or -10.0)
+    min_roi_global = float(getattr(args, "wf_min_roi_global_pct", 0.0) or 0.0)
+
+    # caps candidatas (usa o mesmo --caps-liab do estudo, mas remove 0 e restringe ao range [base,max])
+    caps_all = _parse_csv_floats(str(getattr(args, "caps_liab", "") or ""))
+    if not caps_all:
+        caps_all = [0.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0]
+    caps_cand = []
+    seen = set()
+    for c in caps_all:
+        try:
+            cc = float(c)
+        except Exception:
+            continue
+        if cc <= 0:
+            continue
+        if cc < min(base_cap, max_cap) - 1e-9 or cc > max(base_cap, max_cap) + 1e-9:
+            continue
+        if cc in seen:
+            continue
+        seen.add(cc)
+        caps_cand.append(cc)
+    caps_cand.sort()
+    if float(base_cap) not in caps_cand:
+        caps_cand.append(float(base_cap))
+        caps_cand.sort()
+    if float(max_cap) not in caps_cand:
+        caps_cand.append(float(max_cap))
+        caps_cand.sort()
 
     # indices de início do teste
     starts = []
@@ -630,6 +659,7 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
         return
 
     print("\n### Walk-forward (treino→teste) — política por bins de limit\n")
+    print(f"- Modo WF: {wf_mode}")
     print(f"- Treino: {train_days}d | Teste: {test_days}d | Step: {step_days}d")
     print(f"- Bins (limit_ntiles no treino): {wf_ntiles}")
     print(f"- Caps: base={base_cap:.2f} max={max_cap:.2f}")
@@ -640,9 +670,12 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
     if drop_enabled:
         msg += f" (thr={drop_roi_thr:.2f}%)"
     print(msg + "\n")
+    if wf_mode == "global_cap":
+        print(f"- Global cap: escolhe cap no treino max(P&L) sujeito a ROI/liab >= {min_roi_global:.2f}%")
+        print(f"- Caps candidatas: {', '.join(_num(c,2) for c in caps_cand)}\n")
 
     hdr = (
-        "| step | train (UTC) | test (UTC) | n_train | n_test | pnl_policy | pnl_cap50 | pnl_cap100 | ROI_policy | ROI_cap50 | ROI_cap100 | drop_bins | expand_bins |\n"
+        "| step | train (UTC) | test (UTC) | n_train | n_test | pnl_policy | pnl_cap_base | pnl_cap_max | ROI_policy | ROI_base | ROI_max | drop_bins | expand_bins |\n"
         "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
     print(hdr)
@@ -678,65 +711,82 @@ def _run_walk_forward(events: List[Event], *, since: datetime, until: datetime, 
             i += step_days
             continue
 
-        # bins aprendidos no treino
-        train_lims = [float(e.limit_stake) for e in train_events if float(e.limit_stake) > 0]
-        bins = _quantile_bins(train_lims, ntiles=int(wf_ntiles))
-        cap_by_bin: Dict[int, float] = {}
         drop_bins = 0
         expand_bins = 0
-        if bins:
-            # alerta de parametrização: se min_n_bin é alto demais, a policy tende a não fazer nada (cap_base em tudo)
-            try:
-                approx = float(len(train_events)) / max(1.0, float(len(bins)))
-                if float(min_n_bin) > approx + 1e-9:
-                    print(
-                        f"[wf][warn] step {step_idx+1}: n_train={len(train_events)} com {len(bins)} bins ⇒ ~{approx:.1f}/bin < min_n_bin={min_n_bin}. "
-                        f"Considere `--wf-limit-ntiles 4|5` e/ou `--wf-min-n-bin 2|3`.\n"
-                    )
-            except Exception:
-                pass
-            for bi, (lo, hi) in enumerate(bins):
-                sub = [e for e in train_events if (float(lo) <= float(e.limit_stake) <= float(hi))]
-                if len(sub) < min_n_bin:
-                    cap_by_bin[int(bi)] = float(base_cap)
+        pnl_base, used_base = _pnl_used_for_cap(test_events, cap_liab=float(base_cap))
+        pnl_max, used_max = _pnl_used_for_cap(test_events, cap_liab=float(max_cap))
+
+        # política (dois modos)
+        if wf_mode == "global_cap":
+            # escolhe cap no treino: max P&L sujeito a ROI>=min_roi_global
+            best_cap = float(base_cap)
+            best_p = None
+            best_roi = None
+            for c in caps_cand:
+                p_tr, u_tr = _pnl_used_for_cap(train_events, cap_liab=float(c))
+                roi_tr = (p_tr / u_tr * 100.0) if u_tr > 1e-12 else None
+                if roi_tr is None or float(roi_tr) < float(min_roi_global):
                     continue
-                p_base, u_base = _pnl_used_for_cap(sub, cap_liab=float(base_cap))
-                roi_base = (p_base / u_base * 100.0) if u_base > 1e-12 else None
-                p_max, u_max = _pnl_used_for_cap(sub, cap_liab=float(max_cap))
-                roi_marg = ((p_max - p_base) / (u_max - u_base) * 100.0) if (u_max - u_base) > 1e-12 else None
+                if best_p is None or float(p_tr) > float(best_p):
+                    best_p = float(p_tr)
+                    best_cap = float(c)
+                    best_roi = float(roi_tr)
+            pnl_pol, used_pol = _pnl_used_for_cap(test_events, cap_liab=float(best_cap))
+            # como é global, drop/expand_bins são 0; mas mantemos colunas
+            drop_bins = 0
+            expand_bins = 0
+        else:
+            # bins aprendidos no treino (policy por bins)
+            train_lims = [float(e.limit_stake) for e in train_events if float(e.limit_stake) > 0]
+            bins = _quantile_bins(train_lims, ntiles=int(wf_ntiles))
+            cap_by_bin: Dict[int, float] = {}
+            if bins:
+                # alerta de parametrização: se min_n_bin é alto demais, a policy tende a não fazer nada (cap_base em tudo)
+                try:
+                    approx = float(len(train_events)) / max(1.0, float(len(bins)))
+                    if float(min_n_bin) > approx + 1e-9:
+                        print(
+                            f"[wf][warn] step {step_idx+1}: n_train={len(train_events)} com {len(bins)} bins ⇒ ~{approx:.1f}/bin < min_n_bin={min_n_bin}. "
+                            f"Considere `--wf-limit-ntiles 4|5` e/ou `--wf-min-n-bin 2|3`.\n"
+                        )
+                except Exception:
+                    pass
+                for bi, (lo, hi) in enumerate(bins):
+                    sub = [e for e in train_events if (float(lo) <= float(e.limit_stake) <= float(hi))]
+                    if len(sub) < min_n_bin:
+                        cap_by_bin[int(bi)] = float(base_cap)
+                        continue
+                    p_base_tr, u_base_tr = _pnl_used_for_cap(sub, cap_liab=float(base_cap))
+                    roi_base_tr = (p_base_tr / u_base_tr * 100.0) if u_base_tr > 1e-12 else None
+                    p_max_tr, u_max_tr = _pnl_used_for_cap(sub, cap_liab=float(max_cap))
+                    roi_marg_tr = ((p_max_tr - p_base_tr) / (u_max_tr - u_base_tr) * 100.0) if (u_max_tr - u_base_tr) > 1e-12 else None
 
-                # default: nunca pior que cap_base (expand-only)
-                cap_eff = float(base_cap)
-                # expansão (condicional)
-                if (roi_base is not None) and (roi_marg is not None) and (float(roi_base) >= float(min_roi_base)) and (float(roi_marg) >= float(min_roi_marg)):
-                    cap_eff = float(max_cap)
-                    expand_bins += 1
-                # drop (opcional; use com cuidado)
-                if drop_enabled and (roi_base is not None) and (float(roi_base) < float(drop_roi_thr)):
-                    cap_eff = 0.0
-                    drop_bins += 1
-                cap_by_bin[int(bi)] = float(cap_eff)
+                    cap_eff = float(base_cap)
+                    if (roi_base_tr is not None) and (roi_marg_tr is not None) and (float(roi_base_tr) >= float(min_roi_base)) and (float(roi_marg_tr) >= float(min_roi_marg)):
+                        cap_eff = float(max_cap)
+                        expand_bins += 1
+                    if drop_enabled and (roi_base_tr is not None) and (float(roi_base_tr) < float(drop_roi_thr)):
+                        cap_eff = 0.0
+                        drop_bins += 1
+                    cap_by_bin[int(bi)] = float(cap_eff)
 
-        # avaliação no teste
-        pnl_pol, used_pol = _pnl_used_for_cap(test_events, cap_liab=float(max_cap), cap_by_bin=cap_by_bin, bins=bins)
-        pnl_50, used_50 = _pnl_used_for_cap(test_events, cap_liab=float(base_cap))
-        pnl_100, used_100 = _pnl_used_for_cap(test_events, cap_liab=float(max_cap))
+            pnl_pol, used_pol = _pnl_used_for_cap(test_events, cap_liab=float(max_cap), cap_by_bin=cap_by_bin, bins=bins)
 
         roi_pol = (pnl_pol / used_pol * 100.0) if used_pol > 1e-12 else None
-        roi50 = (pnl_50 / used_50 * 100.0) if used_50 > 1e-12 else None
-        roi100 = (pnl_100 / used_100 * 100.0) if used_100 > 1e-12 else None
+        roi_base = (pnl_base / used_base * 100.0) if used_base > 1e-12 else None
+        roi_max = (pnl_max / used_max * 100.0) if used_max > 1e-12 else None
 
         print(
             f"| {step_idx+1} | {tr0.isoformat()}→{tr1.isoformat()} | {te0.isoformat()}→{te1.isoformat()} | {len(train_events)} | {len(test_events)} | "
-            f"{_num(pnl_pol,2)} | {_num(pnl_50,2)} | {_num(pnl_100,2)} | {_pct(roi_pol,2)} | {_pct(roi50,2)} | {_pct(roi100,2)} | {drop_bins} | {expand_bins} |"
+            f"{_num(pnl_pol,2)} | {_num(pnl_base,2)} | {_num(pnl_max,2)} | {_pct(roi_pol,2)} | {_pct(roi_base,2)} | {_pct(roi_max,2)} | {drop_bins} | {expand_bins} |"
         )
 
         agg["p_pol"] += float(pnl_pol)
         agg["u_pol"] += float(used_pol)
-        agg["p50"] += float(pnl_50)
-        agg["u50"] += float(used_50)
-        agg["p100"] += float(pnl_100)
-        agg["u100"] += float(used_100)
+        agg["p50"] += float(pnl_base)
+        agg["u50"] += float(used_base)
+        agg["p100"] += float(pnl_max)
+        agg["u100"] += float(used_max)
         agg["steps"] += 1
 
         step_idx += 1
@@ -991,11 +1041,23 @@ def main() -> int:
     p.add_argument("--wf-test-days", type=int, default=int(os.getenv("STUDY_WF_TEST_DAYS", "7")), help="Dias de teste por step (WF).")
     p.add_argument("--wf-step-days", type=int, default=int(os.getenv("STUDY_WF_STEP_DAYS", "7")), help="Avanço do step em dias (WF).")
     p.add_argument("--wf-limit-ntiles", type=int, default=int(os.getenv("STUDY_WF_LIMIT_NTILES", "0")), help="Número de bins de limit usados no treino (WF). 0 = usa --limit-ntiles.")
+    p.add_argument(
+        "--wf-mode",
+        choices=["bin_policy", "global_cap"],
+        default=os.getenv("STUDY_WF_MODE", "bin_policy").strip() or "bin_policy",
+        help="Modo do walk-forward: policy por bins (bin_policy) ou escolher cap global por step (global_cap).",
+    )
     p.add_argument("--wf-base-cap", type=float, default=float(os.getenv("STUDY_WF_BASE_CAP", "50")), help="Cap base (liability) usado como 'mínimo' por bin (WF).")
     p.add_argument("--wf-max-cap", type=float, default=float(os.getenv("STUDY_WF_MAX_CAP", "100")), help="Cap máximo (liability) permitido quando o bin passa no guardrail marginal (WF).")
     p.add_argument("--wf-min-roi-base-cap-pct", type=float, default=float(os.getenv("STUDY_WF_MIN_ROI_BASE_CAP_PCT", "0")), help="Guardrail: ROI/liab mínimo no bin @cap_base para manter o bin (WF).")
     p.add_argument("--wf-min-roi-marg-pct", type=float, default=float(os.getenv("STUDY_WF_MIN_ROI_MARG_PCT", "5")), help="Guardrail: ROI marginal mínimo (base→max) para permitir expandir cap no bin (WF).")
     p.add_argument("--wf-min-n-bin", type=int, default=int(os.getenv("STUDY_WF_MIN_N_BIN", "8")), help="Mínimo de eventos no treino por bin para decidir (senão mantém cap_base).")
+    p.add_argument(
+        "--wf-min-roi-global-pct",
+        type=float,
+        default=float(os.getenv("STUDY_WF_MIN_ROI_GLOBAL_PCT", "0")),
+        help="(wf-mode=global_cap) ROI/liab mínimo no treino para considerar um cap candidato.",
+    )
     p.add_argument(
         "--wf-policy",
         choices=["expand_only", "drop_and_expand"],
