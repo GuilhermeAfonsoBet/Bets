@@ -731,6 +731,8 @@ class DailyReportCfg:
     wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
+    # Estatística exploratória no OOS (deve ficar OFF no daily 19h)
+    wf_experimental_stats: bool = (os.getenv("DAILY_WF_EXPERIMENTAL_STATS", "0").strip() in ("1", "true", "True", "yes", "YES"))
     wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "2.0")
     wf_ah_scope: str = os.getenv("DAILY_WF_AH_SCOPE", "pre")
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
@@ -894,6 +896,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-key-by-league"]
         if str(cfg.wf_key_by_league_scope).strip():
             args += ["--wf-key-by-league-scope", str(cfg.wf_key_by_league_scope).strip()]
+        if bool(cfg.wf_experimental_stats):
+            args += ["--wf-experimental-stats"]
     if str(cfg.wf_ah_max_abs_line).strip():
         args += ["--wf-ah-max-abs-line", str(cfg.wf_ah_max_abs_line).strip()]
         if str(cfg.wf_ah_scope).strip():

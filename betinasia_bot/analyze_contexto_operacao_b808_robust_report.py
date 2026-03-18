@@ -788,6 +788,13 @@ async def main() -> int:
         help="Ativa shrinkage (empirical Bayes) para estabilizar ROI do treino por combinação no WF (reduz liga/desliga por ruído).",
     )
     parser.add_argument(
+        "--wf-experimental-stats",
+        action="store_true",
+        default=(str(os.getenv("WF_EXPERIMENTAL_STATS", "0")).strip() in ("1", "true", "True", "yes", "YES")),
+        help="Habilita blocos estatísticos exploratórios (bootstrap por key, BH-FDR, testes permutacionais, rolling/sign-test). "
+        "Por segurança operacional, deve ficar OFF no relatório diário (19h) e só ser usado em rodadas manuais.",
+    )
+    parser.add_argument(
         "--wf-train-mode",
         default=os.getenv("WF_TRAIN_MODE", "rolling"),
         choices=["rolling", "expanding"],
@@ -970,8 +977,10 @@ async def main() -> int:
         bank_sens_export["grid"] = [float(x) for x in grid]
         bank_sens_export["scenarios"][str(name)] = {"meta": dict(meta or {}), "rows": list(rows or [])}
 
-    # Evidência estatística (OOS): acumuladores por match_id e por dia (após budget/sizing).
-    # Usado para bootstrap (cluster por match) e teste por dia da semana.
+    wf_exp_stats = bool(getattr(args, "wf_experimental_stats", False))
+
+    # Evidência estatística (OOS; exploratório): acumuladores por match_id, dia, key, liga.
+    # Importante: isso NÃO deve rodar no daily 19h por padrão.
     match_obs_exp: Dict[int, float] = {}
     match_obs_pnl: Dict[int, float] = {}
     match_obs_exp_back: Dict[int, float] = {}
@@ -984,9 +993,7 @@ async def main() -> int:
     match_obs_pnl_in: Dict[int, float] = {}
     day_obs_exp: Dict[str, float] = {}
     day_obs_pnl: Dict[str, float] = {}
-    # OOS (obs) por combinação (key) × match_id (para significância e shrinkage por key)
     key_match_obs: Dict[str, Dict[int, Dict[str, float]]] = {}
-    # OOS (obs) por liga (para testar efeito de liga no in-match)
     league_match_obs: Dict[str, Dict[int, Dict[str, float]]] = {}
 
     def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
@@ -6164,60 +6171,61 @@ async def main() -> int:
                         turn_roi += float(st_eq)
                         roi_pct = float(ev.get("roi"))
                         _p = float(exp) * roi_pct / 100.0
-                        # Evidência OOS (obs): acumula por match_id e por dia (após budget) para bootstrap e weekday-test.
-                        try:
-                            dday_ev = str(ev.get("day") or "").strip()
-                            if dday_ev:
-                                day_obs_exp[dday_ev] = float(day_obs_exp.get(dday_ev, 0.0)) + float(exp)
-                                day_obs_pnl[dday_ev] = float(day_obs_pnl.get(dday_ev, 0.0)) + float(_p)
-                        except Exception:
-                            pass
-                        try:
-                            mid_ev = int(ev.get("match_id") or 0)
-                            if mid_ev > 0:
-                                match_obs_exp[mid_ev] = float(match_obs_exp.get(mid_ev, 0.0)) + float(exp)
-                                match_obs_pnl[mid_ev] = float(match_obs_pnl.get(mid_ev, 0.0)) + float(_p)
-                                if ev.get("side") == "Back":
-                                    match_obs_exp_back[mid_ev] = float(match_obs_exp_back.get(mid_ev, 0.0)) + float(exp)
-                                    match_obs_pnl_back[mid_ev] = float(match_obs_pnl_back.get(mid_ev, 0.0)) + float(_p)
-                                else:
-                                    match_obs_exp_lay[mid_ev] = float(match_obs_exp_lay.get(mid_ev, 0.0)) + float(exp)
-                                    match_obs_pnl_lay[mid_ev] = float(match_obs_pnl_lay.get(mid_ev, 0.0)) + float(_p)
-                                if ev.get("regime") == "Pre":
-                                    match_obs_exp_pre[mid_ev] = float(match_obs_exp_pre.get(mid_ev, 0.0)) + float(exp)
-                                    match_obs_pnl_pre[mid_ev] = float(match_obs_pnl_pre.get(mid_ev, 0.0)) + float(_p)
-                                else:
-                                    match_obs_exp_in[mid_ev] = float(match_obs_exp_in.get(mid_ev, 0.0)) + float(exp)
-                                    match_obs_pnl_in[mid_ev] = float(match_obs_pnl_in.get(mid_ev, 0.0)) + float(_p)
+                        if wf_exp_stats:
+                            # Evidência OOS (obs): acumula por match_id e por dia (após budget) para bootstrap e weekday-test.
+                            try:
+                                dday_ev = str(ev.get("day") or "").strip()
+                                if dday_ev:
+                                    day_obs_exp[dday_ev] = float(day_obs_exp.get(dday_ev, 0.0)) + float(exp)
+                                    day_obs_pnl[dday_ev] = float(day_obs_pnl.get(dday_ev, 0.0)) + float(_p)
+                            except Exception:
+                                pass
+                            try:
+                                mid_ev = int(ev.get("match_id") or 0)
+                                if mid_ev > 0:
+                                    match_obs_exp[mid_ev] = float(match_obs_exp.get(mid_ev, 0.0)) + float(exp)
+                                    match_obs_pnl[mid_ev] = float(match_obs_pnl.get(mid_ev, 0.0)) + float(_p)
+                                    if ev.get("side") == "Back":
+                                        match_obs_exp_back[mid_ev] = float(match_obs_exp_back.get(mid_ev, 0.0)) + float(exp)
+                                        match_obs_pnl_back[mid_ev] = float(match_obs_pnl_back.get(mid_ev, 0.0)) + float(_p)
+                                    else:
+                                        match_obs_exp_lay[mid_ev] = float(match_obs_exp_lay.get(mid_ev, 0.0)) + float(exp)
+                                        match_obs_pnl_lay[mid_ev] = float(match_obs_pnl_lay.get(mid_ev, 0.0)) + float(_p)
+                                    if ev.get("regime") == "Pre":
+                                        match_obs_exp_pre[mid_ev] = float(match_obs_exp_pre.get(mid_ev, 0.0)) + float(exp)
+                                        match_obs_pnl_pre[mid_ev] = float(match_obs_pnl_pre.get(mid_ev, 0.0)) + float(_p)
+                                    else:
+                                        match_obs_exp_in[mid_ev] = float(match_obs_exp_in.get(mid_ev, 0.0)) + float(exp)
+                                        match_obs_pnl_in[mid_ev] = float(match_obs_pnl_in.get(mid_ev, 0.0)) + float(_p)
 
-                                # Por key×match (para estatística por combinação)
-                                try:
-                                    kk_ev = _key(ev)
-                                    if kk_ev:
-                                        dkm = key_match_obs.setdefault(str(kk_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0})
-                                        dkm["exp"] += float(exp)
-                                        dkm["pnl"] += float(_p)
-                                        dkm["n"] += 1.0
-                                except Exception:
-                                    pass
+                                    # Por key×match (para estatística por combinação)
+                                    try:
+                                        kk_ev = _key(ev)
+                                        if kk_ev:
+                                            dkm = key_match_obs.setdefault(str(kk_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0})
+                                            dkm["exp"] += float(exp)
+                                            dkm["pnl"] += float(_p)
+                                            dkm["n"] += 1.0
+                                    except Exception:
+                                        pass
 
-                                # Por liga×match (para testar efeito de liga especialmente no in-match)
-                                try:
-                                    lg_ev = str(ev.get("league") or "—").strip() or "—"
-                                    lg_ev = lg_ev.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
-                                    if len(lg_ev) > 48:
-                                        lg_ev = lg_ev[:48].rstrip() + "…"
-                                    dlm = league_match_obs.setdefault(str(lg_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0, "exp_in": 0.0, "pnl_in": 0.0})
-                                    dlm["exp"] += float(exp)
-                                    dlm["pnl"] += float(_p)
-                                    dlm["n"] += 1.0
-                                    if str(ev.get("regime")) == "In":
-                                        dlm["exp_in"] += float(exp)
-                                        dlm["pnl_in"] += float(_p)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                                    # Por liga×match (para testar efeito de liga especialmente no in-match)
+                                    try:
+                                        lg_ev = str(ev.get("league") or "—").strip() or "—"
+                                        lg_ev = lg_ev.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+                                        if len(lg_ev) > 48:
+                                            lg_ev = lg_ev[:48].rstrip() + "…"
+                                        dlm = league_match_obs.setdefault(str(lg_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0, "exp_in": 0.0, "pnl_in": 0.0})
+                                        dlm["exp"] += float(exp)
+                                        dlm["pnl"] += float(_p)
+                                        dlm["n"] += 1.0
+                                        if str(ev.get("regime")) == "In":
+                                            dlm["exp_in"] += float(exp)
+                                            dlm["pnl_in"] += float(_p)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                         if ev.get("side") == "Back":
                             back_st_roi += float(exp)
                             pnl_obs += _p
@@ -6875,437 +6883,320 @@ async def main() -> int:
                 lines.append("\n")
 
                 # ------------------------------------------------------------
-                # 12.1b Evidência estatística de edge (resultado OOS; obs)
+                # 12.1b+ (EXPLORATÓRIO): evidência estatística / estabilidade / sazonalidade / liga
                 # ------------------------------------------------------------
-                def _bootstrap_roi_by_cluster(exp_by_id: Dict[int, float], pnl_by_id: Dict[int, float], *, n_boot: int = 4000) -> Dict[str, Any]:
-                    ids = [int(k) for k in exp_by_id.keys() if float(exp_by_id.get(k) or 0.0) > 0]
-                    if not ids:
-                        return {"n": 0}
-                    exps = np.array([float(exp_by_id[i]) for i in ids], dtype=float)
-                    pnls = np.array([float(pnl_by_id.get(i, 0.0)) for i in ids], dtype=float)
-                    exp_sum = float(exps.sum())
-                    if exp_sum <= 0:
-                        return {"n": int(len(ids)), "exp_sum": exp_sum}
-                    roi_hat = float(pnls.sum() / exp_sum) * 100.0
-                    try:
-                        rng = np.random.default_rng(12345)
-                        idx = rng.integers(0, len(ids), size=(int(n_boot), len(ids)))
-                        exp_s = exps[idx].sum(axis=1)
-                        pnl_s = pnls[idx].sum(axis=1)
-                        roi_s = np.where(exp_s > 0, (pnl_s / exp_s) * 100.0, np.nan)
-                        roi_s = roi_s[np.isfinite(roi_s)]
-                        if roi_s.size <= 10:
-                            return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat}
-                        ci = (float(np.quantile(roi_s, 0.025)), float(np.quantile(roi_s, 0.975)))
-                        p_pos = float(np.mean(roi_s > 0.0))
-                        return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat, "ci95": ci, "p_roi_gt0": p_pos}
-                    except Exception:
-                        return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat}
-
-                def _weekday_name(d: str) -> str:
-                    try:
-                        dt0 = datetime.strptime(str(d), "%Y-%m-%d")
-                        return ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"][dt0.weekday()]
-                    except Exception:
-                        return "NA"
-
-                def _weekday_perm_test(day_exp: Dict[str, float], day_pnl: Dict[str, float], *, n_perm: int = 8000) -> Dict[str, Any]:
-                    days = [d for d in day_exp.keys() if float(day_exp.get(d) or 0.0) > 0]
-                    if len(days) < 10:
-                        return {"n_days": int(len(days)), "p_value": None}
-                    roi = np.array([float(day_pnl.get(d, 0.0)) / float(day_exp.get(d, 1.0)) for d in days], dtype=float)
-                    w = np.array([float(day_exp.get(d, 0.0)) for d in days], dtype=float)
-                    lab = np.array([_weekday_name(d) for d in days], dtype=object)
-                    # estatística: ANOVA ponderada (F) em ROI por dia, peso=exposição do dia
-                    cats = sorted({str(x) for x in lab})
-                    if len(cats) < 2:
-                        return {"n_days": int(len(days)), "p_value": None}
-                    def _F(labs: np.ndarray) -> float:
-                        mu = float((roi * w).sum() / max(1e-12, float(w.sum())))
-                        ssb = 0.0
-                        ssw = 0.0
-                        k = 0
-                        for c in cats:
-                            m = (labs == c)
-                            if not np.any(m):
-                                continue
-                            k += 1
-                            wc = float(w[m].sum())
-                            if wc <= 0:
-                                continue
-                            muc = float((roi[m] * w[m]).sum() / max(1e-12, wc))
-                            ssb += wc * (muc - mu) ** 2
-                            ssw += float(((roi[m] - muc) ** 2 * w[m]).sum())
-                        if k <= 1:
-                            return 0.0
-                        n = float(w.sum())
-                        num = ssb / max(1.0, float(k - 1))
-                        den = ssw / max(1.0, float(len(days) - k))
-                        return float(num / max(1e-12, den))
-                    f_obs = _F(lab)
-                    try:
-                        rng = np.random.default_rng(54321)
-                        cnt = 0
-                        for _ in range(int(n_perm)):
-                            labp = rng.permutation(lab)
-                            if _F(labp) >= f_obs:
-                                cnt += 1
-                        p = float((cnt + 1) / (float(n_perm) + 1.0))
-                        return {"n_days": int(len(days)), "p_value": p, "f_obs": float(f_obs), "k": int(len(cats))}
-                    except Exception:
-                        return {"n_days": int(len(days)), "p_value": None, "f_obs": float(f_obs), "k": int(len(cats))}
-
-                lines.append("### 12.1b Interpretação OOS: evidência de edge (resultado)\n")
-                lines.append(
-                    "Objetivo: responder se há **edge OOS** de forma quantitativa. Aqui usamos **apenas jogos com ROI observado** "
-                    "(placar), e fazemos **bootstrap clusterizado por `match_id`** (mais robusto que tratar sinais individuais como i.i.d.).\n\n"
-                )
-                exp_risk_obs = float(back_st_roi or 0.0) + float(lay_liab_roi or 0.0)
-                roi_risk_obs = (float(pnl_obs_sum) / float(exp_risk_obs) * 100.0) if exp_risk_obs > 0 else None
-                bt_all = _bootstrap_roi_by_cluster(match_obs_exp, match_obs_pnl, n_boot=4000)
-                bt_back = _bootstrap_roi_by_cluster(match_obs_exp_back, match_obs_pnl_back, n_boot=4000)
-                bt_lay = _bootstrap_roi_by_cluster(match_obs_exp_lay, match_obs_pnl_lay, n_boot=4000)
-                lines.append("| Indicador | Total | Back | Lay |\n")
-                lines.append("|---|---:|---:|---:|\n")
-                lines.append(
-                    f"| ROI por risco (obs; P&L/exp) | {_fmt_num(roi_risk_obs,2)}% | {_fmt_num((pnl_obs_back_sum/(back_st_roi or 1e-12))*100.0 if (back_st_roi or 0)>0 else None,2)}% | "
-                    f"{_fmt_num((pnl_obs_lay_sum/(lay_liab_roi or 1e-12))*100.0 if (lay_liab_roi or 0)>0 else None,2)}% |\n"
-                )
-                lines.append(
-                    f"| Bootstrap (match_id): N matches | {int(bt_all.get('n') or 0)} | {int(bt_back.get('n') or 0)} | {int(bt_lay.get('n') or 0)} |\n"
-                )
-                ci_all = bt_all.get("ci95") if isinstance(bt_all.get("ci95"), (list, tuple)) else None
-                ci_back = bt_back.get("ci95") if isinstance(bt_back.get("ci95"), (list, tuple)) else None
-                ci_lay = bt_lay.get("ci95") if isinstance(bt_lay.get("ci95"), (list, tuple)) else None
-                lines.append(
-                    f"| Bootstrap: ROI_hat (obs; %) | {_fmt_num(bt_all.get('roi_hat'),2)}% | {_fmt_num(bt_back.get('roi_hat'),2)}% | {_fmt_num(bt_lay.get('roi_hat'),2)}% |\n"
-                )
-                lines.append(
-                    f"| Bootstrap: CI95 ROI (obs) | "
-                    f"{(_fmt_num(ci_all[0],2)+'% .. '+_fmt_num(ci_all[1],2)+'%') if ci_all else '—'} | "
-                    f"{(_fmt_num(ci_back[0],2)+'% .. '+_fmt_num(ci_back[1],2)+'%') if ci_back else '—'} | "
-                    f"{(_fmt_num(ci_lay[0],2)+'% .. '+_fmt_num(ci_lay[1],2)+'%') if ci_lay else '—'} |\n"
-                )
-                lines.append(
-                    f"| Prob(ROI>0) (bootstrap) | {_fmt_num(float(bt_all.get('p_roi_gt0') or 0.0)*100.0,1)}% | "
-                    f"{_fmt_num(float(bt_back.get('p_roi_gt0') or 0.0)*100.0,1)}% | {_fmt_num(float(bt_lay.get('p_roi_gt0') or 0.0)*100.0,1)}% |\n"
-                )
-                lines.append("\n")
-                lines.append(
-                    "**Leitura (criteriosa):**\n"
-                    "- Se a **CI95 do ROI** estiver **inteiramente acima de 0**, isso é evidência forte de edge na janela OOS.\n"
-                    "- Se a CI95 cruzar 0, o resultado é **inconclusivo** (pode haver edge pequeno, ou instabilidade/shift).\n"
-                    "- Mesmo com CI>0, isso não é “prova definitiva”: OOS ainda pode ter dependência temporal, mudanças de regime e viés de cobertura (placar/settlement).\n\n"
-                )
-
-                # ------------------------------------------------------------
-                # 12.1c Dia da semana (teste simples)
-                # ------------------------------------------------------------
-                lines.append("### 12.1c Teste: influência por dia da semana (OOS)\n")
-                lines.append(
-                    "Agrupamos por **dia (YYYY-MM-DD)** no OOS e computamos ROI por risco (P&L/exp) por dia. "
-                    "Em seguida aplicamos um **teste permutacional** (ANOVA ponderada por exposição) para checar se há evidência "
-                    "de diferença sistemática entre dias da semana.\n\n"
-                )
-                # tabela por weekday
-                wd_groups: Dict[str, Dict[str, float]] = {}
-                for dday, ex in day_obs_exp.items():
-                    if ex is None or float(ex) <= 0:
-                        continue
-                    wdn = _weekday_name(dday)
-                    wd_groups.setdefault(wdn, {"exp": 0.0, "pnl": 0.0, "n_days": 0.0})
-                    wd_groups[wdn]["exp"] += float(ex)
-                    wd_groups[wdn]["pnl"] += float(day_obs_pnl.get(dday, 0.0))
-                    wd_groups[wdn]["n_days"] += 1.0
-                lines.append("| Dia da semana | n_dias | Exposição (risco) | P&L (obs) | ROI (obs; P&L/exp) |\n")
-                lines.append("|---|---:|---:|---:|---:|\n")
-                for wdn in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom", "NA"]:
-                    g = wd_groups.get(wdn)
-                    if not g:
-                        continue
-                    roi_wd = (float(g["pnl"]) / float(g["exp"]) * 100.0) if float(g["exp"]) > 0 else None
-                    lines.append(f"| {wdn} | {int(g['n_days'])} | {_fmt_num(g['exp'],2)} | {_fmt_num(g['pnl'],2)} | {_fmt_num(roi_wd,2)}% |\n")
-                lines.append("\n")
-                pt = _weekday_perm_test(day_obs_exp, day_obs_pnl, n_perm=8000)
-                lines.append(
-                    f"- Teste permutacional (H0: sem diferença entre weekdays): p_value≈`{_fmt_num(pt.get('p_value'),4)}` "
-                    f"(n_dias={int(pt.get('n_days') or 0)}, k={int(pt.get('k') or 0)}).\n\n"
-                )
-                lines.append(
-                    "_Aviso: este teste é exploratório; com poucos dias OOS, o poder estatístico é baixo e o resultado pode ser instável._\n\n"
-                )
-
-                # ------------------------------------------------------------
-                # 12.1e Significância por combinação (key): bootstrap + BH-FDR
-                # ------------------------------------------------------------
-                def _bh_fdr(pvals: List[Tuple[str, float]], *, alpha: float = 0.10) -> Dict[str, Any]:
-                    """
-                    Benjamini–Hochberg (FDR). Retorna cutoff e conjunto rejeitado.
-                    pvals: [(name, p)]
-                    """
-                    xs = [(k, float(p)) for (k, p) in (pvals or []) if p is not None and math.isfinite(float(p)) and 0.0 <= float(p) <= 1.0]
-                    xs.sort(key=lambda x: x[1])
-                    m = len(xs)
-                    if m == 0:
-                        return {"m": 0, "alpha": alpha, "cutoff": None, "reject": set()}
-                    cutoff = None
-                    kstar = 0
-                    for i, (_, p) in enumerate(xs, start=1):
-                        thr = float(alpha) * float(i) / float(m)
-                        if p <= thr:
-                            cutoff = float(p)
-                            kstar = i
-                    reject = set(k for (k, _) in xs[:kstar]) if kstar > 0 else set()
-                    return {"m": m, "alpha": alpha, "cutoff": cutoff, "reject": reject}
-
-                def _key_stats_from_key_match_obs(km: Dict[str, Dict[int, Dict[str, float]]], *, n_boot: int = 2500, min_matches: int = 20) -> List[Dict[str, Any]]:
-                    rows: List[Dict[str, Any]] = []
-                    if not km:
-                        return rows
-                    rng = np.random.default_rng(24680)
-                    for k, mp in km.items():
-                        mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp") or 0.0) > 0]
-                        if len(mids) < int(min_matches):
-                            continue
-                        exps = np.array([float(mp[mid]["exp"]) for mid in mids], dtype=float)
-                        pnls = np.array([float(mp[mid]["pnl"]) for mid in mids], dtype=float)
+                if not wf_exp_stats:
+                    lines.append("### 12.1b Explorações estatísticas (OFF)\n")
+                    lines.append(
+                        "_Blocos exploratórios (bootstrap por key, BH-FDR, weekday/league perm-test, rolling/sign-test) estão **desligados** por padrão "
+                        "para não afetar o relatório diário das 19h. Para habilitar em rodadas manuais: `--wf-experimental-stats` "
+                        "ou `WF_EXPERIMENTAL_STATS=1`._\n\n"
+                    )
+                else:
+                    # Helpers (sem custo alto até serem chamados)
+                    def _bootstrap_roi_by_cluster(exp_by_id: Dict[int, float], pnl_by_id: Dict[int, float], *, n_boot: int = 4000) -> Dict[str, Any]:
+                        ids = [int(k) for k in exp_by_id.keys() if float(exp_by_id.get(k) or 0.0) > 0]
+                        if not ids:
+                            return {"n": 0}
+                        exps = np.array([float(exp_by_id[i]) for i in ids], dtype=float)
+                        pnls = np.array([float(pnl_by_id.get(i, 0.0)) for i in ids], dtype=float)
                         exp_sum = float(exps.sum())
                         if exp_sum <= 0:
-                            continue
+                            return {"n": int(len(ids)), "exp_sum": exp_sum}
                         roi_hat = float(pnls.sum() / exp_sum) * 100.0
-                        # bootstrap clusterizado por match: p-value (one-sided) e CI95
-                        idx = rng.integers(0, len(mids), size=(int(n_boot), len(mids)))
-                        exp_s = exps[idx].sum(axis=1)
-                        pnl_s = pnls[idx].sum(axis=1)
-                        roi_s = np.where(exp_s > 0, (pnl_s / exp_s) * 100.0, np.nan)
-                        roi_s = roi_s[np.isfinite(roi_s)]
-                        if roi_s.size < 50:
-                            continue
-                        ci = (float(np.quantile(roi_s, 0.025)), float(np.quantile(roi_s, 0.975)))
-                        p_le0 = float(np.mean(roi_s <= 0.0))  # H0: ROI<=0
-                        rows.append(
-                            {
-                                "key": str(k),
-                                "n_matches": int(len(mids)),
-                                "exp_sum": exp_sum,
-                                "roi_hat": roi_hat,
-                                "ci95_lb": float(ci[0]),
-                                "ci95_ub": float(ci[1]),
-                                "p_roi_le0": p_le0,
-                            }
-                        )
-                    return rows
+                        try:
+                            rng = np.random.default_rng(12345)
+                            idx = rng.integers(0, len(ids), size=(int(n_boot), len(ids)))
+                            exp_s = exps[idx].sum(axis=1)
+                            pnl_s = pnls[idx].sum(axis=1)
+                            roi_s = np.where(exp_s > 0, (pnl_s / exp_s) * 100.0, np.nan)
+                            roi_s = roi_s[np.isfinite(roi_s)]
+                            if roi_s.size <= 20:
+                                return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat}
+                            ci = (float(np.quantile(roi_s, 0.025)), float(np.quantile(roi_s, 0.975)))
+                            p_pos = float(np.mean(roi_s > 0.0))
+                            return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat, "ci95": ci, "p_roi_gt0": p_pos}
+                        except Exception:
+                            return {"n": int(len(ids)), "exp_sum": exp_sum, "roi_hat": roi_hat}
 
-                def _empirical_bayes_shrink(means: np.ndarray, vars_over_n: np.ndarray) -> Tuple[float, float, np.ndarray]:
-                    """
-                    Empirical Bayes Normal-Normal:
-                    theta_k ~ N(mu, tau^2), y_k | theta_k ~ N(theta_k, s_k^2/n_k)
-                    Retorna (mu_hat, tau2_hat, w_k) onde posterior mean = w_k*y_k + (1-w_k)*mu_hat.
-                    """
-                    if means.size == 0:
-                        return 0.0, 0.0, np.array([], dtype=float)
-                    mu = float(np.nanmean(means))
-                    # método dos momentos
-                    vbar = float(np.nanmean(vars_over_n))
-                    vmeans = float(np.nanvar(means, ddof=1)) if means.size >= 2 else 0.0
-                    tau2 = max(0.0, vmeans - vbar)
-                    w = np.where((tau2 + vars_over_n) > 0, tau2 / (tau2 + vars_over_n), 0.0)
-                    return mu, float(tau2), w
+                    def _weekday_name(d: str) -> str:
+                        try:
+                            dt0 = datetime.strptime(str(d), "%Y-%m-%d")
+                            return ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"][dt0.weekday()]
+                        except Exception:
+                            return "NA"
 
-                lines.append("### 12.1e Evidência por combinação (key): significância (bootstrap) + shrinkage (Bayes hierárquico)\n")
-                lines.append(
-                    "Aqui estimamos ROI OOS por **combinação (key)** usando bootstrap por `match_id`. Depois aplicamos:\n\n"
-                    "- **BH‑FDR** (ex.: 10%) para controlar falsos positivos quando avaliamos muitas keys.\n"
-                    "- **Shrinkage (Empirical Bayes / partial pooling)** para estabilizar keys com baixo N.\n\n"
-                )
-                key_rows = _key_stats_from_key_match_obs(key_match_obs, n_boot=2500, min_matches=20)
-                if not key_rows:
-                    lines.append("_Sem keys suficientes (min_matches=20) para rodar este bloco._\n\n")
-                else:
-                    # shrinkage sobre roi_hat com variância proxy via largura do CI (aprox)
-                    means = np.array([float(r["roi_hat"]) for r in key_rows], dtype=float)
-                    # proxy de var: (ub-lb)/(2*1.96) ~= SE; var_over_n = SE^2
-                    se = np.array([max(1e-9, float(r["ci95_ub"] - r["ci95_lb"]) / (2.0 * 1.96)) for r in key_rows], dtype=float)
-                    var_over_n = se ** 2
-                    mu_hat, tau2_hat, w = _empirical_bayes_shrink(means, var_over_n)
-                    for i, r in enumerate(key_rows):
-                        r["roi_shrunk"] = float(w[i] * float(r["roi_hat"]) + (1.0 - float(w[i])) * float(mu_hat))
-                        r["shrink_w"] = float(w[i])
-
-                    # BH-FDR em p_roi_le0 (one-sided)
-                    fdr = _bh_fdr([(str(r["key"]), float(r["p_roi_le0"])) for r in key_rows], alpha=0.10)
-                    rej = fdr.get("reject") if isinstance(fdr.get("reject"), set) else set()
-                    for r in key_rows:
-                        r["fdr10_sig"] = (str(r["key"]) in rej)
-
-                    # imprime top por roi_shrunk (e também por evidência)
-                    key_rows.sort(key=lambda r: (float(r.get("roi_shrunk") or -1e9), float(r.get("exp_sum") or 0.0)), reverse=True)
-                    lines.append(
-                        f"- Shrinkage: mu_global≈`{_fmt_num(mu_hat,2)}%`, tau2≈`{_fmt_num(tau2_hat,6)}`; "
-                        f"BH‑FDR: m=`{int(fdr.get('m') or 0)}`, alpha=`{_fmt_num(float(fdr.get('alpha') or 0.0)*100.0,1)}%`, cutoff≈`{_fmt_num(fdr.get('cutoff'),4)}`.\n\n"
-                    )
-                    lines.append("| key | n_matches | exp_sum | ROI_hat | CI95 | p(ROI<=0) | ROI_shrunk | w | FDR10 |\n")
-                    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-                    for r in key_rows[:40]:
-                        ci_s = f"{_fmt_num(r.get('ci95_lb'),2)}%..{_fmt_num(r.get('ci95_ub'),2)}%"
-                        lines.append(
-                            f"| `{r.get('key')}` | {int(r.get('n_matches') or 0)} | {_fmt_num(r.get('exp_sum'),2)} | "
-                            f"{_fmt_num(r.get('roi_hat'),2)}% | {ci_s} | {_fmt_num(float(r.get('p_roi_le0') or 0.0)*100.0,1)}% | "
-                            f"{_fmt_num(r.get('roi_shrunk'),2)}% | {_fmt_num(r.get('shrink_w'),2)} | {'✅' if r.get('fdr10_sig') else '—'} |\n"
-                        )
-                    lines.append("\n")
-
-                # ------------------------------------------------------------
-                # 12.1f Estabilidade temporal (rolling) em ROI/turnover (exp)
-                # ------------------------------------------------------------
-                lines.append("### 12.1f Estabilidade temporal: rolling ROI/turnover (OOS)\n")
-                if daily_turn and daily_pnl_exp and len(daily_turn) >= 10:
-                    d_sorted = sorted(daily_turn.keys())
-                    roi_day = []
-                    for dday in d_sorted:
-                        t = float(daily_turn.get(dday, 0.0))
-                        p = float(daily_pnl_exp.get(dday, 0.0))
-                        roi_day.append((dday, (p / t * 100.0) if t > 0 else None, t, p))
-                    lines.append("| Dia | Turnover | P&L (exp) | ROI/turnover |\n")
-                    lines.append("|---|---:|---:|---:|\n")
-                    for dday, r, t, p in roi_day[-14:]:
-                        lines.append(f"| {dday} | {_fmt_num(t,2)} | {_fmt_num(p,2)} | {_fmt_num(r,2)}% |\n")
-                    lines.append("\n")
-                    # rolling 7d (ponderado por turnover)
-                    try:
-                        wins = [7, 14]
-                        for wlen in wins:
-                            if len(roi_day) < wlen:
-                                continue
-                            t_sum = float(sum(float(x[2]) for x in roi_day[-wlen:]))
-                            p_sum = float(sum(float(x[3]) for x in roi_day[-wlen:]))
-                            r_roll = (p_sum / t_sum * 100.0) if t_sum > 0 else None
-                            lines.append(f"- Rolling {wlen}d (turnover-weighted): ROI≈`{_fmt_num(r_roll,2)}%` (P&L={_fmt_num(p_sum,2)}, Turnover={_fmt_num(t_sum,2)}).\n")
-                        lines.append("\n")
-                    except Exception:
-                        lines.append("\n")
-                    # sign test (dias com ROI>0)
-                    try:
-                        xs = [float(x[1]) for x in roi_day if x[1] is not None]
-                        n = len(xs)
-                        kpos = int(sum(1 for x in xs if x > 0.0))
-                        # p-value binomial (aprox normal)
-                        p0 = 0.5
-                        mu = n * p0
-                        sd = math.sqrt(max(1e-12, n * p0 * (1 - p0)))
-                        z = (kpos - mu) / sd if sd > 0 else 0.0
-                        # two-sided
-                        p_two = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0)))))
-                        lines.append(f"- Sign test (dias ROI>0): k={kpos}/{n}, z≈`{_fmt_num(z,2)}`, p≈`{_fmt_num(p_two,4)}`.\n\n")
-                    except Exception:
-                        lines.append("\n")
-                else:
-                    lines.append("_Sem série diária suficiente para rolling (precisa >=10 dias com turnover>0)._ \n\n")
-
-                # ------------------------------------------------------------
-                # 12.1d Roadmap: próximos avanços estatísticos
-                # ------------------------------------------------------------
-                lines.append("### 12.1d Próximos avanços estatísticos (para testar performance do modelo)\n")
-                lines.append(
-                    "Ideias para evoluir a validação (todas aplicáveis sem mexer no executor, só no pipeline de análise):\n\n"
-                    "- **Rolling / expanding WF (rolling origin)**: manter uma janela móvel (ex.: treino 28d, teste 7d, step 1d) para medir estabilidade do edge e detectar drift.\n"
-                    "- **Critério estatístico para 'edge'**: além de ROI médio, reportar `CI95`, `Prob(ROI>0)` e/ou limite inferior `LB(CI95)` por key/bucket (cluster por match_id).\n"
-                    "- **Controle de múltiplos testes** (quando otimiza muitos buckets/keys): Benjamini–Hochberg (FDR) para reduzir falsos positivos.\n"
-                    "- **Shrinkage / Bayes hierárquico**: partial pooling por liga/mercado/regime para estabilizar estimativas com baixo N; evita flip de sinal no rolling.\n"
-                    "- **Modelos robustos a outliers**: usar estimadores robustos (winsor/Huber) e/ou reportar quantis de ROI por match (p10/p50/p90).\n"
-                    "- **Separar qualidade de entrada vs resultado**: CLV OOS como métrica ortogonal (edge de preço) e ROI como métrica de desfecho; divergência CLV>0 e ROI≈0 sugere problema de settlement/cobertura/tamanho.\n"
-                    "- **Testes de sazonalidade**: além de dia da semana, checar horário (UTC), competição, e 'prime-time' (interação com liquidez/PMM).\n\n"
-                )
-
-                # ------------------------------------------------------------
-                # 12.1g Teste: efeito de liga no in‑match (justifica key_by_league_scope=all?)
-                # ------------------------------------------------------------
-                lines.append("### 12.1g Teste: a liga influencia o resultado no in‑match?\n")
-                lines.append(
-                    "Pergunta: faz sentido incluir `league` como feature/chave também no **in‑match**? "
-                    "Aqui medimos heterogeneidade de ROI por liga **apenas no in‑match** (obs; pós-budget), clusterizando por `match_id`.\n\n"
-                    "Como habilitar no WF: use `--wf-key-by-league --wf-key-by-league-scope all` (ou no daily via `DAILY_WF_KEY_BY_LEAGUE=1` e `DAILY_WF_KEY_BY_LEAGUE_SCOPE=all`).\n\n"
-                )
-                # prepara ligas com volume suficiente (in‑match)
-                try:
-                    league_rows = []
-                    for lg, mp in (league_match_obs or {}).items():
-                        mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp_in") or 0.0) > 0]
-                        if len(mids) < 15:
-                            continue
-                        exp = float(sum(float(mp[mid].get("exp_in") or 0.0) for mid in mids))
-                        pnl = float(sum(float(mp[mid].get("pnl_in") or 0.0) for mid in mids))
-                        roi = (pnl / exp * 100.0) if exp > 0 else None
-                        league_rows.append((exp, lg, len(mids), exp, pnl, roi))
-                    league_rows.sort(key=lambda x: x[0], reverse=True)
-                    if not league_rows:
-                        lines.append("_Sem ligas com volume suficiente no in‑match (min_matches_in=15)._ \n\n")
-                    else:
-                        lines.append("| Liga | n_matches (in) | Exposição (in) | P&L (in) | ROI (in; obs) |\n")
-                        lines.append("|---|---:|---:|---:|---:|\n")
-                        for _, lg, nmid, exp, pnl, roi in league_rows[:20]:
-                            lines.append(f"| `{lg}` | {int(nmid)} | {_fmt_num(exp,2)} | {_fmt_num(pnl,2)} | {_fmt_num(roi,2)}% |\n")
-                        lines.append("\n")
-
-                        # teste permutacional entre ligas (ponderado por exposição por match)
-                        # stat: F em ROI_match por liga (peso=exp_match). Usa apenas ligas top por exp.
-                        top_lgs = [lg for _, lg, *_ in league_rows[:12]]
-                        xs_roi = []
-                        xs_w = []
-                        xs_lab = []
-                        for lg in top_lgs:
-                            mp = league_match_obs.get(lg, {})
-                            for mid, rec in mp.items():
-                                e = float((rec or {}).get("exp_in") or 0.0)
-                                if e <= 0:
+                    def _weekday_perm_test(day_exp: Dict[str, float], day_pnl: Dict[str, float], *, n_perm: int = 8000) -> Dict[str, Any]:
+                        days = [d for d in day_exp.keys() if float(day_exp.get(d) or 0.0) > 0]
+                        if len(days) < 10:
+                            return {"n_days": int(len(days)), "p_value": None, "k": 0}
+                        roi = np.array([float(day_pnl.get(d, 0.0)) / float(day_exp.get(d, 1.0)) for d in days], dtype=float)
+                        w = np.array([float(day_exp.get(d, 0.0)) for d in days], dtype=float)
+                        lab = np.array([_weekday_name(d) for d in days], dtype=object)
+                        cats = sorted({str(x) for x in lab})
+                        if len(cats) < 2:
+                            return {"n_days": int(len(days)), "p_value": None, "k": int(len(cats))}
+                        def _F(labs: np.ndarray) -> float:
+                            mu = float((roi * w).sum() / max(1e-12, float(w.sum())))
+                            ssb = 0.0
+                            ssw = 0.0
+                            k = 0
+                            for c in cats:
+                                m = (labs == c)
+                                if not np.any(m):
                                     continue
-                                p = float((rec or {}).get("pnl_in") or 0.0)
-                                xs_roi.append(p / e)
-                                xs_w.append(e)
-                                xs_lab.append(lg)
-                        if len(xs_roi) >= 80 and len(set(xs_lab)) >= 3:
-                            roi = np.array(xs_roi, dtype=float) * 100.0
-                            w = np.array(xs_w, dtype=float)
-                            lab = np.array(xs_lab, dtype=object)
-                            cats = sorted({str(x) for x in lab})
-                            def _F_labs(labs: np.ndarray) -> float:
-                                mu = float((roi * w).sum() / max(1e-12, float(w.sum())))
-                                ssb = 0.0
-                                ssw = 0.0
-                                k = 0
-                                for c in cats:
-                                    m = (labs == c)
-                                    if not np.any(m):
+                                k += 1
+                                wc = float(w[m].sum())
+                                if wc <= 0:
+                                    continue
+                                muc = float((roi[m] * w[m]).sum() / max(1e-12, wc))
+                                ssb += wc * (muc - mu) ** 2
+                                ssw += float(((roi[m] - muc) ** 2 * w[m]).sum())
+                            if k <= 1:
+                                return 0.0
+                            num = ssb / max(1.0, float(k - 1))
+                            den = ssw / max(1.0, float(len(days) - k))
+                            return float(num / max(1e-12, den))
+                        f_obs = _F(lab)
+                        try:
+                            rng = np.random.default_rng(54321)
+                            n_perm = int(n_perm)
+                            cnt = 0
+                            for _ in range(n_perm):
+                                labp = rng.permutation(lab)
+                                if _F(labp) >= f_obs:
+                                    cnt += 1
+                            p = float((cnt + 1) / (float(n_perm) + 1.0))
+                            return {"n_days": int(len(days)), "p_value": p, "f_obs": float(f_obs), "k": int(len(cats))}
+                        except Exception:
+                            return {"n_days": int(len(days)), "p_value": None, "f_obs": float(f_obs), "k": int(len(cats))}
+
+                    def _bh_fdr(pvals: List[Tuple[str, float]], *, alpha: float = 0.10) -> Dict[str, Any]:
+                        xs = [(k, float(p)) for (k, p) in (pvals or []) if p is not None and math.isfinite(float(p)) and 0.0 <= float(p) <= 1.0]
+                        xs.sort(key=lambda x: x[1])
+                        m = len(xs)
+                        if m == 0:
+                            return {"m": 0, "alpha": alpha, "cutoff": None, "reject": set()}
+                        cutoff = None
+                        kstar = 0
+                        for i, (_, p) in enumerate(xs, start=1):
+                            thr = float(alpha) * float(i) / float(m)
+                            if p <= thr:
+                                cutoff = float(p)
+                                kstar = i
+                        reject = set(k for (k, _) in xs[:kstar]) if kstar > 0 else set()
+                        return {"m": m, "alpha": alpha, "cutoff": cutoff, "reject": reject}
+
+                    def _empirical_bayes_shrink(means: np.ndarray, vars_over_n: np.ndarray) -> Tuple[float, float, np.ndarray]:
+                        if means.size == 0:
+                            return 0.0, 0.0, np.array([], dtype=float)
+                        mu = float(np.nanmean(means))
+                        vbar = float(np.nanmean(vars_over_n)) if vars_over_n.size else 0.0
+                        vmeans = float(np.nanvar(means, ddof=1)) if means.size >= 2 else 0.0
+                        tau2 = max(0.0, vmeans - vbar)
+                        w = np.where((tau2 + vars_over_n) > 0, tau2 / (tau2 + vars_over_n), 0.0)
+                        return mu, float(tau2), w
+
+                    # 12.1b — evidência global (obs)
+                    lines.append("### 12.1b Interpretação OOS: evidência de edge (resultado)\n")
+                    lines.append(
+                        "Objetivo: responder se há **edge OOS** de forma quantitativa. Aqui usamos **apenas jogos com ROI observado** "
+                        "(placar), e fazemos **bootstrap clusterizado por `match_id`**.\n\n"
+                    )
+                    exp_risk_obs = float(back_st_roi or 0.0) + float(lay_liab_roi or 0.0)
+                    roi_risk_obs = (float(pnl_obs_sum) / float(exp_risk_obs) * 100.0) if exp_risk_obs > 0 else None
+                    bt_all = _bootstrap_roi_by_cluster(match_obs_exp, match_obs_pnl, n_boot=4000)
+                    bt_back = _bootstrap_roi_by_cluster(match_obs_exp_back, match_obs_pnl_back, n_boot=4000)
+                    bt_lay = _bootstrap_roi_by_cluster(match_obs_exp_lay, match_obs_pnl_lay, n_boot=4000)
+                    lines.append("| Indicador | Total | Back | Lay |\n|---|---:|---:|---:|\n")
+                    lines.append(
+                        f"| ROI por risco (obs; P&L/exp) | {_fmt_num(roi_risk_obs,2)}% | {_fmt_num((pnl_obs_back_sum/(back_st_roi or 1e-12))*100.0 if (back_st_roi or 0)>0 else None,2)}% | "
+                        f"{_fmt_num((pnl_obs_lay_sum/(lay_liab_roi or 1e-12))*100.0 if (lay_liab_roi or 0)>0 else None,2)}% |\n"
+                    )
+                    def _ci_s(bt: dict) -> str:
+                        ci = bt.get("ci95") if isinstance(bt.get("ci95"), (list, tuple)) else None
+                        if ci and len(ci) == 2:
+                            return f"{_fmt_num(ci[0],2)}% .. {_fmt_num(ci[1],2)}%"
+                        return "—"
+                    lines.append(f"| Bootstrap N matches | {int(bt_all.get('n') or 0)} | {int(bt_back.get('n') or 0)} | {int(bt_lay.get('n') or 0)} |\n")
+                    lines.append(f"| Bootstrap ROI_hat | {_fmt_num(bt_all.get('roi_hat'),2)}% | {_fmt_num(bt_back.get('roi_hat'),2)}% | {_fmt_num(bt_lay.get('roi_hat'),2)}% |\n")
+                    lines.append(f"| Bootstrap CI95 | {_ci_s(bt_all)} | {_ci_s(bt_back)} | {_ci_s(bt_lay)} |\n")
+                    lines.append(
+                        f"| Prob(ROI>0) | {_fmt_num(float(bt_all.get('p_roi_gt0') or 0.0)*100.0,1)}% | {_fmt_num(float(bt_back.get('p_roi_gt0') or 0.0)*100.0,1)}% | {_fmt_num(float(bt_lay.get('p_roi_gt0') or 0.0)*100.0,1)}% |\n\n"
+                    )
+
+                    # 12.1c — weekday
+                    lines.append("### 12.1c Teste: influência por dia da semana (OOS)\n")
+                    wd_groups: Dict[str, Dict[str, float]] = {}
+                    for dday, ex in (day_obs_exp or {}).items():
+                        if ex is None or float(ex) <= 0:
+                            continue
+                        wdn = _weekday_name(dday)
+                        wd_groups.setdefault(wdn, {"exp": 0.0, "pnl": 0.0, "n_days": 0.0})
+                        wd_groups[wdn]["exp"] += float(ex)
+                        wd_groups[wdn]["pnl"] += float(day_obs_pnl.get(dday, 0.0))
+                        wd_groups[wdn]["n_days"] += 1.0
+                    lines.append("| Dia da semana | n_dias | Exposição (risco) | P&L (obs) | ROI (obs; P&L/exp) |\n|---|---:|---:|---:|---:|\n")
+                    for wdn in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom", "NA"]:
+                        g = wd_groups.get(wdn)
+                        if not g:
+                            continue
+                        roi_wd = (float(g["pnl"]) / float(g["exp"]) * 100.0) if float(g["exp"]) > 0 else None
+                        lines.append(f"| {wdn} | {int(g['n_days'])} | {_fmt_num(g['exp'],2)} | {_fmt_num(g['pnl'],2)} | {_fmt_num(roi_wd,2)}% |\n")
+                    pt = _weekday_perm_test(day_obs_exp, day_obs_pnl, n_perm=8000)
+                    lines.append(f"\n- Teste permutacional (H0: sem diferença): p_value≈`{_fmt_num(pt.get('p_value'),4)}` (n_dias={int(pt.get('n_days') or 0)}, k={int(pt.get('k') or 0)}).\n\n")
+
+                    # 12.1e — por key: bootstrap + FDR + shrinkage
+                    lines.append("### 12.1e Evidência por combinação (key): significância + shrinkage\n")
+                    key_rows: List[Dict[str, Any]] = []
+                    try:
+                        rng = np.random.default_rng(24680)
+                        for k, mp in (key_match_obs or {}).items():
+                            mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp") or 0.0) > 0]
+                            if len(mids) < 20:
+                                continue
+                            exps = np.array([float(mp[mid]["exp"]) for mid in mids], dtype=float)
+                            pnls = np.array([float(mp[mid]["pnl"]) for mid in mids], dtype=float)
+                            exp_sum = float(exps.sum())
+                            if exp_sum <= 0:
+                                continue
+                            roi_hat = float(pnls.sum() / exp_sum) * 100.0
+                            idx = rng.integers(0, len(mids), size=(2500, len(mids)))
+                            exp_s = exps[idx].sum(axis=1)
+                            pnl_s = pnls[idx].sum(axis=1)
+                            roi_s = np.where(exp_s > 0, (pnl_s / exp_s) * 100.0, np.nan)
+                            roi_s = roi_s[np.isfinite(roi_s)]
+                            if roi_s.size < 200:
+                                continue
+                            ci = (float(np.quantile(roi_s, 0.025)), float(np.quantile(roi_s, 0.975)))
+                            p_le0 = float(np.mean(roi_s <= 0.0))
+                            key_rows.append({"key": str(k), "n_matches": int(len(mids)), "exp_sum": exp_sum, "roi_hat": roi_hat, "ci95_lb": ci[0], "ci95_ub": ci[1], "p_roi_le0": p_le0})
+                    except Exception:
+                        key_rows = []
+                    if not key_rows:
+                        lines.append("_Sem keys suficientes (min_matches=20) para rodar este bloco._\n\n")
+                    else:
+                        means = np.array([float(r["roi_hat"]) for r in key_rows], dtype=float)
+                        se = np.array([max(1e-9, float(r["ci95_ub"] - r["ci95_lb"]) / (2.0 * 1.96)) for r in key_rows], dtype=float)
+                        var_over_n = se ** 2
+                        mu_hat, tau2_hat, w = _empirical_bayes_shrink(means, var_over_n)
+                        for i, r in enumerate(key_rows):
+                            r["roi_shrunk"] = float(w[i] * float(r["roi_hat"]) + (1.0 - float(w[i])) * float(mu_hat))
+                            r["shrink_w"] = float(w[i])
+                        fdr = _bh_fdr([(str(r["key"]), float(r["p_roi_le0"])) for r in key_rows], alpha=0.10)
+                        rej = fdr.get("reject") if isinstance(fdr.get("reject"), set) else set()
+                        for r in key_rows:
+                            r["fdr10_sig"] = (str(r["key"]) in rej)
+                        key_rows.sort(key=lambda r: (float(r.get("roi_shrunk") or -1e9), float(r.get("exp_sum") or 0.0)), reverse=True)
+                        lines.append(
+                            f"- Shrinkage: mu_global≈`{_fmt_num(mu_hat,2)}%`, tau2≈`{_fmt_num(tau2_hat,6)}`; "
+                            f"BH‑FDR: m=`{int(fdr.get('m') or 0)}`, cutoff≈`{_fmt_num(fdr.get('cutoff'),4)}`.\n\n"
+                        )
+                        lines.append("| key | n_matches | exp_sum | ROI_hat | CI95 | p(ROI<=0) | ROI_shrunk | w | FDR10 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                        for r in key_rows[:40]:
+                            ci_s = f"{_fmt_num(r.get('ci95_lb'),2)}%..{_fmt_num(r.get('ci95_ub'),2)}%"
+                            lines.append(
+                                f"| `{r.get('key')}` | {int(r.get('n_matches') or 0)} | {_fmt_num(r.get('exp_sum'),2)} | "
+                                f"{_fmt_num(r.get('roi_hat'),2)}% | {ci_s} | {_fmt_num(float(r.get('p_roi_le0') or 0.0)*100.0,1)}% | "
+                                f"{_fmt_num(r.get('roi_shrunk'),2)}% | {_fmt_num(r.get('shrink_w'),2)} | {'✅' if r.get('fdr10_sig') else '—'} |\n"
+                            )
+                        lines.append("\n")
+
+                    # 12.1f — estabilidade temporal
+                    lines.append("### 12.1f Estabilidade temporal: rolling ROI/turnover (OOS)\n")
+                    if daily_turn and daily_pnl_exp and len(daily_turn) >= 10:
+                        d_sorted = sorted(daily_turn.keys())
+                        roi_day = []
+                        for dday in d_sorted:
+                            t = float(daily_turn.get(dday, 0.0))
+                            p = float(daily_pnl_exp.get(dday, 0.0))
+                            roi_day.append((dday, (p / t * 100.0) if t > 0 else None, t, p))
+                        lines.append("| Dia | Turnover | P&L (exp) | ROI/turnover |\n|---|---:|---:|---:|\n")
+                        for dday, r, t, p in roi_day[-14:]:
+                            lines.append(f"| {dday} | {_fmt_num(t,2)} | {_fmt_num(p,2)} | {_fmt_num(r,2)}% |\n")
+                        t7 = float(sum(float(x[2]) for x in roi_day[-7:]))
+                        p7 = float(sum(float(x[3]) for x in roi_day[-7:]))
+                        t14 = float(sum(float(x[2]) for x in roi_day[-14:]))
+                        p14 = float(sum(float(x[3]) for x in roi_day[-14:]))
+                        r7 = (p7 / t7 * 100.0) if t7 > 0 else None
+                        r14 = (p14 / t14 * 100.0) if t14 > 0 else None
+                        lines.append(f"\n- Rolling 7d: ROI≈`{_fmt_num(r7,2)}%` (P&L={_fmt_num(p7,2)}, Turnover={_fmt_num(t7,2)}).\n")
+                        lines.append(f"- Rolling 14d: ROI≈`{_fmt_num(r14,2)}%` (P&L={_fmt_num(p14,2)}, Turnover={_fmt_num(t14,2)}).\n\n")
+                    else:
+                        lines.append("_Sem série diária suficiente para rolling (precisa >=10 dias)._ \n\n")
+
+                    # 12.1g — efeito de liga no In
+                    lines.append("### 12.1g Teste: a liga influencia o resultado no in‑match?\n")
+                    try:
+                        league_rows = []
+                        for lg, mp in (league_match_obs or {}).items():
+                            mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp_in") or 0.0) > 0]
+                            if len(mids) < 15:
+                                continue
+                            exp = float(sum(float(mp[mid].get("exp_in") or 0.0) for mid in mids))
+                            pnl = float(sum(float(mp[mid].get("pnl_in") or 0.0) for mid in mids))
+                            roi = (pnl / exp * 100.0) if exp > 0 else None
+                            league_rows.append((exp, lg, len(mids), exp, pnl, roi))
+                        league_rows.sort(key=lambda x: x[0], reverse=True)
+                        if not league_rows:
+                            lines.append("_Sem ligas com volume suficiente no in‑match (min_matches_in=15)._ \n\n")
+                        else:
+                            lines.append("| Liga | n_matches (in) | Exposição (in) | P&L (in) | ROI (in; obs) |\n|---|---:|---:|---:|---:|\n")
+                            for _, lg, nmid, exp, pnl, roi in league_rows[:20]:
+                                lines.append(f"| `{lg}` | {int(nmid)} | {_fmt_num(exp,2)} | {_fmt_num(pnl,2)} | {_fmt_num(roi,2)}% |\n")
+                            # perm test em top ligas (compacto)
+                            top_lgs = [lg for _, lg, *_ in league_rows[:12]]
+                            xs_roi, xs_w, xs_lab = [], [], []
+                            for lg in top_lgs:
+                                mp = league_match_obs.get(lg, {})
+                                for _, rec in mp.items():
+                                    e = float((rec or {}).get("exp_in") or 0.0)
+                                    if e <= 0:
                                         continue
-                                    k += 1
-                                    wc = float(w[m].sum())
-                                    if wc <= 0:
-                                        continue
-                                    muc = float((roi[m] * w[m]).sum() / max(1e-12, wc))
-                                    ssb += wc * (muc - mu) ** 2
-                                    ssw += float(((roi[m] - muc) ** 2 * w[m]).sum())
-                                if k <= 1:
-                                    return 0.0
-                                num = ssb / max(1.0, float(k - 1))
-                                den = ssw / max(1.0, float(len(roi) - k))
-                                return float(num / max(1e-12, den))
-                            f_obs = _F_labs(lab)
-                            try:
+                                    p = float((rec or {}).get("pnl_in") or 0.0)
+                                    xs_roi.append(p / e)
+                                    xs_w.append(e)
+                                    xs_lab.append(lg)
+                            if len(xs_roi) >= 80 and len(set(xs_lab)) >= 3:
+                                roi = np.array(xs_roi, dtype=float) * 100.0
+                                w = np.array(xs_w, dtype=float)
+                                lab = np.array(xs_lab, dtype=object)
+                                cats = sorted({str(x) for x in lab})
+                                def _F_labs(labs: np.ndarray) -> float:
+                                    mu = float((roi * w).sum() / max(1e-12, float(w.sum())))
+                                    ssb = 0.0
+                                    ssw = 0.0
+                                    k = 0
+                                    for c in cats:
+                                        m = (labs == c)
+                                        if not np.any(m):
+                                            continue
+                                        k += 1
+                                        wc = float(w[m].sum())
+                                        if wc <= 0:
+                                            continue
+                                        muc = float((roi[m] * w[m]).sum() / max(1e-12, wc))
+                                        ssb += wc * (muc - mu) ** 2
+                                        ssw += float(((roi[m] - muc) ** 2 * w[m]).sum())
+                                    if k <= 1:
+                                        return 0.0
+                                    num = ssb / max(1.0, float(k - 1))
+                                    den = ssw / max(1.0, float(len(roi) - k))
+                                    return float(num / max(1e-12, den))
+                                f_obs = _F_labs(lab)
                                 rng = np.random.default_rng(13579)
                                 n_perm = 6000
                                 cnt = 0
-                                for _ in range(int(n_perm)):
+                                for _ in range(n_perm):
                                     labp = rng.permutation(lab)
                                     if _F_labs(labp) >= f_obs:
                                         cnt += 1
                                 p = float((cnt + 1) / (float(n_perm) + 1.0))
-                                lines.append(f"- Teste permutacional (top ligas; H0: sem diferença): p_value≈`{_fmt_num(p,4)}` (F≈`{_fmt_num(f_obs,2)}`, ligas={len(cats)}, matches={len(roi)}).\n\n")
-                            except Exception:
-                                lines.append(f"- Teste permutacional: F≈`{_fmt_num(f_obs,2)}` (falha ao calcular p-value).\n\n")
-                        else:
-                            lines.append("_Sem volume suficiente para teste permutacional entre ligas no in‑match (precisa >=80 matches nos top grupos)._ \n\n")
-                except Exception:
-                    lines.append("_Falha ao calcular efeito de liga no in‑match (dados insuficientes ou formato inesperado)._ \n\n")
+                                lines.append(f"\n- Teste permutacional (top ligas; H0: sem diferença): p_value≈`{_fmt_num(p,4)}` (F≈`{_fmt_num(f_obs,2)}`, ligas={len(cats)}, matches={len(roi)}).\n\n")
+                            else:
+                                lines.append("\n_Sem volume suficiente para teste permutacional entre ligas no in‑match._\n\n")
+                    except Exception:
+                        lines.append("_Falha ao calcular efeito de liga no in‑match (dados insuficientes)._ \n\n")
 
                 # Marginal por combinação (key): turnover share + lucro marginal (projeção 30d)
                 try:
