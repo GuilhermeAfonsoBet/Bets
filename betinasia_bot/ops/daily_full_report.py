@@ -1854,6 +1854,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n"
                     )
                 s1.append("\n")
+            s1.append(
+                "- Nota: `ROIw` é o **ROI ponderado por exposição** (peso=stake no Back; peso=liability no Lay). "
+                "Em prática, dentro de um bucket, `ROIw ≈ (∑P&L)/(∑exposição)`; já o `ROI mean` é a média simples por linha/sinal.\n\n"
+            )
             # Lay também em ROI por stake (bounded; sanity-check)
             lay_stake_blk = adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake"), dict)) else {}
             b2 = lay_stake_blk.get("lay") if isinstance(lay_stake_blk.get("lay"), dict) else {}
@@ -2702,7 +2706,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         oos_annex = "## Anexo A) OOS walk-forward (Seção 12)\n\n" + _demote_h2_to_h3(oos_txt.strip() + "\n")
 
     # Ajuste adicional (capacidade): sensibilidade por banca com efeito do gate de slippage.
-    # Usa (a) curvas base exportadas pelo OOS (bank_sensitivity.json) e (b) contrafactual observado (execuções com placar).
+    # Usa (a) curvas base exportadas pelo OOS (wf_bank_sensitivity.json) e (b) contrafactual observado (execuções com placar).
     try:
         sens = _read_json(bank_sens_json) if "bank_sens_json" in locals() else None
         cf_src = None
@@ -2710,38 +2714,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             cf_src = adh_long.get("slippage_filter_counterfactual")
         elif isinstance(adh_short, dict) and isinstance(adh_short.get("slippage_filter_counterfactual"), dict):
             cf_src = adh_short.get("slippage_filter_counterfactual")
-        if isinstance(sens, dict) and isinstance(sens.get("scenarios"), dict) and isinstance(cf_src, dict):
-            back = cf_src.get("back") if isinstance(cf_src.get("back"), dict) else {}
-            lay = cf_src.get("lay") if isinstance(cf_src.get("lay"), dict) else {}
-            # "exposição" do contrafactual (apenas cobertura com placar+odd).
-            # Back: stake. Lay: preferir liability (sempre existe no contrafactual); se stake existir (versões novas),
-            # podemos usar stake, mas não dependemos dele.
-            back_exp_base = float(back.get("stake") or 0.0)
-            back_exp_filt = float(back.get("stake_filtered") or 0.0)
-            lay_exp_base = (
-                float(lay.get("liability") or 0.0)
-                if lay.get("liability") is not None
-                else float(lay.get("stake") or 0.0)
-            )
-            lay_exp_filt = (
-                float(lay.get("liability_filtered") or 0.0)
-                if lay.get("liability_filtered") is not None
-                else float(lay.get("stake_filtered") or 0.0)
-            )
-            exp_base = float(back_exp_base) + float(lay_exp_base)
-            exp_filt = float(back_exp_filt) + float(lay_exp_filt)
-            pnl_base = float(back.get("pnl") or 0.0) + float(lay.get("pnl") or 0.0)
-            pnl_filt = float(back.get("pnl_filtered") or 0.0) + float(lay.get("pnl_filtered") or 0.0)
-            n_base = int(back.get("n") or 0) + int(lay.get("n") or 0)
-            n_filt = int(back.get("n_filtered") or 0) + int(lay.get("n_filtered") or 0)
-            exp_factor = _safe_div(exp_filt, exp_base)
-            n_factor = _safe_div(n_filt, n_base)
-            roi_base = _safe_div(pnl_base, exp_base)
-            roi_filt = _safe_div(pnl_filt, exp_filt)
-            roi_factor = _safe_div(roi_filt, roi_base) if (roi_base is not None and roi_filt is not None and roi_base != 0) else None
-            profit_factor = _safe_div(pnl_filt, pnl_base) if pnl_base != 0 else None
-
-            # Sempre imprime o bloco (ou um aviso), para o operador saber se o ajuste foi calculado.
+        if isinstance(cf_src, dict):
+            # Sempre imprime um bloco diagnóstico, mesmo se o JSON de sensibilidade estiver ausente (para não “sumir” no PDF).
+            sens_ok = bool(isinstance(sens, dict) and isinstance(sens.get("scenarios"), dict) and sens.get("scenarios"))
             block = []
             block.append("\n### Ajuste operacional: Sensibilidade por banca com gate de slippage (contrafactual)\n\n")
             block.append(
@@ -2749,53 +2724,102 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "como um ajuste de capacidade, usando a evidência contrafactual nas execuções cobertas por placar. "
                 "O ajuste é um **proxy**: usa exposição observada (Back=stake, Lay=liability) para estimar redução de N/turnover e mudança de ROI._\n\n"
             )
-            block.append(
-                f"- Fatores (da janela contrafactual): pass_exposição≈`{_fmt_num((exp_factor*100.0) if exp_factor is not None else None,2)}%`, "
-                f"pass_N≈`{_fmt_num((n_factor*100.0) if n_factor is not None else None,2)}%`, "
-                f"ROI_mult≈`{_fmt_num(roi_factor,3)}` , lucro_mult≈`{_fmt_num(profit_factor,3)}`.\n\n"
-            )
-            if exp_factor is None or profit_factor is None:
+            try:
                 block.append(
-                    f"_Aviso: ajuste não pôde ser aplicado (exp_base={_fmt_num(exp_base,2)}, exp_filt={_fmt_num(exp_filt,2)}, pnl_base={_fmt_num(pnl_base,2)})._\n\n"
+                    f"- Fonte OOS (curvas por banca): `{str(bank_sens_json)}` (existe={('sim' if (bank_sens_json.exists() if 'bank_sens_json' in locals() else False) else 'não')}; "
+                    f"sens_ok={('sim' if sens_ok else 'não')}).\n\n"
+                )
+                if isinstance(sens, dict) and isinstance(sens.get("warn"), str) and sens.get("warn"):
+                    block.append(f"- Aviso do export: `{sens.get('warn')}`.\n\n")
+            except Exception:
+                pass
+
+            if not sens_ok:
+                block.append(
+                    "_Aviso: não foi possível aplicar o ajuste na sensibilidade por banca porque o export `wf_bank_sensitivity.json` está ausente/vazio/ilegível. "
+                    "Isso não afeta o OOS em si; apenas impede esta tabela ajustada. "
+                    "Se persistir, verifique se o daily está rodando a versão mais recente do `analyze_contexto_operacao_b808_robust_report.py` com "
+                    "`--wf-export-bank-sensitivity-json` habilitado._\n\n"
                 )
             else:
-                scen = sens.get("scenarios") if isinstance(sens.get("scenarios"), dict) else {}
-                name_map = {
-                    "12.2b_base": "1.2b (base)",
-                    "12.2c_eq4_signals_sqrt": "1.2c (EQ 4%/4% cap50%, signals_sqrt)",
-                    "12.2e_eq4_fixed": "1.2e (EQ 4%/4% cap50%, fixed)",
-                    "12.2d_eq2_signals_sqrt": "1.2d (EQ 2%/2% cap33%, signals_sqrt)",
-                }
-                for name, payload in scen.items():
-                    rows = payload.get("rows") if isinstance(payload, dict) else None
-                    if not isinstance(rows, list) or not rows:
-                        continue
-                    ttl = name_map.get(str(name), str(name))
-                    block.append(f"**{ttl} — com gate de slippage (ajuste proxy)**\n\n")
-                    block.append("| Banca (ref) | Turnover 30d (adj, proxy) | Lucro 30d (adj) | ROI/banca 30d (adj) | n_after_budget (adj) |\n")
-                    block.append("|---:|---:|---:|---:|---:|\n")
-                    for r in rows:
-                        if not isinstance(r, dict):
+                sens = sens or {}
+                back = cf_src.get("back") if isinstance(cf_src.get("back"), dict) else {}
+                lay = cf_src.get("lay") if isinstance(cf_src.get("lay"), dict) else {}
+                # "exposição" do contrafactual (apenas cobertura com placar+odd).
+                # Back: stake. Lay: preferir liability (sempre existe no contrafactual); se stake existir (versões novas),
+                # podemos usar stake, mas não dependemos dele.
+                back_exp_base = float(back.get("stake") or 0.0)
+                back_exp_filt = float(back.get("stake_filtered") or 0.0)
+                lay_exp_base = (
+                    float(lay.get("liability") or 0.0)
+                    if lay.get("liability") is not None
+                    else float(lay.get("stake") or 0.0)
+                )
+                lay_exp_filt = (
+                    float(lay.get("liability_filtered") or 0.0)
+                    if lay.get("liability_filtered") is not None
+                    else float(lay.get("stake_filtered") or 0.0)
+                )
+                exp_base = float(back_exp_base) + float(lay_exp_base)
+                exp_filt = float(back_exp_filt) + float(lay_exp_filt)
+                pnl_base = float(back.get("pnl") or 0.0) + float(lay.get("pnl") or 0.0)
+                pnl_filt = float(back.get("pnl_filtered") or 0.0) + float(lay.get("pnl_filtered") or 0.0)
+                n_base = int(back.get("n") or 0) + int(lay.get("n") or 0)
+                n_filt = int(back.get("n_filtered") or 0) + int(lay.get("n_filtered") or 0)
+                exp_factor = _safe_div(exp_filt, exp_base)
+                n_factor = _safe_div(n_filt, n_base)
+                roi_base = _safe_div(pnl_base, exp_base)
+                roi_filt = _safe_div(pnl_filt, exp_filt)
+                roi_factor = _safe_div(roi_filt, roi_base) if (roi_base is not None and roi_filt is not None and roi_base != 0) else None
+                profit_factor = _safe_div(pnl_filt, pnl_base) if pnl_base != 0 else None
+
+                block.append(
+                    f"- Fatores (da janela contrafactual): pass_exposição≈`{_fmt_num((exp_factor*100.0) if exp_factor is not None else None,2)}%`, "
+                    f"pass_N≈`{_fmt_num((n_factor*100.0) if n_factor is not None else None,2)}%`, "
+                    f"ROI_mult≈`{_fmt_num(roi_factor,3)}` , lucro_mult≈`{_fmt_num(profit_factor,3)}`.\n\n"
+                )
+                if exp_factor is None or profit_factor is None:
+                    block.append(
+                        f"_Aviso: ajuste não pôde ser aplicado (exp_base={_fmt_num(exp_base,2)}, exp_filt={_fmt_num(exp_filt,2)}, pnl_base={_fmt_num(pnl_base,2)})._\n\n"
+                    )
+                else:
+                    scen = sens.get("scenarios") if isinstance(sens.get("scenarios"), dict) else {}
+                    name_map = {
+                        "12.2b_base": "1.2b (base)",
+                        "12.2c_eq4_signals_sqrt": "1.2c (EQ 4%/4% cap50%, signals_sqrt)",
+                        "12.2e_eq4_fixed": "1.2e (EQ 4%/4% cap50%, fixed)",
+                        "12.2d_eq2_signals_sqrt": "1.2d (EQ 2%/2% cap33%, signals_sqrt)",
+                    }
+                    for name, payload in scen.items():
+                        rows = payload.get("rows") if isinstance(payload, dict) else None
+                        if not isinstance(rows, list) or not rows:
                             continue
-                        br = r.get("bank_ref")
-                        t0 = _safe_float(r.get("turn_30d"))
-                        p0 = _safe_float(r.get("profit_30d_exp"))
-                        beff = _safe_float(r.get("bank_eff"))
-                        n0 = None
-                        try:
-                            h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
-                            n0 = int(h.get("n_after_budget")) if h.get("n_after_budget") is not None else None
-                        except Exception:
+                        ttl = name_map.get(str(name), str(name))
+                        block.append(f"**{ttl} — com gate de slippage (ajuste proxy)**\n\n")
+                        block.append("| Banca (ref) | Turnover 30d (adj, proxy) | Lucro 30d (adj) | ROI/banca 30d (adj) | n_after_budget (adj) |\n")
+                        block.append("|---:|---:|---:|---:|---:|\n")
+                        for r in rows:
+                            if not isinstance(r, dict):
+                                continue
+                            br = r.get("bank_ref")
+                            t0 = _safe_float(r.get("turn_30d"))
+                            p0 = _safe_float(r.get("profit_30d_exp"))
+                            beff = _safe_float(r.get("bank_eff"))
                             n0 = None
-                        # turnover: proxy pelo pass_exposição (principalmente para Lay, onde exposição é liability)
-                        t1 = (float(t0) * float(exp_factor)) if t0 is not None else None
-                        p1 = (float(p0) * float(profit_factor)) if p0 is not None else None
-                        roi_bank = (float(p1) / float(beff) * 100.0) if (p1 is not None and beff is not None and beff > 0) else None
-                        n1 = int(round(float(n0) * float(n_factor))) if (n0 is not None and n_factor is not None) else None
-                        block.append(
-                            f"| {_fmt_num(br,2)} | {_fmt_num(t1,2)} | {_fmt_num(p1,2)} | {_fmt_num(roi_bank,2)}% | {n1 if n1 is not None else '—'} |\n"
-                        )
-                    block.append("\n")
+                            try:
+                                h = r.get("limit_hits") if isinstance(r.get("limit_hits"), dict) else {}
+                                n0 = int(h.get("n_after_budget")) if h.get("n_after_budget") is not None else None
+                            except Exception:
+                                n0 = None
+                            # turnover: proxy pelo pass_exposição (principalmente para Lay, onde exposição é liability)
+                            t1 = (float(t0) * float(exp_factor)) if t0 is not None else None
+                            p1 = (float(p0) * float(profit_factor)) if p0 is not None else None
+                            roi_bank = (float(p1) / float(beff) * 100.0) if (p1 is not None and beff is not None and beff > 0) else None
+                            n1 = int(round(float(n0) * float(n_factor))) if (n0 is not None and n_factor is not None) else None
+                            block.append(
+                                f"| {_fmt_num(br,2)} | {_fmt_num(t1,2)} | {_fmt_num(p1,2)} | {_fmt_num(roi_bank,2)}% | {n1 if n1 is not None else '—'} |\n"
+                            )
+                        block.append("\n")
 
             add_txt = "".join(block)
             if oos_as_annex and oos_annex:
