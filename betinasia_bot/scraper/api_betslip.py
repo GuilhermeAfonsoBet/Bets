@@ -128,6 +128,24 @@ class ApiBetslipClient:
         self.MOLLY_CLIENT_NAME = "sonic"
         self.MOLLY_CLIENT_VERSION = os.getenv("BETINASIA_MOLLY_CLIENT_VERSION", "2.5.54")
 
+        # Timeouts configuráveis via env (para operação/mitigação de "No PMMs received")
+        try:
+            self.PMM_TIMEOUT = float(os.getenv("EXECUTOR_PMM_TIMEOUT_SEC", str(self.PMM_TIMEOUT)))
+        except Exception:
+            pass
+        try:
+            self.PMM_MIN_WAIT = float(os.getenv("EXECUTOR_PMM_MIN_WAIT_SEC", str(self.PMM_MIN_WAIT)))
+        except Exception:
+            pass
+        try:
+            self.PMM_IDLE_TIMEOUT = float(os.getenv("EXECUTOR_PMM_IDLE_TIMEOUT_SEC", str(self.PMM_IDLE_TIMEOUT)))
+        except Exception:
+            pass
+        try:
+            self.BETSLIP_ID_TIMEOUT = float(os.getenv("EXECUTOR_BETSLIP_ID_TIMEOUT_SEC", str(self.BETSLIP_ID_TIMEOUT)))
+        except Exception:
+            pass
+
     async def close_visible_betslip_ui(self) -> bool:
         """
         Best-effort: fecha o betslip no UI (quando o site renderiza o aside).
