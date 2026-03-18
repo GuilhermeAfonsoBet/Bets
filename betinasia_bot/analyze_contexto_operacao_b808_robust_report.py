@@ -984,6 +984,10 @@ async def main() -> int:
     match_obs_pnl_in: Dict[int, float] = {}
     day_obs_exp: Dict[str, float] = {}
     day_obs_pnl: Dict[str, float] = {}
+    # OOS (obs) por combinação (key) × match_id (para significância e shrinkage por key)
+    key_match_obs: Dict[str, Dict[int, Dict[str, float]]] = {}
+    # OOS (obs) por liga (para testar efeito de liga no in-match)
+    league_match_obs: Dict[str, Dict[int, Dict[str, float]]] = {}
 
     def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
         """
@@ -6185,6 +6189,33 @@ async def main() -> int:
                                 else:
                                     match_obs_exp_in[mid_ev] = float(match_obs_exp_in.get(mid_ev, 0.0)) + float(exp)
                                     match_obs_pnl_in[mid_ev] = float(match_obs_pnl_in.get(mid_ev, 0.0)) + float(_p)
+
+                                # Por key×match (para estatística por combinação)
+                                try:
+                                    kk_ev = _key(ev)
+                                    if kk_ev:
+                                        dkm = key_match_obs.setdefault(str(kk_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0})
+                                        dkm["exp"] += float(exp)
+                                        dkm["pnl"] += float(_p)
+                                        dkm["n"] += 1.0
+                                except Exception:
+                                    pass
+
+                                # Por liga×match (para testar efeito de liga especialmente no in-match)
+                                try:
+                                    lg_ev = str(ev.get("league") or "—").strip() or "—"
+                                    lg_ev = lg_ev.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+                                    if len(lg_ev) > 48:
+                                        lg_ev = lg_ev[:48].rstrip() + "…"
+                                    dlm = league_match_obs.setdefault(str(lg_ev), {}).setdefault(int(mid_ev), {"exp": 0.0, "pnl": 0.0, "n": 0.0, "exp_in": 0.0, "pnl_in": 0.0})
+                                    dlm["exp"] += float(exp)
+                                    dlm["pnl"] += float(_p)
+                                    dlm["n"] += 1.0
+                                    if str(ev.get("regime")) == "In":
+                                        dlm["exp_in"] += float(exp)
+                                        dlm["pnl_in"] += float(_p)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         if ev.get("side") == "Back":
@@ -7005,6 +7036,173 @@ async def main() -> int:
                 )
 
                 # ------------------------------------------------------------
+                # 12.1e Significância por combinação (key): bootstrap + BH-FDR
+                # ------------------------------------------------------------
+                def _bh_fdr(pvals: List[Tuple[str, float]], *, alpha: float = 0.10) -> Dict[str, Any]:
+                    """
+                    Benjamini–Hochberg (FDR). Retorna cutoff e conjunto rejeitado.
+                    pvals: [(name, p)]
+                    """
+                    xs = [(k, float(p)) for (k, p) in (pvals or []) if p is not None and math.isfinite(float(p)) and 0.0 <= float(p) <= 1.0]
+                    xs.sort(key=lambda x: x[1])
+                    m = len(xs)
+                    if m == 0:
+                        return {"m": 0, "alpha": alpha, "cutoff": None, "reject": set()}
+                    cutoff = None
+                    kstar = 0
+                    for i, (_, p) in enumerate(xs, start=1):
+                        thr = float(alpha) * float(i) / float(m)
+                        if p <= thr:
+                            cutoff = float(p)
+                            kstar = i
+                    reject = set(k for (k, _) in xs[:kstar]) if kstar > 0 else set()
+                    return {"m": m, "alpha": alpha, "cutoff": cutoff, "reject": reject}
+
+                def _key_stats_from_key_match_obs(km: Dict[str, Dict[int, Dict[str, float]]], *, n_boot: int = 2500, min_matches: int = 20) -> List[Dict[str, Any]]:
+                    rows: List[Dict[str, Any]] = []
+                    if not km:
+                        return rows
+                    rng = np.random.default_rng(24680)
+                    for k, mp in km.items():
+                        mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp") or 0.0) > 0]
+                        if len(mids) < int(min_matches):
+                            continue
+                        exps = np.array([float(mp[mid]["exp"]) for mid in mids], dtype=float)
+                        pnls = np.array([float(mp[mid]["pnl"]) for mid in mids], dtype=float)
+                        exp_sum = float(exps.sum())
+                        if exp_sum <= 0:
+                            continue
+                        roi_hat = float(pnls.sum() / exp_sum) * 100.0
+                        # bootstrap clusterizado por match: p-value (one-sided) e CI95
+                        idx = rng.integers(0, len(mids), size=(int(n_boot), len(mids)))
+                        exp_s = exps[idx].sum(axis=1)
+                        pnl_s = pnls[idx].sum(axis=1)
+                        roi_s = np.where(exp_s > 0, (pnl_s / exp_s) * 100.0, np.nan)
+                        roi_s = roi_s[np.isfinite(roi_s)]
+                        if roi_s.size < 50:
+                            continue
+                        ci = (float(np.quantile(roi_s, 0.025)), float(np.quantile(roi_s, 0.975)))
+                        p_le0 = float(np.mean(roi_s <= 0.0))  # H0: ROI<=0
+                        rows.append(
+                            {
+                                "key": str(k),
+                                "n_matches": int(len(mids)),
+                                "exp_sum": exp_sum,
+                                "roi_hat": roi_hat,
+                                "ci95_lb": float(ci[0]),
+                                "ci95_ub": float(ci[1]),
+                                "p_roi_le0": p_le0,
+                            }
+                        )
+                    return rows
+
+                def _empirical_bayes_shrink(means: np.ndarray, vars_over_n: np.ndarray) -> Tuple[float, float, np.ndarray]:
+                    """
+                    Empirical Bayes Normal-Normal:
+                    theta_k ~ N(mu, tau^2), y_k | theta_k ~ N(theta_k, s_k^2/n_k)
+                    Retorna (mu_hat, tau2_hat, w_k) onde posterior mean = w_k*y_k + (1-w_k)*mu_hat.
+                    """
+                    if means.size == 0:
+                        return 0.0, 0.0, np.array([], dtype=float)
+                    mu = float(np.nanmean(means))
+                    # método dos momentos
+                    vbar = float(np.nanmean(vars_over_n))
+                    vmeans = float(np.nanvar(means, ddof=1)) if means.size >= 2 else 0.0
+                    tau2 = max(0.0, vmeans - vbar)
+                    w = np.where((tau2 + vars_over_n) > 0, tau2 / (tau2 + vars_over_n), 0.0)
+                    return mu, float(tau2), w
+
+                lines.append("### 12.1e Evidência por combinação (key): significância (bootstrap) + shrinkage (Bayes hierárquico)\n")
+                lines.append(
+                    "Aqui estimamos ROI OOS por **combinação (key)** usando bootstrap por `match_id`. Depois aplicamos:\n\n"
+                    "- **BH‑FDR** (ex.: 10%) para controlar falsos positivos quando avaliamos muitas keys.\n"
+                    "- **Shrinkage (Empirical Bayes / partial pooling)** para estabilizar keys com baixo N.\n\n"
+                )
+                key_rows = _key_stats_from_key_match_obs(key_match_obs, n_boot=2500, min_matches=20)
+                if not key_rows:
+                    lines.append("_Sem keys suficientes (min_matches=20) para rodar este bloco._\n\n")
+                else:
+                    # shrinkage sobre roi_hat com variância proxy via largura do CI (aprox)
+                    means = np.array([float(r["roi_hat"]) for r in key_rows], dtype=float)
+                    # proxy de var: (ub-lb)/(2*1.96) ~= SE; var_over_n = SE^2
+                    se = np.array([max(1e-9, float(r["ci95_ub"] - r["ci95_lb"]) / (2.0 * 1.96)) for r in key_rows], dtype=float)
+                    var_over_n = se ** 2
+                    mu_hat, tau2_hat, w = _empirical_bayes_shrink(means, var_over_n)
+                    for i, r in enumerate(key_rows):
+                        r["roi_shrunk"] = float(w[i] * float(r["roi_hat"]) + (1.0 - float(w[i])) * float(mu_hat))
+                        r["shrink_w"] = float(w[i])
+
+                    # BH-FDR em p_roi_le0 (one-sided)
+                    fdr = _bh_fdr([(str(r["key"]), float(r["p_roi_le0"])) for r in key_rows], alpha=0.10)
+                    rej = fdr.get("reject") if isinstance(fdr.get("reject"), set) else set()
+                    for r in key_rows:
+                        r["fdr10_sig"] = (str(r["key"]) in rej)
+
+                    # imprime top por roi_shrunk (e também por evidência)
+                    key_rows.sort(key=lambda r: (float(r.get("roi_shrunk") or -1e9), float(r.get("exp_sum") or 0.0)), reverse=True)
+                    lines.append(
+                        f"- Shrinkage: mu_global≈`{_fmt_num(mu_hat,2)}%`, tau2≈`{_fmt_num(tau2_hat,6)}`; "
+                        f"BH‑FDR: m=`{int(fdr.get('m') or 0)}`, alpha=`{_fmt_num(float(fdr.get('alpha') or 0.0)*100.0,1)}%`, cutoff≈`{_fmt_num(fdr.get('cutoff'),4)}`.\n\n"
+                    )
+                    lines.append("| key | n_matches | exp_sum | ROI_hat | CI95 | p(ROI<=0) | ROI_shrunk | w | FDR10 |\n")
+                    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                    for r in key_rows[:40]:
+                        ci_s = f"{_fmt_num(r.get('ci95_lb'),2)}%..{_fmt_num(r.get('ci95_ub'),2)}%"
+                        lines.append(
+                            f"| `{r.get('key')}` | {int(r.get('n_matches') or 0)} | {_fmt_num(r.get('exp_sum'),2)} | "
+                            f"{_fmt_num(r.get('roi_hat'),2)}% | {ci_s} | {_fmt_num(float(r.get('p_roi_le0') or 0.0)*100.0,1)}% | "
+                            f"{_fmt_num(r.get('roi_shrunk'),2)}% | {_fmt_num(r.get('shrink_w'),2)} | {'✅' if r.get('fdr10_sig') else '—'} |\n"
+                        )
+                    lines.append("\n")
+
+                # ------------------------------------------------------------
+                # 12.1f Estabilidade temporal (rolling) em ROI/turnover (exp)
+                # ------------------------------------------------------------
+                lines.append("### 12.1f Estabilidade temporal: rolling ROI/turnover (OOS)\n")
+                if daily_turn and daily_pnl_exp and len(daily_turn) >= 10:
+                    d_sorted = sorted(daily_turn.keys())
+                    roi_day = []
+                    for dday in d_sorted:
+                        t = float(daily_turn.get(dday, 0.0))
+                        p = float(daily_pnl_exp.get(dday, 0.0))
+                        roi_day.append((dday, (p / t * 100.0) if t > 0 else None, t, p))
+                    lines.append("| Dia | Turnover | P&L (exp) | ROI/turnover |\n")
+                    lines.append("|---|---:|---:|---:|\n")
+                    for dday, r, t, p in roi_day[-14:]:
+                        lines.append(f"| {dday} | {_fmt_num(t,2)} | {_fmt_num(p,2)} | {_fmt_num(r,2)}% |\n")
+                    lines.append("\n")
+                    # rolling 7d (ponderado por turnover)
+                    try:
+                        wins = [7, 14]
+                        for wlen in wins:
+                            if len(roi_day) < wlen:
+                                continue
+                            t_sum = float(sum(float(x[2]) for x in roi_day[-wlen:]))
+                            p_sum = float(sum(float(x[3]) for x in roi_day[-wlen:]))
+                            r_roll = (p_sum / t_sum * 100.0) if t_sum > 0 else None
+                            lines.append(f"- Rolling {wlen}d (turnover-weighted): ROI≈`{_fmt_num(r_roll,2)}%` (P&L={_fmt_num(p_sum,2)}, Turnover={_fmt_num(t_sum,2)}).\n")
+                        lines.append("\n")
+                    except Exception:
+                        lines.append("\n")
+                    # sign test (dias com ROI>0)
+                    try:
+                        xs = [float(x[1]) for x in roi_day if x[1] is not None]
+                        n = len(xs)
+                        kpos = int(sum(1 for x in xs if x > 0.0))
+                        # p-value binomial (aprox normal)
+                        p0 = 0.5
+                        mu = n * p0
+                        sd = math.sqrt(max(1e-12, n * p0 * (1 - p0)))
+                        z = (kpos - mu) / sd if sd > 0 else 0.0
+                        # two-sided
+                        p_two = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0)))))
+                        lines.append(f"- Sign test (dias ROI>0): k={kpos}/{n}, z≈`{_fmt_num(z,2)}`, p≈`{_fmt_num(p_two,4)}`.\n\n")
+                    except Exception:
+                        lines.append("\n")
+                else:
+                    lines.append("_Sem série diária suficiente para rolling (precisa >=10 dias com turnover>0)._ \n\n")
+
+                # ------------------------------------------------------------
                 # 12.1d Roadmap: próximos avanços estatísticos
                 # ------------------------------------------------------------
                 lines.append("### 12.1d Próximos avanços estatísticos (para testar performance do modelo)\n")
@@ -7018,6 +7216,96 @@ async def main() -> int:
                     "- **Separar qualidade de entrada vs resultado**: CLV OOS como métrica ortogonal (edge de preço) e ROI como métrica de desfecho; divergência CLV>0 e ROI≈0 sugere problema de settlement/cobertura/tamanho.\n"
                     "- **Testes de sazonalidade**: além de dia da semana, checar horário (UTC), competição, e 'prime-time' (interação com liquidez/PMM).\n\n"
                 )
+
+                # ------------------------------------------------------------
+                # 12.1g Teste: efeito de liga no in‑match (justifica key_by_league_scope=all?)
+                # ------------------------------------------------------------
+                lines.append("### 12.1g Teste: a liga influencia o resultado no in‑match?\n")
+                lines.append(
+                    "Pergunta: faz sentido incluir `league` como feature/chave também no **in‑match**? "
+                    "Aqui medimos heterogeneidade de ROI por liga **apenas no in‑match** (obs; pós-budget), clusterizando por `match_id`.\n\n"
+                    "Como habilitar no WF: use `--wf-key-by-league --wf-key-by-league-scope all` (ou no daily via `DAILY_WF_KEY_BY_LEAGUE=1` e `DAILY_WF_KEY_BY_LEAGUE_SCOPE=all`).\n\n"
+                )
+                # prepara ligas com volume suficiente (in‑match)
+                try:
+                    league_rows = []
+                    for lg, mp in (league_match_obs or {}).items():
+                        mids = [int(mid) for mid in mp.keys() if float((mp.get(mid) or {}).get("exp_in") or 0.0) > 0]
+                        if len(mids) < 15:
+                            continue
+                        exp = float(sum(float(mp[mid].get("exp_in") or 0.0) for mid in mids))
+                        pnl = float(sum(float(mp[mid].get("pnl_in") or 0.0) for mid in mids))
+                        roi = (pnl / exp * 100.0) if exp > 0 else None
+                        league_rows.append((exp, lg, len(mids), exp, pnl, roi))
+                    league_rows.sort(key=lambda x: x[0], reverse=True)
+                    if not league_rows:
+                        lines.append("_Sem ligas com volume suficiente no in‑match (min_matches_in=15)._ \n\n")
+                    else:
+                        lines.append("| Liga | n_matches (in) | Exposição (in) | P&L (in) | ROI (in; obs) |\n")
+                        lines.append("|---|---:|---:|---:|---:|\n")
+                        for _, lg, nmid, exp, pnl, roi in league_rows[:20]:
+                            lines.append(f"| `{lg}` | {int(nmid)} | {_fmt_num(exp,2)} | {_fmt_num(pnl,2)} | {_fmt_num(roi,2)}% |\n")
+                        lines.append("\n")
+
+                        # teste permutacional entre ligas (ponderado por exposição por match)
+                        # stat: F em ROI_match por liga (peso=exp_match). Usa apenas ligas top por exp.
+                        top_lgs = [lg for _, lg, *_ in league_rows[:12]]
+                        xs_roi = []
+                        xs_w = []
+                        xs_lab = []
+                        for lg in top_lgs:
+                            mp = league_match_obs.get(lg, {})
+                            for mid, rec in mp.items():
+                                e = float((rec or {}).get("exp_in") or 0.0)
+                                if e <= 0:
+                                    continue
+                                p = float((rec or {}).get("pnl_in") or 0.0)
+                                xs_roi.append(p / e)
+                                xs_w.append(e)
+                                xs_lab.append(lg)
+                        if len(xs_roi) >= 80 and len(set(xs_lab)) >= 3:
+                            roi = np.array(xs_roi, dtype=float) * 100.0
+                            w = np.array(xs_w, dtype=float)
+                            lab = np.array(xs_lab, dtype=object)
+                            cats = sorted({str(x) for x in lab})
+                            def _F_labs(labs: np.ndarray) -> float:
+                                mu = float((roi * w).sum() / max(1e-12, float(w.sum())))
+                                ssb = 0.0
+                                ssw = 0.0
+                                k = 0
+                                for c in cats:
+                                    m = (labs == c)
+                                    if not np.any(m):
+                                        continue
+                                    k += 1
+                                    wc = float(w[m].sum())
+                                    if wc <= 0:
+                                        continue
+                                    muc = float((roi[m] * w[m]).sum() / max(1e-12, wc))
+                                    ssb += wc * (muc - mu) ** 2
+                                    ssw += float(((roi[m] - muc) ** 2 * w[m]).sum())
+                                if k <= 1:
+                                    return 0.0
+                                num = ssb / max(1.0, float(k - 1))
+                                den = ssw / max(1.0, float(len(roi) - k))
+                                return float(num / max(1e-12, den))
+                            f_obs = _F_labs(lab)
+                            try:
+                                rng = np.random.default_rng(13579)
+                                n_perm = 6000
+                                cnt = 0
+                                for _ in range(int(n_perm)):
+                                    labp = rng.permutation(lab)
+                                    if _F_labs(labp) >= f_obs:
+                                        cnt += 1
+                                p = float((cnt + 1) / (float(n_perm) + 1.0))
+                                lines.append(f"- Teste permutacional (top ligas; H0: sem diferença): p_value≈`{_fmt_num(p,4)}` (F≈`{_fmt_num(f_obs,2)}`, ligas={len(cats)}, matches={len(roi)}).\n\n")
+                            except Exception:
+                                lines.append(f"- Teste permutacional: F≈`{_fmt_num(f_obs,2)}` (falha ao calcular p-value).\n\n")
+                        else:
+                            lines.append("_Sem volume suficiente para teste permutacional entre ligas no in‑match (precisa >=80 matches nos top grupos)._ \n\n")
+                except Exception:
+                    lines.append("_Falha ao calcular efeito de liga no in‑match (dados insuficientes ou formato inesperado)._ \n\n")
 
                 # Marginal por combinação (key): turnover share + lucro marginal (projeção 30d)
                 try:
