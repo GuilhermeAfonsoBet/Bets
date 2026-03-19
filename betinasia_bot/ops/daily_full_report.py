@@ -853,6 +853,49 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     kpi_ok_24h = compute_kpis_from_lines(exec_lines_24h, path=str(cfg.executor_jsonl), only_status=["LIVE_OK", "DRY_OK"])
     (day_dir / "execution_kpis_ok_24h.json").write_text(json.dumps(kpi_ok_24h, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # atividade recente (ajuda a diagnosticar "hoje não teve aposta" sem depender do DB)
+    exec_activity: Dict[str, Any] = {"last_live_ok_ts": None, "live_ok_1h": 0, "live_ok_6h": 0, "live_ok_24h": 0}
+    try:
+        nowu = _utcnow()
+        cut1 = nowu - timedelta(hours=1.0)
+        cut6 = nowu - timedelta(hours=6.0)
+        cut24 = nowu - timedelta(hours=24.0)
+        last_live = None
+        c1 = c6 = c24 = 0
+        for ln in exec_lines:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            res = obj.get("result") if isinstance(obj, dict) else None
+            req = obj.get("request") if isinstance(obj, dict) else None
+            if not isinstance(res, dict):
+                continue
+            st = str(res.get("status") or "")
+            if st == "HEARTBEAT":
+                continue
+            if st != "LIVE_OK":
+                continue
+            ts0 = _parse_iso_dt_best(str(res.get("finished_at") or res.get("created_at") or (req.get("created_at") if isinstance(req, dict) else "") or ""))
+            if not ts0:
+                continue
+            if last_live is None or ts0 > last_live:
+                last_live = ts0
+            if ts0 >= cut24:
+                c24 += 1
+            if ts0 >= cut6:
+                c6 += 1
+            if ts0 >= cut1:
+                c1 += 1
+        exec_activity = {
+            "last_live_ok_ts": last_live.isoformat() if last_live else None,
+            "live_ok_1h": int(c1),
+            "live_ok_6h": int(c6),
+            "live_ok_24h": int(c24),
+        }
+    except Exception:
+        exec_activity = {"last_live_ok_ts": None, "live_ok_1h": 0, "live_ok_6h": 0, "live_ok_24h": 0}
+
     # 3) Rodar OOS (walk-forward) e exportar policy
     base_md = day_dir / "report_base.md"
     policy_hist = cfg.wf_policy_history_dir / f"wf_policy_{day}.json"
@@ -1268,6 +1311,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"- Último registro no `executor_jsonl`: `{exec_last_ts.isoformat()}` (idade ≈ `{_fmt_num(age_h,1)}h`, limiar `{_fmt_num(thr_h,1)}h`).\n"
                     "- Isso explica dias com `Exec rows=0` mesmo com auditoria DB (funil) mostrando volume.\n\n"
                 )
+    except Exception:
+        pass
+
+    # atividade recente (LIVE_OK): diagnostica rapidamente "hoje não teve aposta"
+    try:
+        last_live_ok = exec_activity.get("last_live_ok_ts") if isinstance(exec_activity, dict) else None
+        s0.append("\n**Atividade recente (executor)**\n\n")
+        s0.append(
+            f"- Último `LIVE_OK`: `{last_live_ok or '—'}` | "
+            f"`LIVE_OK` (1h/6h/24h): `{int(exec_activity.get('live_ok_1h') or 0)}/{int(exec_activity.get('live_ok_6h') or 0)}/{int(exec_activity.get('live_ok_24h') or 0)}`\n"
+        )
+        if int(exec_activity.get("live_ok_6h") or 0) == 0:
+            s0.append("- Se isso persistir com auditoria OK no DB, suspeite de sessão/PMM/timeout ou bridge travado (ver checklist abaixo).\n")
+        s0.append("\n")
     except Exception:
         pass
 
