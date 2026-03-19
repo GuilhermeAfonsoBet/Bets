@@ -614,8 +614,22 @@ async def run_report(
     total_rows_ctx_lay: List[Dict[str, Any]] = []
     total_rows_ctx_lay_stake: List[Dict[str, Any]] = []
     # contrafactual: filtro de slippage (apenas execuções com ROI via placar)
+    # Observação operacional: por padrão aplicamos o gate do Lay apenas no PRE (evita interferir em Lay in‑match, ex.: Lay_In_Yes),
+    # mas isso é configurável por env.
+    slip_gate_back_scope = str(os.getenv("SLIPPAGE_GATE_BACK_SCOPE", "all") or "all").strip().lower()  # all|pre|in
+    slip_gate_lay_scope = str(os.getenv("SLIPPAGE_GATE_LAY_SCOPE", "pre") or "pre").strip().lower()  # all|pre|in
+    if slip_gate_back_scope not in ("all", "pre", "in"):
+        slip_gate_back_scope = "all"
+    if slip_gate_lay_scope not in ("all", "pre", "in"):
+        slip_gate_lay_scope = "pre"
+
     cf = {
-        "rule": {"back_skip_raw_pct_le": -2.0, "lay_skip_raw_pct_gt": 2.0},
+        "rule": {
+            "back_skip_raw_pct_le": -2.0,
+            "lay_skip_raw_pct_gt": 2.0,
+            "back_scope": slip_gate_back_scope,
+            "lay_scope": slip_gate_lay_scope,
+        },
         "note": "Contrafactual baseado apenas nas execuções com ROI via placar (audit+scores+odd). Não é P&L accounting.",
         "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
         # Lay: além de liability, guardamos stake para permitir ajuste de turnover (capacidade) em tabelas de sensibilidade
@@ -873,6 +887,14 @@ async def run_report(
             "n_exec_rows": len(xs),
             "n_exec_success": 0,
             "status_counts": {},
+            # P&L por placar (somente cobertura com ROI) quebrado por Back/Lay × Pre/In.
+            # Back: exposição=stake; Lay: exposição=liability.
+            "pnl_placar_by_type": {
+                "Back_Pre": {"n": 0, "exposure": 0.0, "pnl": 0.0},
+                "Back_In": {"n": 0, "exposure": 0.0, "pnl": 0.0},
+                "Lay_Pre": {"n": 0, "exposure": 0.0, "pnl": 0.0},
+                "Lay_In": {"n": 0, "exposure": 0.0, "pnl": 0.0},
+            },
             "back": {
                 "n_success": 0,
                 "n_cov": 0,
@@ -992,6 +1014,20 @@ async def run_report(
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
+                # quebra por Pre/In (para conciliar com OOS e com contagens por jogo)
+                try:
+                    reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    reg = ("In" if bool(e.is_live) else "Pre")
+                try:
+                    k2 = f"Back_{reg}"
+                    blk = perf.get("pnl_placar_by_type", {}).get(k2) if isinstance(perf.get("pnl_placar_by_type"), dict) else None
+                    if isinstance(blk, dict):
+                        blk["n"] = int(blk.get("n") or 0) + 1
+                        blk["exposure"] = float(blk.get("exposure") or 0.0) + float(stake)
+                        blk["pnl"] = float(blk.get("pnl") or 0.0) + float(pnl)
+                except Exception:
+                    pass
                 perf["back"]["stake_sum_cov"] += float(stake)
                 perf["back"]["pnl_sum"] += float(pnl)
                 if mult > 0:
@@ -1030,7 +1066,11 @@ async def run_report(
                     cf["back"]["n"] += 1
                     cf["back"]["pnl"] += float(pnl)
                     cf["back"]["stake"] += float(stake)
-                    skip = (raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                    scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
                     if not skip:
                         cf["back"]["n_filtered"] += 1
                         cf["back"]["pnl_filtered"] += float(pnl)
@@ -1041,7 +1081,11 @@ async def run_report(
                     cf_day["back"]["n"] += 1
                     cf_day["back"]["pnl"] += float(pnl)
                     cf_day["back"]["stake"] += float(stake)
-                    skip = (raw_pct is not None and float(raw_pct) <= float(cf_day["rule"]["back_skip_raw_pct_le"]))
+                    scope = str((cf_day.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf_day["rule"]["back_skip_raw_pct_le"]))
                     if not skip:
                         cf_day["back"]["n_filtered"] += 1
                         cf_day["back"]["pnl_filtered"] += float(pnl)
@@ -1057,6 +1101,19 @@ async def run_report(
                 if roi_liab is None:
                     continue
                 pnl = liab * float(roi_liab) / 100.0
+                try:
+                    reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    reg = ("In" if bool(e.is_live) else "Pre")
+                try:
+                    k2 = f"Lay_{reg}"
+                    blk = perf.get("pnl_placar_by_type", {}).get(k2) if isinstance(perf.get("pnl_placar_by_type"), dict) else None
+                    if isinstance(blk, dict):
+                        blk["n"] = int(blk.get("n") or 0) + 1
+                        blk["exposure"] = float(blk.get("exposure") or 0.0) + float(liab)
+                        blk["pnl"] = float(blk.get("pnl") or 0.0) + float(pnl)
+                except Exception:
+                    pass
                 perf["lay"]["liability_sum_cov"] += float(liab)
                 perf["lay"]["pnl_sum"] += float(pnl)
                 # outcome invertido vs Back
@@ -1103,22 +1160,34 @@ async def run_report(
                 try:
                     cf["lay"]["n"] += 1
                     cf["lay"]["pnl"] += float(pnl)
+                    cf["lay"]["stake"] += float(stake)
                     cf["lay"]["liability"] += float(liab)
-                    skip = (raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                    scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
                     if not skip:
                         cf["lay"]["n_filtered"] += 1
                         cf["lay"]["pnl_filtered"] += float(pnl)
+                        cf["lay"]["stake_filtered"] += float(stake)
                         cf["lay"]["liability_filtered"] += float(liab)
                 except Exception:
                     pass
                 try:
                     cf_day["lay"]["n"] += 1
                     cf_day["lay"]["pnl"] += float(pnl)
+                    cf_day["lay"]["stake"] += float(stake)
                     cf_day["lay"]["liability"] += float(liab)
-                    skip = (raw_pct is not None and float(raw_pct) > float(cf_day["rule"]["lay_skip_raw_pct_gt"]))
+                    scope = str((cf_day.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf_day["rule"]["lay_skip_raw_pct_gt"]))
                     if not skip:
                         cf_day["lay"]["n_filtered"] += 1
                         cf_day["lay"]["pnl_filtered"] += float(pnl)
+                        cf_day["lay"]["stake_filtered"] += float(stake)
                         cf_day["lay"]["liability_filtered"] += float(liab)
                 except Exception:
                     pass

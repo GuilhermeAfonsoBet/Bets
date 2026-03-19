@@ -1371,11 +1371,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| OK_valid/total (24h, DB) | {_fmt_num(ok_valid_pct,1)}% | ≥{_fmt_num(thr_ok_valid_pct,1)}% | **{_fmt_status(chk_okv)}** |\n")
     s0.append(f"| API_FAILED/total (24h, DB) | {_fmt_num(api_failed_pct,1)}% | ≤{_fmt_num(thr_api_failed_pct,1)}% | **{_fmt_status(chk_api)}** |\n")
     s0.append(f"| STALE_QUEUE_WAIT/total (24h, DB) | {_fmt_num(stale_pct,1)}% | ≤{_fmt_num(thr_stale_pct,1)}% | **{_fmt_status(chk_stale)}** |\n")
-    s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
-    if pmm_consults_24h is not None and no_pmms_24h is not None:
+    if pmm_consults_24h is not None and no_pmms_24h is not None and no_pmms_rate_24h is not None:
         s0.append(
-            f"| `No PMMs` / `PMM-consults` (24h, DB) | {int(no_pmms_24h)}/{int(pmm_consults_24h)} ({_fmt_num(no_pmms_rate_24h,2)}%) | — | — |\n"
+            f"| `No PMMs received` (24h, DB) | {int(no_pmms_24h)} / {int(pmm_consults_24h)} ({_fmt_num(no_pmms_rate_24h,2)}%) | ≤{int(thr_no_pmms)} (abs) | **{_fmt_status(chk_pmms)}** |\n"
         )
+    else:
+        s0.append(f"| `No PMMs received` (24h, DB) | {int(err_pmms)} | ≤{int(thr_no_pmms)} | **{_fmt_status(chk_pmms)}** |\n")
+        s0.append("| `No PMMs` / `PMM-consults` (24h, DB) | — | — | — |\n")
     s0.append(f"| `too_many_open_betslips` (24h, DB) | {int(err_open)} | ≤{int(thr_open_betslips)} | **{_fmt_status(chk_open)}** |\n")
     s0.append(
         f"| Latência p90 `call_to_done_ms` (24h; sucessos) | {_fmt_num(p90_call_24h,0)}ms | ≤{int(thr_p90_ms)}ms | **{_fmt_status(chk_p90)}** |\n"
@@ -1759,16 +1761,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         try:
             s1.append("**Execução — métricas mínimas por tipo (Back/Lay × Pre/In; janela curta)**\n\n")
             s1.append(
-                "| Tipo | #ordens | #linhas | #jogos | Valor em risco ($) | Ticket médio ($/ordem) | Stake total ($) | #liq | #pend | P&L (liq, $) | ROI% (liq) |\n"
+                "| Tipo | #ordens | #eventos_jsonl | #linhas_api | #jogos | Valor em risco ($) | Ticket médio ($/ordem) | Stake total ($) | #liq | #pend | P&L (liq, $) | ROI% (liq) |\n"
             )
-            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
             order = ["Back_Pre", "Back_In", "Lay_Pre", "Lay_In"]
             for k in order:
                 r = exec_min.get("by_type", {}).get(k) if isinstance(exec_min.get("by_type"), dict) else None
                 if not isinstance(r, dict):
                     continue
                 s1.append(
-                    f"| {k.replace('_', ' ')} | {int(r.get('n_orders') or 0)} | {int(r.get('n_bets') or 0)} | {int(r.get('n_matches') or 0)} | "
+                    f"| {k.replace('_', ' ')} | {int(r.get('n_orders') or 0)} | {int(r.get('n_bets') or 0)} | {int(r.get('n_bet_lines_api') or 0)} | {int(r.get('n_matches') or 0)} | "
                     f"{_fmt_num(r.get('amount_risk_sum'), 2)} | {_fmt_num(r.get('amount_risk_avg_per_order'), 2)} | "
                     f"{_fmt_num(r.get('stake_sum'), 2)} | {int(r.get('n_settled') or 0)} | {int(r.get('n_unsettled') or 0)} | {_fmt_num(r.get('pnl_real_sum_settled') or r.get('pnl_sum_settled'), 2)} | "
                     f"{_fmt_pct(r.get('roi_pct_settled'))} |\n"
@@ -1776,7 +1778,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             tot = exec_min.get("total") if isinstance(exec_min.get("total"), dict) else {}
             if isinstance(tot, dict) and tot:
                 s1.append(
-                    f"| **TOTAL** | **{int(tot.get('n_orders') or 0)}** | **{int(tot.get('n_bets') or 0)}** | **{int(tot.get('n_matches') or 0)}** | "
+                    f"| **TOTAL** | **{int(tot.get('n_orders') or 0)}** | **{int(tot.get('n_bets') or 0)}** | **{int(tot.get('n_bet_lines_api') or 0)}** | **{int(tot.get('n_matches') or 0)}** | "
                     f"**{_fmt_num(tot.get('amount_risk_sum'), 2)}** | **{_fmt_num(tot.get('amount_risk_avg_per_order'), 2)}** | "
                     f"**{_fmt_num(tot.get('stake_sum'), 2)}** | **{int(tot.get('n_settled') or 0)}** | **{int(tot.get('n_unsettled') or 0)}** | **{_fmt_num(tot.get('pnl_real_sum_settled') or tot.get('pnl_sum_settled'), 2)}** | "
                     f"**{_fmt_pct(tot.get('roi_pct_settled'))}** |\n"
@@ -1830,6 +1832,42 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
         s1.append("\n")
+
+        # Quebra por tipo (Back/Lay × Pre/In) no P&L por placar (cobertura). Ajuda a explicar dias OOS/placar positivos vs accounting negativo.
+        try:
+            s1.append("**Quebra (placar): Back/Lay × Pre/In (somente cobertos por ROI)**\n\n")
+            s1.append("| Dia | P&L Back Pre | ROI Back Pre | P&L Back In | ROI Back In | P&L Lay Pre | ROI Lay Pre/liab | P&L Lay In | ROI Lay In/liab |\n")
+            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for it in adh_day.get("per_day") or []:
+                if not isinstance(it, dict):
+                    continue
+                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                bt = ex.get("pnl_placar_by_type") if isinstance(ex.get("pnl_placar_by_type"), dict) else {}
+                def _p(k: str) -> float:
+                    try:
+                        return float((bt.get(k) or {}).get("pnl") or 0.0) if isinstance(bt.get(k), dict) else 0.0
+                    except Exception:
+                        return 0.0
+                def _e(k: str) -> float:
+                    try:
+                        return float((bt.get(k) or {}).get("exposure") or 0.0) if isinstance(bt.get(k), dict) else 0.0
+                    except Exception:
+                        return 0.0
+                pbp, ebp = _p("Back_Pre"), _e("Back_Pre")
+                pbi, ebi = _p("Back_In"), _e("Back_In")
+                plp, elp = _p("Lay_Pre"), _e("Lay_Pre")
+                pli, eli = _p("Lay_In"), _e("Lay_In")
+                r_bp = (pbp / ebp * 100.0) if ebp > 0 else None
+                r_bi = (pbi / ebi * 100.0) if ebi > 0 else None
+                r_lp = (plp / elp * 100.0) if elp > 0 else None
+                r_li = (pli / eli * 100.0) if eli > 0 else None
+                s1.append(
+                    f"| {it.get('day')} | {_fmt_num(pbp,2)} | {_fmt_pct(r_bp)} | {_fmt_num(pbi,2)} | {_fmt_pct(r_bi)} | "
+                    f"{_fmt_num(plp,2)} | {_fmt_pct(r_lp)} | {_fmt_num(pli,2)} | {_fmt_pct(r_li)} |\n"
+                )
+            s1.append("\n")
+        except Exception:
+            pass
 
         # slippage x ROI (3 buckets raw com sinal) — acumulado na janela (não só um dia)
         raw_total = {}
