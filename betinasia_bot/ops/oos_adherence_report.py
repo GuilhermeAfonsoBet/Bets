@@ -717,8 +717,14 @@ async def run_report(
                 _ah_track("all_exec", line=e.line, regime=("In" if bool(e.is_live) else "Pre"))
             except Exception:
                 pass
+            st_norm = str(e.status or "").strip().upper()
+            is_success = st_norm in ("DRY_OK", "LIVE_OK")
             a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
             if not a:
+                continue
+            # P&L/ROI por placar só faz sentido para execuções bem‑sucedidas (LIVE_OK/DRY_OK).
+            # Caso contrário, vira "what-if" e tende a ficar sistematicamente acima/abaixo do accounting.
+            if not is_success:
                 continue
             try:
                 _ah_track("cov_placar", line=str(a.get("line") or e.line or ""), regime=("In" if bool(e.is_live) else "Pre"))
@@ -750,10 +756,18 @@ async def run_report(
                         comb_meta.setdefault(comb, {"side": "Back", "regime": regime, "reversal": "Any", "league": None})
                     except Exception:
                         pass
+                try:
+                    regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    regime = ("In" if bool(e.is_live) else "Pre")
                 cf["back"]["n"] += 1
                 cf["back"]["pnl"] += float(pnl)
                 cf["back"]["stake"] += float(stake)
-                skip = (raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                apply_gate = True
+                if scope in ("pre", "in"):
+                    apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
+                skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
                 if not skip:
                     cf["back"]["n_filtered"] += 1
                     cf["back"]["pnl_filtered"] += float(pnl)
@@ -784,11 +798,19 @@ async def run_report(
                         comb_meta.setdefault(comb, {"side": "Lay", "regime": regime, "reversal": rev, "league": None})
                     except Exception:
                         pass
+                try:
+                    regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    regime = ("In" if bool(e.is_live) else "Pre")
                 cf["lay"]["n"] += 1
                 cf["lay"]["pnl"] += float(pnl)
                 cf["lay"]["stake"] += float(stake)
                 cf["lay"]["liability"] += float(liab)
-                skip = (raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                apply_gate = True
+                if scope in ("pre", "in"):
+                    apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
+                skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
                 if not skip:
                     cf["lay"]["n_filtered"] += 1
                     cf["lay"]["pnl_filtered"] += float(pnl)
@@ -983,6 +1005,8 @@ async def run_report(
                         perf["lay"]["liability_sum"] += float(stake0) * max(0.0, float(odd0) - 1.0)
 
             # só calcula "resultado" quando há placar e odd
+            if not is_success:
+                continue
             a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
             if not a:
                 continue
