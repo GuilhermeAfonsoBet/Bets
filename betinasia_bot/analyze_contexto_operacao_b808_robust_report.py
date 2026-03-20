@@ -511,14 +511,24 @@ def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optio
         return None, None
 
     try:
-        ah_line = float(str(line).replace(",", "."))
+        sel = (side or "").strip().lower()
+        raw = str(line).strip().replace(",", ".").replace("−", "-")
+        ah = float(raw)
+        # Convenção: quando `line` vem sem sinal (ex.: "2"), interpretamos como magnitude
+        # do handicap do `side` (home:+line, away:+line). Convertendo para handicap do HOME:
+        # - side=home => home_handicap=+line
+        # - side=away => home_handicap=-line
+        # Se vier com sinal (ex.: "-0.5"), tratamos como handicap do HOME já assinado.
+        home_handicap = ah if (raw.startswith("+") or raw.startswith("-")) else (ah if sel == "home" else -ah)
     except Exception:
         return None, None
 
-    if (side or "").strip() == "home":
-        adjusted = goal_diff + ah_line
+    if sel == "home":
+        adjusted = goal_diff + home_handicap
+    elif sel == "away":
+        adjusted = -goal_diff - home_handicap
     else:
-        adjusted = -goal_diff - ah_line
+        return None, None
 
     # win/loss/push/half
     if adjusted > 0.25:
@@ -2598,14 +2608,23 @@ async def main() -> int:
             except Exception:
                 return None
             try:
-                ah_line = float(str(d.get("line", "")).replace(",", "."))
+                side = (str(d.get("side") or "")).strip().lower()
+                raw = str(d.get("line", "")).strip().replace(",", ".").replace("−", "-")
+                ah = float(raw)
+                # Convenção: quando `line` vem sem sinal (ex.: "2"), interpretamos como magnitude
+                # do handicap do `side` (home:+line, away:+line). Convertendo para handicap do HOME:
+                # - side=home => home_handicap=+line
+                # - side=away => home_handicap=-line
+                # Se vier com sinal (ex.: "-0.5"), tratamos como handicap do HOME já assinado.
+                home_handicap = ah if (raw.startswith("+") or raw.startswith("-")) else (ah if side == "home" else -ah)
             except Exception:
                 return None
-            side = (str(d.get("side") or "")).strip()
             if side == "home":
-                adjusted = goal_diff + ah_line
+                adjusted = goal_diff + home_handicap
+            elif side == "away":
+                adjusted = -goal_diff - home_handicap
             else:
-                adjusted = -goal_diff - ah_line
+                return None
             if adjusted > 0.25:
                 return 1.0
             if adjusted == 0.25:
@@ -2978,13 +2997,23 @@ async def main() -> int:
             except Exception:
                 return None
             try:
-                ah_line = float(str(line).replace(",", "."))
+                sel = (side or "").strip().lower()
+                raw = str(line).strip().replace(",", ".").replace("−", "-")
+                ah = float(raw)
+                # Convenção: quando `line` vem sem sinal (ex.: "2"), interpretamos como magnitude
+                # do handicap do `side` (home:+line, away:+line). Convertendo para handicap do HOME:
+                # - side=home => home_handicap=+line
+                # - side=away => home_handicap=-line
+                # Se vier com sinal (ex.: "-0.5"), tratamos como handicap do HOME já assinado.
+                home_handicap = ah if (raw.startswith("+") or raw.startswith("-")) else (ah if sel == "home" else -ah)
             except Exception:
                 return None
-            if (side or "").strip() == "home":
-                adjusted = goal_diff + ah_line
+            if sel == "home":
+                adjusted = goal_diff + home_handicap
+            elif sel == "away":
+                adjusted = -goal_diff - home_handicap
             else:
-                adjusted = -goal_diff - ah_line
+                return None
             if adjusted > 0.25:
                 return 1.0
             if adjusted == 0.25:

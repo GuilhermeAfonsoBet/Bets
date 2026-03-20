@@ -128,12 +128,19 @@ def _mult_back_from_scores(line: Any, side: str, hs: Any, aws: Any) -> Optional[
         if hs is None or aws is None:
             return None
         goal_diff = int(hs) - int(aws)
-        ah_line = float(str(line).replace(",", "."))
         sel = str(side or "").strip().lower()
+        raw = str(line).strip().replace(",", ".").replace("−", "-")
+        ah = float(raw)
+        # Convenção: quando `line` vem sem sinal (ex.: "2"), interpretamos como magnitude
+        # do handicap do `side` (home:+line, away:+line). Convertendo para handicap do HOME:
+        # - side=home => home_handicap=+line
+        # - side=away => home_handicap=-line
+        # Se vier com sinal (ex.: "-0.5"), tratamos como handicap do HOME já assinado.
+        home_handicap = ah if (raw.startswith("+") or raw.startswith("-")) else (ah if sel == "home" else -ah)
         if sel == "home":
-            adjusted = goal_diff + ah_line
+            adjusted = goal_diff + home_handicap
         elif sel == "away":
-            adjusted = -goal_diff - ah_line
+            adjusted = -goal_diff - home_handicap
         else:
             return None
         if adjusted > 0.5:

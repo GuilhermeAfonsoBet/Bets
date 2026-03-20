@@ -196,18 +196,26 @@ async def main():
         if d['home_score'] is not None and d['away_score'] is not None:
             goal_diff = d['home_score'] - d['away_score']
             try:
-                ah_line = float(d['line'].replace(',', '.'))
+                side = (d.get('side') or '').strip().lower()
+                raw = str(d.get('line') or '').strip().replace(',', '.').replace('−', '-')
+                ah = float(raw)
+                # Convenção: quando `line` vem sem sinal (ex.: "2"), interpretamos como magnitude
+                # do handicap do `side` (home:+line, away:+line). Convertendo para handicap do HOME:
+                # - side=home => home_handicap=+line
+                # - side=away => home_handicap=-line
+                # Se vier com sinal (ex.: "-0.5"), tratamos como handicap do HOME já assinado.
+                home_handicap = ah if (raw.startswith('+') or raw.startswith('-')) else (ah if side == 'home' else -ah)
             except:
-                ah_line = None
+                home_handicap = None
             
-            if ah_line is not None:
+            if home_handicap is not None:
                 # Determina se a aposta ganhou
                 # Side=home: aposta no home com handicap AH
                 # Side=away: aposta no away com handicap -AH
-                if d['side'] == 'home':
-                    adjusted = goal_diff + ah_line
+                if side == 'home':
+                    adjusted = goal_diff + home_handicap
                 else:
-                    adjusted = -goal_diff - ah_line
+                    adjusted = -goal_diff - home_handicap
                 
                 # Resultado: win (>0), lose (<0), push (=0), half win/lose (0.25, -0.25)
                 if adjusted > 0.25:
