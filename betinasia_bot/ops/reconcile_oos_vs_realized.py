@@ -272,6 +272,7 @@ class ExecOrder:
     match_id: Optional[int]
     side: Optional[str]
     line: Optional[str]
+    odd_decision_raw: Optional[float]
     odd_decision: Optional[float]
     odd_final: Optional[float]
     delta_pct: Optional[float]
@@ -310,6 +311,7 @@ def _parse_executor_jsonl_orders(path: Path) -> Dict[str, ExecOrder]:
         sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
         stake_sent = _safe_float(sent.get("stake"))
         odd_final = _sanitize_decimal_odd(res.get("odd_final"))
+        odd_dec_raw = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
 
         pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
         liab_req = _safe_float((pol or {}).get("liability_requested"))
@@ -344,6 +346,7 @@ def _parse_executor_jsonl_orders(path: Path) -> Dict[str, ExecOrder]:
             match_id=(_safe_int(res.get("match_id")) if res.get("match_id") is not None else (_safe_int(req.get("match_id")) if req.get("match_id") is not None else None)),
             side=str(res.get("side") or req.get("side") or "").strip() or None,
             line=str(res.get("line") or req.get("line") or "").strip() or None,
+            odd_decision_raw=odd_dec_raw,
             odd_decision=_sanitize_decimal_odd(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision")),
             odd_final=odd_final,
             delta_pct=_safe_float(res.get("delta_pct")),
@@ -599,6 +602,12 @@ async def run(*, balance_csv: Path, executor_jsonl: Path, out_csv: Optional[Path
 
         delta_slip = (float(pnl_fin) - float(pnl_dec)) if (pnl_fin is not None and pnl_dec is not None) else None
         delta_resid = (float(acct_pnl) - float(pnl_fin)) if (pnl_fin is not None) else None
+        delta_pct_sanitized = None
+        try:
+            if odd_dec is not None and odd_fin is not None and float(odd_dec) > 0:
+                delta_pct_sanitized = (float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0
+        except Exception:
+            delta_pct_sanitized = None
 
         rows_out.append(
             {
@@ -622,8 +631,10 @@ async def run(*, balance_csv: Path, executor_jsonl: Path, out_csv: Optional[Path
                 "stake_sent": stake if stake > 0 else None,
                 "liability": liability if liability > 0 else None,
                 "odd_decision": odd_dec,
+                "odd_decision_raw": e.odd_decision_raw,
                 "odd_final": odd_fin,
                 "delta_pct": e.delta_pct,
+                "delta_pct_sanitized": delta_pct_sanitized,
                 "bookie_final": e.bookie_final,
                 "pnl_score_at_decision_odd": pnl_dec,
                 "pnl_score_at_final_odd": pnl_fin,
@@ -784,7 +795,8 @@ def main() -> int:
     print("\n### TOP |delta_slippage_pnl| (score@odd_final - score@odd_decision)\n")
     for r in (rep.get("top_delta_slippage") or [])[:10]:
         print(
-            "order_id=%s exec_day=%s is_live=%s side=%s line=%s mult=%s odd_dec=%s odd_fin=%s stake=%s liab=%s dslip=%s acct=%s gate=%s thr=%s"
+            "order_id=%s exec_day=%s is_live=%s side=%s line=%s mult=%s odd_dec(raw=%s)=%s odd_fin=%s "
+            "delta_pct(exec=%s, san=%s) stake=%s liab=%s dslip=%s acct=%s gate=%s thr=%s"
             % (
                 r.get("order_id"),
                 r.get("exec_day"),
@@ -792,8 +804,11 @@ def main() -> int:
                 r.get("exec_side"),
                 r.get("line"),
                 r.get("mult_back"),
+                _fmt(r.get("odd_decision_raw"), 3),
                 _fmt(r.get("odd_decision"), 3),
                 _fmt(r.get("odd_final"), 3),
+                _fmt(r.get("delta_pct"), 2),
+                _fmt(r.get("delta_pct_sanitized"), 2),
                 _fmt(r.get("stake_sent"), 2),
                 _fmt(r.get("liability"), 2),
                 _fmt(r.get("delta_slippage_pnl"), 2),
