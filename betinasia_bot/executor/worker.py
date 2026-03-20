@@ -54,6 +54,21 @@ def _ms(dt_s: float) -> int:
     return int(round(dt_s * 1000.0))
 
 
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if not s:
+            return None
+        s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
+
+
 def _extract_snapshot(side: ExecSide, api_result: Optional[BetslipApiResult]) -> Tuple[Optional[float], Optional[str], Optional[float], Optional[int], Optional[str]]:
     if not api_result:
         return None, None, None, None, "NO_API_RESULT"
@@ -679,13 +694,16 @@ class ExecutorWorker:
                 thr = _safe_float(gate.get("lay_in_max_delta_pct") or gate.get("max_pct"))
             if thr is None:
                 thr = _safe_float(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_MAX_PCT", "0"))
+            fail_closed = str(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_FAIL_CLOSED", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
             if (
                 thr is not None
                 and float(thr) > 0
                 and req.exec_side == ExecSide.LAY
                 and bool(req.is_live)
-                and dry.delta_pct is not None
-                and float(dry.delta_pct) > float(thr)
+                and (
+                    (dry.delta_pct is not None and float(dry.delta_pct) > float(thr))
+                    or (fail_closed and dry.delta_pct is None)
+                )
             ):
                 # best-effort: fecha betslip antes de sair (evita too_many_open_betslips)
                 try:
@@ -694,9 +712,12 @@ class ExecutorWorker:
                     pass
                 dry.status = ExecStatus.CAP_BLOCKED
                 dry.http_status = 200
-                dry.error = f"SLIPPAGE_GATE_LAY_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr):.2f}"
+                if dry.delta_pct is None:
+                    dry.error = f"SLIPPAGE_GATE_LAY_IN_MISSING_DELTA_PCT thr={float(thr):.2f}"
+                else:
+                    dry.error = f"SLIPPAGE_GATE_LAY_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr):.2f}"
                 dry.raw = dict(dry.raw or {})
-                dry.raw["slippage_gate"] = {"enabled": True, "lay_in_max_delta_pct": float(thr), "delta_pct": float(dry.delta_pct)}
+                dry.raw["slippage_gate"] = {"enabled": True, "lay_in_max_delta_pct": float(thr), "delta_pct": (float(dry.delta_pct) if dry.delta_pct is not None else None), "fail_closed": bool(fail_closed)}
                 return dry
         except Exception:
             pass

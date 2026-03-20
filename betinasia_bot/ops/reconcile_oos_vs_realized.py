@@ -499,7 +499,13 @@ async def _fetch_bridge_seen_volume(
           COUNT(*) FILTER (WHERE (s.meta->>'reason') = 'dup_key')::bigint AS n_dup_key,
           COUNT(*) FILTER (WHERE (s.meta->>'reason') = 'min_limit')::bigint AS n_min_limit,
           COUNT(DISTINCT m.id)::bigint AS n_matches_seen,
-          COUNT(DISTINCT m.id) FILTER (WHERE COALESCE((s.meta->>'accepted')::boolean, FALSE) = TRUE)::bigint AS n_matches_accepted
+          COUNT(DISTINCT m.id) FILTER (WHERE COALESCE((s.meta->>'accepted')::boolean, FALSE) = TRUE)::bigint AS n_matches_accepted,
+          COUNT(DISTINCT m.id) FILTER (WHERE COALESCE(a.is_live, FALSE) = TRUE)::bigint AS n_matches_seen_in,
+          COUNT(DISTINCT m.id) FILTER (WHERE a.is_live IS NULL OR a.is_live = FALSE)::bigint AS n_matches_seen_pre,
+          COUNT(DISTINCT m.id) FILTER (WHERE COALESCE((s.meta->>'accepted')::boolean, FALSE) = TRUE AND COALESCE(a.is_live, FALSE) = TRUE)::bigint AS n_matches_accepted_in,
+          COUNT(DISTINCT m.id) FILTER (WHERE COALESCE((s.meta->>'accepted')::boolean, FALSE) = TRUE AND (a.is_live IS NULL OR a.is_live = FALSE))::bigint AS n_matches_accepted_pre,
+          COUNT(*) FILTER (WHERE (s.meta->>'reason') = 'not_active' AND COALESCE(a.is_live, FALSE) = TRUE)::bigint AS n_not_active_in,
+          COUNT(*) FILTER (WHERE (s.meta->>'reason') = 'not_active' AND (a.is_live IS NULL OR a.is_live = FALSE))::bigint AS n_not_active_pre
         FROM executor_bridge_seen s
         JOIN betslip_audit_results a ON a.id = s.src_id
         LEFT JOIN matches m ON m.external_id = a.event_id
@@ -775,7 +781,7 @@ def main() -> int:
     bridge_vol = rep.get("bridge_seen_by_day") or {}
     if audit_vol or bridge_vol:
         print("\n### VOLUME (DB) — oportunidades (audit) vs decisões (bridge_seen)\n")
-        print("day         audit_ok_matches(in/pre)  bridge_matches_seen/accepted  bridge_seen accepted not_active dup_key min_limit")
+        print("day         audit_ok_matches(in/pre)  bridge_matches_seen/accepted(in/pre)  bridge_seen accepted not_active(in/pre) dup_key min_limit")
         days = sorted(set(list(audit_vol.keys()) + list(bridge_vol.keys())))
         for day in days:
             av = audit_vol.get(day) or {}
@@ -787,9 +793,10 @@ def main() -> int:
             bma = bv.get("n_matches_accepted")
             print(
                 f"{day}  ok_matches={okm} (in={ok_in}, pre={ok_pre})  "
-                f"bridge_matches={bms}/{bma}  "
+                f"bridge_matches={bms}/{bma} (in={bv.get('n_matches_accepted_in')}/{bv.get('n_matches_seen_in')}, pre={bv.get('n_matches_accepted_pre')}/{bv.get('n_matches_seen_pre')})  "
                 f"seen={bv.get('n_seen')} acc={bv.get('n_accepted')} "
-                f"not_active={bv.get('n_not_active')} dup_key={bv.get('n_dup_key')} min_limit={bv.get('n_min_limit')}"
+                f"not_active={bv.get('n_not_active')} (in={bv.get('n_not_active_in')}, pre={bv.get('n_not_active_pre')}) "
+                f"dup_key={bv.get('n_dup_key')} min_limit={bv.get('n_min_limit')}"
             )
 
     print("\n### TOP |delta_slippage_pnl| (score@odd_final - score@odd_decision)\n")
