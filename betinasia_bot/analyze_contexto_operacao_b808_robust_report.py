@@ -867,6 +867,13 @@ async def main() -> int:
         "'all' inclui liga também no in-match.",
     )
     parser.add_argument(
+        "--wf-sides",
+        choices=["both", "lay", "back"],
+        default=os.getenv("WF_SIDES", "both").strip() or "both",
+        help="Restringe o universo do walk-forward por lado. "
+        "Use 'lay' para evitar que a carteira OOS selecione Back quando a operação ainda é Lay-only. Default: both.",
+    )
+    parser.add_argument(
         "--wf-liquidity-mode",
         choices=["none", "gate_p50", "gate_p75", "gate_min"],
         default=os.getenv("WF_LIQUIDITY_MODE", "none").strip() or "none",
@@ -5104,6 +5111,12 @@ async def main() -> int:
                         best = (o, t)
                 return best
 
+            wf_sides = str(getattr(args, "wf_sides", "both") or "both").strip().lower()
+            if wf_sides not in ("both", "lay", "back"):
+                wf_sides = "both"
+            allow_back = wf_sides in ("both", "back")
+            allow_lay = wf_sides in ("both", "lay")
+
             # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
             def _is_live_eff(d: dict, *, ts: Optional[datetime] = None) -> bool:
                 """
@@ -5125,135 +5138,137 @@ async def main() -> int:
                     pass
                 return False
 
-            for d0 in oos_any:
-                aid = d0.get("id")
-                if aid is None:
-                    continue
-                if wf_excl_exec_back and str(d0.get("exec_bucket")) in wf_excl_exec_back:
-                    continue
-                ts = d0.get("audited_at")
-                if not isinstance(ts, datetime):
-                    continue
-                is_live_eff = _is_live_eff(d0, ts=ts)
-                ws0 = _safe_float(d0.get("ws_odd"))
-                if ws0 is None or ws0 <= 0:
-                    continue
-                # Operação atual: Back entra por WS@t+5s (ou offset configurado).
-                # Mantemos fallback para BS apenas se o proxy WS não existir.
-                bs = _safe_float(d0.get("bs_odd"))
-                src = None
-                t_proxy = None
-                entry = None
-                ref = _ws_proxy_odd(d0)
-                if ref:
-                    entry, t_proxy = float(ref[0]), float(ref[1])
-                    src = f"WS@t+{t_proxy:.1f}s"
-                elif bs is not None and bs > 0:
-                    entry = float(bs)
-                    src = "BS_FALLBACK"
-                if entry is None or entry <= 0:
-                    continue
-                diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
-                if diff is None:
-                    continue
-                # filtro de qualidade (mesmo range do BS confiável)
-                if not (-10.0 <= float(diff) <= 10.0):
-                    continue
-                # edge Back
-                if float(diff) < float(back_cut):
-                    continue
-                # ROI no ponto de entrada (stake=1)
-                _, roi_entry = compute_roi_pct(
-                    line=str(d0.get("line", "")),
-                    side=str(d0.get("side", "")),
-                    ws_odd=None,
-                    bs_odd=float(entry),
-                    hs=d0.get("home_score"),
-                    aws=d0.get("away_score"),
-                )
-                # CLV pre-match
-                clv_entry = None
-                if not is_live_eff:
-                    clo = _safe_float(d0.get("closing_odd"))
-                    if clo is not None and clo > 0:
-                        clv_entry = (float(entry) - float(clo)) / float(clo) * 100.0
-                combo_events.append(
-                    {
-                        "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
-                        "audit_id": int(aid),
-                        "side": "Back",
-                        "regime": "Pre" if (not is_live_eff) else "In",
-                        "reversal": "Any",
-                        "match_id": int(d0.get("match_id")),
-                        "league": str(d0.get("league") or ""),
-                        "ah_abs": line_abs(d0.get("line")),
-                        "liq_limit": (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None),
-                        "clv_back": clv_entry,
-                        "clv_lay_conv": None,
-                        "roi": roi_entry,
-                        "entry_odd": float(entry),
-                        "entry_source": src,
-                        "diff_pct": float(diff),
-                    }
-                )
+            if allow_back:
+                for d0 in oos_any:
+                    aid = d0.get("id")
+                    if aid is None:
+                        continue
+                    if wf_excl_exec_back and str(d0.get("exec_bucket")) in wf_excl_exec_back:
+                        continue
+                    ts = d0.get("audited_at")
+                    if not isinstance(ts, datetime):
+                        continue
+                    is_live_eff = _is_live_eff(d0, ts=ts)
+                    ws0 = _safe_float(d0.get("ws_odd"))
+                    if ws0 is None or ws0 <= 0:
+                        continue
+                    # Operação atual: Back entra por WS@t+5s (ou offset configurado).
+                    # Mantemos fallback para BS apenas se o proxy WS não existir.
+                    bs = _safe_float(d0.get("bs_odd"))
+                    src = None
+                    t_proxy = None
+                    entry = None
+                    ref = _ws_proxy_odd(d0)
+                    if ref:
+                        entry, t_proxy = float(ref[0]), float(ref[1])
+                        src = f"WS@t+{t_proxy:.1f}s"
+                    elif bs is not None and bs > 0:
+                        entry = float(bs)
+                        src = "BS_FALLBACK"
+                    if entry is None or entry <= 0:
+                        continue
+                    diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
+                    if diff is None:
+                        continue
+                    # filtro de qualidade (mesmo range do BS confiável)
+                    if not (-10.0 <= float(diff) <= 10.0):
+                        continue
+                    # edge Back
+                    if float(diff) < float(back_cut):
+                        continue
+                    # ROI no ponto de entrada (stake=1)
+                    _, roi_entry = compute_roi_pct(
+                        line=str(d0.get("line", "")),
+                        side=str(d0.get("side", "")),
+                        ws_odd=None,
+                        bs_odd=float(entry),
+                        hs=d0.get("home_score"),
+                        aws=d0.get("away_score"),
+                    )
+                    # CLV pre-match
+                    clv_entry = None
+                    if not is_live_eff:
+                        clo = _safe_float(d0.get("closing_odd"))
+                        if clo is not None and clo > 0:
+                            clv_entry = (float(entry) - float(clo)) / float(clo) * 100.0
+                    combo_events.append(
+                        {
+                            "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                            "audit_id": int(aid),
+                            "side": "Back",
+                            "regime": "Pre" if (not is_live_eff) else "In",
+                            "reversal": "Any",
+                            "match_id": int(d0.get("match_id")),
+                            "league": str(d0.get("league") or ""),
+                            "ah_abs": line_abs(d0.get("line")),
+                            "liq_limit": (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None),
+                            "clv_back": clv_entry,
+                            "clv_lay_conv": None,
+                            "roi": roi_entry,
+                            "entry_odd": float(entry),
+                            "entry_source": src,
+                            "diff_pct": float(diff),
+                        }
+                    )
 
             # --- Lay: entrada pós-reversal (ou fim do período). Alinha com operação WS e NÃO depende de status OK. ---
-            for d0 in oos_any:
-                aid = d0.get("id")
-                if aid is None:
-                    continue
-                if wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
-                    continue
-                ts = d0.get("audited_at")
-                if not isinstance(ts, datetime):
-                    continue
-                ws0 = _safe_float(d0.get("ws_odd"))
-                if ws0 is None or ws0 <= 0:
-                    continue
-                em = _entry_metrics_lay(d0)
-                if not isinstance(em, dict):
-                    continue
-                entry = _safe_float(em.get("odd_entry"))
-                src = "WS_ENTRY"
-                if entry is None or entry <= 0:
-                    # fallback: se odd_entry não vier, tentar WS proxy no offset (melhor que nada)
-                    ref = _ws_proxy_odd(d0)
-                    if not ref:
+            if allow_lay:
+                for d0 in oos_any:
+                    aid = d0.get("id")
+                    if aid is None:
                         continue
-                    entry = float(ref[0])
-                    src = f"WS@t+{float(ref[1]):.1f}s"
-                diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
-                if diff is None:
-                    continue
-                if not (-10.0 <= float(diff) <= 10.0):
-                    continue
-                # edge Lay (mesmo corte antigo, mas agora usando WS-entry vs WS0)
-                if float(diff) > float(lay_cut):
-                    continue
-                is_live_eff = _is_live_eff(d0, ts=ts)
-                combo_events.append(
-                    {
-                        "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
-                        "audit_id": int(aid),
-                        "side": "Lay",
-                        "regime": "Pre" if (not is_live_eff) else "In",
-                        "reversal": "Yes" if bool(em.get("had_reversal")) else "No",
-                        "match_id": int(d0.get("match_id")),
-                        "league": str(d0.get("league") or ""),
-                        "ah_abs": line_abs(d0.get("line")),
-                        "liq_limit": (
-                            _safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"]))
-                            if (_safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"])) or 0.0) > 0
-                            else (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None)
-                        ),
-                        "clv_back": None,
-                        "clv_lay_conv": em.get("clv_conv_entry") if (not is_live_eff) else None,
-                        "roi": em.get("roi_entry"),
-                        "entry_odd": float(entry),
-                        "entry_source": src,
-                        "diff_pct": float(diff),
-                    }
-                )
+                    if wf_excl_exec_lay and str(d0.get("exec_bucket")) in wf_excl_exec_lay:
+                        continue
+                    ts = d0.get("audited_at")
+                    if not isinstance(ts, datetime):
+                        continue
+                    ws0 = _safe_float(d0.get("ws_odd"))
+                    if ws0 is None or ws0 <= 0:
+                        continue
+                    em = _entry_metrics_lay(d0)
+                    if not isinstance(em, dict):
+                        continue
+                    entry = _safe_float(em.get("odd_entry"))
+                    src = "WS_ENTRY"
+                    if entry is None or entry <= 0:
+                        # fallback: se odd_entry não vier, tentar WS proxy no offset (melhor que nada)
+                        ref = _ws_proxy_odd(d0)
+                        if not ref:
+                            continue
+                        entry = float(ref[0])
+                        src = f"WS@t+{float(ref[1]):.1f}s"
+                    diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
+                    if diff is None:
+                        continue
+                    if not (-10.0 <= float(diff) <= 10.0):
+                        continue
+                    # edge Lay (mesmo corte antigo, mas agora usando WS-entry vs WS0)
+                    if float(diff) > float(lay_cut):
+                        continue
+                    is_live_eff = _is_live_eff(d0, ts=ts)
+                    combo_events.append(
+                        {
+                            "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                            "audit_id": int(aid),
+                            "side": "Lay",
+                            "regime": "Pre" if (not is_live_eff) else "In",
+                            "reversal": "Yes" if bool(em.get("had_reversal")) else "No",
+                            "match_id": int(d0.get("match_id")),
+                            "league": str(d0.get("league") or ""),
+                            "ah_abs": line_abs(d0.get("line")),
+                            "liq_limit": (
+                                _safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"]))
+                                if (_safe_float(_get_path(d0.get("hypothesis_details") or {}, ["lay", "available_limit"])) or 0.0) > 0
+                                else (_safe_float(d0.get("limit")) if (_safe_float(d0.get("limit")) or 0.0) > 0 else None)
+                            ),
+                            "clv_back": None,
+                            "clv_lay_conv": em.get("clv_conv_entry") if (not is_live_eff) else None,
+                            "roi": em.get("roi_entry"),
+                            "entry_odd": float(entry),
+                            "entry_source": src,
+                            "diff_pct": float(diff),
+                        }
+                    )
 
             # ------------------------------------------------------------
             # (Após montar `combo_events`) estatística de liquidez por lado (Back/Lay)

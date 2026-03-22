@@ -575,16 +575,37 @@ def _pick_prev_policy_file(policy_dir: Path, *, cur_day: str) -> Optional[Path]:
         xs = sorted([p for p in policy_dir.glob("wf_policy_*.json") if p.is_file()])
         if not xs:
             return None
-        # usa o nome YYYYMMDD dentro do filename para ordenar por data
-        def _k(p: Path) -> str:
+        def _day_from_name(p: Path) -> Optional[str]:
+            # aceita wf_policy_YYYYMMDD.json ou wf_policy_YYYYMMDD_HHMMSS.json
             s = p.name.replace("wf_policy_", "").replace(".json", "")
-            return s
-        xs2 = sorted(xs, key=_k)
-        prev = None
-        for p in xs2:
-            if _k(p) < str(cur_day):
-                prev = p
-        return prev
+            s = s.split("_", 1)[0]
+            if len(s) == 8 and s.isdigit():
+                return s
+            return None
+
+        # preferir o snapshot canônico do dia (sem sufixo), se existir
+        by_day: Dict[str, Dict[str, Optional[Path]]] = {}
+        for p in xs:
+            d = _day_from_name(p)
+            if not d:
+                continue
+            slot = by_day.setdefault(d, {"canonical": None, "fallback": None})
+            if p.name == f"wf_policy_{d}.json":
+                slot["canonical"] = p
+            else:
+                # fallback: guarda o "maior" lexicográfico do dia (normalmente o mais recente)
+                cur = slot.get("fallback")
+                if cur is None or p.name > cur.name:
+                    slot["fallback"] = p
+
+        prev_day = None
+        for d in sorted(by_day.keys()):
+            if str(d) < str(cur_day):
+                prev_day = d
+        if not prev_day:
+            return None
+        slot = by_day.get(prev_day) or {}
+        return slot.get("canonical") or slot.get("fallback")
     except Exception:
         return None
 
@@ -898,7 +919,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # 3) Rodar OOS (walk-forward) e exportar policy
     base_md = day_dir / "report_base.md"
-    policy_hist = cfg.wf_policy_history_dir / f"wf_policy_{day}.json"
+    # Histórico de policy:
+    # - `wf_policy_YYYYMMDD.json` é o snapshot canônico do dia (não deve ser sobrescrito em reruns).
+    # - reruns escrevem `wf_policy_YYYYMMDD_HHMMSS.json` para evitar “revisar o passado”.
+    policy_canon = cfg.wf_policy_history_dir / f"wf_policy_{day}.json"
+    policy_hist = policy_canon
+    if policy_canon.exists():
+        policy_hist = cfg.wf_policy_history_dir / f"wf_policy_{day}_{ts.strftime('%H%M%S')}.json"
     bank_sens_json = day_dir / "wf_bank_sensitivity.json"
     cfg.wf_policy_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -957,6 +984,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
     if str(cfg.wf_exclude_exec_buckets_lay).strip():
         args += ["--wf-exclude-exec-buckets-lay", str(cfg.wf_exclude_exec_buckets_lay).strip()]
+    # Restrição por lado (evita que o portfólio OOS selecione Back quando a operação é Lay-only).
+    try:
+        wf_sides = str(os.getenv("DAILY_WF_SIDES", "") or "").strip().lower()
+        if wf_sides:
+            args += ["--wf-sides", wf_sides]
+    except Exception:
+        pass
 
     # Overrides opcionais (rodagem manual): sizing/budget do WF
     if str(cfg.wf_scheme_pre).strip():
@@ -1008,6 +1042,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
     if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        # Preenche o snapshot canônico do dia (best-effort) apenas se ainda não existir.
+        # Isso evita que re-runs manuais sobrescrevam o arquivo `wf_policy_YYYYMMDD.json`.
+        try:
+            if policy_canon and (not policy_canon.exists()):
+                tmpc = policy_canon.with_suffix(".tmp")
+                tmpc.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
+                tmpc.replace(policy_canon)
+        except Exception:
+            pass
         cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
         tmp = cfg.wf_policy_current.with_suffix(".tmp")
         tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
