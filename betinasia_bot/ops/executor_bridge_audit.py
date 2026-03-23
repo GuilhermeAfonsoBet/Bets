@@ -1653,7 +1653,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     # não derruba o bridge: fallback para stake fixo
                     logger.warning(f"[bridge] wf_budget engine failed src_id={src_id}: {e}")
 
-                # Gate de slippage (enforced no executor antes do LIVE): Lay + in-match, delta_pct > limiar
+                # Gate de slippage (enforced no executor antes do LIVE):
+                # - Lay in-match: delta_pct > thr (odds subiram)
+                # - Back in-match: delta_pct < -thr (odds caíram)
                 try:
                     if cfg.exec_side == ExecSide.LAY:
                         is_live = _row_is_live(row, unknown_as_live=True)
@@ -1662,6 +1664,13 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             req.meta.setdefault("slippage_gate", {})
                             req.meta["slippage_gate"]["lay_in_max_delta_pct"] = float(thr)
                             # debug: aponta que o gate está ativo para este request
+                            req.meta["slippage_gate"]["enabled"] = True
+                    if cfg.exec_side == ExecSide.BACK:
+                        is_live = _row_is_live(row, unknown_as_live=False)
+                        thr = _rp_float(risk_params, "slippage_gate_back_in_max_adverse_delta_pct")
+                        if is_live and thr is not None and float(thr) > 0:
+                            req.meta.setdefault("slippage_gate", {})
+                            req.meta["slippage_gate"]["back_in_max_adverse_delta_pct"] = float(thr)
                             req.meta["slippage_gate"]["enabled"] = True
                 except Exception:
                     pass

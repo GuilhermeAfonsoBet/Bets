@@ -686,25 +686,36 @@ class ExecutorWorker:
             return dry
 
         # Gate de slippage (opcional): bloqueia LIVE se odds piorarem além do limiar.
-        # Caso de uso: Lay in-match, bloquear se delta_pct > 2% (ou outro threshold).
+        # Caso de uso: in-match, bloquear se odds piorarem além do limiar (Lay: odds sobem; Back: odds caem).
         try:
-            thr = None
             gate = req.meta.get("slippage_gate") if isinstance(req.meta, dict) else None
+            thr_lay = None
+            thr_back = None
             if isinstance(gate, dict):
-                thr = _safe_float(gate.get("lay_in_max_delta_pct") or gate.get("max_pct"))
-            if thr is None:
-                thr = _safe_float(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_MAX_PCT", "0"))
-            fail_closed = str(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_FAIL_CLOSED", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
-            if (
-                thr is not None
-                and float(thr) > 0
-                and req.exec_side == ExecSide.LAY
-                and bool(req.is_live)
-                and (
-                    (dry.delta_pct is not None and float(dry.delta_pct) > float(thr))
-                    or (fail_closed and dry.delta_pct is None)
-                )
-            ):
+                thr_lay = _safe_float(gate.get("lay_in_max_delta_pct"))
+                # Para Back, o movimento adverso é odds CAINDO: bloqueia se delta_pct < -thr_back
+                thr_back = _safe_float(gate.get("back_in_max_adverse_delta_pct") or gate.get("back_in_max_delta_pct"))
+
+            if thr_lay is None:
+                thr_lay = _safe_float(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_MAX_PCT", "0"))
+            if thr_back is None:
+                thr_back = _safe_float(os.getenv("EXECUTOR_SLIPPAGE_GATE_BACK_IN_MAX_PCT", "0"))
+
+            fail_closed_lay = str(os.getenv("EXECUTOR_SLIPPAGE_GATE_LAY_IN_FAIL_CLOSED", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+            fail_closed_back = str(os.getenv("EXECUTOR_SLIPPAGE_GATE_BACK_IN_FAIL_CLOSED", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+
+            blocked = False
+            block_label = None
+            if bool(req.is_live) and req.exec_side == ExecSide.LAY and thr_lay is not None and float(thr_lay) > 0:
+                if (dry.delta_pct is not None and float(dry.delta_pct) > float(thr_lay)) or (fail_closed_lay and dry.delta_pct is None):
+                    blocked = True
+                    block_label = "LAY_IN"
+            if bool(req.is_live) and req.exec_side == ExecSide.BACK and thr_back is not None and float(thr_back) > 0:
+                if (dry.delta_pct is not None and float(dry.delta_pct) < -float(thr_back)) or (fail_closed_back and dry.delta_pct is None):
+                    blocked = True
+                    block_label = "BACK_IN"
+
+            if blocked:
                 # best-effort: fecha betslip antes de sair (evita too_many_open_betslips)
                 try:
                     await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
@@ -712,12 +723,30 @@ class ExecutorWorker:
                     pass
                 dry.status = ExecStatus.CAP_BLOCKED
                 dry.http_status = 200
-                if dry.delta_pct is None:
-                    dry.error = f"SLIPPAGE_GATE_LAY_IN_MISSING_DELTA_PCT thr={float(thr):.2f}"
-                else:
-                    dry.error = f"SLIPPAGE_GATE_LAY_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr):.2f}"
                 dry.raw = dict(dry.raw or {})
-                dry.raw["slippage_gate"] = {"enabled": True, "lay_in_max_delta_pct": float(thr), "delta_pct": (float(dry.delta_pct) if dry.delta_pct is not None else None), "fail_closed": bool(fail_closed)}
+
+                if block_label == "BACK_IN":
+                    if dry.delta_pct is None:
+                        dry.error = f"SLIPPAGE_GATE_BACK_IN_MISSING_DELTA_PCT thr={float(thr_back):.2f}"
+                    else:
+                        dry.error = f"SLIPPAGE_GATE_BACK_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr_back):.2f}"
+                    dry.raw["slippage_gate"] = {
+                        "enabled": True,
+                        "back_in_max_adverse_delta_pct": float(thr_back),
+                        "delta_pct": (float(dry.delta_pct) if dry.delta_pct is not None else None),
+                        "fail_closed": bool(fail_closed_back),
+                    }
+                else:
+                    if dry.delta_pct is None:
+                        dry.error = f"SLIPPAGE_GATE_LAY_IN_MISSING_DELTA_PCT thr={float(thr_lay):.2f}"
+                    else:
+                        dry.error = f"SLIPPAGE_GATE_LAY_IN delta_pct={float(dry.delta_pct):.2f} thr={float(thr_lay):.2f}"
+                    dry.raw["slippage_gate"] = {
+                        "enabled": True,
+                        "lay_in_max_delta_pct": float(thr_lay),
+                        "delta_pct": (float(dry.delta_pct) if dry.delta_pct is not None else None),
+                        "fail_closed": bool(fail_closed_lay),
+                    }
                 return dry
         except Exception:
             pass
