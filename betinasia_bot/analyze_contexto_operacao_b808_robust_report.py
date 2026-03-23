@@ -7647,6 +7647,7 @@ async def main() -> int:
                         dpnl_exp: Dict[str, float] = {}
                         n_ev_sized = 0
                         n_ev_roi = 0
+                        n_bind_event_limit = 0
 
                         for st in steps:
                             test_days = set(st.get("test_days") or [])
@@ -7683,12 +7684,16 @@ async def main() -> int:
                                 side = str(ev.get("side") or "")
                                 cap = None
                                 if side == "Back":
-                                    cap = float(cap_back_pre if is_pre else cap_back_in)
+                                    cap_abs = float(cap_back_pre if is_pre else cap_back_in)
+                                    cap = float(cap_abs)
                                     if cap <= 0:
                                         continue
                                     # cap por evento
                                     try:
-                                        cap = min(float(cap), float(_max_back_stake_event(d0)))
+                                        mx = float(_max_back_stake_event(d0))
+                                        if math.isfinite(mx) and mx > 0 and float(mx) < float(cap_abs):
+                                            n_bind_event_limit += 1
+                                        cap = min(float(cap), float(mx))
                                     except Exception:
                                         pass
                                     if cap <= 0:
@@ -7696,7 +7701,8 @@ async def main() -> int:
                                     exp = float(cap)  # exposure = stake
                                     st_eq = float(exp)  # turnover equivalente
                                 else:
-                                    cap = float(cap_lay_pre if is_pre else cap_lay_in)
+                                    cap_abs = float(cap_lay_pre if is_pre else cap_lay_in)
+                                    cap = float(cap_abs)
                                     if cap <= 0:
                                         continue
                                     lay_odd = _lay_entry_odd(d0, ev)
@@ -7705,7 +7711,10 @@ async def main() -> int:
                                     # cap por evento: max_stake_event * (odd-1) -> liab
                                     try:
                                         max_st = float(_max_lay_stake_event(d0))
-                                        cap = min(float(cap), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                                        mx_liab = float(max_st) * max(0.0, float(lay_odd) - 1.0)
+                                        if math.isfinite(mx_liab) and mx_liab > 0 and float(mx_liab) < float(cap_abs):
+                                            n_bind_event_limit += 1
+                                        cap = min(float(cap), float(mx_liab))
                                     except Exception:
                                         pass
                                     if cap <= 0:
@@ -7760,6 +7769,7 @@ async def main() -> int:
                             "days": n_days2,
                             "n_ev_sized": int(n_ev_sized),
                             "n_ev_roi": int(n_ev_roi),
+                            "bind_event_limit_pct": (100.0 * float(n_bind_event_limit) / float(n_ev_sized)) if int(n_ev_sized) > 0 else None,
                         }
 
                     if sweep_on:
@@ -7779,13 +7789,24 @@ async def main() -> int:
                             "- Continua aplicando **limit por evento** (quando disponível; com imputação quando missing/zero).\n"
                             "- Usa a mesma seleção walk-forward (keys ativas por step) e o mesmo gating (AH/liquidez, se ligados).\n\n"
                         )
+                        try:
+                            if back_missing_pct is not None or lay_missing_pct is not None:
+                                lines.append(
+                                    f"Diagnóstico (nesta janela): missing/zero de `limit` (proxy capacidade por aposta): "
+                                    f"Back={_fmt_num(back_missing_pct,2)}% (imputação≈{_fmt_num(back_limit_mean_pos,2)}), "
+                                    f"Lay={_fmt_num(lay_missing_pct,2)}% (imputação≈{_fmt_num(lay_limit_mean_pos,2)}).\n\n"
+                                )
+                        except Exception:
+                            pass
 
                         # Sweep 1D por segmento (isolando os demais como 0)
                         lines.append("**Sweep 1D (isolando segmentos: os demais caps = 0)**\n\n")
-                        lines.append("| Segmento | Cap (abs) | Turnover 30d | Lucro 30d (exp.) | ROI/turn 30d | n_ev_sized | dias |\n")
-                        lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+                        lines.append("| Segmento | Cap (abs) | Turnover 30d | Lucro 30d (exp.) | ROI/turn 30d | %bind event_limit | n_ev_sized | dias |\n")
+                        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|\n")
                         # Também gera CSVs para abrir no Excel (útil quando o output não é renderizado como Markdown).
-                        sweep1d_csv_rows: List[str] = ["segment,cap_abs,turnover_30d,profit_30d_exp,roi_turn_30d_pct,n_ev_sized,days\n"]
+                        sweep1d_csv_rows: List[str] = [
+                            "segment,cap_abs,turnover_30d,profit_30d_exp,roi_turn_30d_pct,bind_event_limit_pct,n_ev_sized,days\n"
+                        ]
                         grid_csv_rows: List[str] = ["cap_back_in,cap_lay_in,turnover_30d,profit_30d_exp,roi_turn_30d_pct\n"]
 
                         def _row(seg: str, cap: float, r: Dict[str, Any]) -> None:
@@ -7794,13 +7815,14 @@ async def main() -> int:
                                     f"{seg},{float(cap):.2f},{_fmt_num(r.get('turn_30d'),2).replace(',','')},"
                                     f"{_fmt_num(r.get('profit_30d_exp'),2).replace(',','')},"
                                     f"{_fmt_num(r.get('roi_turn_30d'),2).replace(',','')},"
+                                    f"{_fmt_num(r.get('bind_event_limit_pct'),2).replace(',','')},"
                                     f"{int(r.get('n_ev_sized') or 0)},{int(r.get('days') or 0)}\n"
                                 )
                             except Exception:
                                 pass
                             lines.append(
                                 f"| {seg} | {_fmt_num(cap,2)} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | "
-                                f"{_fmt_num(r.get('roi_turn_30d'),2)}% | {int(r.get('n_ev_sized') or 0)} | {int(r.get('days') or 0)} |\n"
+                                f"{_fmt_num(r.get('roi_turn_30d'),2)}% | {_fmt_num(r.get('bind_event_limit_pct'),2)}% | {int(r.get('n_ev_sized') or 0)} | {int(r.get('days') or 0)} |\n"
                             )
 
                         for cap in back_caps:
