@@ -1387,6 +1387,17 @@ class H3bApiAudit:
             'lay_success': bool(lay_result and lay_result.success),
             'back_error': back_result.error if (back_result and not back_result.success and back_result.error) else '',
             'lay_error': lay_result.error if (lay_result and not lay_result.success and lay_result.error) else '',
+            # Diagnóstico de WS/PMM (mais granular que apenas "No PMMs received")
+            'back_pmm_count': int(getattr(back_result, "pmm_count", 0) or 0) if back_result else 0,
+            'back_pmm_wait_s': float(getattr(back_result, "pmm_wait_s", 0.0) or 0.0) if back_result else 0.0,
+            'back_ws_age_ms': getattr(back_result, "ws_age_ms", None) if back_result else None,
+            'back_ws_msg_count': int(getattr(back_result, "ws_msg_count", 0) or 0) if back_result else 0,
+            'back_betslip_id_source': str(getattr(back_result, "betslip_id_source", "") or "") if back_result else "",
+            'lay_pmm_count': int(getattr(lay_result, "pmm_count", 0) or 0) if lay_result else 0,
+            'lay_pmm_wait_s': float(getattr(lay_result, "pmm_wait_s", 0.0) or 0.0) if lay_result else 0.0,
+            'lay_ws_age_ms': getattr(lay_result, "ws_age_ms", None) if lay_result else None,
+            'lay_ws_msg_count': int(getattr(lay_result, "ws_msg_count", 0) or 0) if lay_result else 0,
+            'lay_betslip_id_source': str(getattr(lay_result, "betslip_id_source", "") or "") if lay_result else "",
         })
         # Mantém compatibilidade: post_ms/pmm_ms refletem BACK quando existir, senão LAY.
         base['post_ms'] = back_post_ms if back_post_ms > 0 else lay_post_ms

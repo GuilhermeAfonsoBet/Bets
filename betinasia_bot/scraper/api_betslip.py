@@ -28,6 +28,22 @@ from loguru import logger
 from playwright.async_api import Page
 
 
+def _frame_to_text(data: Any) -> str:
+    """
+    Normaliza frames WS para texto JSON.
+    Playwright pode entregar `str` ou `bytes` no callback de `framereceived`.
+    """
+    try:
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="ignore")
+        if isinstance(data, str):
+            return data
+        # fallback: pode virar "b'...'" em alguns casos; preferimos manter best-effort
+        return str(data)
+    except Exception:
+        return ""
+
+
 @dataclass
 class BookmakerPrice:
     """Preço de um bookmaker individual."""
@@ -72,6 +88,16 @@ class BetslipApiResult:
     http_status: int = 0
     has_session_token: bool = False
     rate_limit_retry_after_sec: int = 0
+
+    # Diagnóstico PMM/WS (ajuda a explicar "No PMMs received")
+    betslip_id_source: str = ""  # resp|ws|fallback_last|-
+    pmm_count: int = 0
+    pmm_wait_s: float = 0.0
+    pmm_timeout_s: float = 0.0
+    pmm_min_wait_s: float = 0.0
+    pmm_idle_timeout_s: float = 0.0
+    ws_msg_count: int = 0
+    ws_age_ms: Optional[int] = None
 
 
 @dataclass
@@ -125,6 +151,8 @@ class ApiBetslipClient:
         self._pmm_messages: Dict[str, List[dict]] = {}  # betslip_id -> [pmm_data]
         self._betslip_info: Dict[str, dict] = {}  # betslip_id -> betslip creation data
         self._listening = False
+        self._ws_msg_count: int = 0
+        self._last_ws_ts: float = 0.0
         self.MOLLY_CLIENT_NAME = "sonic"
         self.MOLLY_CLIENT_VERSION = os.getenv("BETINASIA_MOLLY_CLIENT_VERSION", "2.5.54")
 
@@ -273,7 +301,10 @@ class ApiBetslipClient:
         def _attach_frame_listener(ws):
             def on_frame(data):
                 try:
-                    msg = json.loads(str(data))
+                    data_str = _frame_to_text(data)
+                    if not data_str:
+                        return
+                    msg = json.loads(data_str)
                     if not isinstance(msg, list):
                         return
                     for item in msg:
@@ -299,6 +330,11 @@ class ApiBetslipClient:
     
     def _handle_betslip(self, data: dict):
         """Processa mensagem de criação de betslip."""
+        try:
+            self._ws_msg_count += 1
+            self._last_ws_ts = time.time()
+        except Exception:
+            pass
         betslip_id = data.get('betslip_id', '')
         if betslip_id:
             self._betslip_info[betslip_id] = data
@@ -307,6 +343,11 @@ class ApiBetslipClient:
     
     def _handle_pmm(self, data: dict):
         """Processa mensagem PMM (preço de bookmaker)."""
+        try:
+            self._ws_msg_count += 1
+            self._last_ws_ts = time.time()
+        except Exception:
+            pass
         betslip_id = data.get('betslip_id', '')
         if betslip_id:
             if betslip_id not in self._pmm_messages:
@@ -330,6 +371,13 @@ class ApiBetslipClient:
             BetslipApiResult com odds de todos os bookmakers
         """
         result = BetslipApiResult(event_id=event_id, bet_type=bet_type)
+        # snapshot dos parâmetros efetivos (para debugar mismatch env vs runtime)
+        try:
+            result.pmm_timeout_s = float(self.PMM_TIMEOUT)
+            result.pmm_min_wait_s = float(self.PMM_MIN_WAIT)
+            result.pmm_idle_timeout_s = float(self.PMM_IDLE_TIMEOUT)
+        except Exception:
+            pass
         t0 = time.time()
         
         try:
@@ -450,6 +498,7 @@ class ApiBetslipClient:
             resp_data = data or {}
             logger.debug(f"POST data: status={status_code}, resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
             betslip_id = _find_betslip_id(resp_data)
+            betslip_id_source = "resp" if betslip_id else ""
             
             if not betslip_id:
                 # Betslip_id vem via WebSocket ["betslip", {betslip_id: "..."}]
@@ -460,6 +509,7 @@ class ApiBetslipClient:
                         info = self._betslip_info[bid]
                         if info.get('event_id') == event_id:
                             betslip_id = bid
+                            betslip_id_source = "ws"
                             break
                     if betslip_id:
                         break
@@ -470,6 +520,7 @@ class ApiBetslipClient:
                 # Os PMMs podem já estar chegando
                 if self._betslip_info:
                     betslip_id = list(self._betslip_info.keys())[-1]
+                    betslip_id_source = "fallback_last"
                     logger.debug(f"Usando último betslip_id: {betslip_id}")
             
             if not betslip_id:
@@ -478,6 +529,7 @@ class ApiBetslipClient:
                 return result
             
             result.betslip_id = betslip_id
+            result.betslip_id_source = betslip_id_source or "-"
             
             # Inicializa lista de PMMs se não existe
             if betslip_id not in self._pmm_messages:
@@ -511,6 +563,23 @@ class ApiBetslipClient:
             
             # === 3. Processa PMMs ===
             pmm_list = self._pmm_messages.get(betslip_id, [])
+            try:
+                result.pmm_wait_s = float(time.time() - start_wait)
+            except Exception:
+                result.pmm_wait_s = 0.0
+            try:
+                result.pmm_count = int(len(pmm_list or []))
+            except Exception:
+                result.pmm_count = 0
+            try:
+                result.ws_msg_count = int(self._ws_msg_count)
+            except Exception:
+                result.ws_msg_count = 0
+            try:
+                if float(self._last_ws_ts) > 0:
+                    result.ws_age_ms = int(round((time.time() - float(self._last_ws_ts)) * 1000.0))
+            except Exception:
+                result.ws_age_ms = None
             
             if not pmm_list:
                 result.error = f'No PMMs received (waited {time.time() - start_wait:.1f}s)'

@@ -177,6 +177,64 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         pmm_tot["error"] = str(e)[:200]
         pmm_by_version = []
 
+    # Diagnóstico extra: quando há "No PMMs received", qual o estado do WS?
+    # Heurística: se telemetry.*_ws_age_ms está alto (ou nulo) no momento do erro, tende a ser WS morto/desconectado,
+    # não apenas "bookmakers lentos". Isso ajuda a distinguir "aumentar timeout" vs "reconectar/relogin".
+    pmm_ws_diag = {
+        "since_utc": since.isoformat(),
+        "ws_stale_ms_thr": 15000,
+        "no_pmms_total": 0,
+        "no_pmms_ws_stale": 0,
+        "no_pmms_ws_age_ms_median": None,
+        "no_pmms_ws_age_ms_p90": None,
+        "no_pmms_ws_age_ms_max": None,
+        "error": None,
+    }
+    try:
+        q_ws = text(
+            """
+            WITH errs AS (
+              SELECT
+                COALESCE(hypothesis_details->>'api_error', '') AS api_error,
+                NULLIF(COALESCE(hypothesis_details#>>'{telemetry,back_ws_age_ms}',''), '')::double precision AS back_ws_age_ms,
+                NULLIF(COALESCE(hypothesis_details#>>'{telemetry,lay_ws_age_ms}',''), '')::double precision AS lay_ws_age_ms
+              FROM betslip_audit_results
+              WHERE hypothesis_type = :hyp
+                AND reversal_direction = :direction
+                AND audited_at >= :since
+                AND hypothesis_details IS NOT NULL
+                AND COALESCE(hypothesis_details->>'api_error', '') ILIKE '%No PMMs received%'
+            ),
+            ages AS (
+              SELECT
+                COALESCE(back_ws_age_ms, lay_ws_age_ms) AS ws_age_ms
+              FROM errs
+            )
+            SELECT
+              COUNT(*)::bigint AS n,
+              COUNT(*) FILTER (WHERE ws_age_ms IS NULL OR ws_age_ms >= :thr_ms)::bigint AS n_ws_stale,
+              PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ws_age_ms) AS p50,
+              PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ws_age_ms) AS p90,
+              MAX(ws_age_ms) AS mx
+            FROM ages;
+            """
+        )
+        async with db.async_session() as session:
+            r = await session.execute(
+                q_ws,
+                {"hyp": cfg.hypothesis_type, "direction": cfg.direction, "since": since, "thr_ms": int(pmm_ws_diag["ws_stale_ms_thr"])},
+            )
+            row = r.first()
+            if row:
+                m = dict(row._mapping)
+                pmm_ws_diag["no_pmms_total"] = int(m.get("n") or 0)
+                pmm_ws_diag["no_pmms_ws_stale"] = int(m.get("n_ws_stale") or 0)
+                pmm_ws_diag["no_pmms_ws_age_ms_median"] = float(m.get("p50")) if m.get("p50") is not None else None
+                pmm_ws_diag["no_pmms_ws_age_ms_p90"] = float(m.get("p90")) if m.get("p90") is not None else None
+                pmm_ws_diag["no_pmms_ws_age_ms_max"] = float(m.get("mx")) if m.get("mx") is not None else None
+    except Exception as e:
+        pmm_ws_diag["error"] = str(e)[:200]
+
     # pivot leve: por version
     by_version: Dict[str, Dict[str, Any]] = {}
     for it in rows:
@@ -230,7 +288,7 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
         "error_rows": err_rows,
         "top_errors_by_version": top_errors_by_version,
         "by_version": sorted(by_version.values(), key=lambda x: int(x.get("total") or 0), reverse=True),
-        "pmm": {"total": pmm_tot, "by_version": pmm_by_version},
+        "pmm": {"total": pmm_tot, "by_version": pmm_by_version, "ws_diag": pmm_ws_diag},
     }
     out = _json_safe(out)
     try:
