@@ -1407,16 +1407,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     pmm_consults_24h = None
     no_pmms_24h = None
     no_pmms_rate_24h = None
+    pmm_ws_diag = None
     try:
         blk = (audit_rep or {}).get("pmm") if isinstance((audit_rep or {}).get("pmm"), dict) else {}
         tot = blk.get("total") if isinstance(blk.get("total"), dict) else {}
         pmm_consults_24h = int(tot.get("pmm_consults")) if tot.get("pmm_consults") is not None else None
         no_pmms_24h = int(tot.get("no_pmms")) if tot.get("no_pmms") is not None else None
         no_pmms_rate_24h = _safe_float(tot.get("no_pmms_rate_pct"))
+        pmm_ws_diag = blk.get("ws_diag") if isinstance(blk.get("ws_diag"), dict) else None
     except Exception:
         pmm_consults_24h = None
         no_pmms_24h = None
         no_pmms_rate_24h = None
+        pmm_ws_diag = None
 
     ok_valid_pct = (100.0 * okv24 / tot24) if tot24 > 0 else None
     api_failed_pct = (100.0 * api_failed24 / tot24) if tot24 > 0 else None
@@ -1498,6 +1501,24 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     s0.append(f"| n sucessos no JSONL (24h) | {n_succ_24h if n_succ_24h is not None else '—'} | — | — |\n")
     s0.append(f"| Gaps >15min no executor_jsonl (24h; proxy) | {gaps15 if gaps15 is not None else '—'} | ≤{int(thr_gaps_15m)} | **{_fmt_status(chk_gap)}** |\n")
     s0.append("\n")
+
+    # Diagnóstico WS para "No PMMs received": ajuda a distinguir "timeout curto" vs "WS morto".
+    try:
+        if isinstance(pmm_ws_diag, dict) and int(pmm_ws_diag.get("no_pmms_total") or 0) > 0:
+            s0.append("**Diagnóstico de WebSocket (quando ocorre `No PMMs received`)**\n\n")
+            thr_ms = int(pmm_ws_diag.get("ws_stale_ms_thr") or 0)
+            n0 = int(pmm_ws_diag.get("no_pmms_total") or 0)
+            nst = int(pmm_ws_diag.get("no_pmms_ws_stale") or 0)
+            p50 = pmm_ws_diag.get("no_pmms_ws_age_ms_median")
+            p90 = pmm_ws_diag.get("no_pmms_ws_age_ms_p90")
+            mx = pmm_ws_diag.get("no_pmms_ws_age_ms_max")
+            s0.append("| Métrica | Valor |\n|---|---:|\n")
+            s0.append(f"| `No PMMs` total (24h) | {n0} |\n")
+            s0.append(f"| `No PMMs` com WS stale (ws_age_ms≥{thr_ms} ou NULL) | {nst} ({_fmt_num((100.0*nst/n0) if n0 else None,2)}%) |\n")
+            s0.append(f"| ws_age_ms p50 / p90 / max | {_fmt_num(p50,0)} / {_fmt_num(p90,0)} / {_fmt_num(mx,0)} |\n")
+            s0.append("\n")
+    except Exception:
+        pass
 
     # Diagnóstico curto de causa (latência): quando p50 sobe, quase sempre é fila (queue_delay_ms) e/ou timeout de PMM/relógio.
     try:
