@@ -1093,6 +1093,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     adh_long: Optional[Dict[str, Any]] = None
     exec_min: Optional[Dict[str, Any]] = None
     try:
+        slip_cf_start_day = str(os.getenv("OOS_ADHERENCE_SLIP_CF_START_DAY", "") or "").strip() or None
         subprocess.run(
             [
                 sys.executable,
@@ -1106,6 +1107,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "UTC",
                 "--days",
                 str(os.getenv("DAILY_ADHERENCE_DAYS_TABLE", os.getenv("DAILY_ADHERENCE_DAYS", "7"))),
+                *(
+                    ["--slippage-cf-start-day", slip_cf_start_day]
+                    if slip_cf_start_day
+                    else []
+                ),
                 "--out",
                 str(adh_short_json),
             ],
@@ -1116,6 +1122,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         adh_short = None
     try:
+        slip_cf_start_day = str(os.getenv("OOS_ADHERENCE_SLIP_CF_START_DAY", "") or "").strip() or None
         subprocess.run(
             [
                 sys.executable,
@@ -1130,6 +1137,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "--days",
                 str(os.getenv("DAILY_ADHERENCE_DAYS_SLIPPAGE", "0")),
                 "--no-per-day",
+                *(
+                    ["--slippage-cf-start-day", slip_cf_start_day]
+                    if slip_cf_start_day
+                    else []
+                ),
                 "--out",
                 str(adh_long_json),
             ],
@@ -1884,6 +1896,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"**{_fmt_pct(tot.get('roi_pct_settled'))}** |\n"
                 )
             s1.append("\n")
+        except Exception:
+            pass
+    else:
+        # Ajuda a explicar o caso "apostado mas ROI/resultado vazio": aqui usa filtro por status.
+        try:
+            only_st = str(os.getenv("DAILY_EXEC_MIN_BY_TYPE_ONLY_STATUS", "LIVE_OK"))
+            s1.append(
+                f"_Execução — métricas mínimas por tipo: sem dados no recorte (provável filtro `DAILY_EXEC_MIN_BY_TYPE_ONLY_STATUS={only_st}`)._\n\n"
+            )
         except Exception:
             pass
 

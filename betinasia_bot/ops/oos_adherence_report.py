@@ -575,6 +575,7 @@ async def run_report(
     days: int,
     include_today: bool,
     no_per_day: bool = False,
+    slip_cf_start_day: Optional[str] = None,
     out_json: Optional[Path] = None,
 ) -> Dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
@@ -588,6 +589,23 @@ async def run_report(
         tz = timezone.utc
     now_local = now_utc.astimezone(tz)
     end_day = now_local.date() if include_today else (now_local.date() - timedelta(days=1))
+
+    # Corte opcional (pós-fix) para o contrafactual de slippage (placar).
+    # Interpreta `slip_cf_start_day` como dia LOCAL em `tz_name` (YYYY-MM-DD).
+    cf_start_day: Optional[date] = None
+    if slip_cf_start_day:
+        try:
+            cf_start_day = date.fromisoformat(str(slip_cf_start_day).strip())
+        except Exception:
+            cf_start_day = None
+
+    def _cf_allowed(e: Any) -> bool:
+        if cf_start_day is None:
+            return True
+        try:
+            return e.created_at.astimezone(tz).date() >= cf_start_day  # type: ignore[attr-defined]
+        except Exception:
+            return True
 
     policy = _load_json(policy_json) or {}
     active_by_day = _active_keys_by_day_from_policy(policy, tz_name=tz_name)
@@ -639,6 +657,7 @@ async def run_report(
             "lay_skip_raw_pct_gt": 2.0,
             "back_scope": slip_gate_back_scope,
             "lay_scope": slip_gate_lay_scope,
+            "start_day_local": cf_start_day.isoformat() if cf_start_day else None,
         },
         "note": "Contrafactual baseado apenas nas execuções com ROI via placar (audit+scores+odd). Não é P&L accounting.",
         "back": {"n": 0, "pnl": 0.0, "stake": 0.0, "n_filtered": 0, "pnl_filtered": 0.0, "stake_filtered": 0.0},
@@ -770,18 +789,20 @@ async def run_report(
                     regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
                 except Exception:
                     regime = ("In" if bool(e.is_live) else "Pre")
-                cf["back"]["n"] += 1
-                cf["back"]["pnl"] += float(pnl)
-                cf["back"]["stake"] += float(stake)
-                scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
-                apply_gate = True
-                if scope in ("pre", "in"):
-                    apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
-                skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
-                if not skip:
-                    cf["back"]["n_filtered"] += 1
-                    cf["back"]["pnl_filtered"] += float(pnl)
-                    cf["back"]["stake_filtered"] += float(stake)
+                # contrafactual (acumulado): aplica corte pós-fix se configurado
+                if _cf_allowed(e):
+                    cf["back"]["n"] += 1
+                    cf["back"]["pnl"] += float(pnl)
+                    cf["back"]["stake"] += float(stake)
+                    scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                    if not skip:
+                        cf["back"]["n_filtered"] += 1
+                        cf["back"]["pnl_filtered"] += float(pnl)
+                        cf["back"]["stake_filtered"] += float(stake)
             elif side == "lay":
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 liab = stake * max(0.0, float(odd) - 1.0)
@@ -812,20 +833,22 @@ async def run_report(
                     regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
                 except Exception:
                     regime = ("In" if bool(e.is_live) else "Pre")
-                cf["lay"]["n"] += 1
-                cf["lay"]["pnl"] += float(pnl)
-                cf["lay"]["stake"] += float(stake)
-                cf["lay"]["liability"] += float(liab)
-                scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
-                apply_gate = True
-                if scope in ("pre", "in"):
-                    apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
-                skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
-                if not skip:
-                    cf["lay"]["n_filtered"] += 1
-                    cf["lay"]["pnl_filtered"] += float(pnl)
-                    cf["lay"]["stake_filtered"] += float(stake)
-                    cf["lay"]["liability_filtered"] += float(liab)
+                # contrafactual (acumulado): aplica corte pós-fix se configurado
+                if _cf_allowed(e):
+                    cf["lay"]["n"] += 1
+                    cf["lay"]["pnl"] += float(pnl)
+                    cf["lay"]["stake"] += float(stake)
+                    cf["lay"]["liability"] += float(liab)
+                    scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                    apply_gate = True
+                    if scope in ("pre", "in"):
+                        apply_gate = (str(regime).strip().lower() == ("pre" if scope == "pre" else "in"))
+                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                    if not skip:
+                        cf["lay"]["n_filtered"] += 1
+                        cf["lay"]["pnl_filtered"] += float(pnl)
+                        cf["lay"]["stake_filtered"] += float(stake)
+                        cf["lay"]["liability_filtered"] += float(liab)
 
         # carry-forward do último step se existir (mesma lógica do modo per_day)
         if last_step and isinstance(last_step, dict):
@@ -1097,33 +1120,35 @@ async def run_report(
                         pass
                 # contrafactual slippage filter (Back): pula raw<=-2%
                 try:
-                    cf["back"]["n"] += 1
-                    cf["back"]["pnl"] += float(pnl)
-                    cf["back"]["stake"] += float(stake)
-                    scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
-                    apply_gate = True
-                    if scope in ("pre", "in"):
-                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
-                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
-                    if not skip:
-                        cf["back"]["n_filtered"] += 1
-                        cf["back"]["pnl_filtered"] += float(pnl)
-                        cf["back"]["stake_filtered"] += float(stake)
+                    if _cf_allowed(e):
+                        cf["back"]["n"] += 1
+                        cf["back"]["pnl"] += float(pnl)
+                        cf["back"]["stake"] += float(stake)
+                        scope = str((cf.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                        apply_gate = True
+                        if scope in ("pre", "in"):
+                            apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                        skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf["rule"]["back_skip_raw_pct_le"]))
+                        if not skip:
+                            cf["back"]["n_filtered"] += 1
+                            cf["back"]["pnl_filtered"] += float(pnl)
+                            cf["back"]["stake_filtered"] += float(stake)
                 except Exception:
                     pass
                 try:
-                    cf_day["back"]["n"] += 1
-                    cf_day["back"]["pnl"] += float(pnl)
-                    cf_day["back"]["stake"] += float(stake)
-                    scope = str((cf_day.get("rule") or {}).get("back_scope") or "all").strip().lower()
-                    apply_gate = True
-                    if scope in ("pre", "in"):
-                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
-                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf_day["rule"]["back_skip_raw_pct_le"]))
-                    if not skip:
-                        cf_day["back"]["n_filtered"] += 1
-                        cf_day["back"]["pnl_filtered"] += float(pnl)
-                        cf_day["back"]["stake_filtered"] += float(stake)
+                    if _cf_allowed(e):
+                        cf_day["back"]["n"] += 1
+                        cf_day["back"]["pnl"] += float(pnl)
+                        cf_day["back"]["stake"] += float(stake)
+                        scope = str((cf_day.get("rule") or {}).get("back_scope") or "all").strip().lower()
+                        apply_gate = True
+                        if scope in ("pre", "in"):
+                            apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                        skip = bool(apply_gate and raw_pct is not None and float(raw_pct) <= float(cf_day["rule"]["back_skip_raw_pct_le"]))
+                        if not skip:
+                            cf_day["back"]["n_filtered"] += 1
+                            cf_day["back"]["pnl_filtered"] += float(pnl)
+                            cf_day["back"]["stake_filtered"] += float(stake)
                 except Exception:
                     pass
             elif side == "lay":
@@ -1192,37 +1217,39 @@ async def run_report(
                         pass
                 # contrafactual slippage filter (Lay): pula raw>2%
                 try:
-                    cf["lay"]["n"] += 1
-                    cf["lay"]["pnl"] += float(pnl)
-                    cf["lay"]["stake"] += float(stake)
-                    cf["lay"]["liability"] += float(liab)
-                    scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
-                    apply_gate = True
-                    if scope in ("pre", "in"):
-                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
-                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
-                    if not skip:
-                        cf["lay"]["n_filtered"] += 1
-                        cf["lay"]["pnl_filtered"] += float(pnl)
-                        cf["lay"]["stake_filtered"] += float(stake)
-                        cf["lay"]["liability_filtered"] += float(liab)
+                    if _cf_allowed(e):
+                        cf["lay"]["n"] += 1
+                        cf["lay"]["pnl"] += float(pnl)
+                        cf["lay"]["stake"] += float(stake)
+                        cf["lay"]["liability"] += float(liab)
+                        scope = str((cf.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                        apply_gate = True
+                        if scope in ("pre", "in"):
+                            apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                        skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf["rule"]["lay_skip_raw_pct_gt"]))
+                        if not skip:
+                            cf["lay"]["n_filtered"] += 1
+                            cf["lay"]["pnl_filtered"] += float(pnl)
+                            cf["lay"]["stake_filtered"] += float(stake)
+                            cf["lay"]["liability_filtered"] += float(liab)
                 except Exception:
                     pass
                 try:
-                    cf_day["lay"]["n"] += 1
-                    cf_day["lay"]["pnl"] += float(pnl)
-                    cf_day["lay"]["stake"] += float(stake)
-                    cf_day["lay"]["liability"] += float(liab)
-                    scope = str((cf_day.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
-                    apply_gate = True
-                    if scope in ("pre", "in"):
-                        apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
-                    skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf_day["rule"]["lay_skip_raw_pct_gt"]))
-                    if not skip:
-                        cf_day["lay"]["n_filtered"] += 1
-                        cf_day["lay"]["pnl_filtered"] += float(pnl)
-                        cf_day["lay"]["stake_filtered"] += float(stake)
-                        cf_day["lay"]["liability_filtered"] += float(liab)
+                    if _cf_allowed(e):
+                        cf_day["lay"]["n"] += 1
+                        cf_day["lay"]["pnl"] += float(pnl)
+                        cf_day["lay"]["stake"] += float(stake)
+                        cf_day["lay"]["liability"] += float(liab)
+                        scope = str((cf_day.get("rule") or {}).get("lay_scope") or "pre").strip().lower()
+                        apply_gate = True
+                        if scope in ("pre", "in"):
+                            apply_gate = (str(reg).strip().lower() == ("pre" if scope == "pre" else "in"))
+                        skip = bool(apply_gate and raw_pct is not None and float(raw_pct) > float(cf_day["rule"]["lay_skip_raw_pct_gt"]))
+                        if not skip:
+                            cf_day["lay"]["n_filtered"] += 1
+                            cf_day["lay"]["pnl_filtered"] += float(pnl)
+                            cf_day["lay"]["stake_filtered"] += float(stake)
+                            cf_day["lay"]["liability_filtered"] += float(liab)
                 except Exception:
                     pass
 
@@ -1369,6 +1396,11 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=int(os.getenv("OOS_ADHERENCE_DAYS", "7")))
     ap.add_argument("--include-today", action="store_true", default=(os.getenv("OOS_ADHERENCE_INCLUDE_TODAY", "1").strip() not in ("0", "false", "False", "no", "NO")))
     ap.add_argument("--no-per-day", action="store_true", default=(os.getenv("OOS_ADHERENCE_NO_PER_DAY", "0").strip() in ("1", "true", "True", "yes", "YES")))
+    ap.add_argument(
+        "--slippage-cf-start-day",
+        default=os.getenv("OOS_ADHERENCE_SLIP_CF_START_DAY", "").strip() or None,
+        help="(opcional) Restringe o contrafactual de slippage (placar) para execuções a partir deste dia local (YYYY-MM-DD).",
+    )
     ap.add_argument("--out", default=os.getenv("OOS_ADHERENCE_OUT", "").strip() or None)
     args = ap.parse_args()
 
@@ -1389,6 +1421,7 @@ def main() -> int:
             days=int(args.days),
             include_today=bool(args.include_today),
             no_per_day=bool(args.no_per_day),
+            slip_cf_start_day=str(args.slippage_cf_start_day).strip() if args.slippage_cf_start_day else None,
             out_json=outp,
         )
     )
