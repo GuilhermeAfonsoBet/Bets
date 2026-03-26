@@ -3,6 +3,7 @@
 Classe de acesso ao banco de dados PostgreSQL.
 """
 
+import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, update
@@ -42,7 +43,19 @@ class Database:
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
             
-        self.engine = create_async_engine(url, echo=False)
+        # Robustez para serviços long-running (bridge/auditors):
+        # - pool_pre_ping reduz "connection is closed" em conexões recicladas
+        # - pool_recycle evita conexões muito antigas (NAT/timeouts)
+        try:
+            pool_recycle = int(float(os.getenv("DB_POOL_RECYCLE_SEC", "900") or 900))
+        except Exception:
+            pool_recycle = 900
+        self.engine = create_async_engine(
+            url,
+            echo=False,
+            pool_pre_ping=True,
+            pool_recycle=max(0, int(pool_recycle)),
+        )
         self.async_session = sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )

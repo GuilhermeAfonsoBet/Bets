@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
 sys.path.insert(0, ".")
 
@@ -175,6 +176,43 @@ def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _is_db_disconnect_error(e: Exception) -> bool:
+    try:
+        s = str(e).lower()
+    except Exception:
+        return False
+    # mensagens comuns (asyncpg/psycopg/SQLAlchemy)
+    needles = (
+        "connection is closed",
+        "server closed the connection unexpectedly",
+        "terminating connection",
+        "connection was closed",
+        "closed the connection",
+        "connection reset",
+        "ssl connection has been closed unexpectedly",
+    )
+    return any(x in s for x in needles)
+
+
+async def _db_reconnect(db: Database, *, why: str = "") -> None:
+    try:
+        logger.warning(f"[bridge] db reconnect requested why={why or '-'}")
+    except Exception:
+        pass
+    try:
+        await db.close()
+    except Exception:
+        pass
+    await asyncio.sleep(float(os.getenv("BRIDGE_DB_RECONNECT_SLEEP_SEC", "0.4") or 0.4))
+    try:
+        await db.connect()
+    except Exception as e:
+        try:
+            logger.warning(f"[bridge] db reconnect failed: {str(e)[:240]}")
+        except Exception:
+            pass
 
 
 def _parse_iso(s: str) -> Optional[datetime]:
@@ -1020,6 +1058,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     risk_last_check = 0.0
     risk_params: Dict[str, Any] = {}
 
+    # GC de reservas não-finalizadas (evita travar operação por "seen_keys" órfãs)
+    seen_gc_last_check = 0.0
+
     # Monitoramento de saldo (guardrail operacional)
     bal_last_check = 0.0
     bal_payload: Optional[Dict[str, Any]] = None
@@ -1043,6 +1084,35 @@ async def run_bridge(cfg: BridgeConfig) -> int:
 
     while True:
         t0 = time.time()
+
+        # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
+        try:
+            gc_every = float(os.getenv("BRIDGE_SEEN_KEY_GC_SEC", "300") or 300.0)
+        except Exception:
+            gc_every = 300.0
+        try:
+            ttl_sec = float(os.getenv("BRIDGE_SEEN_KEY_TTL_SEC", "3600") or 3600.0)
+        except Exception:
+            ttl_sec = 3600.0
+        try:
+            if gc_every > 0 and ttl_sec > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
+                seen_gc_last_check = time.time()
+                qgc = """
+                DELETE FROM executor_bridge_seen_keys
+                WHERE src_table='betslip_audit_results'
+                  AND action=:action
+                  AND execution_id IS NULL
+                  AND created_at < (now() - (:ttl_sec::double precision * interval '1 second'))
+                """
+                async with db.async_session() as session:
+                    await session.execute(text(qgc), {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)})
+                    await session.commit()
+        except (InterfaceError, OperationalError, DBAPIError) as e:
+            if _is_db_disconnect_error(e):
+                await _db_reconnect(db, why="seen_key_gc_disconnect")
+        except Exception:
+            pass
+
         # reload policy (se configurado)
         if cfg.policy_json and (time.time() - policy_last_check) >= float(cfg.policy_reload_sec):
             policy_last_check = time.time()
@@ -1124,7 +1194,22 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 logger.warning(f"[bridge] risk_params reload failed: {e}")
 
         since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
-        rows = await _fetch_candidates(db, since=since, cfg=cfg)
+        try:
+            rows = await _fetch_candidates(db, since=since, cfg=cfg)
+        except (InterfaceError, OperationalError, DBAPIError) as e:
+            if _is_db_disconnect_error(e):
+                await _db_reconnect(db, why="fetch_candidates_disconnect")
+                await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                continue
+            raise
+        except Exception as e:
+            # qualquer erro inesperado no fetch não deve matar a operação
+            try:
+                logger.warning(f"[bridge] fetch_candidates failed: {str(e)[:240]}")
+            except Exception:
+                pass
+            await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+            continue
         if not rows:
             await asyncio.sleep(float(cfg.poll_sec))
             continue
@@ -1723,6 +1808,15 @@ async def run_bridge(cfg: BridgeConfig) -> int:
             except Exception as e:
                 msg = str(e)
                 logger.exception(f"[bridge] failed src_id={src_id}: {e}")
+                # Falhas de DB não devem consumir a oportunidade nem derrubar o bridge
+                if isinstance(e, (InterfaceError, OperationalError, DBAPIError)) and _is_db_disconnect_error(e):
+                    try:
+                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                    except Exception:
+                        pass
+                    await _db_reconnect(db, why="row_processing_disconnect")
+                    await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                    continue
                 # Se falha de transporte/socket, libera a reserva para retry e NÃO marca seen (senão perde oportunidade).
                 retry_transient = (os.getenv("BRIDGE_RETRY_TRANSIENT", "1").strip() not in ("0", "false", "False", "no", "NO"))
                 is_transient = ("Connection refused" in msg) or ("Connection reset" in msg) or ("Cannot connect to unix socket" in msg)
@@ -1733,7 +1827,11 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                         pass
                     await asyncio.sleep(float(os.getenv("BRIDGE_TRANSIENT_BACKOFF_SEC", "1.0")))
                     continue
-                await _mark_seen(db, src_id=src_id, action=action, execution_id=None, meta={"error": str(e)[:500]})
+                try:
+                    await _mark_seen(db, src_id=src_id, action=action, execution_id=None, meta={"error": str(e)[:500]})
+                except Exception:
+                    # Em falha de DB, não derruba o loop.
+                    pass
 
         dt = time.time() - t0
         # evita loop muito agressivo

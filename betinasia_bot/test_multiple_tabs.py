@@ -3,9 +3,15 @@
 Teste: Verifica se o BetinAsia permite múltiplas abas no mesmo browser.
 """
 import asyncio
+from pathlib import Path
+
+import pytest
 from playwright.async_api import async_playwright
 
 async def test_multiple_tabs():
+    if not Path("betinasia_session.json").exists():
+        pytest.skip("Requer betinasia_session.json (session exportada) para rodar este smoke-test.")
+
     print("\n" + "="*70)
     print("TESTE: Múltiplas abas no BetinAsia")
     print("="*70)
