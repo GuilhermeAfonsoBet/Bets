@@ -22,27 +22,31 @@ def _fmt_err(s: Optional[str], n: int = 160) -> str:
 async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: bool) -> int:
     t0 = _utcnow() - timedelta(minutes=int(minutes))
 
+    # Alguns pipelines gravam `audit_version` apenas na COLUNA (betslip_audit_results.audit_version),
+    # não no JSON hypothesis_details. Preferimos a coluna e mantemos fallback no JSON para compat.
+    ver_expr = "COALESCE(audit_version, hypothesis_details->>'audit_version')"
+
     qt = text(
-        """
+        f"""
         SELECT
           status,
           COUNT(*)::bigint AS n
         FROM betslip_audit_results
         WHERE audited_at >= :t0
-          AND hypothesis_details->>'audit_version' = :audit_version
+          AND {ver_expr} = :audit_version
         GROUP BY 1
         ORDER BY n DESC;
         """
     )
 
     qterr = text(
-        """
+        f"""
         SELECT
           status,
           COUNT(*)::bigint AS n
         FROM betslip_audit_results
         WHERE audited_at >= :t0
-          AND hypothesis_details->>'audit_version' = :audit_version
+          AND {ver_expr} = :audit_version
           AND COALESCE(hypothesis_details->>'api_error','') <> ''
         GROUP BY 1
         ORDER BY n DESC;
@@ -50,7 +54,7 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
     )
 
     qk = text(
-        """
+        f"""
         SELECT
           CASE
             WHEN (hypothesis_details->>'api_error') ILIKE '%No PMMs received%' THEN 'NO_PMMS'
@@ -64,7 +68,7 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
           COUNT(*)::bigint AS n
         FROM betslip_audit_results
         WHERE audited_at >= :t0
-          AND hypothesis_details->>'audit_version' = :audit_version
+          AND {ver_expr} = :audit_version
           AND (:only_errors = FALSE OR COALESCE(hypothesis_details->>'api_error','') <> '')
         GROUP BY 1
         ORDER BY n DESC;
@@ -72,7 +76,7 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
     )
 
     qs = text(
-        """
+        f"""
         SELECT
           audited_at,
           hypothesis_details->>'api_error' AS api_error,
@@ -85,7 +89,7 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
           hypothesis_details->'telemetry'->>'back_total_ms' AS back_total_ms
         FROM betslip_audit_results
         WHERE audited_at >= :t0
-          AND hypothesis_details->>'audit_version' = :audit_version
+          AND {ver_expr} = :audit_version
           AND (:only_errors = FALSE OR COALESCE(hypothesis_details->>'api_error','') <> '')
         ORDER BY audited_at DESC
         LIMIT :lim;
