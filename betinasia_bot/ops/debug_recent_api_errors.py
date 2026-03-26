@@ -57,6 +57,7 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
         f"""
         SELECT
           CASE
+            WHEN COALESCE(hypothesis_details->>'api_error', '') = '' THEN 'NO_ERROR'
             WHEN (hypothesis_details->>'api_error') ILIKE '%No PMMs received%' THEN 'NO_PMMS'
             WHEN (hypothesis_details->>'api_error') ILIKE '%HTTP_401%' OR (hypothesis_details->>'api_error') ILIKE '%auth_error%' THEN 'HTTP_401_AUTH'
             WHEN (hypothesis_details->>'api_error') ILIKE '%NO_ROOT_SESSION_COOKIE%' THEN 'NO_ROOT_SESSION_COOKIE'
@@ -81,6 +82,8 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
           audited_at,
           hypothesis_details->>'api_error' AS api_error,
           hypothesis_details->'telemetry'->>'auth_401' AS auth_401,
+          hypothesis_details->'telemetry'->>'back_error' AS back_error,
+          hypothesis_details->'telemetry'->>'lay_error' AS lay_error,
           hypothesis_details->'telemetry'->>'back_pmm_count' AS back_pmm_count,
           hypothesis_details->'telemetry'->>'back_pmm_wait_s' AS back_pmm_wait_s,
           hypothesis_details->'telemetry'->>'back_ws_age_ms' AS back_ws_age_ms,
@@ -126,6 +129,10 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
             _fmt_err(row.get("api_error")),
             "| auth_401=",
             row.get("auth_401"),
+            "| back_error=",
+            _fmt_err(row.get("back_error"), 120),
+            "| lay_error=",
+            _fmt_err(row.get("lay_error"), 120),
             "| pmm=",
             row.get("back_pmm_count"),
             "wait_s=",

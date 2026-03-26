@@ -2415,8 +2415,24 @@ class H3bApiAudit:
             # Hint para o bridge não misturar Back vs Lay
             if r.get('exec_side_hint'):
                 hypothesis_details['exec_side_hint'] = str(r.get('exec_side_hint'))
-            if (not r.get('success')) and r.get('error'):
-                hypothesis_details['api_error'] = r.get('error')
+            # Sempre persistir causa de falha: alguns caminhos retornam status=API_FAILED mas `error=''`.
+            # Nesses casos, usamos fallbacks da telemetria (back_error/lay_error) para não deixar falhas "mudas".
+            if not r.get('success'):
+                err = r.get('error')
+                if not err:
+                    try:
+                        err = (telemetry or {}).get("back_error") or (telemetry or {}).get("lay_error")
+                    except Exception:
+                        err = None
+                if not err:
+                    try:
+                        st = r.get("status")
+                        if st and str(st) != "API_FAILED":
+                            err = f"status={st}"
+                    except Exception:
+                        err = None
+                if err:
+                    hypothesis_details['api_error'] = str(err)
             finance_snapshot = self._build_finance_snapshot(r)
             if finance_snapshot:
                 hypothesis_details['finance'] = finance_snapshot
