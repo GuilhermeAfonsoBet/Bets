@@ -3,12 +3,17 @@
 Teste: Verifica se o BetinAsia permite múltiplas abas no mesmo browser.
 """
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 from playwright.async_api import async_playwright
 
 async def test_multiple_tabs():
+    # E2E/integrado: depende de rede, proxy, disponibilidade do site.
+    if os.getenv("RUN_BETINASIA_E2E", "0").strip() not in ("1", "true", "True", "yes", "YES"):
+        pytest.skip("E2E desabilitado (set RUN_BETINASIA_E2E=1 para rodar)")
+
     if not Path("betinasia_session.json").exists():
         pytest.skip("Requer betinasia_session.json (session exportada) para rodar este smoke-test.")
 

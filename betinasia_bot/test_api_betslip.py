@@ -8,13 +8,20 @@ Faz login via scraper, extrai cookies, e chama a API diretamente.
 
 import asyncio
 import json
+import os
 import httpx
+import pytest
 from loguru import logger
 from scraper.betinasia import BetinAsiaScraper
 
 
 async def test_betslip_api():
     """Testa a API de betslip diretamente."""
+
+    # Este é um teste E2E/integrado: depende de rede, proxy, e disponibilidade do site.
+    # Por padrão, mantemos desabilitado para não quebrar a suíte em ambientes sem acesso externo.
+    if os.getenv("RUN_BETINASIA_E2E", "0").strip() not in ("1", "true", "True", "yes", "YES"):
+        pytest.skip("E2E desabilitado (set RUN_BETINASIA_E2E=1 para rodar)")
     
     print("=" * 60)
     print("TESTE DA API DE BETSLIP")

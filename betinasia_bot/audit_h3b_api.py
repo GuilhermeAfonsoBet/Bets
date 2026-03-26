@@ -522,7 +522,17 @@ class H3bApiAudit:
         # WS listener único (para odds + PMM + betslip)
         def on_ws(ws):
             def on_frame(data):
-                data_str = str(data)
+                # Playwright pode entregar `str` ou `bytes` no framereceived; `str(bytes)` vira "b'...'"
+                # e quebra o json.loads, causando perda de PMMs mesmo com WS ativo.
+                try:
+                    if isinstance(data, bytes):
+                        data_str = data.decode("utf-8", errors="ignore")
+                    else:
+                        data_str = str(data)
+                except Exception:
+                    data_str = ""
+                if not data_str:
+                    return
                 self._ws_messages.append(data_str)
                 self._last_ws_time = time.time()
                 self._ws_msg_count += 1
