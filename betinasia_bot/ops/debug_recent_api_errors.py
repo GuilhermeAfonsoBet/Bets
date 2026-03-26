@@ -22,6 +22,33 @@ def _fmt_err(s: Optional[str], n: int = 160) -> str:
 async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: bool) -> int:
     t0 = _utcnow() - timedelta(minutes=int(minutes))
 
+    qt = text(
+        """
+        SELECT
+          status,
+          COUNT(*)::bigint AS n
+        FROM betslip_audit_results
+        WHERE audited_at >= :t0
+          AND hypothesis_details->>'audit_version' = :audit_version
+        GROUP BY 1
+        ORDER BY n DESC;
+        """
+    )
+
+    qterr = text(
+        """
+        SELECT
+          status,
+          COUNT(*)::bigint AS n
+        FROM betslip_audit_results
+        WHERE audited_at >= :t0
+          AND hypothesis_details->>'audit_version' = :audit_version
+          AND COALESCE(hypothesis_details->>'api_error','') <> ''
+        GROUP BY 1
+        ORDER BY n DESC;
+        """
+    )
+
     qk = text(
         """
         SELECT
@@ -69,6 +96,10 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
     await db.connect()
     try:
         async with db.async_session() as s:
+            r = await s.execute(qt, {"t0": t0, "audit_version": audit_version})
+            totals = [dict(x._mapping) for x in (r.fetchall() or [])]
+            r = await s.execute(qterr, {"t0": t0, "audit_version": audit_version})
+            totals_err = [dict(x._mapping) for x in (r.fetchall() or [])]
             r = await s.execute(qk, {"t0": t0, "audit_version": audit_version, "only_errors": bool(only_errors)})
             kinds: List[Dict[str, Any]] = [dict(x._mapping) for x in (r.fetchall() or [])]
             r = await s.execute(
@@ -80,6 +111,8 @@ async def _run(*, minutes: int, audit_version: str, limit: int, only_errors: boo
         await db.close()
 
     print(f"audit_version={audit_version} minutes={minutes} only_errors={int(bool(only_errors))}")
+    print("totals_by_status:", totals)
+    print("totals_by_status_with_api_error:", totals_err)
     print("kinds:", kinds)
     print("samples:")
     for row in rows:
@@ -110,14 +143,18 @@ def main() -> int:
     ap.add_argument("--minutes", type=int, default=30)
     ap.add_argument("--audit-version", default="v5.2-api-back")
     ap.add_argument("--limit", type=int, default=25)
-    ap.add_argument("--only-errors", action="store_true", default=True)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--only-errors", action="store_true", help="Mostra somente linhas com api_error (default).")
+    g.add_argument("--all", action="store_true", help="Inclui também linhas sem api_error.")
+    ap.set_defaults(only_errors=True, all=False)
     args = ap.parse_args()
+    only_errors = bool(getattr(args, "only_errors", True)) and (not bool(getattr(args, "all", False)))
     return asyncio.run(
         _run(
             minutes=int(args.minutes),
             audit_version=str(args.audit_version),
             limit=int(args.limit),
-            only_errors=bool(args.only_errors),
+            only_errors=bool(only_errors),
         )
     )
 
