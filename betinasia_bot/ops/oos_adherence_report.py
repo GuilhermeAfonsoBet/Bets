@@ -592,6 +592,10 @@ async def run_report(
 
     # Corte opcional (pós-fix) para o contrafactual de slippage (placar).
     # Interpreta `slip_cf_start_day` como dia LOCAL em `tz_name` (YYYY-MM-DD).
+    #
+    # Importante: apesar do nome histórico (cf = contrafactual), o corte é usado para
+    # TODAS as tabelas de slippage×ROI (raw/cost, totals, ctx e por combo) quando definido,
+    # para evitar que “pré-fix” contamine as estatísticas após correções de cálculo.
     cf_start_day: Optional[date] = None
     if slip_cf_start_day:
         try:
@@ -604,6 +608,15 @@ async def run_report(
             return True
         try:
             return e.created_at.astimezone(tz).date() >= cf_start_day  # type: ignore[attr-defined]
+        except Exception:
+            return True
+
+    # Alias semântico: o mesmo corte vale para slippage×ROI (não só contrafactual).
+    def _slip_allowed_day(d: date) -> bool:
+        if cf_start_day is None:
+            return True
+        try:
+            return d >= cf_start_day
         except Exception:
             return True
 
@@ -1283,15 +1296,16 @@ async def run_report(
             "lay": {"buckets": _bucketize_3way_raw(pairs_raw_lay)},
         }
 
-        # acumula (janela inteira)
-        if pairs_raw_back:
-            total_pairs_raw_back.extend(list(pairs_raw_back))
-        if pairs_raw_lay:
-            total_pairs_raw_lay.extend(list(pairs_raw_lay))
-        if pairs_back:
-            total_pairs_cost_back.extend(list(pairs_back))
-        if pairs_lay:
-            total_pairs_cost_lay.extend(list(pairs_lay))
+        # acumula (janela inteira) — com corte pós-fix se configurado
+        if _slip_allowed_day(d):
+            if pairs_raw_back:
+                total_pairs_raw_back.extend(list(pairs_raw_back))
+            if pairs_raw_lay:
+                total_pairs_raw_lay.extend(list(pairs_raw_lay))
+            if pairs_back:
+                total_pairs_cost_back.extend(list(pairs_back))
+            if pairs_lay:
+                total_pairs_cost_lay.extend(list(pairs_lay))
 
         per_day.append(
             {
@@ -1332,6 +1346,7 @@ async def run_report(
         "per_day": per_day,
         "observed_ah_line_abs": ah_obs,
         "slippage_filter_counterfactual": cf,
+        "slippage_start_day_local": cf_start_day.isoformat() if cf_start_day else None,
         # Estatística acumulada na janela
         "slippage_vs_roi_raw_total": {
             "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
