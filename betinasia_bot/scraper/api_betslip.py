@@ -172,6 +172,25 @@ class ApiBetslipClient:
             self._gc_ttl_sec = 180.0
         self._close_on_fail = (os.getenv("EXECUTOR_CLOSE_BETSLIP_ON_FAIL", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
 
+        # Timeouts hard (ms) para fetch via browser context (evita travar por dezenas de segundos e causar STALE_QUEUE_WAIT).
+        # Defaults conservadores: deixam espaço para latência normal (~700ms) mas cortam outliers patológicos.
+        try:
+            self._betslip_post_timeout_ms = int(float(os.getenv("EXECUTOR_BETSLIP_POST_TIMEOUT_MS", "12000") or 12000))
+        except Exception:
+            self._betslip_post_timeout_ms = 12000
+        try:
+            self._betslip_refresh_timeout_ms = int(float(os.getenv("EXECUTOR_BETSLIP_REFRESH_TIMEOUT_MS", "12000") or 12000))
+        except Exception:
+            self._betslip_refresh_timeout_ms = 12000
+        try:
+            self._orders_timeout_ms = int(float(os.getenv("EXECUTOR_ORDERS_TIMEOUT_MS", "15000") or 15000))
+        except Exception:
+            self._orders_timeout_ms = 15000
+        try:
+            self._orders_get_timeout_ms = int(float(os.getenv("EXECUTOR_ORDERS_GET_TIMEOUT_MS", "12000") or 12000))
+        except Exception:
+            self._orders_get_timeout_ms = 12000
+
         # Timeouts configuráveis via env (para operação/mitigação de "No PMMs received")
         try:
             self.PMM_TIMEOUT = float(os.getenv("EXECUTOR_PMM_TIMEOUT_SEC", str(self.PMM_TIMEOUT)))
@@ -517,6 +536,11 @@ class ApiBetslipClient:
                     """
                     async (params) => {
                         try {
+                            const hasAbort = (typeof AbortController !== 'undefined');
+                            const ctrl = hasAbort ? new AbortController() : null;
+                            const to = (hasAbort && params.timeoutMs && params.timeoutMs > 0)
+                              ? setTimeout(() => { try { ctrl.abort(); } catch(e) {} }, params.timeoutMs)
+                              : null;
                             const resp = await fetch('/v1/betslips/', {
                                 method: 'POST',
                                 credentials: 'same-origin',
@@ -527,6 +551,7 @@ class ApiBetslipClient:
                                     'x-molly-client-name': params.clientName,
                                     'x-molly-client-version': params.clientVersion
                                 },
+                                signal: ctrl ? ctrl.signal : undefined,
                                 body: JSON.stringify({
                                     sport: 'fb',
                                     event_id: params.event_id,
@@ -535,6 +560,7 @@ class ApiBetslipClient:
                                     equivalent_bets: true
                                 })
                             });
+                            if (to) { try { clearTimeout(to); } catch(e) {} }
                             let text = '';
                             let data = null;
                             try { text = await resp.text(); } catch(e) { text = ''; }
@@ -542,7 +568,10 @@ class ApiBetslipClient:
                             const prefix = (text || '').slice(0, 220);
                             return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                         } catch(e) {
-                            return {ok: false, error: e.message};
+                            const name = (e && e.name) ? String(e.name) : '';
+                            const msg = (e && e.message) ? String(e.message) : String(e || '');
+                            const kind = name ? (name + ': ') : '';
+                            return {ok: false, status: 0, error: kind + msg};
                         }
                     }
                     """,
@@ -553,6 +582,7 @@ class ApiBetslipClient:
                         "sessionToken": session_token,
                         "clientName": self.MOLLY_CLIENT_NAME,
                         "clientVersion": self.MOLLY_CLIENT_VERSION,
+                        "timeoutMs": int(self._betslip_post_timeout_ms or 0),
                     },
                 )
 
@@ -586,7 +616,7 @@ class ApiBetslipClient:
                     return result
 
                 if (not ok) or (status_code and status_code != 200):
-                    result.error = response.get("error") or f"HTTP_{status_code}"
+                    result.error = response.get("error") or (f"HTTP_{status_code}" if status_code else "FETCH_FAILED")
                     try:
                         if isinstance(data, dict) and data.get("code"):
                             result.error = f"{result.error} | code={data.get('code')}"
@@ -769,6 +799,9 @@ class ApiBetslipClient:
                     result.highest_limit_bookie = by_limit[0].bookie
                     result.highest_limit_odd = by_limit[0].best_price
                     result.success = True
+                else:
+                    # Evita FAIL "mudo" (pmm chegou, mas nenhuma price_list válida)
+                    result.error = "NO_VALID_BOOKMAKER_PRICES"
 
                 result.total_time_ms = int((time.time() - t0) * 1000)
                 return result
@@ -815,6 +848,11 @@ class ApiBetslipClient:
             response = await self.page.evaluate("""
                 async (params) => {
                     try {
+                        const hasAbort = (typeof AbortController !== 'undefined');
+                        const ctrl = hasAbort ? new AbortController() : null;
+                        const to = (hasAbort && params.timeoutMs && params.timeoutMs > 0)
+                          ? setTimeout(() => { try { ctrl.abort(); } catch(e) {} }, params.timeoutMs)
+                          : null;
                         const resp = await fetch('/v1/betslips/' + params.betslip_id + '/refresh/', {
                             method: 'POST',
                             credentials: 'same-origin',
@@ -825,17 +863,24 @@ class ApiBetslipClient:
                                 'x-molly-client-name': params.clientName,
                                 'x-molly-client-version': params.clientVersion
                             },
+                            signal: ctrl ? ctrl.signal : undefined,
                             body: JSON.stringify({betslipId: params.betslip_id})
                         });
+                        if (to) { try { clearTimeout(to); } catch(e) {} }
                         let text = '';
                         let data = null;
                         try { text = await resp.text(); } catch(e) { text = ''; }
                         try { data = JSON.parse(text); } catch(e) { data = null; }
                         const prefix = (text || '').slice(0, 220);
                         return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
-                    } catch(e) { return {ok: false, error: e.message}; }
+                    } catch(e) {
+                        const name = (e && e.name) ? String(e.name) : '';
+                        const msg = (e && e.message) ? String(e.message) : String(e || '');
+                        const kind = name ? (name + ': ') : '';
+                        return {ok: false, status: 0, error: kind + msg};
+                    }
                 }
-            """, {"betslip_id": betslip_id, "sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION})
+            """, {"betslip_id": betslip_id, "sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION, "timeoutMs": int(self._betslip_refresh_timeout_ms or 0)})
             
             result.request_time_ms = int((time.time() - t0) * 1000)
             result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
@@ -861,7 +906,7 @@ class ApiBetslipClient:
                 return result
 
             if (not ok) or (status_code and status_code != 200):
-                result.error = response.get("error") or f"HTTP_{status_code}"
+                result.error = response.get("error") or (f"HTTP_{status_code}" if status_code else "FETCH_FAILED")
                 if status_code:
                     result.error = f"HTTP_{status_code}: {result.error}"
                 if prefix:
@@ -975,6 +1020,11 @@ class ApiBetslipClient:
                 """
                 async (params) => {
                     try {
+                        const hasAbort = (typeof AbortController !== 'undefined');
+                        const ctrl = hasAbort ? new AbortController() : null;
+                        const to = (hasAbort && params.timeoutMs && params.timeoutMs > 0)
+                          ? setTimeout(() => { try { ctrl.abort(); } catch(e) {} }, params.timeoutMs)
+                          : null;
                         const resp = await fetch('/v1/orders/', {
                             method: 'POST',
                             credentials: 'same-origin',
@@ -985,8 +1035,10 @@ class ApiBetslipClient:
                                 'x-molly-client-name': params.clientName,
                                 'x-molly-client-version': params.clientVersion
                             },
+                            signal: ctrl ? ctrl.signal : undefined,
                             body: JSON.stringify(params.payload)
                         });
+                        if (to) { try { clearTimeout(to); } catch(e) {} }
                         let text = '';
                         let data = null;
                         try { text = await resp.text(); } catch(e) { text = ''; }
@@ -994,11 +1046,14 @@ class ApiBetslipClient:
                         const prefix = (text || '').slice(0, 1200);
                         return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                     } catch(e) {
-                        return {ok: false, error: e.message};
+                        const name = (e && e.name) ? String(e.name) : '';
+                        const msg = (e && e.message) ? String(e.message) : String(e || '');
+                        const kind = name ? (name + ': ') : '';
+                        return {ok: false, status: 0, error: kind + msg};
                     }
                 }
                 """,
-                {"sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION, "payload": payload},
+                {"sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION, "payload": payload, "timeoutMs": int(self._orders_timeout_ms or 0)},
             )
             res.request_time_ms = int((time.time() - t0) * 1000)
 
@@ -1048,6 +1103,11 @@ class ApiBetslipClient:
                         const u = '/v1/orders/?placer=' + encodeURIComponent(params.placer)
                                   + '&page_size=' + encodeURIComponent(String(params.pageSize))
                                   + '&page=' + encodeURIComponent(String(params.page));
+                        const hasAbort = (typeof AbortController !== 'undefined');
+                        const ctrl = hasAbort ? new AbortController() : null;
+                        const to = (hasAbort && params.timeoutMs && params.timeoutMs > 0)
+                          ? setTimeout(() => { try { ctrl.abort(); } catch(e) {} }, params.timeoutMs)
+                          : null;
                         const resp = await fetch(u, {
                             method: 'GET',
                             credentials: 'same-origin',
@@ -1056,8 +1116,10 @@ class ApiBetslipClient:
                                 'session': params.sessionToken,
                                 'x-molly-client-name': params.clientName,
                                 'x-molly-client-version': params.clientVersion
-                            }
+                            },
+                            signal: ctrl ? ctrl.signal : undefined,
                         });
+                        if (to) { try { clearTimeout(to); } catch(e) {} }
                         let text = '';
                         let data = null;
                         try { text = await resp.text(); } catch(e) { text = ''; }
@@ -1065,7 +1127,10 @@ class ApiBetslipClient:
                         const prefix = (text || '').slice(0, 1200);
                         return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
                     } catch(e) {
-                        return {ok: false, status: 0, error: e.message};
+                        const name = (e && e.name) ? String(e.name) : '';
+                        const msg = (e && e.message) ? String(e.message) : String(e || '');
+                        const kind = name ? (name + ': ') : '';
+                        return {ok: false, status: 0, error: kind + msg};
                     }
                 }
                 """,
@@ -1076,6 +1141,7 @@ class ApiBetslipClient:
                     "sessionToken": session_token,
                     "clientName": self.MOLLY_CLIENT_NAME,
                     "clientVersion": self.MOLLY_CLIENT_VERSION,
+                    "timeoutMs": int(self._orders_get_timeout_ms or 0),
                 },
             )
             dt_ms = int((time.time() - t0) * 1000)

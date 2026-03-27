@@ -1491,6 +1491,19 @@ class H3bApiAudit:
             if lay_result and not lay_result.success and lay_result.error:
                 back_err = f"{back_err} | lay={lay_result.error}"
 
+            # Mitigação: quando o subcanal API (PMM/betslip) fica stale, o POST até pode responder 200,
+            # mas os PMMs não chegam (No PMMs) e o ws_age_ms cresce. Isso tende a persistir até reload.
+            try:
+                if "No PMMs received" in str(back_err):
+                    wsa = getattr(back_result, "ws_age_ms", None) if back_result else None
+                    wsa = int(wsa) if isinstance(wsa, (int, float, str)) and str(wsa).strip() else None
+                    # se ws_age_ms é muito alto, forçamos reload com cooldown para reativar o canal "api"
+                    if wsa is not None and wsa >= int(float(os.getenv("AUDIT_API_WS_STALE_MS", "15000") or 15000)):
+                        telemetry["api_ws_stale_reload"] = True
+                        await self._force_reload("api_ws_stale_no_pmms")
+            except Exception:
+                pass
+
             # Se a API retorna 401/auth_error, isso é quase sempre sessão inválida/ausente.
             # Forçamos relogin com cooldown para recuperar automaticamente.
             back_http = int(getattr(back_result, "http_status", 0) or 0) if back_result else 0
