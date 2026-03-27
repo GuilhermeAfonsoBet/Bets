@@ -82,7 +82,13 @@ class H3bApiAudit:
         self.db: Optional[Database] = None
 
         # WS
-        self._ws_messages: List[str] = []
+        # Buffer WS limitado para evitar OOM (o monitor consome continuamente).
+        self._ws_messages: deque[str] = deque()
+        self._ws_messages_dropped: int = 0
+        try:
+            self._ws_messages_max = int(float(os.getenv("AUDIT_WS_BUFFER_MAX", "20000") or 20000))
+        except Exception:
+            self._ws_messages_max = 20000
         self._ws_msg_count: int = 0
         self._last_ws_time: float = 0
         self._start_time: float = 0
@@ -94,7 +100,12 @@ class H3bApiAudit:
         self.detector = HypothesisDetector()
 
         # Stats
-        self.results: List[dict] = []
+        # Resultados limitados (evita consumo infinito de RAM).
+        self.results: deque[dict] = deque()
+        try:
+            self._results_max = int(float(os.getenv("AUDIT_RESULTS_MAX", "5000") or 5000))
+        except Exception:
+            self._results_max = 5000
         self.events_processed: int = 0
         self.h3b_detected: int = 0
         self.total_errors: int = 0
@@ -113,6 +124,13 @@ class H3bApiAudit:
         self._last_relogin_ts: float = 0.0
         self._shutdown_lock = asyncio.Lock()
         self._tasks: List[asyncio.Task] = []
+
+        # Deduplicação com TTL (evita set infinito).
+        try:
+            self._audited_ttl_sec = float(os.getenv("AUDIT_DEDUP_TTL_SEC", "7200") or 7200)
+        except Exception:
+            self._audited_ttl_sec = 7200.0
+        self._audited_ts: Dict[str, float] = {}
 
         # Modos:
         # - api: comportamento atual (WS detecta + BS via API para validar)
@@ -533,7 +551,15 @@ class H3bApiAudit:
                     data_str = ""
                 if not data_str:
                     return
-                self._ws_messages.append(data_str)
+                try:
+                    self._ws_messages.append(data_str)
+                    mx = int(self._ws_messages_max or 0)
+                    if mx > 0:
+                        while len(self._ws_messages) > mx:
+                            self._ws_messages.popleft()
+                            self._ws_messages_dropped += 1
+                except Exception:
+                    pass
                 self._last_ws_time = time.time()
                 self._ws_msg_count += 1
                 
@@ -631,11 +657,17 @@ class H3bApiAudit:
     # ================================================================
     async def _monitor_loop(self, queue: asyncio.Queue, audited: set):
         logger.info("Monitor iniciado")
-        last_idx = 0
+        last_seen = 0  # contador total já visto (aproximação quando usamos deque)
 
         while self.running:
-            new = self._ws_messages[last_idx:]
-            last_idx = len(self._ws_messages)
+            # Como usamos deque com trim, consumimos por pop-left.
+            new: List[str] = []
+            try:
+                while self._ws_messages:
+                    new.append(self._ws_messages.popleft())
+            except Exception:
+                new = []
+            last_seen += len(new)
 
             if not new:
                 await asyncio.sleep(0.05)
@@ -766,6 +798,17 @@ class H3bApiAudit:
                     continue
 
                 audit_key = f"{event_id}|{market_type}|{period}|{h3b.ah_line}|{h3b.side}"
+                # Dedup com TTL
+                try:
+                    now = time.time()
+                except Exception:
+                    now = 0.0
+                try:
+                    ts = float(self._audited_ts.get(audit_key, 0.0) or 0.0)
+                    if ts > 0 and (now - ts) <= float(self._audited_ttl_sec):
+                        continue
+                except Exception:
+                    pass
                 if audit_key in audited:
                     continue
 
@@ -799,6 +842,18 @@ class H3bApiAudit:
                     continue
                 self.max_queue_depth_observed = max(self.max_queue_depth_observed, queue.qsize())
                 audited.add(audit_key)
+                try:
+                    self._audited_ts[audit_key] = float(time.time())
+                except Exception:
+                    pass
+
+                # GC dedup map
+                try:
+                    if self._audited_ttl_sec > 0 and len(self._audited_ts) > 200000:
+                        cutoff = time.time() - float(self._audited_ttl_sec)
+                        self._audited_ts = {k: v for k, v in self._audited_ts.items() if float(v) >= cutoff}
+                except Exception:
+                    pass
 
     # ================================================================
     # EXECUTOR (via API, não DOM)
@@ -843,7 +898,14 @@ class H3bApiAudit:
             telemetry['pipeline_total_ms'] = int((time.time() - h3b['detected_at']) * 1000)
             telemetry['executor_total_ms'] = int((time.time() - h3b['dequeued_at']) * 1000)
             self._emit_audit_telemetry(result)
-            self.results.append(result)
+            try:
+                self.results.append(result)
+                mxr = int(self._results_max or 0)
+                if mxr > 0:
+                    while len(self.results) > mxr:
+                        self.results.popleft()
+            except Exception:
+                pass
 
             temporal_refs = result.get('_temporal_refs')
             ws_refs = result.get('_ws_series_refs')
@@ -2552,7 +2614,8 @@ class H3bApiAudit:
                 f"Fila temporal: now={temporal_queue_now} max={self.max_temporal_queue_depth_observed} | "
                 f"drops: fullq={self.dropped_full_queue} staleq={self.dropped_stale_queue_wait} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
-                f"H3B: {self.h3b_detected} | Erros: {self.total_errors}")
+                f"H3B: {self.h3b_detected} | Erros: {self.total_errors} | "
+                f"ws_buf_drop={self._ws_messages_dropped}")
 
             if ws_age > WS_RELOAD_INTERVAL:
                 logger.warning("WS morto, recarregando...")
