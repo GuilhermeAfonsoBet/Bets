@@ -150,11 +150,27 @@ class ApiBetslipClient:
         self.page = page
         self._pmm_messages: Dict[str, List[dict]] = {}  # betslip_id -> [pmm_data]
         self._betslip_info: Dict[str, dict] = {}  # betslip_id -> betslip creation data
+        self._betslip_ts: Dict[str, float] = {}  # betslip_id -> last seen ts (pmm or betslip)
         self._listening = False
         self._ws_msg_count: int = 0
         self._last_ws_ts: float = 0.0
         self.MOLLY_CLIENT_NAME = "sonic"
         self.MOLLY_CLIENT_VERSION = os.getenv("BETINASIA_MOLLY_CLIENT_VERSION", "2.5.54")
+        self._lock = asyncio.Lock()
+
+        # Mitigações operacionais
+        # - Serialização evita cross-talk de betslip_id quando múltiplos workers chamam get_betslip_odds em paralelo.
+        # - GC evita crescimento infinito (OOM) quando há falhas contínuas (ex.: No PMMs).
+        self._serialize = (os.getenv("EXECUTOR_BETSLIP_SERIALIZE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+        try:
+            self._gc_max_entries = int(float(os.getenv("EXECUTOR_BETSLIP_CACHE_MAX", "400") or 400))
+        except Exception:
+            self._gc_max_entries = 400
+        try:
+            self._gc_ttl_sec = float(os.getenv("EXECUTOR_BETSLIP_CACHE_TTL_SEC", "180") or 180)
+        except Exception:
+            self._gc_ttl_sec = 180.0
+        self._close_on_fail = (os.getenv("EXECUTOR_CLOSE_BETSLIP_ON_FAIL", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
 
         # Timeouts configuráveis via env (para operação/mitigação de "No PMMs received")
         try:
@@ -171,6 +187,71 @@ class ApiBetslipClient:
             pass
         try:
             self.BETSLIP_ID_TIMEOUT = float(os.getenv("EXECUTOR_BETSLIP_ID_TIMEOUT_SEC", str(self.BETSLIP_ID_TIMEOUT)))
+        except Exception:
+            pass
+
+    def _gc(self) -> None:
+        """
+        Coleta lixo das estruturas de cache (PMMs/betslips).
+        Evita OOM em operação longa com falhas repetidas.
+        """
+        try:
+            now = time.time()
+        except Exception:
+            return
+        # TTL
+        try:
+            if self._gc_ttl_sec > 0:
+                stale = [bid for bid, ts in (self._betslip_ts or {}).items() if (now - float(ts)) > float(self._gc_ttl_sec)]
+                for bid in stale:
+                    try:
+                        self._pmm_messages.pop(bid, None)
+                        self._betslip_info.pop(bid, None)
+                        self._betslip_ts.pop(bid, None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Cap por quantidade
+        try:
+            mx = int(self._gc_max_entries or 0)
+            if mx > 0 and len(self._betslip_ts) > mx:
+                # remove os mais antigos
+                items = sorted((self._betslip_ts or {}).items(), key=lambda kv: float(kv[1] or 0.0))
+                to_drop = items[: max(0, len(items) - mx)]
+                for bid, _ts in to_drop:
+                    try:
+                        self._pmm_messages.pop(bid, None)
+                        self._betslip_info.pop(bid, None)
+                        self._betslip_ts.pop(bid, None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _touch(self, betslip_id: str) -> None:
+        bid = str(betslip_id or "").strip()
+        if not bid:
+            return
+        try:
+            self._betslip_ts[bid] = time.time()
+        except Exception:
+            pass
+
+    def _cleanup_betslip(self, betslip_id: str) -> None:
+        bid = str(betslip_id or "").strip()
+        if not bid:
+            return
+        try:
+            self._pmm_messages.pop(bid, None)
+        except Exception:
+            pass
+        try:
+            self._betslip_info.pop(bid, None)
+        except Exception:
+            pass
+        try:
+            self._betslip_ts.pop(bid, None)
         except Exception:
             pass
 
@@ -340,6 +421,8 @@ class ApiBetslipClient:
             self._betslip_info[betslip_id] = data
             if betslip_id not in self._pmm_messages:
                 self._pmm_messages[betslip_id] = []
+            self._touch(betslip_id)
+            self._gc()
     
     def _handle_pmm(self, data: dict):
         """Processa mensagem PMM (preço de bookmaker)."""
@@ -353,6 +436,8 @@ class ApiBetslipClient:
             if betslip_id not in self._pmm_messages:
                 self._pmm_messages[betslip_id] = []
             self._pmm_messages[betslip_id].append(data)
+            self._touch(betslip_id)
+            self._gc()
     
     async def get_betslip_odds(self, event_id: str, bet_type: str, betslip_type: str = "normal") -> BetslipApiResult:
         """
@@ -370,18 +455,25 @@ class ApiBetslipClient:
         Returns:
             BetslipApiResult com odds de todos os bookmakers
         """
-        result = BetslipApiResult(event_id=event_id, bet_type=bet_type)
-        # snapshot dos parâmetros efetivos (para debugar mismatch env vs runtime)
-        try:
-            result.pmm_timeout_s = float(self.PMM_TIMEOUT)
-            result.pmm_min_wait_s = float(self.PMM_MIN_WAIT)
-            result.pmm_idle_timeout_s = float(self.PMM_IDLE_TIMEOUT)
-        except Exception:
-            pass
-        t0 = time.time()
-        
-        try:
-            def _find_betslip_id(obj, depth: int = 0) -> str:
+        async def _impl() -> BetslipApiResult:
+            result = BetslipApiResult(event_id=event_id, bet_type=bet_type)
+            try:
+                result.pmm_timeout_s = float(self.PMM_TIMEOUT)
+                result.pmm_min_wait_s = float(self.PMM_MIN_WAIT)
+                result.pmm_idle_timeout_s = float(self.PMM_IDLE_TIMEOUT)
+            except Exception:
+                pass
+
+            t0 = time.time()
+            betslip_id = ""
+
+            # snapshot antes do POST (ajuda a identificar o betslip novo via WS sem cross-talk)
+            try:
+                pre_betslip_ids: set[str] = set(self._betslip_info.keys())
+            except Exception:
+                pre_betslip_ids = set()
+
+            def _find_betslip_id(obj: Any, depth: int = 0) -> str:
                 if depth > 4:
                     return ""
                 if isinstance(obj, dict):
@@ -400,7 +492,7 @@ class ApiBetslipClient:
                             return bid
                 return ""
 
-            def _extract_retry_after_sec(obj) -> int:
+            def _extract_retry_after_sec(obj: Any) -> int:
                 try:
                     if isinstance(obj, dict):
                         for k in ("retry_after", "retryAfter"):
@@ -412,275 +504,297 @@ class ApiBetslipClient:
                 except Exception:
                     return 0
 
-            # === 1. POST /v1/betslips/ via browser fetch ===
-            session_token = await self._get_root_session_token()
-            result.has_session_token = bool(session_token)
-            if not session_token:
-                result.error = "NO_ROOT_SESSION_COOKIE"
-                return result
-            t_post = time.time()
-            
-            response = await self.page.evaluate("""
-                async (params) => {
-                    try {
-                        const resp = await fetch('/v1/betslips/', {
-                            method: 'POST',
-                            credentials: 'same-origin',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Accept': 'application/json, text/plain, */*',
-                                'session': params.sessionToken,
-                                'x-molly-client-name': params.clientName,
-                                'x-molly-client-version': params.clientVersion
-                            },
-                            body: JSON.stringify({
-                                sport: 'fb',
-                                event_id: params.event_id,
-                                bet_type: params.bet_type,
-                                betslip_type: params.betslip_type,
-                                equivalent_bets: true
-                            })
-                        });
-                        let text = '';
-                        let data = null;
-                        try { text = await resp.text(); } catch(e) { text = ''; }
-                        try { data = JSON.parse(text); } catch(e) { data = null; }
-                        const prefix = (text || '').slice(0, 220);
-                        return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
-                    } catch(e) {
-                        return {ok: false, error: e.message};
+            try:
+                # === 1. POST /v1/betslips/ via browser fetch ===
+                session_token = await self._get_root_session_token()
+                result.has_session_token = bool(session_token)
+                if not session_token:
+                    result.error = "NO_ROOT_SESSION_COOKIE"
+                    return result
+
+                t_post = time.time()
+                response = await self.page.evaluate(
+                    """
+                    async (params) => {
+                        try {
+                            const resp = await fetch('/v1/betslips/', {
+                                method: 'POST',
+                                credentials: 'same-origin',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json, text/plain, */*',
+                                    'session': params.sessionToken,
+                                    'x-molly-client-name': params.clientName,
+                                    'x-molly-client-version': params.clientVersion
+                                },
+                                body: JSON.stringify({
+                                    sport: 'fb',
+                                    event_id: params.event_id,
+                                    bet_type: params.bet_type,
+                                    betslip_type: params.betslip_type,
+                                    equivalent_bets: true
+                                })
+                            });
+                            let text = '';
+                            let data = null;
+                            try { text = await resp.text(); } catch(e) { text = ''; }
+                            try { data = JSON.parse(text); } catch(e) { data = null; }
+                            const prefix = (text || '').slice(0, 220);
+                            return {ok: resp.ok, status: resp.status, data: data, text_prefix: prefix};
+                        } catch(e) {
+                            return {ok: false, error: e.message};
+                        }
                     }
-                }
-            """, {"event_id": event_id, "bet_type": bet_type, "betslip_type": betslip_type, "sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION})
-            
-            result.request_time_ms = int((time.time() - t_post) * 1000)
-            result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
-            
-            logger.info(f"POST /v1/betslips/: status={response.get('status') if response else 'none'}, "
-                        f"ok={response.get('ok') if response else False}, "
-                        f"time={result.request_time_ms}ms, "
-                        f"data_keys={list(response.get('data', {}).keys()) if response and isinstance(response.get('data'), dict) else 'n/a'}")
-            
-            if not response or not isinstance(response, dict):
-                result.error = "No response"
-                logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
-                return result
+                    """,
+                    {
+                        "event_id": event_id,
+                        "bet_type": bet_type,
+                        "betslip_type": betslip_type,
+                        "sessionToken": session_token,
+                        "clientName": self.MOLLY_CLIENT_NAME,
+                        "clientVersion": self.MOLLY_CLIENT_VERSION,
+                    },
+                )
 
-            status_code = int(response.get("status") or 0)
-            ok = bool(response.get("ok"))
-            data = response.get("data")
-            prefix = str(response.get("text_prefix") or "")
+                result.request_time_ms = int((time.time() - t_post) * 1000)
+                result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
 
-            retry_after = _extract_retry_after_sec(data)
-            if retry_after > 0:
-                result.rate_limit_retry_after_sec = int(retry_after)
-                result.error = f"RATE_LIMIT retry_after={int(retry_after)}s"
-                logger.warning(f"POST /v1/betslips/ rate limit: {result.error} | status={status_code} | prefix={prefix[:120]}")
-                return result
+                logger.info(
+                    f"POST /v1/betslips/: status={response.get('status') if response else 'none'}, "
+                    f"ok={response.get('ok') if response else False}, "
+                    f"time={result.request_time_ms}ms, "
+                    f"data_keys={list(response.get('data', {}).keys()) if response and isinstance(response.get('data'), dict) else 'n/a'}"
+                )
 
-            if (not ok) or (status_code and status_code != 200):
-                # Status != 200 pode ocorrer como 401/403/429 etc. (resp.ok=False)
-                result.error = response.get("error") or f"HTTP_{status_code}"
-                # tenta extrair code (ex.: too_many_open_betslips)
-                try:
-                    if isinstance(data, dict) and data.get("code"):
-                        result.error = f"{result.error} | code={data.get('code')}"
-                except Exception:
-                    pass
-                if status_code:
-                    result.error = f"HTTP_{status_code}: {result.error}"
-                if prefix:
-                    result.error = f"{result.error} | resp_prefix={prefix[:160]}"
-                logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
-                return result
-            
-            # Extrai betslip_id da resposta
-            resp_data = data or {}
-            logger.debug(f"POST data: status={status_code}, resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
-            betslip_id = _find_betslip_id(resp_data)
-            betslip_id_source = "resp" if betslip_id else ""
-            
-            if not betslip_id:
-                # Betslip_id vem via WebSocket ["betslip", {betslip_id: "..."}]
-                # Espera até 3 segundos pelo WS message
-                wait_start = time.time()
-                while time.time() - wait_start < float(self.BETSLIP_ID_TIMEOUT):
-                    for bid in reversed(list(self._betslip_info.keys())):
-                        info = self._betslip_info[bid]
-                        if info.get('event_id') == event_id:
-                            betslip_id = bid
-                            betslip_id_source = "ws"
+                if not response or not isinstance(response, dict):
+                    result.error = "No response"
+                    logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
+                    return result
+
+                status_code = int(response.get("status") or 0)
+                ok = bool(response.get("ok"))
+                data = response.get("data")
+                prefix = str(response.get("text_prefix") or "")
+
+                retry_after = _extract_retry_after_sec(data)
+                if retry_after > 0:
+                    result.rate_limit_retry_after_sec = int(retry_after)
+                    result.error = f"RATE_LIMIT retry_after={int(retry_after)}s"
+                    logger.warning(
+                        f"POST /v1/betslips/ rate limit: {result.error} | status={status_code} | prefix={prefix[:120]}"
+                    )
+                    return result
+
+                if (not ok) or (status_code and status_code != 200):
+                    result.error = response.get("error") or f"HTTP_{status_code}"
+                    try:
+                        if isinstance(data, dict) and data.get("code"):
+                            result.error = f"{result.error} | code={data.get('code')}"
+                    except Exception:
+                        pass
+                    if status_code:
+                        result.error = f"HTTP_{status_code}: {result.error}"
+                    if prefix:
+                        result.error = f"{result.error} | resp_prefix={prefix[:160]}"
+                    logger.warning(f"POST /v1/betslips/ falhou: {result.error}")
+                    return result
+
+                # === 1b. Identifica betslip_id ===
+                resp_data = data or {}
+                betslip_id = _find_betslip_id(resp_data)
+                betslip_id_source = "resp" if betslip_id else ""
+
+                if not betslip_id:
+                    wait_start = time.time()
+                    while time.time() - wait_start < float(self.BETSLIP_ID_TIMEOUT):
+                        try:
+                            bids = list(self._betslip_info.keys())
+                        except Exception:
+                            bids = []
+                        for bid in reversed(bids):
+                            if bid in pre_betslip_ids:
+                                continue
+                            info = self._betslip_info.get(bid) or {}
+                            try:
+                                if info.get("event_id") == event_id:
+                                    betslip_id = bid
+                                    betslip_id_source = "ws"
+                                    break
+                            except Exception:
+                                continue
+                        if betslip_id:
                             break
-                    if betslip_id:
+                        await asyncio.sleep(0.05)
+
+                if not betslip_id:
+                    # fallback conservador: último betslip "novo" (após o POST)
+                    try:
+                        for bid in reversed(list(self._betslip_info.keys())):
+                            if bid in pre_betslip_ids:
+                                continue
+                            betslip_id = bid
+                            betslip_id_source = "fallback_new"
+                            logger.debug(f"Usando betslip_id recém-criado (fallback_new): {betslip_id}")
+                            break
+                    except Exception:
+                        pass
+
+                if not betslip_id:
+                    keys = list(resp_data.keys()) if isinstance(resp_data, dict) else []
+                    result.error = (
+                        f"No betslip_id received after {float(self.BETSLIP_ID_TIMEOUT):.0f}s "
+                        f"(status=200 keys={keys}, has_session={result.has_session_token})"
+                    )
+                    return result
+
+                result.betslip_id = betslip_id
+                result.betslip_id_source = betslip_id_source or "-"
+                self._touch(betslip_id)
+                self._gc()
+
+                if betslip_id not in self._pmm_messages:
+                    self._pmm_messages[betslip_id] = []
+
+                # === 2. Espera PMMs via WS ===
+                last_pmm_time = time.time()
+                start_wait = time.time()
+                last_count = 0
+
+                while True:
+                    elapsed = time.time() - start_wait
+                    current_count = len(self._pmm_messages.get(betslip_id, []))
+                    if current_count > last_count:
+                        last_pmm_time = time.time()
+                        last_count = current_count
+                    if elapsed > self.PMM_TIMEOUT:
                         break
+                    if current_count > 0 and elapsed > self.PMM_MIN_WAIT:
+                        idle = time.time() - last_pmm_time
+                        if idle > self.PMM_IDLE_TIMEOUT:
+                            break
                     await asyncio.sleep(0.05)
-            
-            if not betslip_id:
-                # Último fallback: pega o betslip_id mais recente (qualquer evento)
-                # Os PMMs podem já estar chegando
-                if self._betslip_info:
-                    betslip_id = list(self._betslip_info.keys())[-1]
-                    betslip_id_source = "fallback_last"
-                    logger.debug(f"Usando último betslip_id: {betslip_id}")
-            
-            if not betslip_id:
-                keys = list(resp_data.keys()) if isinstance(resp_data, dict) else []
-                result.error = f'No betslip_id received after {float(self.BETSLIP_ID_TIMEOUT):.0f}s (status=200 keys={keys}, has_session={result.has_session_token})'
-                return result
-            
-            result.betslip_id = betslip_id
-            result.betslip_id_source = betslip_id_source or "-"
-            
-            # Inicializa lista de PMMs se não existe
-            if betslip_id not in self._pmm_messages:
-                self._pmm_messages[betslip_id] = []
-            
-            # === 2. Espera PMMs chegarem via WebSocket ===
-            last_pmm_time = time.time()
-            start_wait = time.time()
-            last_count = 0
-            
-            while True:
-                elapsed = time.time() - start_wait
-                current_count = len(self._pmm_messages.get(betslip_id, []))
-                
-                # Novo PMM chegou? Reseta idle timer
-                if current_count > last_count:
-                    last_pmm_time = time.time()
-                    last_count = current_count
-                
-                # Timeout total
-                if elapsed > self.PMM_TIMEOUT:
-                    break
-                
-                # Se já tem PMMs e ficou idle por PMM_IDLE_TIMEOUT
-                if current_count > 0 and elapsed > self.PMM_MIN_WAIT:
-                    idle = time.time() - last_pmm_time
-                    if idle > self.PMM_IDLE_TIMEOUT:
-                        break
-                
-                await asyncio.sleep(0.05)  # 50ms polling
-            
-            # === 3. Processa PMMs ===
-            pmm_list = self._pmm_messages.get(betslip_id, [])
-            try:
-                result.pmm_wait_s = float(time.time() - start_wait)
-            except Exception:
-                result.pmm_wait_s = 0.0
-            try:
-                result.pmm_count = int(len(pmm_list or []))
-            except Exception:
-                result.pmm_count = 0
-            try:
-                result.ws_msg_count = int(self._ws_msg_count)
-            except Exception:
-                result.ws_msg_count = 0
-            try:
-                if float(self._last_ws_ts) > 0:
-                    result.ws_age_ms = int(round((time.time() - float(self._last_ws_ts)) * 1000.0))
-            except Exception:
-                result.ws_age_ms = None
-            
-            if not pmm_list:
-                result.error = f'No PMMs received (waited {time.time() - start_wait:.1f}s)'
+
+                pmm_list = self._pmm_messages.get(betslip_id, [])
+                try:
+                    result.pmm_wait_s = float(time.time() - start_wait)
+                except Exception:
+                    result.pmm_wait_s = 0.0
+                try:
+                    result.pmm_count = int(len(pmm_list or []))
+                except Exception:
+                    result.pmm_count = 0
+                try:
+                    result.ws_msg_count = int(self._ws_msg_count)
+                except Exception:
+                    result.ws_msg_count = 0
+                try:
+                    if float(self._last_ws_ts) > 0:
+                        result.ws_age_ms = int(round((time.time() - float(self._last_ws_ts)) * 1000.0))
+                except Exception:
+                    result.ws_age_ms = None
+
+                if not pmm_list:
+                    result.error = f"No PMMs received (waited {time.time() - start_wait:.1f}s)"
+                    result.total_time_ms = int((time.time() - t0) * 1000)
+                    try:
+                        if self._close_on_fail and betslip_id:
+                            await self.close_betslip(betslip_id)
+                    except Exception:
+                        pass
+                    return result
+
+                # === 3. Processa PMMs ===
+                bookie_latest: Dict[str, dict] = {}
+                for pmm in pmm_list:
+                    bookie = pmm.get("bookie", "")
+                    if not bookie:
+                        continue
+                    key = f"{bookie}_{pmm.get('username', '')}"
+                    bookie_latest[key] = pmm
+
+                for _key, pmm in bookie_latest.items():
+                    bookie = pmm.get("bookie", "")
+                    status = pmm.get("status", {})
+                    if status.get("code") != "success":
+                        continue
+                    price_list = pmm.get("price_list", [])
+                    if not price_list:
+                        continue
+                    first_tier = price_list[0]
+                    effective = first_tier.get("effective", {})
+                    price = effective.get("price", 0)
+                    max_stake_data = effective.get("max", [])
+                    if not price or price <= 0:
+                        continue
+
+                    max_stake = 0.0
+                    currency = "GBP"
+                    if isinstance(max_stake_data, list) and len(max_stake_data) >= 2:
+                        currency = max_stake_data[0]
+                        max_stake = float(max_stake_data[1])
+
+                    all_prices = []
+                    for tier in price_list:
+                        eff = tier.get("effective", {})
+                        p = eff.get("price", 0)
+                        m = eff.get("max", [])
+                        mx = float(m[1]) if isinstance(m, list) and len(m) >= 2 else 0.0
+                        all_prices.append({"price": p, "max_stake": mx})
+
+                    result.bookmakers.append(
+                        BookmakerPrice(
+                            bookie=bookie,
+                            best_price=float(price),
+                            max_stake=float(max_stake),
+                            currency=str(currency or "GBP"),
+                            num_tiers=len(price_list),
+                            all_prices=all_prices,
+                        )
+                    )
+
+                result.bookmakers.sort(key=lambda b: b.best_price, reverse=True)
+                result.num_bookmakers = len(result.bookmakers)
+
+                if result.bookmakers:
+                    best = result.bookmakers[0]
+                    result.best_odd = best.best_price
+                    result.best_bookie = best.bookie
+                    result.best_limit = best.max_stake
+                    if len(result.bookmakers) > 1:
+                        second = result.bookmakers[1]
+                        result.second_odd = second.best_price
+                        result.second_bookie = second.bookie
+                    by_limit = sorted(result.bookmakers, key=lambda b: b.max_stake, reverse=True)
+                    result.highest_limit = by_limit[0].max_stake
+                    result.highest_limit_bookie = by_limit[0].bookie
+                    result.highest_limit_odd = by_limit[0].best_price
+                    result.success = True
+
                 result.total_time_ms = int((time.time() - t0) * 1000)
                 return result
-            
-            # Agrupa por bookmaker (pega o mais recente de cada)
-            bookie_latest: Dict[str, dict] = {}
-            for pmm in pmm_list:
-                bookie = pmm.get('bookie', '')
-                if not bookie:
-                    continue
-                # Chave: bookie + username (mesmo bookie pode ter múltiplas contas)
-                key = f"{bookie}_{pmm.get('username', '')}"
-                bookie_latest[key] = pmm
-            
-            # Extrai odds e limites
-            for key, pmm in bookie_latest.items():
-                bookie = pmm.get('bookie', '')
-                status = pmm.get('status', {})
-                
-                if status.get('code') != 'success':
-                    continue
-                
-                price_list = pmm.get('price_list', [])
-                if not price_list:
-                    continue
-                
-                # Primeiro tier = melhor preço
-                first_tier = price_list[0]
-                effective = first_tier.get('effective', {})
-                price = effective.get('price', 0)
-                max_stake_data = effective.get('max', [])
-                
-                if not price or price <= 0:
-                    continue
-                
-                # Extrai limite (formato: ["GBP", 14717.49])
-                max_stake = 0
-                currency = "GBP"
-                if isinstance(max_stake_data, list) and len(max_stake_data) >= 2:
-                    currency = max_stake_data[0]
-                    max_stake = float(max_stake_data[1])
-                
-                # Todos os tiers
-                all_prices = []
-                for tier in price_list:
-                    eff = tier.get('effective', {})
-                    p = eff.get('price', 0)
-                    m = eff.get('max', [])
-                    mx = float(m[1]) if isinstance(m, list) and len(m) >= 2 else 0
-                    all_prices.append({'price': p, 'max_stake': mx})
-                
-                bk = BookmakerPrice(
-                    bookie=bookie,
-                    best_price=price,
-                    max_stake=max_stake,
-                    currency=currency,
-                    num_tiers=len(price_list),
-                    all_prices=all_prices,
-                )
-                result.bookmakers.append(bk)
-            
-            # Ordena por preço (melhor primeiro)
-            result.bookmakers.sort(key=lambda b: b.best_price, reverse=True)
-            result.num_bookmakers = len(result.bookmakers)
-            
-            if result.bookmakers:
-                best = result.bookmakers[0]
-                result.best_odd = best.best_price
-                result.best_bookie = best.bookie
-                result.best_limit = best.max_stake
-                
-                if len(result.bookmakers) > 1:
-                    second = result.bookmakers[1]
-                    result.second_odd = second.best_price
-                    result.second_bookie = second.bookie
-                
-                # Maior limite
-                by_limit = sorted(result.bookmakers, key=lambda b: b.max_stake, reverse=True)
-                result.highest_limit = by_limit[0].max_stake
-                result.highest_limit_bookie = by_limit[0].bookie
-                result.highest_limit_odd = by_limit[0].best_price
-                
-                result.success = True
-            
-            result.total_time_ms = int((time.time() - t0) * 1000)
-            
-            # Cleanup
-            if betslip_id in self._pmm_messages:
-                del self._pmm_messages[betslip_id]
-            if betslip_id in self._betslip_info:
-                del self._betslip_info[betslip_id]
-            
-            return result
-            
-        except Exception as e:
-            result.error = str(e)
-            result.total_time_ms = int((time.time() - t0) * 1000)
-            logger.error(f"ApiBetslipClient erro: {e}")
-            return result
+            except Exception as e:
+                result.error = str(e)
+                try:
+                    result.total_time_ms = int((time.time() - t0) * 1000)
+                except Exception:
+                    result.total_time_ms = 0
+                logger.error(f"ApiBetslipClient erro: {e}")
+                return result
+            finally:
+                try:
+                    if betslip_id:
+                        self._cleanup_betslip(betslip_id)
+                except Exception:
+                    pass
+                try:
+                    self._gc()
+                except Exception:
+                    pass
+
+        if self._serialize:
+            async with self._lock:
+                return await _impl()
+        return await _impl()
     
     async def refresh_betslip(self, betslip_id: str) -> BetslipApiResult:
         """Atualiza odds de um betslip existente sem criar novo."""
@@ -1096,25 +1210,26 @@ class ApiBetslipClient:
             except Exception:
                 return None
 
-        def _ah_code_quarters(*, side: str, line: str) -> str:
+        def _ah_code(*, line: str) -> str:
             """
-            A API /v1/betslips/ usa a linha em 'quarters' (int),
-            representando o handicap do HOME.
-              - home: code = round(line * 4)
-              - away: code = round((-line) * 4)   (inverte para home-handicap)
-            Ex.: away +0.75 => home -0.75 => -3  (capturado no place/confirm)
+            Convenção usada no WS/PMM do BetinAsia: a linha de AH no bet_type é a *linha textual*
+            (ex.: -1, -0.75, 0, +1), não uma codificação em "quarters".
             """
             v = _parse_ah_line_to_float(line)
             if v is None:
                 return str(line)
-            home_handicap = float(v) if str(side) == "home" else -float(v)
-            code = int(round(home_handicap * 4.0))
-            return str(code)
+            # normaliza: evita "-0.0"
+            if abs(float(v)) < 1e-12:
+                v = 0.0
+            # mantém precisão típica de quartos
+            if abs(float(v) * 4.0 - round(float(v) * 4.0)) < 1e-9:
+                return str(float(round(float(v) * 4.0)) / 4.0).rstrip("0").rstrip(".") if float(v) % 1 else str(int(float(v)))
+            return str(v)
 
         if market_type == "AH":
             h_or_a = "h" if side == "home" else "a"
             if line is not None:
-                return f"for,ah,{h_or_a},{_ah_code_quarters(side=side, line=line)}"
+                return f"for,ah,{h_or_a},{_ah_code(line=line)}"
             else:
                 return f"for,{h_or_a}"
         elif market_type == "OU":
@@ -1139,7 +1254,6 @@ class ApiBetslipClient:
         if market_type == "AH":
             h_or_a = "h" if side == "home" else "a"
             if line is not None:
-                # mesma codificação de quarters do build_bet_type
                 v = str(ApiBetslipClient.build_bet_type("AH", side, line)).split(",")[-1]
                 return f"against,ah,{h_or_a},{v}"
             else:
