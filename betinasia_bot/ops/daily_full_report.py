@@ -262,7 +262,34 @@ def _md_table_header_cols(table_md: str) -> list[str]:
             return cols
     except Exception:
         return []
-    return []
+
+
+def _parse_md_number(x: Any) -> Optional[float]:
+    """
+    Parser robusto para números vindos de Markdown (OOS / tabelas no PDF):
+    - aceita en-US (1,234.56) e pt-BR (1.234,56)
+    - preserva decimais
+    - aceita percentuais ("49.54%")
+    """
+    try:
+        t = str(x or "").strip().replace("−", "-")
+        if not t:
+            return None
+        t = t.replace("%", "").strip()
+        t = t.replace(" ", "")
+        if "." in t and "," in t:
+            # decide separador decimal pelo último
+            if t.rfind(".") > t.rfind(","):
+                t = t.replace(",", "")
+            else:
+                t = t.replace(".", "").replace(",", ".")
+        else:
+            if "," in t and "." not in t:
+                t = t.replace(",", ".")
+        return float(t)
+    except Exception:
+        return None
+    return None
 
 def _tail_lines(path: Path, n: int) -> list[str]:
     try:
@@ -1610,9 +1637,32 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     idx = {c: i for i, c in enumerate(hdr)}
 
                     def _f(x: str) -> Optional[float]:
+                        """
+                        Parse numérico robusto vindo de Markdown (OOS):
+                        - Aceita formatos en-US (1,234.56) e pt-BR (1.234,56)
+                        - Preserva decimais (não faz replace('.') indiscriminado)
+                        - Aceita percentuais ("49.54%")
+                        """
                         try:
-                            t = str(x).strip().replace(".", "").replace(",", ".")
-                            t = t.replace("%", "")
+                            t = str(x or "").strip().replace("−", "-")
+                            if not t:
+                                return None
+                            t = t.replace("%", "").strip()
+                            # remove espaços e símbolos comuns
+                            t = t.replace(" ", "")
+                            # Se contém ambos '.' e ',', inferimos qual é o separador decimal pelo último.
+                            if "." in t and "," in t:
+                                if t.rfind(".") > t.rfind(","):
+                                    # en-US: ',' milhar, '.' decimal
+                                    t = t.replace(",", "")
+                                else:
+                                    # pt-BR: '.' milhar, ',' decimal
+                                    t = t.replace(".", "").replace(",", ".")
+                            else:
+                                # Apenas ',' => assume decimal pt-BR
+                                if "," in t and "." not in t:
+                                    t = t.replace(",", ".")
+                                # Apenas '.' => já é decimal en-US (mantém)
                             return float(t)
                         except Exception:
                             return None
@@ -1683,12 +1733,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             if len(cols) < 6 or cols[0].lower().startswith("banca"):
                                 continue
                             def _f2(s: str) -> Optional[float]:
-                                try:
-                                    t = str(s).strip().replace(".", "").replace(",", ".")
-                                    t = t.replace("%", "")
-                                    return float(t)
-                                except Exception:
-                                    return None
+                                # reusa o parser robusto acima (mesma semântica)
+                                return _f(s)
                             bank = _f2(cols[0])
                             turn = _f2(cols[1])
                             prof = _f2(cols[2])
@@ -2720,19 +2766,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         cols = [c.strip() for c in ln.strip().strip("|").split("|")]
                         if len(cols) < 6 or cols[0].lower().startswith("banca"):
                             continue
-                        def _f(s: str) -> Optional[float]:
-                            try:
-                                t = str(s).strip().replace(".", "").replace(",", ".")
-                                t = t.replace("%", "")
-                                return float(t)
-                            except Exception:
-                                return None
-                        bank_ref = _f(cols[0])
-                        turn_30 = _f(cols[1])
-                        prof_30 = _f(cols[2])
-                        bank_eff = _f(cols[3])
-                        roi_bank = _f(cols[4])
-                        dd_p95 = _f(cols[5])
+                        bank_ref = _parse_md_number(cols[0])
+                        turn_30 = _parse_md_number(cols[1])
+                        prof_30 = _parse_md_number(cols[2])
+                        bank_eff = _parse_md_number(cols[3])
+                        roi_bank = _parse_md_number(cols[4])
+                        dd_p95 = _parse_md_number(cols[5])
                         if prof_30 is None:
                             continue
                         if best is None or float(prof_30) > float(best["profit_30d_exp"]):

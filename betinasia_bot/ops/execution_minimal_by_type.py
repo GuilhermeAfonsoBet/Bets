@@ -143,16 +143,17 @@ def _mult_back_from_scores(line: Any, side: str, hs: Any, aws: Any) -> Optional[
             adjusted = -goal_diff - home_handicap
         else:
             return None
-        if adjusted > 0.5:
+        # Quarter-lines (0.25/0.75) são comuns em AH. O limiar correto é 0.25:
+        # > 0.25 => win; == 0.25 => half-win; == 0 => push; == -0.25 => half-loss; < -0.25 => loss.
+        if adjusted > 0.25:
             return 1.0
-        if adjusted == 0.5:
+        if adjusted == 0.25:
             return 0.5
         if adjusted == 0.0:
             return 0.0
-        if adjusted == -0.5:
+        if adjusted == -0.25:
             return -0.5
-        if adjusted < -0.5:
-            return -1.0
+        return -1.0
     except Exception:
         return None
     return None
