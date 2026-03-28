@@ -638,6 +638,24 @@ async def run_report(
             start_day = end_day
     else:
         start_day = end_day - timedelta(days=max(0, int(days) - 1))
+
+    # Range efetivo para análises de slippage×ROI quando há corte pós-fix.
+    # Mantemos `range` como janela base (usada para iterar per_day), mas expomos um
+    # range semântico para slippage (que pode ser diferente quando `slip_cf_start_day` é definido).
+    slip_start_day = start_day
+    if cf_start_day is not None:
+        try:
+            slip_start_day = max(start_day, cf_start_day)
+        except Exception:
+            slip_start_day = start_day
+    try:
+        base_span_days = int((end_day - start_day).days) + 1
+    except Exception:
+        base_span_days = None
+    try:
+        slip_span_days = int((end_day - slip_start_day).days) + 1
+    except Exception:
+        slip_span_days = None
     db = Database()
     await db.connect()
 
@@ -1341,7 +1359,20 @@ async def run_report(
         "tz": tz_name,
         "policy_json": str(policy_json),
         "executor_jsonl": str(executor_jsonl),
-        "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
+        "range": {
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "days": int(days),
+            "include_today": bool(include_today),
+            # Clarifica a diferença entre "days (arg)" e a duração real do span.
+            "span_days": base_span_days,
+        },
+        "slippage_range": {
+            "start_day": slip_start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "span_days": slip_span_days,
+            "cut_start_day_local": cf_start_day.isoformat() if cf_start_day else None,
+        },
         "policy_days": active_by_day,
         "per_day": per_day,
         "observed_ah_line_abs": ah_obs,

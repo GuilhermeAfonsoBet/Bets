@@ -2809,9 +2809,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             raw_total = adh_slip.get("slippage_vs_roi_raw_total") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_total"), dict)) else {}
             if isinstance(raw_total, dict) and raw_total:
                 try:
-                    rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                    rg = adh_slip.get("slippage_range", None) if isinstance(adh_slip, dict) else None
+                    if not isinstance(rg, dict) or not rg:
+                        rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                    slip_cut = (adh_slip.get("slippage_start_day_local") if isinstance(adh_slip, dict) else None) or None
                     extra.append(
-                        f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`)**\n\n"
+                        f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`; cut=`{slip_cut}`)**\n\n"
                     )
                 except Exception:
                     extra.append("**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado**\n\n")
