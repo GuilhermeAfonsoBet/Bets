@@ -47,10 +47,15 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
 
     since = _utcnow() - timedelta(hours=float(cfg.hours))
 
+    # Alguns pipelines gravam `audit_version` só no JSON (hypothesis_details->>'audit_version'),
+    # não na coluna betslip_audit_results.audit_version. Para KPIs operacionais isso é crítico:
+    # se usarmos apenas a coluna, o reporte pode “sumir” versões inteiras (ex.: back) e virar 0/—.
+    ver_expr = "COALESCE(audit_version, hypothesis_details->>'audit_version')"
+
     q = text(
-        """
+        f"""
         SELECT
-          audit_version,
+          {ver_expr} AS audit_version,
           status,
           COUNT(*)::bigint AS n,
           SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END)::bigint AS n_ok,
@@ -75,9 +80,9 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
 
     # Diagnóstico dos OK por versão: buckets de |difference_pct| para explicar queda OK_with_bs -> OK_valid
     q_okdiff = text(
-        """
+        f"""
         SELECT
-          audit_version,
+          {ver_expr} AS audit_version,
           SUM(CASE WHEN status='OK' AND difference_pct IS NULL THEN 1 ELSE 0 END)::bigint AS ok_diff_null,
           SUM(CASE WHEN status='OK' AND difference_pct IS NOT NULL AND abs(difference_pct) < 2.0 THEN 1 ELSE 0 END)::bigint AS ok_absdiff_lt2,
           SUM(CASE WHEN status='OK' AND difference_pct IS NOT NULL AND abs(difference_pct) >= 2.0 AND abs(difference_pct) <= 10.0 THEN 1 ELSE 0 END)::bigint AS ok_absdiff_2_10,
@@ -98,9 +103,9 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
 
     # Top erros (api_error) por versão/status para entender "por que não-OK"
     q_err = text(
-        """
+        f"""
         SELECT
-          audit_version,
+          {ver_expr} AS audit_version,
           status,
           COALESCE(hypothesis_details->>'api_error', '') AS api_error,
           COUNT(*)::bigint AS n
@@ -136,16 +141,30 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
     pmm_tot = {"pmm_consults": 0, "no_pmms": 0, "no_pmms_rate_pct": None, "error": None}
     try:
         q_pmm = text(
-            """
+            f"""
             SELECT
-              audit_version,
+              {ver_expr} AS audit_version,
               COUNT(*) FILTER (
                 WHERE (hypothesis_details::jsonb ? 'telemetry')
-                  AND ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+                  AND (
+                    ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'back_total_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_total_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'back_post_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_post_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'post_ms')
+                  )
               )::bigint AS pmm_consults,
               COUNT(*) FILTER (
                 WHERE (hypothesis_details::jsonb ? 'telemetry')
-                  AND ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+                  AND (
+                    ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'back_total_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_total_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'back_post_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_post_ms')
+                    OR ((hypothesis_details::jsonb->'telemetry') ? 'post_ms')
+                  )
                   AND COALESCE(hypothesis_details->>'api_error', '') ILIKE '%No PMMs received%'
               )::bigint AS no_pmms
             FROM betslip_audit_results
