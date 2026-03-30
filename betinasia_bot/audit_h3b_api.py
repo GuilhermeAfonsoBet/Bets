@@ -1340,8 +1340,12 @@ class H3bApiAudit:
         # Versionamento: evita misturar "api back-only" com o legado v4.0-api.
         if self.api_sides == "back":
             base["audit_version"] = "v5.2-api-back"
+            # Hint para o bridge/analytics não misturar Back vs Lay.
+            # (No modo API, o lado de execução é conhecido pelo serviço.)
+            base["exec_side_hint"] = "Back"
         elif self.api_sides == "lay":
             base["audit_version"] = "v5.2-api-lay"
+            base["exec_side_hint"] = "Lay"
         else:
             base["audit_version"] = "v4.0-api"
 
@@ -2466,6 +2470,12 @@ class H3bApiAudit:
             telemetry = r.get('telemetry') or {}
 
             hypothesis_details = {}
+            # Replicar audit_version no JSON para facilitar diagnósticos manuais via SQL (hypothesis_details->>'audit_version')
+            # sem depender da coluna `audit_version` (há pipelines/históricos em que só um dos dois foi usado).
+            try:
+                hypothesis_details["audit_version"] = str(r.get("audit_version") or "v4.0-api")
+            except Exception:
+                pass
             if r.get('direction') is not None:
                 hypothesis_details['direction'] = r.get('direction')
             if r.get('lay_odd') is not None:
@@ -2490,6 +2500,16 @@ class H3bApiAudit:
             # Hint para o bridge não misturar Back vs Lay
             if r.get('exec_side_hint'):
                 hypothesis_details['exec_side_hint'] = str(r.get('exec_side_hint'))
+            else:
+                # Fallback: inferir pelo audit_version (útil para linhas antigas onde o hint não era preenchido).
+                try:
+                    ver = str(r.get("audit_version") or "")
+                    if ver and ("-back" in ver or "gate-back" in ver):
+                        hypothesis_details["exec_side_hint"] = "Back"
+                    elif ver and ("-lay" in ver or "reversal-lay" in ver or "gate-lay" in ver):
+                        hypothesis_details["exec_side_hint"] = "Lay"
+                except Exception:
+                    pass
             # Sempre persistir causa de falha: alguns caminhos retornam status=API_FAILED mas `error=''`.
             # Nesses casos, usamos fallbacks da telemetria (back_error/lay_error) para não deixar falhas "mudas".
             if not r.get('success'):
