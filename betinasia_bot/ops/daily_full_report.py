@@ -2065,9 +2065,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             )
         if isinstance(raw_total, dict) and raw_total:
             try:
-                rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                # Para slippage×ROI, respeitamos o range semântico (pós-fix) quando disponível.
+                rg = adh_slip.get("slippage_range", None) if isinstance(adh_slip, dict) else None
+                if not isinstance(rg, dict) or not rg:
+                    rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                span = rg.get("span_days") if isinstance(rg, dict) else None
                 s1.append(
-                    f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`)**\n\n"
+                    f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; span_days=`{int(span or 0)}`)**\n\n"
                 )
             except Exception:
                 s1.append("**Slippage × ROI por bucket (raw, com sinal) — acumulado**\n\n")
@@ -2812,9 +2816,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     rg = adh_slip.get("slippage_range", None) if isinstance(adh_slip, dict) else None
                     if not isinstance(rg, dict) or not rg:
                         rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
+                    span = rg.get("span_days") if isinstance(rg, dict) else None
                     slip_cut = (adh_slip.get("slippage_start_day_local") if isinstance(adh_slip, dict) else None) or None
                     extra.append(
-                        f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; days=`{int(rg.get('days') or 0)}`; cut=`{slip_cut}`)**\n\n"
+                        f"**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; span_days=`{int(span or 0)}`; cut=`{slip_cut}`)**\n\n"
                     )
                 except Exception:
                     extra.append("**Slippage × ROI (raw, com sinal; 3 buckets) — acumulado**\n\n")
