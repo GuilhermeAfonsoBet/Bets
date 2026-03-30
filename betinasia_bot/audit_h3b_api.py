@@ -781,6 +781,25 @@ class H3bApiAudit:
             except:
                 pass
             logger.info("Banco conectado")
+            try:
+                await self._emit_runtime_event(
+                    kind="START_OK",
+                    level="INFO",
+                    message="started",
+                    meta={
+                        "ws_msg_count": int(self._ws_msg_count or 0),
+                        "ws_messages_max": int(self._ws_messages_max or 0),
+                        "executor_workers": int(self.executor_workers),
+                        "temporal_workers": int(self.temporal_workers),
+                        "max_queue_depth": int(self.max_queue_depth),
+                        "max_queue_wait_ms": int(self.max_queue_wait_ms),
+                    },
+                    # evita spam em caso de retries/health flapping
+                    min_interval_sec=600.0,
+                    try_db=True,
+                )
+            except Exception:
+                pass
 
         return True
 
