@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import time
+import gc
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple, Any
@@ -43,6 +44,7 @@ MAX_AH_LINE = 10.0  # Amplo: captura todas as linhas relevantes
 WS_HEALTH_INTERVAL = 15
 WS_RELOAD_INTERVAL = 120
 STATS_INTERVAL = 50
+RUNTIME_EVENTS_TABLE = "bot_runtime_events"
 
 
 class H3bApiAudit:
@@ -112,6 +114,8 @@ class H3bApiAudit:
         self.consecutive_errors: int = 0
         self.running = True
         self.telemetry_file = "logs/audit_api_telemetry.jsonl"
+        self.runtime_events_file = "logs/audit_runtime_events.jsonl"
+        self._runtime_last_emit: Dict[str, float] = {}
         self.max_queue_depth_observed = 0
         self._queue_ref: Optional[asyncio.Queue] = None
         self.max_temporal_queue_depth_observed = 0
@@ -198,6 +202,124 @@ class H3bApiAudit:
             "FINANCE_FX_BRL", 5.20
         )
         self.finance_base_currency = os.getenv("FINANCE_BASE_CURRENCY", "USD")
+
+    @staticmethod
+    def _rss_mib() -> Optional[float]:
+        """
+        RSS aproximado do processo (MiB). Usado para restart limpo antes do OOM killer.
+        """
+        try:
+            # Linux: /proc/self/status contém "VmRSS:   123456 kB"
+            with open("/proc/self/status", "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    if ln.startswith("VmRSS:"):
+                        parts = ln.split()
+                        if len(parts) >= 2:
+                            kb = float(parts[1])
+                            return kb / 1024.0
+        except Exception:
+            return None
+        return None
+
+    async def _ensure_runtime_events_table(self, db: Database) -> None:
+        try:
+            async with db.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {RUNTIME_EVENTS_TABLE} (
+                          id SERIAL PRIMARY KEY,
+                          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                          component TEXT NOT NULL,
+                          kind TEXT NOT NULL,
+                          level TEXT NOT NULL,
+                          message TEXT NOT NULL,
+                          meta JSONB
+                        );
+                        """
+                    )
+                )
+                await conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{RUNTIME_EVENTS_TABLE}_created_at ON {RUNTIME_EVENTS_TABLE}(created_at);"))
+                await conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{RUNTIME_EVENTS_TABLE}_kind ON {RUNTIME_EVENTS_TABLE}(kind);"))
+        except Exception:
+            return
+
+    async def _emit_runtime_event(
+        self,
+        *,
+        kind: str,
+        level: str,
+        message: str,
+        meta: Optional[dict] = None,
+        min_interval_sec: float = 60.0,
+        try_db: bool = True,
+    ) -> None:
+        """
+        Evento operacional (observabilidade): sempre grava JSONL; opcionalmente também grava no DB.
+        Rate-limited por (kind, message) para evitar flood durante loops de retry.
+        """
+        try:
+            ksig = f"{str(kind)}|{str(message)}"
+            now = time.time()
+            last = float(self._runtime_last_emit.get(ksig, 0.0) or 0.0)
+            if last > 0 and (now - last) < float(min_interval_sec):
+                return
+            self._runtime_last_emit[ksig] = float(now)
+        except Exception:
+            pass
+
+        payload = {
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "component": "audit_h3b_api",
+            "kind": str(kind),
+            "level": str(level),
+            "message": str(message),
+            "meta": meta or {},
+            "mode": str(self.mode),
+            "api_sides": str(self.api_sides),
+            "pid": os.getpid(),
+        }
+        self._append_jsonl(self.runtime_events_file, payload)
+
+        if not try_db:
+            return
+
+        # DB: tenta usar conexão já aberta; se ainda não existe (ex.: falha no login),
+        # abre uma conexão curta (rate-limited acima).
+        try:
+            db = self.db
+            close_after = False
+            if db is None and self.save_to_db:
+                db = Database()
+                await db.connect()
+                close_after = True
+            if db is None:
+                return
+            await self._ensure_runtime_events_table(db)
+            async with db.async_session() as session:
+                await session.execute(
+                    text(
+                        f"""
+                        INSERT INTO {RUNTIME_EVENTS_TABLE} (component, kind, level, message, meta)
+                        VALUES (:component, :kind, :level, :message, (:meta)::jsonb)
+                        """
+                    ),
+                    {
+                        "component": "audit_h3b_api",
+                        "kind": str(kind),
+                        "level": str(level),
+                        "message": str(message),
+                        "meta": json.dumps(payload, ensure_ascii=False),
+                    },
+                )
+                await session.commit()
+            if close_after:
+                try:
+                    await db.close()
+                except Exception:
+                    pass
+        except Exception:
+            return
 
     @staticmethod
     def _parse_offsets(raw: str, *, default: List[float]) -> List[float]:
@@ -521,10 +643,31 @@ class H3bApiAudit:
 
         # Browser (necessário para WS e fetch autenticado)
         self.scraper = BetinAsiaScraper()
-        await self.scraper.start()
-        ok_login = await self.scraper.login()
+        try:
+            await self.scraper.start()
+        except Exception as e:
+            await self._emit_runtime_event(kind="START_BROWSER_FAIL", level="ERROR", message=str(e)[:220], meta={}, min_interval_sec=120.0)
+            raise
+        ok_login = False
+        try:
+            ok_login = await self.scraper.login()
+        except Exception as e:
+            await self._emit_runtime_event(kind="LOGIN_EXCEPTION", level="ERROR", message=str(e)[:220], meta={}, min_interval_sec=120.0)
+            ok_login = False
         if not ok_login:
             logger.error("Login falhou. Abortando (necessário para WS + endpoints /v1/betslips/ quando usado).")
+            try:
+                url = self.scraper._page.url if (self.scraper and getattr(self.scraper, "_page", None)) else ""
+            except Exception:
+                url = ""
+            await self._emit_runtime_event(
+                kind="LOGIN_FAIL",
+                level="ERROR",
+                message="login_failed",
+                meta={"url": url},
+                min_interval_sec=180.0,
+                try_db=True,
+            )
             try:
                 await self.scraper.close()
             except Exception:
@@ -536,6 +679,28 @@ class H3bApiAudit:
         # API client (usa o page do scraper)
         page = self.scraper._page
         self.api_client = ApiBetslipClient(page)
+
+        # Reduz carga/memória: bloqueia media/fonts (não necessário para WS + fetch).
+        try:
+            async def _route_handler(route, request):
+                try:
+                    rt = str(getattr(request, "resource_type", "") or "")
+                    if rt in ("image", "media", "font"):
+                        await route.abort()
+                        return
+                except Exception:
+                    pass
+                try:
+                    await route.continue_()
+                except Exception:
+                    try:
+                        await route.fallback()
+                    except Exception:
+                        pass
+
+            await page.route("**/*", _route_handler)
+        except Exception:
+            pass
 
         # WS listener único (para odds + PMM + betslip)
         def on_ws(ws):
@@ -588,11 +753,27 @@ class H3bApiAudit:
         await page.wait_for_timeout(5000)
         self._start_time = time.time()
         logger.info(f"WS: {self._ws_msg_count} msgs recebidas")
+        try:
+            if int(self._ws_msg_count or 0) <= 0:
+                await self._emit_runtime_event(
+                    kind="WS_NO_MESSAGES",
+                    level="WARN",
+                    message="ws_msg_count_zero_after_start",
+                    meta={},
+                    min_interval_sec=300.0,
+                    try_db=True,
+                )
+        except Exception:
+            pass
 
         # DB
         if self.save_to_db:
-            self.db = Database()
-            await self.db.connect()
+            try:
+                self.db = Database()
+                await self.db.connect()
+            except Exception as e:
+                await self._emit_runtime_event(kind="DB_CONNECT_FAIL", level="ERROR", message=str(e)[:220], meta={}, min_interval_sec=180.0, try_db=False)
+                raise
             try:
                 async with self.db.engine.begin() as conn:
                     await conn.execute(text(
@@ -612,9 +793,31 @@ class H3bApiAudit:
                 ok = await self.start()
             except Exception as e:
                 logger.error(f"Falha na inicialização: {e}")
+                try:
+                    await self._emit_runtime_event(
+                        kind="START_EXCEPTION",
+                        level="ERROR",
+                        message=str(e)[:220],
+                        meta={},
+                        min_interval_sec=120.0,
+                        try_db=True,
+                    )
+                except Exception:
+                    pass
                 ok = False
             if ok:
                 break
+            try:
+                await self._emit_runtime_event(
+                    kind="START_RETRY",
+                    level="WARN",
+                    message="start_failed_retrying",
+                    meta={"backoff_s": float(backoff_s)},
+                    min_interval_sec=120.0,
+                    try_db=True,
+                )
+            except Exception:
+                pass
             logger.warning(f"Start falhou (provável login/bloqueio). Re-tentando em {int(backoff_s)}s...")
             await asyncio.sleep(backoff_s)
             backoff_s = min(300.0, backoff_s * 1.5)
@@ -625,9 +828,8 @@ class H3bApiAudit:
         self._queue_ref = audit_queue
         temporal_queue = asyncio.Queue()
         self._temporal_queue_ref = temporal_queue
-        audited = set()
 
-        tasks = [asyncio.create_task(self._monitor_loop(audit_queue, audited))]
+        tasks = [asyncio.create_task(self._monitor_loop(audit_queue))]
         for wid in range(1, self.executor_workers + 1):
             tasks.append(asyncio.create_task(self._executor_loop(audit_queue, worker_id=wid)))
         for twid in range(1, self.temporal_workers + 1):
@@ -655,7 +857,7 @@ class H3bApiAudit:
     # ================================================================
     # MONITOR
     # ================================================================
-    async def _monitor_loop(self, queue: asyncio.Queue, audited: set):
+    async def _monitor_loop(self, queue: asyncio.Queue):
         logger.info("Monitor iniciado")
         last_seen = 0  # contador total já visto (aproximação quando usamos deque)
 
@@ -706,17 +908,13 @@ class H3bApiAudit:
                             if isinstance(msg_meta, list) and len(msg_meta) >= 3 and msg_meta[1] == 'fb':
                                 eid = msg_meta[2]
                                 if 'ah' in msg_data:
-                                    self._process_odds(eid, msg_data['ah'], 'AH', 'full_time',
-                                                       queue, audited)
+                                    self._process_odds(eid, msg_data['ah'], 'AH', 'full_time', queue)
                                 if 'ahou' in msg_data:
-                                    self._process_odds(eid, msg_data['ahou'], 'OU', 'full_time',
-                                                       queue, audited, over_under=True)
+                                    self._process_odds(eid, msg_data['ahou'], 'OU', 'full_time', queue, over_under=True)
                                 if 'ah_ht' in msg_data:
-                                    self._process_odds(eid, msg_data['ah_ht'], 'AH', 'half_time',
-                                                       queue, audited)
+                                    self._process_odds(eid, msg_data['ah_ht'], 'AH', 'half_time', queue)
                                 if 'ou_ht' in msg_data:
-                                    self._process_odds(eid, msg_data['ou_ht'], 'OU', 'half_time',
-                                                       queue, audited, over_under=True)
+                                    self._process_odds(eid, msg_data['ou_ht'], 'OU', 'half_time', queue, over_under=True)
                 except:
                     continue
 
@@ -724,8 +922,7 @@ class H3bApiAudit:
                 logger.info(f"Processados: {self.events_processed} | H3B: {self.h3b_detected} | "
                             f"Auditados: {len(self.results)} | WS: {self._ws_msg_count}")
 
-    def _process_odds(self, event_id, odds_data, market_type, period,
-                      queue, audited, over_under=False):
+    def _process_odds(self, event_id, odds_data, market_type, period, queue, over_under=False):
         lines = []
         if isinstance(odds_data, list) and len(odds_data) >= 2:
             if isinstance(odds_data[0], (int, float)):
@@ -809,8 +1006,6 @@ class H3bApiAudit:
                         continue
                 except Exception:
                     pass
-                if audit_key in audited:
-                    continue
 
                 is_live = kickoff <= datetime.now(timezone.utc) if kickoff else None
 
@@ -841,7 +1036,6 @@ class H3bApiAudit:
                     self.dropped_full_queue += 1
                     continue
                 self.max_queue_depth_observed = max(self.max_queue_depth_observed, queue.qsize())
-                audited.add(audit_key)
                 try:
                     self._audited_ts[audit_key] = float(time.time())
                 except Exception:
@@ -2650,17 +2844,97 @@ class H3bApiAudit:
                 f"H3B: {self.h3b_detected} | Erros: {self.total_errors} | "
                 f"ws_buf_drop={self._ws_messages_dropped}")
 
+            # Mitigação OOM: monitora RSS e força restart limpo antes do killer.
+            try:
+                thr = float(os.getenv("AUDIT_RSS_RESTART_MIB", "1500") or 1500.0)
+            except Exception:
+                thr = 1500.0
+            try:
+                rss = self._rss_mib()
+                if rss is not None and thr > 0 and float(rss) >= float(thr):
+                    await self._emit_runtime_event(
+                        kind="RSS_RESTART",
+                        level="ERROR",
+                        message=f"rss_mib={float(rss):.1f} >= thr={float(thr):.1f}",
+                        meta={},
+                        min_interval_sec=300.0,
+                        try_db=True,
+                    )
+                    await self.shutdown("rss_exceeded")
+                    return
+            except Exception:
+                pass
+
+            # GC leve dos caches (evita crescimento indefinido)
+            try:
+                # audited TTL cleanup
+                if self._audited_ttl_sec > 0 and self._audited_ts:
+                    cutoff = time.time() - float(self._audited_ttl_sec)
+                    if len(self._audited_ts) > 20000:
+                        self._audited_ts = {k: v for k, v in self._audited_ts.items() if float(v) >= cutoff}
+                # ws_odds_state TTL cleanup
+                ttl_state = float(os.getenv("AUDIT_WS_STATE_TTL_SEC", "3600") or 3600.0)
+                if ttl_state > 0 and self._ws_odds_state:
+                    cutoff2 = time.time() - ttl_state
+                    if len(self._ws_odds_state) > 200000:
+                        self._ws_odds_state = {k: v for k, v in self._ws_odds_state.items() if float(v.get("ts") or 0.0) >= cutoff2}
+                # events_info max cap (best-effort)
+                mx_events = int(float(os.getenv("AUDIT_EVENTS_INFO_MAX", "50000") or 50000))
+                if mx_events > 0 and len(self._events_info) > mx_events:
+                    # remove arbitrary oldest-ish keys by insertion order is not guaranteed; do a cheap trim
+                    for k in list(self._events_info.keys())[: max(1, len(self._events_info) - mx_events)]:
+                        try:
+                            self._events_info.pop(k, None)
+                        except Exception:
+                            pass
+                gc.collect()
+            except Exception:
+                pass
+
             if ws_age > WS_RELOAD_INTERVAL:
                 logger.warning("WS morto, recarregando...")
+                try:
+                    await self._emit_runtime_event(
+                        kind="WS_STALE_RELOAD",
+                        level="WARN",
+                        message=f"ws_age_s={float(ws_age):.0f}",
+                        meta={},
+                        min_interval_sec=300.0,
+                        try_db=True,
+                    )
+                except Exception:
+                    pass
                 try:
                     await self.scraper._page.reload()
                     await self.scraper._page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(3)
                 except Exception as e:
                     logger.error(f"Reload falhou: {e}")
+                    try:
+                        await self._emit_runtime_event(
+                            kind="WS_RELOAD_FAIL",
+                            level="ERROR",
+                            message=str(e)[:220],
+                            meta={},
+                            min_interval_sec=180.0,
+                            try_db=True,
+                        )
+                    except Exception:
+                        pass
                     self.consecutive_errors += 1
                     if self.consecutive_errors >= 10:
                         logger.error("10 erros consecutivos, parando")
+                        try:
+                            await self._emit_runtime_event(
+                                kind="FATAL_CONSECUTIVE_ERRORS",
+                                level="ERROR",
+                                message="consecutive_errors>=10",
+                                meta={},
+                                min_interval_sec=300.0,
+                                try_db=True,
+                            )
+                        except Exception:
+                            pass
                         self.running = False
 
     def _log_stats(self):
