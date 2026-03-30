@@ -1225,9 +1225,13 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 await asyncio.sleep(float(cfg.poll_sec))
                 continue
 
-            for row in rows:
-                src_id = int(row.get("id") or 0)
-                action = f"{cfg.mode}:{cfg.exec_side.value}"
+            # Processa apenas 1 candidato por ciclo para manter a semântica de `continue`
+            # (historicamente: pular para o próximo ciclo do while, não para o próximo item).
+            # Observação: `rows` já vem limitado por `max_per_cycle`.
+            row = rows[0]
+            src_id = int(row.get("id") or 0)
+            action = f"{cfg.mode}:{cfg.exec_side.value}"
+            skey = ""
             try:
                 wf = policy.get("wf") if (policy and isinstance(policy.get("wf"), dict)) else {}
                 if not isinstance(wf, dict):
@@ -1822,7 +1826,8 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 # Falhas de DB não devem consumir a oportunidade nem derrubar o bridge
                 if isinstance(e, (InterfaceError, OperationalError, DBAPIError)) and _is_db_disconnect_error(e):
                     try:
-                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                        if skey:
+                            await _unreserve_seen_key(db, src_key=skey, action=action)
                     except Exception:
                         pass
                     await _db_reconnect(db, why="row_processing_disconnect")
@@ -1833,7 +1838,8 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 is_transient = ("Connection refused" in msg) or ("Connection reset" in msg) or ("Cannot connect to unix socket" in msg)
                 if retry_transient and is_transient:
                     try:
-                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                        if skey:
+                            await _unreserve_seen_key(db, src_key=skey, action=action)
                     except Exception:
                         pass
                     await asyncio.sleep(float(os.getenv("BRIDGE_TRANSIENT_BACKOFF_SEC", "1.0")))
