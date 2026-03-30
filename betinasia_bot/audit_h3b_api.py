@@ -2783,13 +2783,13 @@ class H3bApiAudit:
                     # "Oportunidade válida" deve significar:
                     # - existe snapshot do ticket (bs_odd)
                     # - diferença BS vs WS está dentro de um range confiável (evita parse/mismatch)
-                    # - e há edge mínimo (compatível com buckets do relatório)
+                    # Observação: edge mínimo NÃO é exigido aqui (voltamos ao comportamento antigo).
+                    # O bloqueio de execução por qualidade (ex.: slippage) deve ser feito no executor.
                     dp = float(diff_pct) if (diff_pct is not None) else None
                     is_valid = bool(
                         has_bs
                         and (dp is not None)
                         and (-10.0 <= float(dp) <= 10.0)
-                        and (abs(float(dp)) >= 2.0)
                     )
                 except Exception:
                     is_valid = bool(has_bs)
