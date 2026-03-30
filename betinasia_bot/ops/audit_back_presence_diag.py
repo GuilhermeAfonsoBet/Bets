@@ -2,10 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from sqlalchemy import text
+try:
+    from sqlalchemy import text
+except ModuleNotFoundError as e:
+    # UX: comum rodar com /usr/bin/python3 em vez do venv (onde estão as deps).
+    msg = (
+        "Dependência ausente: 'sqlalchemy'.\n\n"
+        "Este script deve ser executado com o Python do venv do projeto.\n"
+        "Exemplo:\n"
+        "  cd /home/betbot/Bets/betinasia_bot\n"
+        "  ./venv/bin/python -m ops.audit_back_presence_diag --hours 6 --out /tmp/audit_back_diag.json\n"
+    )
+    sys.stderr.write(msg)
+    raise
 
 from storage.database import Database
 
