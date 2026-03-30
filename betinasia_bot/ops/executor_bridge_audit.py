@@ -825,10 +825,20 @@ async def _fetch_candidates(
     }
     if cfg.only_prematch:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
-    async with db.async_session() as session:
-        r = await session.execute(text(q), params)
-        rows = r.fetchall() or []
-        return [dict(x._mapping) for x in rows]
+    # Conexões DB podem cair em serviços long-running; fazemos 1 retry com reconnect.
+    for attempt in (1, 2):
+        try:
+            async with db.async_session() as session:
+                r = await session.execute(text(q), params)
+                rows = r.fetchall() or []
+                return [dict(x._mapping) for x in rows]
+        except (InterfaceError, OperationalError, DBAPIError) as e:
+            if _is_db_disconnect_error(e) and attempt == 1:
+                await _db_reconnect(db, why="fetch_candidates_disconnect_inner")
+                await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                continue
+            raise
+    return []
 
 
 async def _mark_seen(
@@ -1084,139 +1094,140 @@ async def run_bridge(cfg: BridgeConfig) -> int:
 
     while True:
         t0 = time.time()
-
-        # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
         try:
-            gc_every = float(os.getenv("BRIDGE_SEEN_KEY_GC_SEC", "300") or 300.0)
-        except Exception:
-            gc_every = 300.0
-        try:
-            ttl_sec = float(os.getenv("BRIDGE_SEEN_KEY_TTL_SEC", "3600") or 3600.0)
-        except Exception:
-            ttl_sec = 3600.0
-        try:
-            if gc_every > 0 and ttl_sec > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
-                seen_gc_last_check = time.time()
-                qgc = """
-                DELETE FROM executor_bridge_seen_keys
-                WHERE src_table='betslip_audit_results'
-                  AND action=:action
-                  AND execution_id IS NULL
-                  AND created_at < (now() - (:ttl_sec::double precision * interval '1 second'))
-                """
-                async with db.async_session() as session:
-                    await session.execute(text(qgc), {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)})
-                    await session.commit()
-        except (InterfaceError, OperationalError, DBAPIError) as e:
-            if _is_db_disconnect_error(e):
-                await _db_reconnect(db, why="seen_key_gc_disconnect")
-        except Exception:
-            pass
 
-        # reload policy (se configurado)
-        if cfg.policy_json and (time.time() - policy_last_check) >= float(cfg.policy_reload_sec):
-            policy_last_check = time.time()
+            # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
             try:
-                p = Path(cfg.policy_json)
-                mtime = p.stat().st_mtime if p.exists() else None
-                if mtime and (policy_mtime is None or float(mtime) > float(policy_mtime)):
-                    pol = _load_policy_json(cfg.policy_json)
-                    if pol:
-                        policy = pol
-                        policy_mtime = float(mtime)
-                        steps = pol.get("steps") if isinstance(pol.get("steps"), list) else []
-                        last = steps[-1] if steps else None
-                        if isinstance(last, dict):
-                            active_keys = set(last.get("active_keys") or [])
-                            active_keys_base = set(last.get("active_keys_base") or [])
-                            logger.info(
-                                f"[bridge] policy reloaded mtime={policy_mtime:.0f} "
-                                f"active_keys={len(active_keys)} active_base={len(active_keys_base)}"
-                            )
-                        try:
-                            wf = pol.get("wf") if isinstance(pol.get("wf"), dict) else {}
-                            if isinstance(wf, dict) and wf:
-                                logger.info(f"[bridge] wf filters: {_wf_filters_summary(cfg, wf)}")
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.warning(f"[bridge] policy reload failed: {e}")
-
-        # reload bankroll (se configurado)
-        if cfg.bankroll_json and (time.time() - bankroll_last_check) >= float(cfg.bankroll_reload_sec):
-            bankroll_last_check = time.time()
+                gc_every = float(os.getenv("BRIDGE_SEEN_KEY_GC_SEC", "300") or 300.0)
+            except Exception:
+                gc_every = 300.0
             try:
-                p = Path(cfg.bankroll_json)
-                mtime = p.stat().st_mtime if p.exists() else None
-                if mtime and (bankroll_mtime is None or float(mtime) > float(bankroll_mtime)):
-                    b = _load_bankroll_from_json(cfg.bankroll_json)
-                    if b is not None and b > 0:
-                        bankroll_ref = float(b)
-                        bankroll_mtime = float(mtime)
-                        logger.info(f"[bridge] bankroll reloaded mtime={bankroll_mtime:.0f} bankroll_ref={bankroll_ref:.2f}")
-            except Exception as e:
-                logger.warning(f"[bridge] bankroll reload failed: {e}")
-
-        # reload balance (guardrail) — separado do bankroll_ref
-        # Se BRIDGE_BALANCE_JSON não estiver setado, usamos BRIDGE_BANKROLL_JSON como fallback (compat).
-        balance_path = cfg.balance_json or cfg.bankroll_json
-        balance_reload = cfg.balance_reload_sec if cfg.balance_json else cfg.bankroll_reload_sec
-        if balance_path and (time.time() - balance_last_check) >= float(balance_reload):
-            balance_last_check = time.time()
+                ttl_sec = float(os.getenv("BRIDGE_SEEN_KEY_TTL_SEC", "3600") or 3600.0)
+            except Exception:
+                ttl_sec = 3600.0
             try:
-                p = Path(str(balance_path))
-                mtime = p.stat().st_mtime if p.exists() else None
-                if mtime and (balance_mtime is None or float(mtime) > float(balance_mtime)):
-                    b = _load_bankroll_from_json(str(balance_path))
-                    if b is not None and b >= 0:
-                        balance_current_json = float(b)
-                        balance_mtime = float(mtime)
-                        logger.info(
-                            f"[bridge] balance reloaded mtime={balance_mtime:.0f} balance_current≈{balance_current_json:.2f} "
-                            f"src={'balance_json' if cfg.balance_json else 'bankroll_json'}"
-                        )
-            except Exception as e:
-                logger.warning(f"[bridge] balance reload failed: {e}")
-
-        # reload risk params (overrides manuais)
-        if cfg.risk_params_json and (time.time() - risk_last_check) >= float(cfg.risk_params_reload_sec):
-            risk_last_check = time.time()
-            try:
-                p = Path(cfg.risk_params_json)
-                mtime = p.stat().st_mtime if p.exists() else None
-                if mtime and (risk_mtime is None or float(mtime) > float(risk_mtime)):
-                    rp = _load_risk_params_json(cfg.risk_params_json)
-                    if isinstance(rp, dict):
-                        risk_params = rp
-                        risk_mtime = float(mtime)
-                        logger.info(f"[bridge] risk_params reloaded mtime={risk_mtime:.0f} path={cfg.risk_params_json}")
-            except Exception as e:
-                logger.warning(f"[bridge] risk_params reload failed: {e}")
-
-        since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
-        try:
-            rows = await _fetch_candidates(db, since=since, cfg=cfg)
-        except (InterfaceError, OperationalError, DBAPIError) as e:
-            if _is_db_disconnect_error(e):
-                await _db_reconnect(db, why="fetch_candidates_disconnect")
-                await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
-                continue
-            raise
-        except Exception as e:
-            # qualquer erro inesperado no fetch não deve matar a operação
-            try:
-                logger.warning(f"[bridge] fetch_candidates failed: {str(e)[:240]}")
+                if gc_every > 0 and ttl_sec > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
+                    seen_gc_last_check = time.time()
+                    qgc = """
+                    DELETE FROM executor_bridge_seen_keys
+                    WHERE src_table='betslip_audit_results'
+                      AND action=:action
+                      AND execution_id IS NULL
+                      AND created_at < (now() - (:ttl_sec::double precision * interval '1 second'))
+                    """
+                    async with db.async_session() as session:
+                        await session.execute(text(qgc), {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)})
+                        await session.commit()
+            except (InterfaceError, OperationalError, DBAPIError) as e:
+                if _is_db_disconnect_error(e):
+                    await _db_reconnect(db, why="seen_key_gc_disconnect")
             except Exception:
                 pass
-            await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
-            continue
-        if not rows:
-            await asyncio.sleep(float(cfg.poll_sec))
-            continue
 
-        for row in rows:
-            src_id = int(row.get("id") or 0)
-            action = f"{cfg.mode}:{cfg.exec_side.value}"
+            # reload policy (se configurado)
+            if cfg.policy_json and (time.time() - policy_last_check) >= float(cfg.policy_reload_sec):
+                policy_last_check = time.time()
+                try:
+                    p = Path(cfg.policy_json)
+                    mtime = p.stat().st_mtime if p.exists() else None
+                    if mtime and (policy_mtime is None or float(mtime) > float(policy_mtime)):
+                        pol = _load_policy_json(cfg.policy_json)
+                        if pol:
+                            policy = pol
+                            policy_mtime = float(mtime)
+                            steps = pol.get("steps") if isinstance(pol.get("steps"), list) else []
+                            last = steps[-1] if steps else None
+                            if isinstance(last, dict):
+                                active_keys = set(last.get("active_keys") or [])
+                                active_keys_base = set(last.get("active_keys_base") or [])
+                                logger.info(
+                                    f"[bridge] policy reloaded mtime={policy_mtime:.0f} "
+                                    f"active_keys={len(active_keys)} active_base={len(active_keys_base)}"
+                                )
+                            try:
+                                wf = pol.get("wf") if isinstance(pol.get("wf"), dict) else {}
+                                if isinstance(wf, dict) and wf:
+                                    logger.info(f"[bridge] wf filters: {_wf_filters_summary(cfg, wf)}")
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"[bridge] policy reload failed: {e}")
+
+            # reload bankroll (se configurado)
+            if cfg.bankroll_json and (time.time() - bankroll_last_check) >= float(cfg.bankroll_reload_sec):
+                bankroll_last_check = time.time()
+                try:
+                    p = Path(cfg.bankroll_json)
+                    mtime = p.stat().st_mtime if p.exists() else None
+                    if mtime and (bankroll_mtime is None or float(mtime) > float(bankroll_mtime)):
+                        b = _load_bankroll_from_json(cfg.bankroll_json)
+                        if b is not None and b > 0:
+                            bankroll_ref = float(b)
+                            bankroll_mtime = float(mtime)
+                            logger.info(f"[bridge] bankroll reloaded mtime={bankroll_mtime:.0f} bankroll_ref={bankroll_ref:.2f}")
+                except Exception as e:
+                    logger.warning(f"[bridge] bankroll reload failed: {e}")
+
+            # reload balance (guardrail) — separado do bankroll_ref
+            # Se BRIDGE_BALANCE_JSON não estiver setado, usamos BRIDGE_BANKROLL_JSON como fallback (compat).
+            balance_path = cfg.balance_json or cfg.bankroll_json
+            balance_reload = cfg.balance_reload_sec if cfg.balance_json else cfg.bankroll_reload_sec
+            if balance_path and (time.time() - balance_last_check) >= float(balance_reload):
+                balance_last_check = time.time()
+                try:
+                    p = Path(str(balance_path))
+                    mtime = p.stat().st_mtime if p.exists() else None
+                    if mtime and (balance_mtime is None or float(mtime) > float(balance_mtime)):
+                        b = _load_bankroll_from_json(str(balance_path))
+                        if b is not None and b >= 0:
+                            balance_current_json = float(b)
+                            balance_mtime = float(mtime)
+                            logger.info(
+                                f"[bridge] balance reloaded mtime={balance_mtime:.0f} balance_current≈{balance_current_json:.2f} "
+                                f"src={'balance_json' if cfg.balance_json else 'bankroll_json'}"
+                            )
+                except Exception as e:
+                    logger.warning(f"[bridge] balance reload failed: {e}")
+
+            # reload risk params (overrides manuais)
+            if cfg.risk_params_json and (time.time() - risk_last_check) >= float(cfg.risk_params_reload_sec):
+                risk_last_check = time.time()
+                try:
+                    p = Path(cfg.risk_params_json)
+                    mtime = p.stat().st_mtime if p.exists() else None
+                    if mtime and (risk_mtime is None or float(mtime) > float(risk_mtime)):
+                        rp = _load_risk_params_json(cfg.risk_params_json)
+                        if isinstance(rp, dict):
+                            risk_params = rp
+                            risk_mtime = float(mtime)
+                            logger.info(f"[bridge] risk_params reloaded mtime={risk_mtime:.0f} path={cfg.risk_params_json}")
+                except Exception as e:
+                    logger.warning(f"[bridge] risk_params reload failed: {e}")
+
+            since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
+            try:
+                rows = await _fetch_candidates(db, since=since, cfg=cfg)
+            except (InterfaceError, OperationalError, DBAPIError) as e:
+                if _is_db_disconnect_error(e):
+                    await _db_reconnect(db, why="fetch_candidates_disconnect")
+                    await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                    continue
+                raise
+            except Exception as e:
+                # qualquer erro inesperado no fetch não deve matar a operação
+                try:
+                    logger.warning(f"[bridge] fetch_candidates failed: {str(e)[:240]}")
+                except Exception:
+                    pass
+                await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                continue
+            if not rows:
+                await asyncio.sleep(float(cfg.poll_sec))
+                continue
+
+            for row in rows:
+                src_id = int(row.get("id") or 0)
+                action = f"{cfg.mode}:{cfg.exec_side.value}"
             try:
                 wf = policy.get("wf") if (policy and isinstance(policy.get("wf"), dict)) else {}
                 if not isinstance(wf, dict):
@@ -1833,9 +1844,16 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     # Em falha de DB, não derruba o loop.
                     pass
 
-        dt = time.time() - t0
-        # evita loop muito agressivo
-        await asyncio.sleep(max(0.1, float(cfg.poll_sec) - dt))
+            dt = time.time() - t0
+            # evita loop muito agressivo
+            await asyncio.sleep(max(0.1, float(cfg.poll_sec) - dt))
+        except (InterfaceError, OperationalError, DBAPIError) as e:
+            # Fail-safe: nunca mata o bridge por desconexão do DB em qualquer ponto do loop.
+            if _is_db_disconnect_error(e):
+                await _db_reconnect(db, why="run_bridge_outer_disconnect")
+                await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                continue
+            raise
 
 
 def main() -> int:
