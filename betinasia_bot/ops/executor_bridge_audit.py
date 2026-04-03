@@ -285,6 +285,10 @@ class BridgeConfig:
     # Alinhamento OOS vs bridge: quando True (default), aplica filtros/limiares do WF (policy_json.wf)
     # no bridge, evitando divergência com o OOS.
     enforce_wf_filters: bool = True
+    # Em LIVE, por padrão exigimos que o auditor tenha preenchido exec_side_hint corretamente.
+    # Isso evita que linhas antigas/sem hint (ou geradas por outros auditores) sejam consumidas
+    # pelo bridge do lado errado por engano.
+    strict_exec_side_hint_live: bool = True
 
 
 def _wf_float(wf: Dict[str, Any], *keys: str) -> Optional[float]:
@@ -780,6 +784,18 @@ async def _fetch_candidates(
     cfg: BridgeConfig,
 ) -> List[Dict[str, Any]]:
     # Nota: betslip_audit_results está em models_hypothesis (tabela criada pela connect()).
+    strict_hint = bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live)
+    hint_clause = """
+      AND (
+        lower(COALESCE(r.hypothesis_details::jsonb->>'exec_side_hint', '')) = lower(:exec_side_hint)
+      )
+    """ if strict_hint else """
+      AND (
+        r.hypothesis_details IS NULL
+        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
+        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+      )
+    """
     q = """
     SELECT
       r.id,
@@ -805,11 +821,7 @@ async def _fetch_candidates(
     WHERE r.audited_at >= :since
       AND s.id IS NULL
       AND r.is_valid_opportunity = TRUE
-      AND (
-        r.hypothesis_details IS NULL
-        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
-        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
-      )
+    """ + hint_clause + """
       AND r.event_id IS NOT NULL AND r.event_id <> ''
       AND upper(r.market_type) = 'AH'
       AND r.hypothesis_type = :hyp
@@ -913,6 +925,7 @@ async def _signals_count_estimate(
     exec_side: ExecSide,
     lookback_h: float,
     prematch_only: bool,
+    strict_hint: bool,
 ) -> int:
     """
     Estimativa do total de sinais para este jogo (event_id) numa janela curta.
@@ -928,9 +941,18 @@ async def _signals_count_estimate(
       AND r.is_valid_opportunity = TRUE
       AND (:prematch_only = FALSE OR r.is_live IS NULL OR r.is_live = FALSE)
       AND (
-        r.hypothesis_details IS NULL
-        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
-        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+        (
+          :strict_hint = FALSE
+          AND (
+            r.hypothesis_details IS NULL
+            OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
+            OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+          )
+        )
+        OR (
+          :strict_hint = TRUE
+          AND lower(COALESCE(r.hypothesis_details::jsonb->>'exec_side_hint', '')) = lower(:exec_side_hint)
+        )
       )
     """
     async with db.async_session() as session:
@@ -942,6 +964,7 @@ async def _signals_count_estimate(
                 "hyp": str(hyp),
                 "exec_side_hint": str(exec_side.value),
                 "prematch_only": bool(prematch_only),
+                "strict_hint": bool(strict_hint),
             },
         )
         row = r.fetchone()
@@ -1543,6 +1566,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             exec_side=cfg.exec_side,
                             lookback_h=float(_rp_float(risk_params, "signals_lookback_h") or cfg.signals_lookback_h),
                             prematch_only=bool(cfg.only_prematch),
+                            strict_hint=bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live),
                         )
                         bud_match = float(bud_base)
                         if risk_mode == "signals_sqrt":
@@ -1866,6 +1890,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Bridge: DB audit -> Executor (/execute).")
     ap.add_argument("--mode", default=os.getenv("BRIDGE_MODE", "shadow"), choices=["shadow", "live"])
     ap.add_argument("--exec-side", default=os.getenv("BRIDGE_EXEC_SIDE", "Back"), choices=["Back", "Lay"])
+    ap.add_argument(
+        "--strict-exec-side-hint-live",
+        action="store_true",
+        default=(os.getenv("BRIDGE_STRICT_EXEC_SIDE_HINT_LIVE", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Se true (default), em LIVE exige hypothesis_details.exec_side_hint == exec_side (não aceita vazio).",
+    )
     ap.add_argument("--stake", type=float, default=float(os.getenv("BRIDGE_STAKE", "3.0")))
     ap.add_argument("--poll-sec", type=float, default=float(os.getenv("BRIDGE_POLL_SEC", "2.0")))
     ap.add_argument("--lookback-sec", type=int, default=int(os.getenv("BRIDGE_LOOKBACK_SEC", "120")))
@@ -1935,6 +1965,7 @@ def main() -> int:
         max_per_cycle=int(args.max_per_cycle),
         mode=str(args.mode),
         exec_side=ExecSide(str(args.exec_side)),
+        strict_exec_side_hint_live=bool(args.strict_exec_side_hint_live),
         stake=float(args.stake),
         unix_socket=str(args.unix_socket),
         http_url=(str(args.http_url) if args.http_url else None),
