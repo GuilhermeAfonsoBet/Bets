@@ -517,6 +517,16 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
     return out
 
 
+def _uniq_sorted_str(xs: Iterable[Any]) -> List[str]:
+    out = []
+    try:
+        s = {str(x).strip() for x in xs if str(x).strip()}
+        out = sorted(s)
+    except Exception:
+        out = []
+    return out
+
+
 async def _fetch_bridge_stats(db: Database, *, start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
     q = text(
         """
@@ -1093,6 +1103,17 @@ async def run_report(
                 "stake_sum_cov": 0.0,
                 "pnl_sum": 0.0,
                 "roi_pct": None,
+                # cobertura (placar) entre sucessos: % por n e por stake
+                "cov_pct_n": None,
+                "cov_pct_stake": None,
+                "n_uncov": 0,
+                "stake_sum_uncov": 0.0,
+                # cobertura por jogo (event_id) — útil para conciliar com accounting
+                "events_success_n": 0,
+                "events_cov_n": 0,
+                "events_cov_pct": None,
+                "event_ids_success": [],
+                "event_ids_cov": [],
             },
             "lay": {
                 "n_success": 0,
@@ -1110,6 +1131,18 @@ async def run_report(
                 "liability_sum_cov": 0.0,
                 "pnl_sum": 0.0,
                 "roi_pct_per_liability": None,
+                # cobertura (placar) entre sucessos
+                "cov_pct_n": None,
+                "cov_pct_stake": None,
+                "n_uncov": 0,
+                "stake_sum_uncov": 0.0,
+                "liability_sum_uncov": 0.0,
+                # cobertura por jogo (event_id)
+                "events_success_n": 0,
+                "events_cov_n": 0,
+                "events_cov_pct": None,
+                "event_ids_success": [],
+                "event_ids_cov": [],
             },
             "odd_anomalies": {"back": {"n": 0, "max": None}, "lay": {"n": 0, "max": None}},
             "slippage": {
@@ -1123,6 +1156,12 @@ async def run_report(
             # ROI por stake (Lay) é limitado e evita explosões quando odd≈1.
             "lay_roi_pct_per_stake": None,
         }
+
+        # sets por jogo (event_id), para conciliação com accounting
+        ev_success_back: set[str] = set()
+        ev_cov_back: set[str] = set()
+        ev_success_lay: set[str] = set()
+        ev_cov_lay: set[str] = set()
 
         slip_raw_back: List[float] = []
         slip_cost_back: List[float] = []
@@ -1159,9 +1198,19 @@ async def run_report(
                 if side0 == "back":
                     perf["back"]["n_success"] += 1
                     perf["back"]["stake_sum"] += float(stake0)
+                    try:
+                        if e.event_id:
+                            ev_success_back.add(str(e.event_id).strip())
+                    except Exception:
+                        pass
                 elif side0 == "lay":
                     perf["lay"]["n_success"] += 1
                     perf["lay"]["stake_sum"] += float(stake0)
+                    try:
+                        if e.event_id:
+                            ev_success_lay.add(str(e.event_id).strip())
+                    except Exception:
+                        pass
                     odd0 = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
                     if odd0 is not None:
                         perf["lay"]["liability_sum"] += float(stake0) * max(0.0, float(odd0) - 1.0)
@@ -1200,6 +1249,12 @@ async def run_report(
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
+                try:
+                    ev_id = str(a.get("event_id") or e.event_id or "").strip()
+                    if ev_id:
+                        ev_cov_back.add(ev_id)
+                except Exception:
+                    pass
                 # quebra por Pre/In (para conciliar com OOS e com contagens por jogo)
                 try:
                     reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
@@ -1289,6 +1344,12 @@ async def run_report(
                 if roi_liab is None:
                     continue
                 pnl = liab * float(roi_liab) / 100.0
+                try:
+                    ev_id = str(a.get("event_id") or e.event_id or "").strip()
+                    if ev_id:
+                        ev_cov_lay.add(ev_id)
+                except Exception:
+                    pass
                 try:
                     reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
                 except Exception:
@@ -1388,6 +1449,51 @@ async def run_report(
         perf["back"]["roi_pct"] = back_roi
         perf["lay"]["roi_pct_per_liability"] = lay_roi
         perf["lay_roi_pct_per_stake"] = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["stake_sum_cov"]) * 100.0) if perf["lay"]["stake_sum_cov"] else None
+
+        # cobertura (placar) entre sucessos — Back/Lay
+        try:
+            ns = int(perf.get("back", {}).get("n_success") or 0)
+            nc = int(perf.get("back", {}).get("n_cov") or 0)
+            st = float(perf.get("back", {}).get("stake_sum") or 0.0)
+            stc = float(perf.get("back", {}).get("stake_sum_cov") or 0.0)
+            perf["back"]["n_uncov"] = int(max(0, ns - nc))
+            perf["back"]["stake_sum_uncov"] = float(max(0.0, st - stc))
+            perf["back"]["cov_pct_n"] = (float(nc) / float(ns) * 100.0) if ns > 0 else None
+            perf["back"]["cov_pct_stake"] = (float(stc) / float(st) * 100.0) if st > 0 else None
+        except Exception:
+            pass
+        try:
+            ns = int(perf.get("lay", {}).get("n_success") or 0)
+            nc = int(perf.get("lay", {}).get("n_cov") or 0)
+            st = float(perf.get("lay", {}).get("stake_sum") or 0.0)
+            stc = float(perf.get("lay", {}).get("stake_sum_cov") or 0.0)
+            li = float(perf.get("lay", {}).get("liability_sum") or 0.0)
+            lic = float(perf.get("lay", {}).get("liability_sum_cov") or 0.0)
+            perf["lay"]["n_uncov"] = int(max(0, ns - nc))
+            perf["lay"]["stake_sum_uncov"] = float(max(0.0, st - stc))
+            perf["lay"]["liability_sum_uncov"] = float(max(0.0, li - lic))
+            perf["lay"]["cov_pct_n"] = (float(nc) / float(ns) * 100.0) if ns > 0 else None
+            perf["lay"]["cov_pct_stake"] = (float(stc) / float(st) * 100.0) if st > 0 else None
+        except Exception:
+            pass
+
+        # cobertura por jogo (event_id) — útil para conciliar com accounting por jogo
+        try:
+            perf["back"]["events_success_n"] = int(len(ev_success_back))
+            perf["back"]["events_cov_n"] = int(len(ev_cov_back))
+            perf["back"]["events_cov_pct"] = (float(len(ev_cov_back)) / float(len(ev_success_back)) * 100.0) if ev_success_back else None
+            perf["back"]["event_ids_success"] = _uniq_sorted_str(ev_success_back)
+            perf["back"]["event_ids_cov"] = _uniq_sorted_str(ev_cov_back)
+        except Exception:
+            pass
+        try:
+            perf["lay"]["events_success_n"] = int(len(ev_success_lay))
+            perf["lay"]["events_cov_n"] = int(len(ev_cov_lay))
+            perf["lay"]["events_cov_pct"] = (float(len(ev_cov_lay)) / float(len(ev_success_lay)) * 100.0) if ev_success_lay else None
+            perf["lay"]["event_ids_success"] = _uniq_sorted_str(ev_success_lay)
+            perf["lay"]["event_ids_cov"] = _uniq_sorted_str(ev_cov_lay)
+        except Exception:
+            pass
 
         # slippage agregada
         if slip_raw_back:

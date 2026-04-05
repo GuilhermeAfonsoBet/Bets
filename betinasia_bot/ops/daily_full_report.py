@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
 import sys
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -70,6 +73,165 @@ def _fmt_num(x: Any, nd: int = 2) -> str:
         return f"{float(x):,.{nd}f}"
     except Exception:
         return "—"
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        s = s.replace(",", ".")
+        # mantém apenas dígitos/sinal/ponto
+        out = []
+        for ch in s:
+            if ch.isdigit() or ch in ".-":
+                out.append(ch)
+        s2 = "".join(out).strip()
+        if s2 in ("", "-", ".", "-."):
+            return None
+        return float(s2)
+    except Exception:
+        return None
+
+
+def _parse_dt_any(s: Any) -> Optional[datetime]:
+    """
+    Best-effort parse para campos como 'post date' do CSV de accounting.
+    Retorna datetime timezone-aware em UTC quando possível.
+    """
+    try:
+        t = str(s or "").strip()
+        if not t:
+            return None
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        # ISO (com ou sem offset)
+        try:
+            dt = datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+        # formatos comuns
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(t, fmt).replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _pct(num: Any, den: Any) -> Optional[float]:
+    try:
+        n = float(num)
+        d = float(den)
+        if d <= 0:
+            return None
+        return float(n / d * 100.0)
+    except Exception:
+        return None
+
+
+def _acct_pnl_per_event_from_balance_csv(
+    path: Path,
+    *,
+    days_utc: Optional[set[str]] = None,
+    only_type_bet: bool = True,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Agrupa `amount` do balance.csv por dia (UTC) e por jogo (event info event id).
+    Retorna:
+      day -> event_id -> {pnl_sum, stake_est_sum, n_rows, event_name}
+
+    stake_est_sum é uma proxy de turnover: soma de (-amount) quando amount<0.
+    """
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    if not path.exists():
+        return out
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if not isinstance(row, dict):
+                continue
+            if only_type_bet:
+                typ = str(row.get("type") or "").strip().lower()
+                if typ and typ != "bet":
+                    continue
+            dt = _parse_dt_any(row.get("post date") or row.get("post_date") or row.get("date") or "")
+            if dt is None:
+                continue
+            day = dt.date().isoformat()
+            if days_utc is not None and day not in days_utc:
+                continue
+            amt = _safe_float(row.get("amount"))
+            if amt is None:
+                continue
+            ev_id = str(row.get("event info event id") or "").strip()
+            if not ev_id:
+                ev_id = "__NO_EVENT_ID__"
+            ev_name = str(row.get("event info event name") or "").strip()
+            blk = out.setdefault(day, {}).setdefault(ev_id, {"pnl_sum": 0.0, "stake_est_sum": 0.0, "n_rows": 0, "event_name": ev_name})
+            blk["pnl_sum"] = float(blk.get("pnl_sum") or 0.0) + float(amt)
+            blk["n_rows"] = int(blk.get("n_rows") or 0) + 1
+            if ev_name and (not str(blk.get("event_name") or "").strip()):
+                blk["event_name"] = ev_name
+            try:
+                if float(amt) < 0:
+                    blk["stake_est_sum"] = float(blk.get("stake_est_sum") or 0.0) + float(-amt)
+            except Exception:
+                pass
+    return out
+
+
+def _summarize_event_pnls(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    ev_map: event_id -> {pnl_sum, stake_est_sum, ...}
+    """
+    pnls = []
+    stakes = []
+    for _, v in (ev_map or {}).items():
+        try:
+            pnls.append(float(v.get("pnl_sum") or 0.0))
+        except Exception:
+            pass
+        try:
+            stakes.append(float(v.get("stake_est_sum") or 0.0))
+        except Exception:
+            pass
+    pnls_sorted = sorted(pnls)
+    out: Dict[str, Any] = {
+        "events_n": int(len(ev_map or {})),
+        "pnl_sum": float(sum(pnls)) if pnls else 0.0,
+        "stake_est_sum": float(sum(stakes)) if stakes else 0.0,
+        "pnl_median": (float(statistics.median(pnls_sorted)) if pnls_sorted else None),
+    }
+    try:
+        if len(pnls_sorted) >= 10:
+            out["pnl_p10"] = float(statistics.quantiles(pnls_sorted, n=10, method="inclusive")[0])
+            out["pnl_p90"] = float(statistics.quantiles(pnls_sorted, n=10, method="inclusive")[8])
+        else:
+            out["pnl_p10"] = None
+            out["pnl_p90"] = None
+    except Exception:
+        out["pnl_p10"] = None
+        out["pnl_p90"] = None
+    try:
+        abs_sum = float(sum(abs(x) for x in pnls)) if pnls else 0.0
+        out["pnl_conc_max_abs_share"] = (float(max(abs(x) for x in pnls)) / abs_sum) if abs_sum > 0 else None
+    except Exception:
+        out["pnl_conc_max_abs_share"] = None
+    try:
+        abs_st_sum = float(sum(abs(x) for x in stakes)) if stakes else 0.0
+        out["stake_conc_max_share"] = (float(max(abs(x) for x in stakes)) / abs_st_sum) if abs_st_sum > 0 else None
+    except Exception:
+        out["stake_conc_max_share"] = None
+    return out
 
 
 def _pick_last_day_with_slippage_vs_roi_raw(per_day: list[dict]) -> Optional[dict]:
@@ -2223,6 +2385,167 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
         s1.append("\n")
+
+        # Cobertura de placar entre execuções bem-sucedidas (por n, stake e por jogo/event_id).
+        # Isso é crucial para interpretar gaps entre P&L (acct) e P&L/ROI (placar),
+        # porque as métricas por placar só usam o subconjunto coberto (n_cov / stake_sum_cov).
+        try:
+            s1.append("**Cobertura de placar (somente entre execuções bem-sucedidas)**\n\n")
+            s1.append(
+                "| Dia | Back n_cov/n_success | Back stake_cov/stake | Back jogos_cov/jogos_success | Lay n_cov/n_success | Lay stake_cov/stake | Lay jogos_cov/jogos_success |\n"
+            )
+            s1.append("|---|---:|---:|---:|---:|---:|---:|\n")
+            for it in adh_day.get("per_day") or []:
+                if not isinstance(it, dict):
+                    continue
+                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+                lay = ex.get("lay") if isinstance(ex.get("lay"), dict) else {}
+
+                ns_b = int(back.get("n_success") or 0)
+                nc_b = int(back.get("n_cov") or 0)
+                st_b = float(back.get("stake_sum") or 0.0)
+                stc_b = float(back.get("stake_sum_cov") or 0.0)
+                covn_b = back.get("cov_pct_n")
+                covs_b = back.get("cov_pct_stake")
+                if covn_b is None:
+                    covn_b = _pct(nc_b, ns_b)
+                if covs_b is None:
+                    covs_b = _pct(stc_b, st_b)
+
+                evs_b = int(back.get("events_success_n") or 0)
+                evc_b = int(back.get("events_cov_n") or 0)
+                evp_b = back.get("events_cov_pct")
+                if evp_b is None:
+                    evp_b = _pct(evc_b, evs_b)
+
+                ns_l = int(lay.get("n_success") or 0)
+                nc_l = int(lay.get("n_cov") or 0)
+                st_l = float(lay.get("stake_sum") or 0.0)
+                stc_l = float(lay.get("stake_sum_cov") or 0.0)
+                covn_l = lay.get("cov_pct_n")
+                covs_l = lay.get("cov_pct_stake")
+                if covn_l is None:
+                    covn_l = _pct(nc_l, ns_l)
+                if covs_l is None:
+                    covs_l = _pct(stc_l, st_l)
+
+                evs_l = int(lay.get("events_success_n") or 0)
+                evc_l = int(lay.get("events_cov_n") or 0)
+                evp_l = lay.get("events_cov_pct")
+                if evp_l is None:
+                    evp_l = _pct(evc_l, evs_l)
+
+                def _fmt_ratio(n1: int, n0: int, pct: Optional[float]) -> str:
+                    if n0 <= 0:
+                        return "—"
+                    p = f"{float(pct):.1f}%" if pct is not None else "—"
+                    return f"{n1}/{n0} ({p})"
+
+                def _fmt_ratio_num(x1: float, x0: float, pct: Optional[float]) -> str:
+                    if x0 <= 0:
+                        return "—"
+                    p = f"{float(pct):.1f}%" if pct is not None else "—"
+                    return f"{_fmt_num(x1,2)}/{_fmt_num(x0,2)} ({p})"
+
+                s1.append(
+                    f"| {it.get('day')} | {_fmt_ratio(nc_b, ns_b, covn_b)} | {_fmt_ratio_num(stc_b, st_b, covs_b)} | {_fmt_ratio(evc_b, evs_b, evp_b)} | "
+                    f"{_fmt_ratio(nc_l, ns_l, covn_l)} | {_fmt_ratio_num(stc_l, st_l, covs_l)} | {_fmt_ratio(evc_l, evs_l, evp_l)} |\n"
+                )
+            s1.append("\n")
+        except Exception:
+            pass
+
+        # Accounting: P&L por jogo (event_id) e comparação coberto vs não-coberto.
+        # Usa o `balance_csv` baixado no começo do daily.
+        try:
+            bal_csv = Path(str(acct.get("balance_csv") or "")).expanduser() if isinstance(acct, dict) else None
+        except Exception:
+            bal_csv = None
+        try:
+            days_utc = {str(it.get("day") or "") for it in (adh_day.get("per_day") or []) if isinstance(it, dict) and str(it.get("day") or "")}
+        except Exception:
+            days_utc = set()
+        by_day_event = None
+        if bal_csv and days_utc and bal_csv.exists():
+            try:
+                by_day_event = _acct_pnl_per_event_from_balance_csv(bal_csv, days_utc=set(days_utc), only_type_bet=True)
+            except Exception:
+                by_day_event = None
+        if isinstance(by_day_event, dict) and by_day_event:
+            try:
+                s1.append("**Accounting: distribuição de P&L por jogo (event_id; por post date UTC)**\n\n")
+                s1.append(
+                    "| Dia | #jogos | P&L total (acct; bets) | P&L mediana/jogo | P10 | P90 | Concentração P&L (max |abs| / soma |abs|) | Turnover proxy (∑-amount) | Concentração turnover (max share) |\n"
+                )
+                s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    summ = _summarize_event_pnls(ev_map)
+                    s1.append(
+                        f"| {dayk} | {int(summ.get('events_n') or 0)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_num(summ.get('pnl_median'),2)} | "
+                        f"{_fmt_num(summ.get('pnl_p10'),2)} | {_fmt_num(summ.get('pnl_p90'),2)} | {_fmt_pct((float(summ.get('pnl_conc_max_abs_share'))*100.0) if summ.get('pnl_conc_max_abs_share') is not None else None,2)} | "
+                        f"{_fmt_num(summ.get('stake_est_sum'),2)} | {_fmt_pct((float(summ.get('stake_conc_max_share'))*100.0) if summ.get('stake_conc_max_share') is not None else None,2)} |\n"
+                    )
+                s1.append("\n")
+            except Exception:
+                pass
+
+            # Coberto vs não-coberto (placar) no accounting, por jogo/event_id.
+            # Observação: isso depende de conciliar "dia UTC" e de o balance lançar movimentos no mesmo dia.
+            try:
+                s1.append("**Accounting: coberto vs não-coberto (placar), por jogo/event_id (mesmo dia UTC)**\n\n")
+                s1.append(
+                    "| Dia | Back jogos_success | Back jogos_cov | Back jogos_uncov | P&L acct cov | P&L acct uncov | Turnover proxy cov | Turnover proxy uncov |\n"
+                )
+                s1.append("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                    back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    if not dayk or not ev_map:
+                        continue
+
+                    ev_success = set(str(x).strip() for x in (back.get("event_ids_success") or []) if str(x).strip())
+                    ev_cov = set(str(x).strip() for x in (back.get("event_ids_cov") or []) if str(x).strip())
+                    if not ev_success:
+                        continue
+                    ev_uncov = set(ev_success) - set(ev_cov)
+
+                    pnl_cov = 0.0
+                    pnl_uncov = 0.0
+                    st_cov = 0.0
+                    st_uncov = 0.0
+                    for ev_id, rec in (ev_map or {}).items():
+                        if not isinstance(rec, dict):
+                            continue
+                        try:
+                            pnl = float(rec.get("pnl_sum") or 0.0)
+                        except Exception:
+                            pnl = 0.0
+                        try:
+                            st = float(rec.get("stake_est_sum") or 0.0)
+                        except Exception:
+                            st = 0.0
+                        if ev_id in ev_cov:
+                            pnl_cov += pnl
+                            st_cov += st
+                        if ev_id in ev_uncov:
+                            pnl_uncov += pnl
+                            st_uncov += st
+
+                    s1.append(
+                        f"| {dayk} | {len(ev_success)} | {len(ev_cov)} | {len(ev_uncov)} | {_fmt_num(pnl_cov,2)} | {_fmt_num(pnl_uncov,2)} | {_fmt_num(st_cov,2)} | {_fmt_num(st_uncov,2)} |\n"
+                    )
+                s1.append("\n")
+            except Exception:
+                pass
 
         # Quebra por tipo (Back/Lay × Pre/In) no P&L por placar (cobertura). Ajuda a explicar dias OOS/placar positivos vs accounting negativo.
         try:
