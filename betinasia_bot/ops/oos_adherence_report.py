@@ -212,6 +212,65 @@ def _median(xs: List[float]) -> Optional[float]:
         return None
 
 
+def _bucketize_latency_call_to_done_ms_with_context(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Bucketiza por call_to_done_ms (latência) e retorna estatísticas de ROI por bucket,
+    incluindo ROI ponderado por exposição (stake) e contexto (odd/exposure median).
+    """
+    if not rows:
+        return []
+
+    def _lab(lat_ms: Optional[float]) -> str:
+        if lat_ms is None:
+            return "Desconhecido"
+        x = float(lat_ms)
+        if x < 5000:
+            return "< 5s"
+        if x < 10000:
+            return "5-10s"
+        if x < 20000:
+            return "10-20s"
+        if x < 40000:
+            return "20-40s"
+        return "> 40s"
+
+    order = ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]
+    out: List[Dict[str, Any]] = []
+    for lab in order:
+        sub = [r for r in rows if _lab(_safe_float(r.get("lat_ms"))) == lab]
+        rois = [float(r.get("roi")) for r in sub if r.get("roi") is not None]
+        if not rois:
+            continue
+        st = _mean_se_ci95(rois)
+        odds = [float(r.get("odd")) for r in sub if r.get("odd") is not None]
+        exps = [float(r.get("exposure")) for r in sub if r.get("exposure") is not None]
+        exp_sum = float(sum(exps)) if exps else 0.0
+        roi_w = None
+        try:
+            if exp_sum > 0:
+                roi_w = float(
+                    sum(float(r.get("roi")) * float(r.get("exposure")) for r in sub if r.get("roi") is not None and r.get("exposure") is not None)
+                    / exp_sum
+                )
+        except Exception:
+            roi_w = None
+        out.append(
+            {
+                "bucket": lab,
+                "n": int(st.get("n") or 0),
+                "roi_mean": st.get("mean"),
+                "roi_sd": st.get("sd"),
+                "roi_se": st.get("se"),
+                "roi_ci95": st.get("ci95"),
+                "odd_median": _median(odds),
+                "exposure_median": _median(exps),
+                "exposure_sum": exp_sum,
+                "roi_weighted": roi_w,
+            }
+        )
+    return out
+
+
 def _bucketize_3way_raw(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
     """
     Bucketiza por slippage_raw_pct (com sinal), em 3 faixas:
@@ -388,6 +447,10 @@ class ExecRow:
     odd_decision: Optional[float]
     odd_final: Optional[float]
     stake_sent: Optional[float]
+    # latência (ms) — quando o executor fornece timing no JSONL
+    queue_delay_ms: Optional[int] = None
+    call_to_done_ms: Optional[int] = None
+    post_ms: Optional[int] = None
     betslip_id: Optional[str] = None
 
 
@@ -423,6 +486,14 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
             # fallback: muitos executores registram stake na policy (request/result) e não em raw.sent
             pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
             stake_sent = _safe_float((pol or {}).get("stake_requested"))
+
+        timing = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+        qd = _safe_float(timing.get("queue_delay_ms"))
+        cd = _safe_float(timing.get("call_to_done_ms"))
+        pm = _safe_float(timing.get("post_ms"))
+        queue_delay_ms = int(qd) if qd is not None else None
+        call_to_done_ms = int(cd) if cd is not None else None
+        post_ms = int(pm) if pm is not None else None
         out.append(
             ExecRow(
                 created_at=created,
@@ -437,6 +508,9 @@ def _parse_executor_jsonl(path: Path) -> List[ExecRow]:
                 odd_decision=_safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision")),
                 odd_final=_safe_float(res.get("odd_final")),
                 stake_sent=stake_sent,
+                queue_delay_ms=queue_delay_ms,
+                call_to_done_ms=call_to_done_ms,
+                post_ms=post_ms,
                 betslip_id=betslip_id,
             )
         )
@@ -771,6 +845,10 @@ async def run_report(
         audit_ids = sorted({int(e.audit_id) for e in xs if e.audit_id is not None})
         audit_map = await _fetch_audit_rows_for_ids(db, audit_ids)
 
+        # Latência × ROI (Back Pre/In): acumulado na janela (somente execuções com ROI via placar)
+        lat_rows_back_pre: List[Dict[str, Any]] = []
+        lat_rows_back_in: List[Dict[str, Any]] = []
+
         for e in xs:
             # diagnóstico AH em todas as execuções (com ou sem placar)
             try:
@@ -804,6 +882,21 @@ async def run_report(
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
+                # Latência × ROI (Back Pre/In)
+                try:
+                    regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    regime = ("In" if bool(e.is_live) else "Pre")
+                lat_row = {
+                    "lat_ms": (float(e.call_to_done_ms) if e.call_to_done_ms is not None else None),
+                    "roi": float(roi),
+                    "odd": float(odd),
+                    "exposure": float(stake),
+                }
+                if str(regime).strip().lower() == "in":
+                    lat_rows_back_in.append(lat_row)
+                else:
+                    lat_rows_back_pre.append(lat_row)
                 if cost_pct is not None:
                     total_pairs_cost_back.append((float(cost_pct), float(roi)))
                 if raw_pct is not None:
@@ -897,6 +990,11 @@ async def run_report(
             "per_day": [],
             "observed_ah_line_abs": ah_obs,
             "slippage_filter_counterfactual": cf,
+            "latency_vs_roi_call_to_done_ms": {
+                "note": "Latência por execução vem de result.timing.call_to_done_ms no executor_jsonl. ROI/placar usa odd executada (odd_final, senão odd_at_decision).",
+                "back_pre": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_pre)},
+                "back_in": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_in)},
+            },
             "slippage_vs_roi_raw_total": {
                 "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
                 "lay": {"buckets": _bucketize_3way_raw(total_pairs_raw_lay)},

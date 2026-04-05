@@ -333,6 +333,44 @@ def _append_slippage_vs_roi_raw_section(
         return
 
 
+def _append_latency_vs_roi_back_pre_in_section(out_lines: list[str], *, adh_slip: Optional[Dict[str, Any]], title: str) -> None:
+    """
+    Renderiza "Latência × ROI (Back Pre/In)" preservando o padrão de tabelas:
+      - buckets com n + ROI mean (SE; IC95) + ROIw + contexto (odd/exposure)
+    """
+    try:
+        if not isinstance(adh_slip, dict) or not adh_slip:
+            return
+        blk = adh_slip.get("latency_vs_roi_call_to_done_ms") if isinstance(adh_slip.get("latency_vs_roi_call_to_done_ms"), dict) else None
+        if not isinstance(blk, dict) or not blk:
+            return
+
+        out_lines.append(f"**{title}**\n\n")
+        note = str(blk.get("note") or "").strip()
+        if note:
+            out_lines.append(f"- {note}\n\n")
+
+        def _print(subkey: str, subtitle: str) -> None:
+            sub = blk.get(subkey) if isinstance(blk.get(subkey), dict) else {}
+            buckets0 = sub.get("buckets") if isinstance(sub.get("buckets"), list) else []
+            if not any(isinstance(r, dict) and int(r.get("n") or 0) > 0 for r in buckets0):
+                return
+            out_lines.append(f"- **{subtitle}**\n\n")
+            out_lines.append("| Bucket call_to_done_ms | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
+            for r in buckets0:
+                if not isinstance(r, dict):
+                    continue
+                out_lines.append(
+                    f"| {r.get('bucket')} | {int(r.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(r)}{_fmt_ctx_suffix(r)} |\n"
+                )
+            out_lines.append("\n")
+
+        _print("back_pre", "Back Pre (ROI por stake)")
+        _print("back_in", "Back In (ROI por stake)")
+    except Exception:
+        return
+
+
 def _demote_h2_to_h3(md: str) -> str:
     # Usado para "embrulhar" o bloco in-sample sem reescrever o conteúdo.
     out = []
@@ -2223,125 +2261,60 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             pass
 
         # slippage x ROI (3 buckets raw com sinal) — acumulado na janela (não só um dia)
-        raw_total = {}
-        if isinstance(adh_slip, dict):
-            raw_total = adh_slip.get("slippage_vs_roi_raw_total_ctx") if isinstance(adh_slip.get("slippage_vs_roi_raw_total_ctx"), dict) else (
-                adh_slip.get("slippage_vs_roi_raw_total") if isinstance(adh_slip.get("slippage_vs_roi_raw_total"), dict) else {}
+        # 2.2) Latência × ROI (Back Pre/In): só depende do oos_adherence_long (slip)
+        try:
+            _append_latency_vs_roi_back_pre_in_section(
+                s1,
+                adh_slip=adh_slip,
+                title="Latência × ROI (Back Pre/In) — acumulado (call_to_done_ms)",
             )
-        if isinstance(raw_total, dict) and raw_total:
-            try:
-                # Para slippage×ROI, respeitamos o range semântico (pós-fix) quando disponível.
-                rg = adh_slip.get("slippage_range", None) if isinstance(adh_slip, dict) else None
-                if not isinstance(rg, dict) or not rg:
-                    rg = adh_slip.get("range", {}) if isinstance(adh_slip, dict) else {}
-                span = rg.get("span_days") if isinstance(rg, dict) else None
-                s1.append(
-                    f"**Slippage × ROI por bucket (raw, com sinal) — acumulado (range: `{rg.get('start_day')}` → `{rg.get('end_day')}`; span_days=`{int(span or 0)}`)**\n\n"
+        except Exception:
+            pass
+
+        # 2.3) Slippage × ROI (raw, com sinal): acumulado na janela
+        _append_slippage_vs_roi_raw_section(
+            s1,
+            adh_slip=adh_slip,
+            title="Slippage × ROI por bucket (raw, com sinal) — acumulado",
+            combo_top_limit=2,
+        )
+
+        # 2.4) Slippage pós-início (>= 2026-04-04) — mantém as mesmas tabelas, mas com corte.
+        try:
+            post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
+            if post_start:
+                adh_post_json = day_dir / "oos_adherence_long_post_start.json"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "ops.oos_adherence_report",
+                        "--policy-json",
+                        str(cfg.wf_policy_current),
+                        "--executor-jsonl",
+                        str(cfg.executor_jsonl),
+                        "--tz",
+                        "UTC",
+                        "--days",
+                        "0",
+                        "--no-per-day",
+                        "--slippage-cf-start-day",
+                        post_start,
+                        "--out",
+                        str(adh_post_json),
+                    ],
+                    check=False,
+                    cwd=str(Path(__file__).resolve().parent.parent),
                 )
-            except Exception:
-                s1.append("**Slippage × ROI por bucket (raw, com sinal) — acumulado**\n\n")
-            for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
-                b = raw_total.get(side_key) if isinstance(raw_total.get(side_key), dict) else {}
-                buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
-                buckets = _slip_raw_3bucket_rows(buckets0)
-                if not any(int(r.get("n") or 0) > 0 for r in buckets):
-                    continue
-                s1.append(f"- **{title}**\n\n")
-                s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
-                for row in buckets:
-                    s1.append(
-                        f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n"
-                    )
-                s1.append("\n")
-            s1.append(
-                "- Nota: `ROIw` é o **ROI ponderado por exposição** (peso=stake no Back; peso=liability no Lay). "
-                "Em prática, dentro de um bucket, `ROIw ≈ (∑P&L)/(∑exposição)`; já o `ROI mean` é a média simples por linha/sinal.\n\n"
-            )
-            # Lay também em ROI por stake (bounded; sanity-check)
-            lay_stake_blk = adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_total_ctx_lay_stake"), dict)) else {}
-            b2 = lay_stake_blk.get("lay") if isinstance(lay_stake_blk.get("lay"), dict) else {}
-            buckets02 = b2.get("buckets") if isinstance(b2.get("buckets"), list) else []
-            buckets2 = _slip_raw_3bucket_rows(buckets02)
-            if any(int(r.get("n") or 0) > 0 for r in buckets2):
-                s1.append("- **Lay (ROI por stake; bounded)**\n\n")
-                s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
-                for row in buckets2:
-                    s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n")
-                s1.append("\n")
-
-            # Contrafactual: filtro de slippage (placar) — não apostar se Back raw<=-2% e Lay raw>2%
-            try:
-                cf = adh_slip.get("slippage_filter_counterfactual") if isinstance(adh_slip, dict) else None
-                if isinstance(cf, dict) and isinstance(cf.get("rule"), dict):
-                    b = cf.get("back") if isinstance(cf.get("back"), dict) else {}
-                    l = cf.get("lay") if isinstance(cf.get("lay"), dict) else {}
-                    if (int(b.get("n") or 0) + int(l.get("n") or 0)) > 0:
-                        s1.append("**Contrafactual (placar): aplicar filtro de slippage**\n\n")
-                        s1.append("- Regra: **Back** pula `slippage_raw_pct <= -2%`; **Lay** pula `slippage_raw_pct > 2%`.\n")
-                        s1.append("- Observação: usa somente execuções com ROI via placar; não é o P&L do accounting.\n\n")
-                        s1.append("| Lado | n (base) | P&L (base) | Exposição (base) | n (após filtro) | P&L (após) | Exposição (após) |\n")
-                        s1.append("|---|---:|---:|---:|---:|---:|---:|\n")
-                        s1.append(f"| Back | {int(b.get('n') or 0)} | {_fmt_num(b.get('pnl'),2)} | {_fmt_num(b.get('stake'),2)} | {int(b.get('n_filtered') or 0)} | {_fmt_num(b.get('pnl_filtered'),2)} | {_fmt_num(b.get('stake_filtered'),2)} |\n")
-                        s1.append(f"| Lay (liab) | {int(l.get('n') or 0)} | {_fmt_num(l.get('pnl'),2)} | {_fmt_num(l.get('liability'),2)} | {int(l.get('n_filtered') or 0)} | {_fmt_num(l.get('pnl_filtered'),2)} | {_fmt_num(l.get('liability_filtered'),2)} |\n")
-                        try:
-                            pnl0 = float(b.get("pnl") or 0.0) + float(l.get("pnl") or 0.0)
-                            pnl1 = float(b.get("pnl_filtered") or 0.0) + float(l.get("pnl_filtered") or 0.0)
-                            s1.append(f"| **Total** | — | {_fmt_num(pnl0,2)} | — | — | {_fmt_num(pnl1,2)} | — |\n")
-                        except Exception:
-                            pass
-                        s1.append("\n")
-            except Exception:
-                pass
-
-            # Diagnóstico AH (linha) observado na execução
-            try:
-                ah = adh_slip.get("observed_ah_line_abs") if isinstance(adh_slip, dict) else None
-                if isinstance(ah, dict):
-                    thr = ah.get("threshold")
-                    scope = ah.get("scope")
-                    allx = ah.get("all_exec") if isinstance(ah.get("all_exec"), dict) else {}
-                    covx = ah.get("cov_placar") if isinstance(ah.get("cov_placar"), dict) else {}
-                    if int(allx.get("n") or 0) > 0:
-                        s1.append("**Diagnóstico AH (linha) observado na execução**\n\n")
-                        s1.append(f"- Policy: `ah_max_abs_line={thr}` | `ah_scope={scope}`\n")
-                        s1.append(f"- Execuções (todas): `n={int(allx.get('n') or 0)}` | `max|line|={_fmt_num(allx.get('max_abs_line'),2)}` | `n_over={int(allx.get('n_over') or 0)}`\n")
-                        s1.append(f"- Execuções com placar/ROI: `n={int(covx.get('n') or 0)}` | `max|line|={_fmt_num(covx.get('max_abs_line'),2)}` | `n_over={int(covx.get('n_over') or 0)}`\n\n")
-            except Exception:
-                pass
-            # Por combinação (top por volume)
-            rows = adh_slip.get("slippage_vs_roi_raw_by_combo_top") if (isinstance(adh_slip, dict) and isinstance(adh_slip.get("slippage_vs_roi_raw_by_combo_top"), list)) else []
-            if rows:
-                try:
-                    back_rows = [r for r in rows if isinstance(r, dict) and str(r.get("side")) == "Back"]
-                    lay_rows = [r for r in rows if isinstance(r, dict) and str(r.get("side")) == "Lay"]
-                    def _print_combo_block(title: str, xs: list[dict], limit: int = 12) -> None:
-                        if not xs:
-                            return
-                        s1.append(f"**Slippage × ROI por combinação (top {min(limit, len(xs))} por volume; acumulado)**\n\n")
-                        s1.append(f"- **{title}**\n\n")
-                        s1.append("| Combinação | n | ROI<=-2% | n | ROI(-2..2] | n | ROI>2% | n | corr(slip_raw,ROI) |\n")
-                        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-                        for r in xs[:limit]:
-                            comb = str(r.get("comb") or "")
-                            n = int(r.get("n") or 0)
-                            corr = r.get("corr_raw_pct_vs_roi")
-                            # buckets dict
-                            bmap = {str(b.get("bucket")): b for b in (r.get("buckets") or []) if isinstance(b, dict)}
-                            def _bn(lab: str) -> tuple[int, Any]:
-                                bb = bmap.get(lab) or {}
-                                return int(bb.get("n") or 0), bb
-                            n1, roi1 = _bn("<= -2%")
-                            n2, roi2 = _bn("(-2, 2]")
-                            n3, roi3 = _bn("> 2%")
-                            s1.append(
-                                f"| {comb} | {n} | {_fmt_roi_mean_se_ci_pct(roi1)} | {n1} | {_fmt_roi_mean_se_ci_pct(roi2)} | {n2} | {_fmt_roi_mean_se_ci_pct(roi3)} | {n3} | {_fmt_num(corr,2)} |\n"
-                            )
-                        s1.append("\n")
-                    # já está ordenado por n desc
-                    _print_combo_block("Back", back_rows)
-                    _print_combo_block("Lay", lay_rows)
-                except Exception:
-                    pass
+                adh_post = _read_json(adh_post_json)
+                _append_slippage_vs_roi_raw_section(
+                    s1,
+                    adh_slip=adh_post,
+                    title=f"Slippage × ROI por bucket (raw, com sinal) — pós-início (>= {post_start})",
+                    combo_top_limit=2,
+                )
+        except Exception:
+            pass
         else:
             # fallback: último dia com dados
             last = _pick_last_day_with_slippage_vs_roi_raw(list(adh_day.get("per_day") or [])) if isinstance(adh_day, dict) else None
