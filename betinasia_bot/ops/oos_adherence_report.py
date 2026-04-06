@@ -353,6 +353,112 @@ def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[st
     return outb
 
 
+def _agg_pnl_exposure(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Agrega linhas no formato:
+      {pnl: float, exposure: float}
+    Retorna ROI ponderado por exposição (ROIw) = (∑pnl)/(∑exposure)*100.
+    """
+    try:
+        n = int(len(rows or []))
+        exp = float(sum(float(r.get("exposure") or 0.0) for r in (rows or []) if r.get("exposure") is not None))
+        pnl = float(sum(float(r.get("pnl") or 0.0) for r in (rows or []) if r.get("pnl") is not None))
+        roi_w = (float(pnl) / float(exp) * 100.0) if exp > 0 else None
+        return {"n": n, "exposure_sum": exp, "pnl_sum": pnl, "roi_weighted": roi_w}
+    except Exception:
+        return {"n": int(len(rows or [])), "exposure_sum": 0.0, "pnl_sum": 0.0, "roi_weighted": None}
+
+
+def _counterfactual_filters_back(
+    rows: List[Dict[str, Any]],
+    *,
+    slip_raw_pct_max: float = 2.0,
+    lat_ms_max: int = 6000,
+    slip_missing_pass: bool = True,
+    lat_missing_fail_closed: bool = True,
+) -> Dict[str, Any]:
+    """
+    Contrafactual operacional (placar) para Back, aplicado SOMENTE às execuções cobertas por ROI:
+    - filtro de slippage (raw com sinal): remove slippage_raw_pct > +slip_raw_pct_max
+    - filtro de latência (call_to_done_ms): mantém lat_ms <= lat_ms_max
+    Retorna estatísticas base e após filtros (separados e combinados), com deltas.
+    """
+    base = _agg_pnl_exposure(rows)
+
+    def _pass_slip(r: Dict[str, Any]) -> bool:
+        s = r.get("slip_raw_pct")
+        if s is None:
+            return bool(slip_missing_pass)
+        try:
+            return float(s) <= float(slip_raw_pct_max)
+        except Exception:
+            return bool(slip_missing_pass)
+
+    def _pass_lat(r: Dict[str, Any]) -> bool:
+        t = r.get("lat_ms")
+        if t is None:
+            return (not bool(lat_missing_fail_closed))
+        try:
+            return float(t) <= float(lat_ms_max)
+        except Exception:
+            return (not bool(lat_missing_fail_closed))
+
+    after_slip_rows = [r for r in rows if _pass_slip(r)]
+    after_lat_rows = [r for r in rows if _pass_lat(r)]
+    after_both_rows = [r for r in rows if _pass_slip(r) and _pass_lat(r)]
+    after_slip = _agg_pnl_exposure(after_slip_rows)
+    after_lat = _agg_pnl_exposure(after_lat_rows)
+    after_both = _agg_pnl_exposure(after_both_rows)
+
+    def _delta(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            dpnl = float(b.get("pnl_sum") or 0.0) - float(a.get("pnl_sum") or 0.0)
+        except Exception:
+            dpnl = None
+        try:
+            droi = None
+            if a.get("roi_weighted") is not None and b.get("roi_weighted") is not None:
+                droi = float(b.get("roi_weighted")) - float(a.get("roi_weighted"))
+        except Exception:
+            droi = None
+        try:
+            pass_n = (float(b.get("n") or 0) / float(a.get("n") or 0) * 100.0) if float(a.get("n") or 0) > 0 else None
+        except Exception:
+            pass_n = None
+        try:
+            pass_exp = (float(b.get("exposure_sum") or 0.0) / float(a.get("exposure_sum") or 0.0) * 100.0) if float(a.get("exposure_sum") or 0.0) > 0 else None
+        except Exception:
+            pass_exp = None
+        return {"delta_pnl_sum": dpnl, "delta_roi_weighted": droi, "pass_n_pct": pass_n, "pass_exposure_pct": pass_exp}
+
+    out: Dict[str, Any] = {
+        "rule": {
+            "slip_raw_pct_max": float(slip_raw_pct_max),
+            "lat_ms_max": int(lat_ms_max),
+            "slip_missing_pass": bool(slip_missing_pass),
+            "lat_missing_fail_closed": bool(lat_missing_fail_closed),
+        },
+        "base": base,
+        "after_slip": after_slip,
+        "after_lat": after_lat,
+        "after_both": after_both,
+        "effect": {
+            "slip": _delta(base, after_slip),
+            "lat": _delta(base, after_lat),
+            "both": _delta(base, after_both),
+        },
+    }
+    # contadores de missing para debug
+    try:
+        out["missing"] = {
+            "slip_raw_pct": int(sum(1 for r in rows if r.get("slip_raw_pct") is None)),
+            "lat_ms": int(sum(1 for r in rows if r.get("lat_ms") is None)),
+        }
+    except Exception:
+        pass
+    return out
+
+
 def _combo_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime) -> str:
     """
     Robustez: se kickoff_time existir, inferimos Pre/In por timestamp (created_at >= kickoff => In).
@@ -1172,6 +1278,11 @@ async def run_report(
         pairs_raw_back: List[Tuple[float, float]] = []
         pairs_raw_lay: List[Tuple[float, float]] = []
 
+        # Linhas cobertas (placar) para contrafactuais operacionais (Back)
+        cov_back_rows: List[Dict[str, Any]] = []
+        cov_back_rows_pre: List[Dict[str, Any]] = []
+        cov_back_rows_in: List[Dict[str, Any]] = []
+
         def _bucketize(pairs: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
             edges = [(0.0, 0.0), (0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 999.0)]
             outb = []
@@ -1249,6 +1360,27 @@ async def run_report(
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
+                # Para contrafactual operacional: precisa ROI (placar), exposição e metadados de execução
+                try:
+                    lat_ms = int(e.call_to_done_ms) if e.call_to_done_ms is not None else None
+                except Exception:
+                    lat_ms = None
+                raw_pct = _slip_raw_pct(odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                try:
+                    cov_row = {
+                        "roi": float(roi),
+                        "pnl": float(pnl),
+                        "exposure": float(stake),
+                        "slip_raw_pct": (float(raw_pct) if raw_pct is not None else None),
+                        "lat_ms": (float(lat_ms) if lat_ms is not None else None),
+                    }
+                    cov_back_rows.append(cov_row)
+                    if str(reg).strip().lower() == "in":
+                        cov_back_rows_in.append(cov_row)
+                    else:
+                        cov_back_rows_pre.append(cov_row)
+                except Exception:
+                    pass
                 try:
                     ev_id = str(a.get("event_id") or e.event_id or "").strip()
                     if ev_id:
@@ -1284,7 +1416,7 @@ async def run_report(
                 else:
                     perf["back"]["push"] += 1
 
-                raw_pct = _slip_raw_pct(odd_dec=e.odd_decision, odd_fin=e.odd_final)
+                # raw_pct já calculado acima (reusa)
                 cost_pct = _slip_cost_pct(exec_side="back", odd_dec=e.odd_decision, odd_fin=e.odd_final)
                 if raw_pct is not None and cost_pct is not None:
                     slip_raw_back.append(float(raw_pct))
@@ -1449,6 +1581,34 @@ async def run_report(
         perf["back"]["roi_pct"] = back_roi
         perf["lay"]["roi_pct_per_liability"] = lay_roi
         perf["lay_roi_pct_per_stake"] = (float(perf["lay"]["pnl_sum"]) / float(perf["lay"]["stake_sum_cov"]) * 100.0) if perf["lay"]["stake_sum_cov"] else None
+
+        # Contrafactual operacional (placar): filtros de slippage/latência no subconjunto coberto
+        try:
+            perf["back"]["filters_counterfactual"] = _counterfactual_filters_back(
+                cov_back_rows,
+                slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                slip_missing_pass=True,
+                lat_missing_fail_closed=True,
+            )
+            perf["back"]["filters_counterfactual_by_regime"] = {
+                "pre": _counterfactual_filters_back(
+                    cov_back_rows_pre,
+                    slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                    lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                    slip_missing_pass=True,
+                    lat_missing_fail_closed=True,
+                ),
+                "in": _counterfactual_filters_back(
+                    cov_back_rows_in,
+                    slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                    lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                    slip_missing_pass=True,
+                    lat_missing_fail_closed=True,
+                ),
+            }
+        except Exception:
+            pass
 
         # cobertura (placar) entre sucessos — Back/Lay
         try:

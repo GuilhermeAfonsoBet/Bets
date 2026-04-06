@@ -2456,6 +2456,38 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Contrafactual operacional (placar): efeito de filtros simples
+        # - remover slippage_raw_pct > +2% (beneficia se preços “subiram” demais vs decisão)
+        # - manter call_to_done_ms <= 6s (proxy de execução rápida)
+        # Observação: aplica-se SOMENTE ao subconjunto com ROI via placar (cobertura).
+        try:
+            s1.append("**Contrafactual (placar): filtros operacionais (Back)**\n\n")
+            s1.append(
+                "| Dia | Base P&L | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw |\n"
+            )
+            s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for it in adh_day.get("per_day") or []:
+                if not isinstance(it, dict):
+                    continue
+                ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                back = ex.get("back") if isinstance(ex.get("back"), dict) else {}
+                cf = back.get("filters_counterfactual") if isinstance(back.get("filters_counterfactual"), dict) else {}
+                base = cf.get("base") if isinstance(cf.get("base"), dict) else {}
+                a_slip = cf.get("after_slip") if isinstance(cf.get("after_slip"), dict) else {}
+                a_lat = cf.get("after_lat") if isinstance(cf.get("after_lat"), dict) else {}
+                a_both = cf.get("after_both") if isinstance(cf.get("after_both"), dict) else {}
+                if not base:
+                    continue
+                s1.append(
+                    f"| {it.get('day')} | {_fmt_num(base.get('pnl_sum'),2)} | {_fmt_pct(base.get('roi_weighted'))} | "
+                    f"{_fmt_num(a_slip.get('pnl_sum'),2)} | {_fmt_pct(a_slip.get('roi_weighted'))} | "
+                    f"{_fmt_num(a_lat.get('pnl_sum'),2)} | {_fmt_pct(a_lat.get('roi_weighted'))} | "
+                    f"{_fmt_num(a_both.get('pnl_sum'),2)} | {_fmt_pct(a_both.get('roi_weighted'))} |\n"
+                )
+            s1.append("\n")
+        except Exception:
+            pass
+
         # Accounting: P&L por jogo (event_id) e comparação coberto vs não-coberto.
         # Usa o `balance_csv` baixado no começo do daily.
         try:
