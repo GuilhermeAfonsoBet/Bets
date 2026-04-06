@@ -1006,7 +1006,9 @@ async def run_report(
             mult = _mult_back_from_scores(a.get("line") or e.line, a.get("side") or (e.side or ""), a.get("home_score"), a.get("away_score"))
             if mult is None:
                 continue
-            odd = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+            # ROI/placar deve refletir a odd executada. Sem odd_final, não há como medir
+            # slippage nem ROI realizado com consistência, então tratamos como não-coberto.
+            odd = _sanitize_decimal_odd(e.odd_final)
             if odd is None:
                 continue
             side = str(e.exec_side or "").strip().lower()
@@ -1126,7 +1128,7 @@ async def run_report(
             "observed_ah_line_abs": ah_obs,
             "slippage_filter_counterfactual": cf,
             "latency_vs_roi_call_to_done_ms": {
-                "note": "Latência por execução vem de result.timing.call_to_done_ms no executor_jsonl. ROI/placar usa odd executada (odd_final, senão odd_at_decision).",
+                "note": "Latência por execução vem de result.timing.call_to_done_ms no executor_jsonl. ROI/placar usa somente odd executada (odd_final). Se odd_final estiver ausente, a execução não entra no subconjunto coberto.",
                 "back_pre": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_pre)},
                 "back_in": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_in)},
             },
@@ -1341,7 +1343,8 @@ async def run_report(
                             ev_success_lay.add(str(e.event_id).strip())
                     except Exception:
                         pass
-                    odd0 = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+                    # liability (exposição) é medida na odd executada; sem odd_final não estimamos.
+                    odd0 = _sanitize_decimal_odd(e.odd_final)
                     if odd0 is not None:
                         perf["lay"]["liability_sum"] += float(stake0) * max(0.0, float(odd0) - 1.0)
 
@@ -1358,10 +1361,11 @@ async def run_report(
             mult = _mult_back_from_scores(a.get("line") or e.line, a.get("side") or (e.side or ""), a.get("home_score"), a.get("away_score"))
             if mult is None:
                 continue
-            odd = _sanitize_decimal_odd(e.odd_final if e.odd_final is not None else e.odd_decision)
+            # ROI/placar deve usar odd executada; sem odd_final consideramos não-coberto.
+            odd = _sanitize_decimal_odd(e.odd_final)
             if odd is None:
                 # registra anomalia por lado (quando havia algo preenchido)
-                raw_odd = e.odd_final if e.odd_final is not None else e.odd_decision
+                raw_odd = e.odd_final
                 if raw_odd is not None and side0 in ("back", "lay"):
                     blk = perf.get("odd_anomalies", {}).get(side0, {})
                     try:
@@ -1379,6 +1383,11 @@ async def run_report(
                 stake = float(e.stake_sent) if e.stake_sent is not None else 1.0
                 roi = _roi_back_pct(float(odd), float(mult))
                 pnl = stake * roi / 100.0
+                # Regime Pre/In: usado tanto para split de P&L quanto para contrafactuais por regime.
+                try:
+                    reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
+                except Exception:
+                    reg = ("In" if bool(e.is_live) else "Pre")
                 # Para contrafactual operacional: precisa ROI (placar), exposição e metadados de execução
                 try:
                     lat_ms = int(e.call_to_done_ms) if e.call_to_done_ms is not None else None
@@ -1407,10 +1416,6 @@ async def run_report(
                 except Exception:
                     pass
                 # quebra por Pre/In (para conciliar com OOS e com contagens por jogo)
-                try:
-                    reg = _combo_regime_from_audit(a, exec_created_at=e.created_at)
-                except Exception:
-                    reg = ("In" if bool(e.is_live) else "Pre")
                 try:
                     k2 = f"Back_{reg}"
                     blk = perf.get("pnl_placar_by_type", {}).get(k2) if isinstance(perf.get("pnl_placar_by_type"), dict) else None
