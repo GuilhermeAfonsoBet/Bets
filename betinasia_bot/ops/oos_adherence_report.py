@@ -353,6 +353,23 @@ def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[st
     return outb
 
 
+def _slip_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime, exec_is_live: bool) -> str:
+    """
+    Regime Pre/In para slippage×ROI (placar).
+    Preferimos inferência por kickoff_time quando disponível; caso contrário, fallback para is_live do executor.
+    """
+    try:
+        ko = a.get("kickoff_time")
+        if isinstance(ko, datetime):
+            return "In" if exec_created_at >= ko else "Pre"
+    except Exception:
+        pass
+    try:
+        return "In" if bool(exec_is_live) else "Pre"
+    except Exception:
+        return "Pre"
+
+
 def _agg_pnl_exposure(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Agrega linhas no formato:
@@ -860,6 +877,8 @@ async def run_report(
     comb_meta: Dict[str, Dict[str, Any]] = {}
     # contexto para interpretação (odd/exposure)
     total_rows_ctx_back: List[Dict[str, Any]] = []
+    total_rows_ctx_back_pre: List[Dict[str, Any]] = []
+    total_rows_ctx_back_in: List[Dict[str, Any]] = []
     total_rows_ctx_lay: List[Dict[str, Any]] = []
     total_rows_ctx_lay_stake: List[Dict[str, Any]] = []
     # contrafactual: filtro de slippage (apenas execuções com ROI via placar)
@@ -1426,6 +1445,14 @@ async def run_report(
                 if raw_pct is not None:
                     pairs_raw_back.append((float(raw_pct), float(roi)))
                     total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                    try:
+                        slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                        if str(slip_reg).strip().lower() == "in":
+                            total_rows_ctx_back_in.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                        else:
+                            total_rows_ctx_back_pre.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                    except Exception:
+                        pass
                     # por combinação (sem quebra por liga): Back/Lay × Pre/In × Yes/No/Any
                     try:
                         regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
@@ -1750,6 +1777,10 @@ async def run_report(
         "slippage_vs_roi_raw_total_ctx": {
             "back": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back)},
             "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay)},
+        },
+        "slippage_vs_roi_raw_total_ctx_by_regime": {
+            "back_pre": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back_pre)},
+            "back_in": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back_in)},
         },
         # Lay também em ROI por stake (bounded; útil para sanity-check de retornos)
         "slippage_vs_roi_raw_total_ctx_lay_stake": {

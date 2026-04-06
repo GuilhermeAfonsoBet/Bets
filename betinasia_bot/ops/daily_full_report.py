@@ -386,6 +386,24 @@ def _append_slippage_vs_roi_raw_section(
                 )
             out_lines.append("\n")
 
+        # Back: separar Pre vs In (hipótese: latência/slippage pesa mais em in‑match)
+        try:
+            by_reg = adh_slip.get("slippage_vs_roi_raw_total_ctx_by_regime") if isinstance(adh_slip, dict) else None
+            if isinstance(by_reg, dict) and (isinstance(by_reg.get("back_pre"), dict) or isinstance(by_reg.get("back_in"), dict)):
+                for key, sub in (("back_pre", "Back Pre (ROI por stake)"), ("back_in", "Back In (ROI por stake)")):
+                    blk = by_reg.get(key) if isinstance(by_reg.get(key), dict) else {}
+                    buckets0 = blk.get("buckets") if isinstance(blk.get("buckets"), list) else []
+                    buckets = _slip_raw_3bucket_rows(buckets0)
+                    if not any(int(r.get("n") or 0) > 0 for r in buckets):
+                        continue
+                    out_lines.append(f"- **{sub}**\n\n")
+                    out_lines.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
+                    for row in buckets:
+                        out_lines.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)}{_fmt_ctx_suffix(row)} |\n")
+                    out_lines.append("\n")
+        except Exception:
+            pass
+
         out_lines.append(
             "- Nota: `ROIw` é o **ROI ponderado por exposição** (peso=stake no Back; peso=liability no Lay). "
             "Em prática, dentro de um bucket, `ROIw ≈ (∑P&L)/(∑exposição)`; já o `ROI mean` é a média simples por linha/sinal.\n\n"
