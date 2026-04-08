@@ -551,6 +551,55 @@ def _append_latency_vs_roi_back_pre_in_section(out_lines: list[str], *, adh_slip
         return
 
 
+def _append_slippage_vs_latency_back_pre_in_section(out_lines: list[str], *, adh_slip: Optional[Dict[str, Any]], title: str) -> None:
+    """
+    Renderiza "Slippage × Latência (Back Pre/In)" usando o agregado exportado por `oos_adherence_report`.
+    Mantém o padrão de buckets e inclui estatísticas de slippage_raw_pct e ROIw por bucket.
+    """
+    try:
+        if not isinstance(adh_slip, dict) or not adh_slip:
+            return
+        blk = adh_slip.get("slippage_vs_latency_call_to_done_ms") if isinstance(adh_slip.get("slippage_vs_latency_call_to_done_ms"), dict) else None
+        if not isinstance(blk, dict) or not blk:
+            return
+        out_lines.append(f"**{title}**\n\n")
+        note = str(blk.get("note") or "").strip()
+        if note:
+            out_lines.append(f"- {note}\n\n")
+
+        def _print(subkey: str, subtitle: str) -> None:
+            sub = blk.get(subkey) if isinstance(blk.get(subkey), dict) else {}
+            buckets0 = sub.get("buckets") if isinstance(sub.get("buckets"), list) else []
+            if not any(isinstance(r, dict) and int(r.get("n") or 0) > 0 for r in buckets0):
+                return
+            out_lines.append(f"- **{subtitle}**\n\n")
+            out_lines.append("| Bucket call_to_done_ms | n | Slippage_raw mean (SE; IC95) | Slippage_raw mediana | Slippage_raw_w (por exp.) | ROIw (por exp.) |\n")
+            out_lines.append("|---|---:|---:|---:|---:|---:|\n")
+            for r in buckets0:
+                if not isinstance(r, dict):
+                    continue
+                ci = r.get("slip_raw_ci95") if isinstance(r.get("slip_raw_ci95"), dict) else None
+                se = r.get("slip_raw_se")
+                mean = r.get("slip_raw_mean")
+                if mean is None:
+                    mean_s = "—"
+                else:
+                    se_s = _fmt_pct(se) if se is not None else "—"
+                    if ci and (ci.get("lb") is not None) and (ci.get("ub") is not None):
+                        mean_s = f"{_fmt_pct(mean)} (SE {se_s}) [{_fmt_pct(ci.get('lb'))}, {_fmt_pct(ci.get('ub'))}]"
+                    else:
+                        mean_s = f"{_fmt_pct(mean)} (SE {se_s})"
+                out_lines.append(
+                    f"| {r.get('bucket')} | {int(r.get('n') or 0)} | {mean_s} | {_fmt_pct(r.get('slip_raw_median'))} | {_fmt_pct(r.get('slip_raw_weighted'))} | {_fmt_pct(r.get('roi_weighted'))} |\n"
+                )
+            out_lines.append("\n")
+
+        _print("back_pre", "Back Pre (slippage_raw_pct por stake)")
+        _print("back_in", "Back In (slippage_raw_pct por stake)")
+    except Exception:
+        return
+
+
 def _demote_h2_to_h3(md: str) -> str:
     # Usado para "embrulhar" o bloco in-sample sem reescrever o conteúdo.
     out = []
@@ -1946,6 +1995,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Decomposição extra (call_to_done = queue_delay + post + overhead): ajuda a distinguir "fila" vs "POST lento" (UI/anti-bot)
+    try:
+        blk_post_24 = ((kpi_ok_24h.get("timing_ms") or {}).get("post") or {}) if isinstance(kpi_ok_24h, dict) else {}
+        p50_post_24h = int(blk_post_24.get("p50") or 0) or None
+        p90_post_24h = int(blk_post_24.get("p90") or 0) or None
+        if p50_call_24h is not None and p50_queue_24h is not None and p50_post_24h is not None:
+            p50_over = int(max(0, int(p50_call_24h) - int(p50_queue_24h) - int(p50_post_24h)))
+            s0.append("**Decomposição (latência; p50, 24h; sucessos)**\n\n")
+            s0.append("| Componente | p50 |\n|---|---:|\n")
+            s0.append(f"| call_to_done_ms | {_fmt_num(p50_call_24h,0)}ms |\n")
+            s0.append(f"| queue_delay_ms | {_fmt_num(p50_queue_24h,0)}ms |\n")
+            s0.append(f"| post_ms | {_fmt_num(p50_post_24h,0)}ms |\n")
+            s0.append(f"| overhead (aprox.) | {_fmt_num(p50_over,0)}ms |\n")
+            s0.append("\n")
+            # Aciona recomendações específicas quando post_ms é o gargalo
+            if int(p50_post_24h) >= 2000:
+                s0.append(
+                    "- Leitura: `post_ms` alto sugere lentidão no passo de POST/submit (UI/JS/anti-bot/latência de página), não fila. Mitigação típica: estabilizar sessão, reduzir re-login, otimizar fluxo do scraper e revisar timeout/retries.\n\n"
+                )
+    except Exception:
+        pass
+
     hard_fails = []
     if not chk_allow:
         hard_fails.append("LIVE bloqueado (`EXECUTOR_ALLOW_LIVE=0`)")
@@ -2361,9 +2432,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     if isinstance(adh_day, dict) and isinstance(adh_day.get("per_day"), list) and adh_day.get("per_day"):
         s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
         s1.append(
-            "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | P&L total (acct) | P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
+            "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | P&L total (acct) | ROI/$ (acct) | P&L Back Pre (acct, aloc.) | P&L Back In (acct, aloc.) | P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
         )
-        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for it in adh_day.get("per_day") or []:
             if not isinstance(it, dict):
                 continue
@@ -2395,14 +2466,44 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         pnl_acct = float(mp.get(dayk) or 0.0)
             except Exception:
                 pnl_acct = None
+
+            # Accounting ROI/$: usa stake_total do Back como denominador (operacional), porque o balance.csv não expõe stake/liability por lado.
+            roi_acct_dol = None
+            try:
+                if pnl_acct is not None and st_back is not None and float(st_back) > 0:
+                    roi_acct_dol = float(pnl_acct) / float(st_back) * 100.0
+            except Exception:
+                roi_acct_dol = None
+
+            # P&L accounting alocado por regime (proxy) usando share de stake enviado (Back) em Pre vs In.
+            pnl_acct_back_pre = None
+            pnl_acct_back_in = None
+            try:
+                st_pre = float(back.get("stake_sum_pre") or 0.0)
+                st_in = float(back.get("stake_sum_in") or 0.0)
+                st_tot = float(st_pre + st_in)
+                if pnl_acct is not None and st_tot > 0:
+                    w_pre = st_pre / st_tot
+                    w_in = st_in / st_tot
+                    pnl_acct_back_pre = float(pnl_acct) * float(w_pre)
+                    pnl_acct_back_in = float(pnl_acct) * float(w_in)
+            except Exception:
+                pnl_acct_back_pre = None
+                pnl_acct_back_in = None
             s1.append(
                 f"| {it.get('day')} | {int(ex.get('n_exec_rows') or 0)} | {int(ex.get('n_exec_success') or 0)} | {int(sc.get('LIVE_OK') or 0)} | {int(sc.get('DRY_OK') or 0)} | "
                 f"{int(sc.get('API_FAILED') or 0)} | {int(back.get('n_success') or 0)} | {int(lay.get('n_success') or 0)} | "
                 f"{_fmt_num(st_back,2)} | {_fmt_num(st_lay,2)} | {_fmt_num(liab_lay,2)} | "
-                f"{_fmt_num(pnl_acct,2)} | {_fmt_num(pnl_total_placar,2)} | {_fmt_pct(roi_dol)} | {_fmt_num(pnl_back,2)} | {_fmt_pct(back.get('roi_pct'))} | "
+                f"{_fmt_num(pnl_acct,2)} | {_fmt_pct(roi_acct_dol)} | {_fmt_num(pnl_acct_back_pre,2)} | {_fmt_num(pnl_acct_back_in,2)} | "
+                f"{_fmt_num(pnl_total_placar,2)} | {_fmt_pct(roi_dol)} | {_fmt_num(pnl_back,2)} | {_fmt_pct(back.get('roi_pct'))} | "
                 f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
         s1.append("\n")
+
+        s1.append(
+            "_Nota: `ROI/$ (acct)` e `P&L Back Pre/In (acct)` usam `stake_sum` do Back (executor_jsonl) como denominador e alocação por share Pre/In. "
+            "Isso é um **proxy**: o accounting (balance.csv) não expõe stake/liability por lado/regime._\n\n"
+        )
 
         # Cobertura de placar entre execuções bem-sucedidas (por n, stake e por jogo/event_id).
         # Isso é crucial para interpretar gaps entre P&L (acct) e P&L/ROI (placar),
@@ -2644,7 +2745,17 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 2.3) Slippage × ROI (raw, com sinal): acumulado na janela
+        # 2.3) Slippage × Latência (Back Pre/In): acumulado na janela
+        try:
+            _append_slippage_vs_latency_back_pre_in_section(
+                s1,
+                adh_slip=adh_slip,
+                title="Slippage × Latência (Back Pre/In) — acumulado (call_to_done_ms)",
+            )
+        except Exception:
+            pass
+
+        # 2.4) Slippage × ROI (raw, com sinal): acumulado na janela
         _append_slippage_vs_roi_raw_section(
             s1,
             adh_slip=adh_slip,
@@ -2652,7 +2763,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             combo_top_limit=2,
         )
 
-        # 2.4) Slippage pós-início (>= 2026-04-04) — mantém as mesmas tabelas, mas com corte.
+        # 2.5) Slippage pós-início (>= 2026-04-04) — mantém as mesmas tabelas, mas com corte.
         try:
             post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
             if post_start:
@@ -2680,6 +2791,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     cwd=str(Path(__file__).resolve().parent.parent),
                 )
                 adh_post = _read_json(adh_post_json)
+                try:
+                    _append_slippage_vs_latency_back_pre_in_section(
+                        s1,
+                        adh_slip=adh_post,
+                        title=f"Slippage × Latência (Back Pre/In) — pós-início (>= {post_start})",
+                    )
+                except Exception:
+                    pass
                 _append_slippage_vs_roi_raw_section(
                     s1,
                     adh_slip=adh_post,
@@ -2688,29 +2807,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 )
         except Exception:
             pass
-        else:
-            # fallback: último dia com dados
-            last = _pick_last_day_with_slippage_vs_roi_raw(list(adh_day.get("per_day") or [])) if isinstance(adh_day, dict) else None
-            if isinstance(last, dict):
-                ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
-                rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
-                if rawblk:
-                    s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — exemplo do dia `{last.get('day')}`**\n\n")
-                    for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
-                        b = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
-                        buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
-                        buckets = _slip_raw_3bucket_rows(buckets0)
-                        if not any(int(r.get("n") or 0) > 0 for r in buckets):
-                            continue
-                        s1.append(f"- **{title}**\n\n")
-                        s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
-                        for row in buckets:
-                            s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)} |\n")
-                        s1.append("\n")
-            else:
-                s1.append(
-                    "_Slippage × ROI (por bucket) indisponível na janela: precisa de execuções com odd (decision/final) **e** placar (ROI) no DB._\n\n"
-                )
+        # fallback: se nada foi renderizado, pega o último dia com buckets (melhor do que vazio)
+        try:
+            if (not isinstance(adh_slip, dict) or not adh_slip) and isinstance(adh_day, dict):
+                last = _pick_last_day_with_slippage_vs_roi_raw(list(adh_day.get("per_day") or []))
+                if isinstance(last, dict):
+                    ex = last.get("execution") if isinstance(last.get("execution"), dict) else {}
+                    rawblk = ex.get("slippage_vs_roi_raw") if isinstance(ex.get("slippage_vs_roi_raw"), dict) else {}
+                    if rawblk:
+                        s1.append(f"**Slippage × ROI por bucket (raw, com sinal) — exemplo do dia `{last.get('day')}`**\n\n")
+                        for side_key, title in (("back", "Back (ROI por stake)"), ("lay", "Lay (ROI por liability)")):
+                            b = rawblk.get(side_key) if isinstance(rawblk.get(side_key), dict) else {}
+                            buckets0 = b.get("buckets") if isinstance(b.get("buckets"), list) else []
+                            buckets = _slip_raw_3bucket_rows(buckets0)
+                            if not any(int(r.get("n") or 0) > 0 for r in buckets):
+                                continue
+                            s1.append(f"- **{title}**\n\n")
+                            s1.append("| Bucket slippage_raw_pct | n | ROI mean (SE; IC95) |\n|---|---:|---:|\n")
+                            for row in buckets:
+                                s1.append(f"| {row.get('bucket')} | {int(row.get('n') or 0)} | {_fmt_roi_mean_se_ci_pct(row)} |\n")
+                            s1.append("\n")
+        except Exception:
+            pass
 
     # Funil (24h) por auditoria: total → OK/valid → erros principais
     if isinstance(audit_rep, dict) and isinstance(audit_rep.get("by_version"), list) and audit_rep.get("by_version"):

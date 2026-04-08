@@ -15,6 +15,17 @@ from sqlalchemy import text
 from storage.database import Database
 
 
+def _add_float(d: Dict[str, float], k: str, v: Optional[float]) -> None:
+    try:
+        if not k:
+            return
+        if v is None:
+            return
+        d[k] = float(d.get(k, 0.0)) + float(v)
+    except Exception:
+        return
+
+
 def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -265,6 +276,74 @@ def _bucketize_latency_call_to_done_ms_with_context(rows: List[Dict[str, Any]]) 
                 "odd_median": _median(odds),
                 "exposure_median": _median(exps),
                 "exposure_sum": exp_sum,
+                "roi_weighted": roi_w,
+            }
+        )
+    return out
+
+
+def _bucketize_slip_raw_pct_vs_latency_with_context(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Bucketiza por call_to_done_ms (latência) e retorna estatísticas de slippage_raw_pct por bucket,
+    junto com ROI ponderado por exposição (ROIw) para ajudar a ligar execução (latência/slippage) a resultado.
+    Espera rows no formato:
+      {lat_ms, slip_raw_pct, roi, odd, exposure}
+    """
+    if not rows:
+        return []
+
+    def _lab(lat_ms: Optional[float]) -> str:
+        if lat_ms is None:
+            return "Desconhecido"
+        x = float(lat_ms)
+        if x < 5000:
+            return "< 5s"
+        if x < 10000:
+            return "5-10s"
+        if x < 20000:
+            return "10-20s"
+        if x < 40000:
+            return "20-40s"
+        return "> 40s"
+
+    order = ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]
+    out: List[Dict[str, Any]] = []
+    for lab in order:
+        sub = [r for r in rows if _lab(_safe_float(r.get("lat_ms"))) == lab]
+        slips = [float(r.get("slip_raw_pct")) for r in sub if r.get("slip_raw_pct") is not None]
+        if not slips:
+            continue
+        st = _mean_se_ci95(slips)
+        odds = [float(r.get("odd")) for r in sub if r.get("odd") is not None]
+        exps = [float(r.get("exposure")) for r in sub if r.get("exposure") is not None]
+        exp_sum = float(sum(exps)) if exps else 0.0
+        slip_w = None
+        roi_w = None
+        try:
+            if exp_sum > 0:
+                slip_w = float(
+                    sum(float(r.get("slip_raw_pct")) * float(r.get("exposure")) for r in sub if r.get("slip_raw_pct") is not None and r.get("exposure") is not None)
+                    / exp_sum
+                )
+                roi_w = float(
+                    sum(float(r.get("roi")) * float(r.get("exposure")) for r in sub if r.get("roi") is not None and r.get("exposure") is not None) / exp_sum
+                )
+        except Exception:
+            slip_w = None
+            roi_w = None
+        out.append(
+            {
+                "bucket": lab,
+                "n": int(st.get("n") or 0),
+                "slip_raw_mean": st.get("mean"),
+                "slip_raw_sd": st.get("sd"),
+                "slip_raw_se": st.get("se"),
+                "slip_raw_ci95": st.get("ci95"),
+                "slip_raw_median": _median(slips),
+                "odd_median": _median(odds),
+                "exposure_median": _median(exps),
+                "exposure_sum": exp_sum,
+                "slip_raw_weighted": slip_w,
                 "roi_weighted": roi_w,
             }
         )
@@ -983,6 +1062,9 @@ async def run_report(
         # Latência × ROI (Back Pre/In): acumulado na janela (somente execuções com ROI via placar)
         lat_rows_back_pre: List[Dict[str, Any]] = []
         lat_rows_back_in: List[Dict[str, Any]] = []
+        # Slippage × Latência (Back Pre/In): acumulado (somente execuções com ROI via placar)
+        slip_lat_rows_back_pre: List[Dict[str, Any]] = []
+        slip_lat_rows_back_in: List[Dict[str, Any]] = []
 
         for e in xs:
             # diagnóstico AH em todas as execuções (com ou sem placar)
@@ -1030,15 +1112,39 @@ async def run_report(
                     "odd": float(odd),
                     "exposure": float(stake),
                 }
-                if str(regime).strip().lower() == "in":
-                    lat_rows_back_in.append(lat_row)
-                else:
-                    lat_rows_back_pre.append(lat_row)
-                if cost_pct is not None:
-                    total_pairs_cost_back.append((float(cost_pct), float(roi)))
-                if raw_pct is not None:
-                    total_pairs_raw_back.append((float(raw_pct), float(roi)))
-                    total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                # Respeita corte pós-fix também no modo "totais apenas"
+                if _cf_allowed(e):
+                    if str(regime).strip().lower() == "in":
+                        lat_rows_back_in.append(lat_row)
+                    else:
+                        lat_rows_back_pre.append(lat_row)
+                    if cost_pct is not None:
+                        total_pairs_cost_back.append((float(cost_pct), float(roi)))
+                    if raw_pct is not None:
+                        total_pairs_raw_back.append((float(raw_pct), float(roi)))
+                        total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                        try:
+                            slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                            if str(slip_reg).strip().lower() == "in":
+                                total_rows_ctx_back_in.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                            else:
+                                total_rows_ctx_back_pre.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
+                        except Exception:
+                            pass
+                        try:
+                            slip_lat_row = {
+                                "lat_ms": (float(e.call_to_done_ms) if e.call_to_done_ms is not None else None),
+                                "slip_raw_pct": float(raw_pct),
+                                "roi": float(roi),
+                                "odd": float(odd),
+                                "exposure": float(stake),
+                            }
+                            if str(regime).strip().lower() == "in":
+                                slip_lat_rows_back_in.append(slip_lat_row)
+                            else:
+                                slip_lat_rows_back_pre.append(slip_lat_row)
+                        except Exception:
+                            pass
                     try:
                         regime = _combo_regime_from_audit(a, exec_created_at=e.created_at)
                         comb = f"Back_{regime}_Any"
@@ -1071,11 +1177,13 @@ async def run_report(
                 if roi_liab is None:
                     continue
                 pnl = liab * float(roi_liab) / 100.0
-                if cost_pct is not None:
-                    total_pairs_cost_lay.append((float(cost_pct), float(roi_liab)))
-                if raw_pct is not None:
-                    total_pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
-                    total_rows_ctx_lay.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_liab), "odd": float(odd), "exposure": float(liab)})
+                # Respeita corte pós-fix também no modo "totais apenas"
+                if _cf_allowed(e):
+                    if cost_pct is not None:
+                        total_pairs_cost_lay.append((float(cost_pct), float(roi_liab)))
+                    if raw_pct is not None:
+                        total_pairs_raw_lay.append((float(raw_pct), float(roi_liab)))
+                        total_rows_ctx_lay.append({"slip_raw_pct": float(raw_pct), "roi": float(roi_liab), "odd": float(odd), "exposure": float(liab)})
                     try:
                         roi_st = (float(pnl) / float(stake) * 100.0) if stake > 0 else None
                     except Exception:
@@ -1123,14 +1231,26 @@ async def run_report(
             "policy_json": str(policy_json),
             "executor_jsonl": str(executor_jsonl),
             "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
+            "slippage_range": {
+                "start_day": slip_start_day.isoformat(),
+                "end_day": end_day.isoformat(),
+                "span_days": slip_span_days,
+                "cut_start_day_local": cf_start_day.isoformat() if cf_start_day else None,
+            },
             "policy_days": active_by_day,
             "per_day": [],
             "observed_ah_line_abs": ah_obs,
             "slippage_filter_counterfactual": cf,
+            "slippage_start_day_local": cf_start_day.isoformat() if cf_start_day else None,
             "latency_vs_roi_call_to_done_ms": {
                 "note": "Latência por execução vem de result.timing.call_to_done_ms no executor_jsonl. ROI/placar usa somente odd executada (odd_final). Se odd_final estiver ausente, a execução não entra no subconjunto coberto.",
                 "back_pre": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_pre)},
                 "back_in": {"buckets": _bucketize_latency_call_to_done_ms_with_context(lat_rows_back_in)},
+            },
+            "slippage_vs_latency_call_to_done_ms": {
+                "note": "Slippage_raw_pct vs latência usa execuções com ROI via placar e odd_final presente; slippage_raw_pct=(odd_final-odd_at_decision)/odd_at_decision.",
+                "back_pre": {"buckets": _bucketize_slip_raw_pct_vs_latency_with_context(slip_lat_rows_back_pre)},
+                "back_in": {"buckets": _bucketize_slip_raw_pct_vs_latency_with_context(slip_lat_rows_back_in)},
             },
             "slippage_vs_roi_raw_total": {
                 "back": {"buckets": _bucketize_3way_raw(total_pairs_raw_back)},
@@ -1139,6 +1259,10 @@ async def run_report(
             "slippage_vs_roi_raw_total_ctx": {
                 "back": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back)},
                 "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay)},
+            },
+            "slippage_vs_roi_raw_total_ctx_by_regime": {
+                "back_pre": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back_pre)},
+                "back_in": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_back_in)},
             },
             "slippage_vs_roi_raw_total_ctx_lay_stake": {
                 "lay": {"buckets": _bucketize_3way_raw_with_context(total_rows_ctx_lay_stake)},
@@ -1226,6 +1350,9 @@ async def run_report(
                 "half_losses": 0,
                 # stake enviado total (sucessos)
                 "stake_sum": 0.0,
+                # stake enviado por regime (Pre/In) — útil para alocar P&L do accounting por regime (proxy)
+                "stake_sum_pre": 0.0,
+                "stake_sum_in": 0.0,
                 # stake com cobertura (placar+odd)
                 "stake_sum_cov": 0.0,
                 "pnl_sum": 0.0,
@@ -1330,6 +1457,21 @@ async def run_report(
                 if side0 == "back":
                     perf["back"]["n_success"] += 1
                     perf["back"]["stake_sum"] += float(stake0)
+                    # split Pre/In (best-effort): usa kickoff_time do audit quando disponível
+                    try:
+                        reg = None
+                        a0 = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
+                        if isinstance(a0, dict) and a0:
+                            reg = _slip_regime_from_audit(a0, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                        if reg is None:
+                            reg = ("In" if bool(e.is_live) else "Pre")
+                        if str(reg).strip().lower() == "in":
+                            perf["back"]["stake_sum_in"] += float(stake0)
+                        else:
+                            perf["back"]["stake_sum_pre"] += float(stake0)
+                    except Exception:
+                        # não falha o relatório por ausência de audit/kickoff
+                        pass
                     try:
                         if e.event_id:
                             ev_success_back.add(str(e.event_id).strip())
