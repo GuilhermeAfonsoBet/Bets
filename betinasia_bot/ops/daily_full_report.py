@@ -205,12 +205,27 @@ def _summarize_event_pnls(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         except Exception:
             pass
     pnls_sorted = sorted(pnls)
+    stakes_sorted = sorted(stakes)
     out: Dict[str, Any] = {
         "events_n": int(len(ev_map or {})),
         "pnl_sum": float(sum(pnls)) if pnls else 0.0,
         "stake_est_sum": float(sum(stakes)) if stakes else 0.0,
         "pnl_median": (float(statistics.median(pnls_sorted)) if pnls_sorted else None),
     }
+    # Stake médio/jogo (proxy): soma de (-amount) por jogo / #jogos
+    try:
+        n_ev = int(out.get("events_n") or 0)
+        st_sum = float(out.get("stake_est_sum") or 0.0)
+        out["stake_mean_per_game"] = (st_sum / float(n_ev)) if n_ev > 0 else None
+    except Exception:
+        out["stake_mean_per_game"] = None
+    # ROI mediana (proxy): (P&L mediana/jogo) / (stake médio/jogo)
+    try:
+        pm = out.get("pnl_median")
+        sm = out.get("stake_mean_per_game")
+        out["roi_median_pct"] = (float(pm) / float(sm) * 100.0) if (pm is not None and sm is not None and float(sm) > 0) else None
+    except Exception:
+        out["roi_median_pct"] = None
     try:
         if len(pnls_sorted) >= 10:
             out["pnl_p10"] = float(statistics.quantiles(pnls_sorted, n=10, method="inclusive")[0])
@@ -231,6 +246,291 @@ def _summarize_event_pnls(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         out["stake_conc_max_share"] = (float(max(abs(x) for x in stakes)) / abs_st_sum) if abs_st_sum > 0 else None
     except Exception:
         out["stake_conc_max_share"] = None
+    return out
+
+
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(str(x).strip())
+    except Exception:
+        return None
+
+
+def _extract_order_id_from_raw(raw: Any) -> Optional[str]:
+    """
+    Best-effort: extrai order_id do `result.raw` do executor_jsonl.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        oid = str(raw.get("order_id") or "").strip() or None
+    except Exception:
+        oid = None
+    if oid:
+        return oid
+    # fallback: tenta achar em order_resp
+    try:
+        resp = raw.get("order_resp")
+        if isinstance(resp, dict):
+            for k in ("id", "order_id", "orderId", "uuid", "uid"):
+                v = resp.get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+            for k in ("data", "order", "result"):
+                v = resp.get(k)
+                if isinstance(v, dict):
+                    for kk in ("id", "order_id", "orderId", "uuid", "uid"):
+                        vv = v.get(kk)
+                        if vv is None:
+                            continue
+                        s = str(vv).strip()
+                        if s:
+                            return s
+        if isinstance(resp, str):
+            s = resp.strip()
+            return s or None
+    except Exception:
+        return None
+    return None
+
+
+def _slip_raw_pct(*, odd_dec: Optional[float], odd_fin: Optional[float]) -> Optional[float]:
+    try:
+        if odd_dec is None or odd_fin is None or float(odd_dec) <= 0:
+            return None
+        return float((float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0)
+    except Exception:
+        return None
+
+
+def _agg_pnl_exposure(rows: list[dict]) -> Dict[str, Any]:
+    """
+    Agrega {pnl, exposure} e retorna ROIw=(∑pnl)/(∑exposure)*100.
+    """
+    try:
+        n = int(len(rows or []))
+        exp = float(sum(float(r.get("exposure") or 0.0) for r in (rows or []) if r.get("exposure") is not None))
+        pnl = float(sum(float(r.get("pnl") or 0.0) for r in (rows or []) if r.get("pnl") is not None))
+        roi_w = (float(pnl) / float(exp) * 100.0) if exp > 0 else None
+        return {"n": n, "exposure_sum": exp, "pnl_sum": pnl, "roi_weighted": roi_w}
+    except Exception:
+        return {"n": int(len(rows or [])), "exposure_sum": 0.0, "pnl_sum": 0.0, "roi_weighted": None}
+
+
+def _counterfactual_filters_back(
+    rows: list[dict],
+    *,
+    slip_raw_pct_max: float = 2.0,
+    lat_ms_max: int = 6000,
+    slip_missing_pass: bool = True,
+    lat_missing_fail_closed: bool = True,
+) -> Dict[str, Any]:
+    """
+    Contrafactual operacional aplicado a rows com {pnl, exposure, slip_raw_pct, lat_ms}.
+    """
+    base = _agg_pnl_exposure(rows)
+
+    def _pass_slip(r: Dict[str, Any]) -> bool:
+        s = r.get("slip_raw_pct")
+        if s is None:
+            return bool(slip_missing_pass)
+        try:
+            return float(s) <= float(slip_raw_pct_max)
+        except Exception:
+            return bool(slip_missing_pass)
+
+    def _pass_lat(r: Dict[str, Any]) -> bool:
+        t = r.get("lat_ms")
+        if t is None:
+            return (not bool(lat_missing_fail_closed))
+        try:
+            return float(t) <= float(lat_ms_max)
+        except Exception:
+            return (not bool(lat_missing_fail_closed))
+
+    after_slip_rows = [r for r in rows if _pass_slip(r)]
+    after_lat_rows = [r for r in rows if _pass_lat(r)]
+    after_both_rows = [r for r in rows if _pass_slip(r) and _pass_lat(r)]
+    after_slip = _agg_pnl_exposure(after_slip_rows)
+    after_lat = _agg_pnl_exposure(after_lat_rows)
+    after_both = _agg_pnl_exposure(after_both_rows)
+
+    def _delta(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            dpnl = float(b.get("pnl_sum") or 0.0) - float(a.get("pnl_sum") or 0.0)
+        except Exception:
+            dpnl = None
+        try:
+            droi = None
+            if a.get("roi_weighted") is not None and b.get("roi_weighted") is not None:
+                droi = float(b.get("roi_weighted")) - float(a.get("roi_weighted"))
+        except Exception:
+            droi = None
+        try:
+            pass_n = (float(b.get("n") or 0) / float(a.get("n") or 0) * 100.0) if float(a.get("n") or 0) > 0 else None
+        except Exception:
+            pass_n = None
+        try:
+            pass_exp = (float(b.get("exposure_sum") or 0.0) / float(a.get("exposure_sum") or 0.0) * 100.0) if float(a.get("exposure_sum") or 0.0) > 0 else None
+        except Exception:
+            pass_exp = None
+        return {"delta_pnl_sum": dpnl, "delta_roi_weighted": droi, "pass_n_pct": pass_n, "pass_exposure_pct": pass_exp}
+
+    out: Dict[str, Any] = {
+        "rule": {
+            "slip_raw_pct_max": float(slip_raw_pct_max),
+            "lat_ms_max": int(lat_ms_max),
+            "slip_missing_pass": bool(slip_missing_pass),
+            "lat_missing_fail_closed": bool(lat_missing_fail_closed),
+        },
+        "base": base,
+        "after_slip": after_slip,
+        "after_lat": after_lat,
+        "after_both": after_both,
+        "effect": {
+            "slip": _delta(base, after_slip),
+            "lat": _delta(base, after_lat),
+            "both": _delta(base, after_both),
+        },
+    }
+    return out
+
+
+def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Lê executor_jsonl e retorna order_id -> métricas para Back LIVE_OK:
+      {created_at_utc, slip_raw_pct, lat_ms, stake_sent, is_inplay_guess}
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not path.exists():
+        return out
+    for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        st = str(res.get("status") or "").strip()
+        if st != "LIVE_OK":
+            continue
+        exec_side = str(res.get("exec_side") or req.get("exec_side") or "").strip().lower()
+        if exec_side != "back":
+            continue
+        created = _parse_dt_any(str(res.get("created_at") or req.get("created_at") or ""))
+        if created is None:
+            # fallback: tenta ISO parser já existente na base via fromisoformat (em _parse_dt_any)
+            continue
+        raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+        oid = _extract_order_id_from_raw(raw)
+        if not oid or not str(oid).isdigit():
+            continue
+        sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
+        stake = _safe_float(sent.get("stake"))
+        if stake is None:
+            pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
+            stake = _safe_float((pol or {}).get("stake_requested"))
+        timing = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+        lat_ms = _safe_float(timing.get("call_to_done_ms"))
+        lat_ms_i = int(lat_ms) if lat_ms is not None else None
+        odd_dec = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
+        odd_fin = _safe_float(res.get("odd_final"))
+        slip = _slip_raw_pct(odd_dec=odd_dec, odd_fin=odd_fin)
+        is_live = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
+        rec = {
+            "order_id": str(oid),
+            "created_at": created.astimezone(timezone.utc),
+            "slip_raw_pct": slip,
+            "lat_ms": (float(lat_ms_i) if lat_ms_i is not None else None),
+            "exposure": (float(stake) if stake is not None else None),
+            "is_live": bool(is_live) if is_live is not None else False,
+        }
+        prev = out.get(str(oid))
+        if prev is None or rec["created_at"] >= prev.get("created_at"):
+            out[str(oid)] = rec
+    return out
+
+
+def _acct_amount_by_order_day_from_balance_csv(
+    path: Path,
+    *,
+    days_utc: Optional[set[str]] = None,
+    only_type_bet: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Retorna: order_id -> day(UTC) -> amount_sum.
+    Necessário para contrafactual exato no accounting ledger (post date UTC).
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if not path.exists():
+        return out
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        r = csv.DictReader(f)
+        cols = list(r.fieldnames or [])
+        if not cols:
+            return out
+        cols_l = [c.lower() for c in cols]
+        # heurística similar a ops.reconcile_oos_vs_realized
+        dt_col = None
+        for k in ("post date", "post_date", "date", "settled", "closed", "time"):
+            for c in cols:
+                if c.lower() == k or c.lower().startswith(k) or k in c.lower():
+                    dt_col = c
+                    break
+            if dt_col:
+                break
+        pnl_col = None
+        for k in ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"):
+            for c in cols:
+                if c.lower() == k or c.lower().startswith(k) or k in c.lower():
+                    pnl_col = c
+                    break
+            if pnl_col:
+                break
+        typ_col = None
+        for c in cols:
+            if c.lower() == "type" or c.lower().startswith("type"):
+                typ_col = c
+                break
+        oid_col = None
+        for k in ("order_id", "order id", "order", "bet id", "bet_id", "id"):
+            for c in cols:
+                cl = c.lower()
+                if cl == k or cl.startswith(k) or k in cl:
+                    oid_col = c
+                    break
+            if oid_col:
+                break
+        for row in r:
+            if not isinstance(row, dict):
+                continue
+            if not oid_col or not pnl_col or not dt_col:
+                continue
+            if only_type_bet and typ_col:
+                typ = str(row.get(typ_col) or "").strip().lower()
+                if typ and typ != "bet":
+                    continue
+            oid = str(row.get(oid_col) or "").strip()
+            if not oid or not oid.isdigit():
+                continue
+            dt = _parse_dt_any(str(row.get(dt_col) or ""))
+            if dt is None:
+                continue
+            day = dt.date().isoformat()
+            if days_utc is not None and day not in days_utc:
+                continue
+            amt = _safe_float(row.get(pnl_col))
+            if amt is None:
+                continue
+            blk = out.setdefault(oid, {})
+            blk[day] = float(blk.get(day) or 0.0) + float(amt)
     return out
 
 
@@ -2580,7 +2880,77 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         # - manter call_to_done_ms <= 6s (proxy de execução rápida)
         # Observação: aplica-se SOMENTE ao subconjunto com ROI via placar (cobertura).
         try:
-            s1.append("**Contrafactual (placar): filtros operacionais (Back)**\n\n")
+            # Versão 1 (Accounting ledger, por order_id): exata em termos de movimentos no balance.csv
+            # (quando houver coluna de order_id). A interpretação é: "se eu tivesse aplicado esses filtros,
+            # eu não teria colocado estas ordens; portanto, seus lançamentos no ledger não existiriam".
+            if bal_csv and bal_csv.exists():
+                try:
+                    exec_by_oid = _parse_executor_jsonl_back_live_orders(Path(str(cfg.executor_jsonl)))
+                except Exception:
+                    exec_by_oid = {}
+                try:
+                    days_utc_cf = {str(it.get("day") or "") for it in (adh_day.get("per_day") or []) if isinstance(it, dict) and str(it.get("day") or "")}
+                except Exception:
+                    days_utc_cf = set()
+                acct_by_oid_day = _acct_amount_by_order_day_from_balance_csv(bal_csv, days_utc=set(days_utc_cf), only_type_bet=True) if days_utc_cf else {}
+
+                if exec_by_oid and acct_by_oid_day:
+                    s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back)**\n\n")
+                    s1.append(
+                        "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders com acct no dia) |\n"
+                    )
+                    s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                    for it in adh_day.get("per_day") or []:
+                        if not isinstance(it, dict):
+                            continue
+                        dayk = str(it.get("day") or "")
+                        if not dayk:
+                            continue
+                        rows0 = []
+                        n_with_acct = 0
+                        for oid, em in (exec_by_oid or {}).items():
+                            if not isinstance(em, dict):
+                                continue
+                            amt_by_day = acct_by_oid_day.get(str(oid)) if isinstance(acct_by_oid_day.get(str(oid)), dict) else None
+                            if not amt_by_day or dayk not in amt_by_day:
+                                continue
+                            n_with_acct += 1
+                            try:
+                                pnl_amt = float(amt_by_day.get(dayk) or 0.0)
+                            except Exception:
+                                pnl_amt = 0.0
+                            rows0.append(
+                                {
+                                    "pnl": pnl_amt,
+                                    "exposure": em.get("exposure"),
+                                    "slip_raw_pct": em.get("slip_raw_pct"),
+                                    "lat_ms": em.get("lat_ms"),
+                                }
+                            )
+                        if not rows0:
+                            continue
+                        cf_acct = _counterfactual_filters_back(
+                            rows0,
+                            slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                            lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                            slip_missing_pass=True,
+                            lat_missing_fail_closed=True,
+                        )
+                        base = cf_acct.get("base") if isinstance(cf_acct.get("base"), dict) else {}
+                        a_slip = cf_acct.get("after_slip") if isinstance(cf_acct.get("after_slip"), dict) else {}
+                        a_lat = cf_acct.get("after_lat") if isinstance(cf_acct.get("after_lat"), dict) else {}
+                        a_both = cf_acct.get("after_both") if isinstance(cf_acct.get("after_both"), dict) else {}
+                        s1.append(
+                            f"| {dayk} | {_fmt_num(base.get('pnl_sum'),2)} | {_fmt_pct(base.get('roi_weighted'))} | "
+                            f"{_fmt_num(a_slip.get('pnl_sum'),2)} | {_fmt_pct(a_slip.get('roi_weighted'))} | "
+                            f"{_fmt_num(a_lat.get('pnl_sum'),2)} | {_fmt_pct(a_lat.get('roi_weighted'))} | "
+                            f"{_fmt_num(a_both.get('pnl_sum'),2)} | {_fmt_pct(a_both.get('roi_weighted'))} | "
+                            f"{int(n_with_acct)} |\n"
+                        )
+                    s1.append("\n")
+
+            # Versão 2 (placar; cobertura): mantém como diagnóstico, mas NÃO é accounting.
+            s1.append("**Contrafactual (placar; somente cobertos por ROI): filtros operacionais (Back)**\n\n")
             s1.append(
                 "| Dia | Base P&L | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw |\n"
             )
@@ -2627,9 +2997,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             try:
                 s1.append("**Accounting: distribuição de P&L por jogo (event_id; por post date UTC)**\n\n")
                 s1.append(
-                    "| Dia | #jogos | P&L total (acct; bets) | P&L mediana/jogo | P10 | P90 | Concentração P&L (max |abs| / soma |abs|) | Turnover proxy (∑-amount) | Concentração turnover (max share) |\n"
+                    "| Dia | #jogos | P&L total (acct; bets) | P&L mediana/jogo | Stake médio/jogo (proxy) | ROI mediana (P&L mediana / stake médio) | P10 | P90 | Concentração P&L (max |abs| / soma |abs|) | Turnover proxy (∑-amount) | Concentração turnover (max share) |\n"
                 )
-                s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
                 for it in adh_day.get("per_day") or []:
                     if not isinstance(it, dict):
                         continue
@@ -2638,6 +3008,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     summ = _summarize_event_pnls(ev_map)
                     s1.append(
                         f"| {dayk} | {int(summ.get('events_n') or 0)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_num(summ.get('pnl_median'),2)} | "
+                        f"{_fmt_num(summ.get('stake_mean_per_game'),2)} | {_fmt_pct(summ.get('roi_median_pct'))} | "
                         f"{_fmt_num(summ.get('pnl_p10'),2)} | {_fmt_num(summ.get('pnl_p90'),2)} | {_fmt_pct((float(summ.get('pnl_conc_max_abs_share'))*100.0) if summ.get('pnl_conc_max_abs_share') is not None else None,2)} | "
                         f"{_fmt_num(summ.get('stake_est_sum'),2)} | {_fmt_pct((float(summ.get('stake_conc_max_share'))*100.0) if summ.get('stake_conc_max_share') is not None else None,2)} |\n"
                     )
