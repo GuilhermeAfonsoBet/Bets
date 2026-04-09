@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -250,7 +251,41 @@ def create_app(svc: ExecutorService) -> web.Application:
         if not svc._workers:
             return web.json_response({"error": "no_workers"}, status=503)
         try:
-            snap = await svc._workers[0].get_account_snapshot(page_size=page_size)
+            # `/account` é um endpoint de observabilidade; não pode bloquear execução.
+            # Usa "best-effort" com cache curto, e tenta qualquer worker (w0 pode estar ocupado).
+            try:
+                lock_timeout_sec = float(req.query.get("lock_timeout_sec") or os.getenv("EXECUTOR_ACCOUNT_LOCK_TIMEOUT_SEC", "0.25"))
+            except Exception:
+                lock_timeout_sec = 0.25
+            try:
+                total_timeout_sec = float(req.query.get("total_timeout_sec") or os.getenv("EXECUTOR_ACCOUNT_TOTAL_TIMEOUT_SEC", "3.0"))
+            except Exception:
+                total_timeout_sec = 3.0
+            try:
+                cache_max_age_sec = float(req.query.get("cache_max_age_sec") or os.getenv("EXECUTOR_ACCOUNT_CACHE_MAX_AGE_SEC", "15.0"))
+            except Exception:
+                cache_max_age_sec = 15.0
+
+            workers = list(svc._workers or [])
+            random.shuffle(workers)
+
+            last_err = None
+            for w in workers:
+                try:
+                    if hasattr(w, "get_account_snapshot_best_effort"):
+                        snap = await w.get_account_snapshot_best_effort(
+                            page_size=int(page_size),
+                            lock_timeout_sec=float(lock_timeout_sec),
+                            total_timeout_sec=float(total_timeout_sec),
+                            cache_max_age_sec=float(cache_max_age_sec),
+                        )
+                    else:
+                        snap = await w.get_account_snapshot(page_size=int(page_size))
+                    return web.json_response(snap)
+                except Exception as e:
+                    last_err = e
+                    continue
+            raise last_err or RuntimeError("account_failed")
             return web.json_response(snap)
         except Exception as e:
             return web.json_response({"error": "account_failed", "detail": str(e)[:300]}, status=500)

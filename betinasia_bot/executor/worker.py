@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -127,6 +128,8 @@ class ExecutorWorker:
     _betslip_cache: Any = None  # OrderedDict[str, str] | None
     _betslip_cache_max_keys: int = 0
     _op_lock: asyncio.Lock = None
+    _account_snapshot_cache: Optional[Dict[str, Any]] = None
+    _account_snapshot_cache_ts: float = 0.0  # time.monotonic()
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
@@ -512,6 +515,180 @@ class ExecutorWorker:
         except Exception:
             return False
 
+    def _cache_account_snapshot(self, snap: Dict[str, Any]) -> None:
+        try:
+            if isinstance(snap, dict):
+                self._account_snapshot_cache = copy.deepcopy(snap)
+                self._account_snapshot_cache_ts = float(time.monotonic())
+        except Exception:
+            pass
+
+    def _get_cached_account_snapshot(self) -> Optional[Dict[str, Any]]:
+        try:
+            if isinstance(self._account_snapshot_cache, dict):
+                return copy.deepcopy(self._account_snapshot_cache)
+        except Exception:
+            return None
+        return None
+
+    async def get_account_snapshot_best_effort(
+        self,
+        *,
+        page_size: int = 50,
+        lock_timeout_sec: float = 0.25,
+        total_timeout_sec: float = 3.0,
+        cache_max_age_sec: float = 15.0,
+    ) -> Dict[str, Any]:
+        """
+        Snapshot para uso operacional (bridge/monitoring).
+
+        Regras:
+        - Nunca deve bloquear execução por muito tempo (usa lock timeout).
+        - Tenta retornar cache recente quando o worker está ocupado.
+        - Aplica timeout total para evitar pendurar em chamadas externas.
+        """
+        now_m = float(time.monotonic())
+        cached = self._get_cached_account_snapshot()
+        cache_age = (now_m - float(self._account_snapshot_cache_ts or 0.0)) if cached else None
+
+        # 1) cache fresco
+        if cached is not None and cache_age is not None and cache_age <= float(cache_max_age_sec):
+            cached["_account_meta"] = {
+                "worker": self.name,
+                "source": "cache_fresh",
+                "cache_age_ms": int(round(float(cache_age) * 1000.0)),
+            }
+            return cached
+
+        lock = self._op_lock or asyncio.Lock()
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=float(lock_timeout_sec))
+                acquired = True
+            except asyncio.TimeoutError:
+                # cache (mesmo stale) é melhor que timeout/hang
+                if cached is not None and cache_age is not None:
+                    cached["_account_meta"] = {
+                        "worker": self.name,
+                        "source": "cache_stale_lock_timeout",
+                        "cache_age_ms": int(round(float(cache_age) * 1000.0)),
+                        "lock_timeout_sec": float(lock_timeout_sec),
+                    }
+                    return cached
+                return {
+                    "ts": _now_utc().isoformat(),
+                    "placer": os.getenv("BETINASIA_USERNAME", "").strip() or None,
+                    "balance_ok": False,
+                    "balance_http": 0,
+                    "balance_error": "ACCOUNT_LOCK_TIMEOUT (no cache)",
+                    "balance": None,
+                    "pnl": {
+                        "orders_ok": False,
+                        "orders_http": 0,
+                        "orders_error": "ACCOUNT_LOCK_TIMEOUT (no cache)",
+                        "n": 0,
+                        "n_open": 0,
+                        "n_closed": 0,
+                        "pnl_realized_sum": None,
+                        "stake_open_sum": None,
+                        "stake_total_sum": None,
+                        "orders": None,
+                    },
+                    "_account_meta": {
+                        "worker": self.name,
+                        "source": "fallback_lock_timeout",
+                        "lock_timeout_sec": float(lock_timeout_sec),
+                    },
+                }
+
+            # 2) refresh live (com timeout total)
+            try:
+                snap = await asyncio.wait_for(self._get_account_snapshot_unlocked(page_size=int(page_size)), timeout=float(total_timeout_sec))
+                if isinstance(snap, dict):
+                    snap["_account_meta"] = {
+                        "worker": self.name,
+                        "source": "live",
+                        "total_timeout_sec": float(total_timeout_sec),
+                    }
+                    self._cache_account_snapshot(snap)
+                return snap
+            except asyncio.TimeoutError:
+                if cached is not None and cache_age is not None:
+                    cached["_account_meta"] = {
+                        "worker": self.name,
+                        "source": "cache_stale_total_timeout",
+                        "cache_age_ms": int(round(float(cache_age) * 1000.0)),
+                        "total_timeout_sec": float(total_timeout_sec),
+                    }
+                    return cached
+                return {
+                    "ts": _now_utc().isoformat(),
+                    "placer": os.getenv("BETINASIA_USERNAME", "").strip() or None,
+                    "balance_ok": False,
+                    "balance_http": 0,
+                    "balance_error": f"ACCOUNT_TIMEOUT total_timeout_sec={float(total_timeout_sec):.2f}",
+                    "balance": None,
+                    "pnl": {
+                        "orders_ok": False,
+                        "orders_http": 0,
+                        "orders_error": f"ACCOUNT_TIMEOUT total_timeout_sec={float(total_timeout_sec):.2f}",
+                        "n": 0,
+                        "n_open": 0,
+                        "n_closed": 0,
+                        "pnl_realized_sum": None,
+                        "stake_open_sum": None,
+                        "stake_total_sum": None,
+                        "orders": None,
+                    },
+                    "_account_meta": {
+                        "worker": self.name,
+                        "source": "fallback_total_timeout",
+                        "total_timeout_sec": float(total_timeout_sec),
+                    },
+                }
+            except Exception as e:
+                msg = str(e)[:220]
+                if cached is not None and cache_age is not None:
+                    cached["_account_meta"] = {
+                        "worker": self.name,
+                        "source": "cache_stale_error",
+                        "cache_age_ms": int(round(float(cache_age) * 1000.0)),
+                        "error": msg,
+                    }
+                    return cached
+                return {
+                    "ts": _now_utc().isoformat(),
+                    "placer": os.getenv("BETINASIA_USERNAME", "").strip() or None,
+                    "balance_ok": False,
+                    "balance_http": 0,
+                    "balance_error": f"ACCOUNT_ERROR {msg}",
+                    "balance": None,
+                    "pnl": {
+                        "orders_ok": False,
+                        "orders_http": 0,
+                        "orders_error": f"ACCOUNT_ERROR {msg}",
+                        "n": 0,
+                        "n_open": 0,
+                        "n_closed": 0,
+                        "pnl_realized_sum": None,
+                        "stake_open_sum": None,
+                        "stake_total_sum": None,
+                        "orders": None,
+                    },
+                    "_account_meta": {
+                        "worker": self.name,
+                        "source": "fallback_error",
+                        "error": msg,
+                    },
+                }
+        finally:
+            if acquired:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
     async def get_account_snapshot(self, *, page_size: int = 50) -> Dict[str, Any]:
         """
         Snapshot operacional (best-effort):
@@ -521,114 +698,127 @@ class ExecutorWorker:
         assert self._api is not None
         assert self._scraper is not None
         async with (self._op_lock or asyncio.Lock()):
-            placer = os.getenv("BETINASIA_USERNAME", "").strip()
+            snap = await self._get_account_snapshot_unlocked(page_size=int(page_size))
+            if isinstance(snap, dict):
+                self._cache_account_snapshot(snap)
+            return snap
 
-            bal: ApiGetResult = await self._api.get_balance_any()
-            if (not bal.ok) and (
-                int(bal.http_status or 0) == 401
-                or "NO_ROOT_SESSION_COOKIE" in str(bal.error or "")
-                or "HTTP_401" in str(bal.error or "")
+    async def _get_account_snapshot_unlocked(self, *, page_size: int = 50) -> Dict[str, Any]:
+        """
+        Implementação do snapshot, assumindo que o lock operacional já foi obtido.
+        Mantém o comportamento antigo do get_account_snapshot().
+        """
+        assert self._api is not None
+        assert self._scraper is not None
+
+        placer = os.getenv("BETINASIA_USERNAME", "").strip()
+
+        bal: ApiGetResult = await self._api.get_balance_any()
+        if (not bal.ok) and (
+            int(bal.http_status or 0) == 401
+            or "NO_ROOT_SESSION_COOKIE" in str(bal.error or "")
+            or "HTTP_401" in str(bal.error or "")
+        ):
+            ok = await self._relogin()
+            if ok:
+                bal = await self._api.get_balance_any()
+
+        orders: Optional[ApiGetResult] = None
+        if placer:
+            orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
+            if (not orders.ok) and (
+                int(orders.http_status or 0) == 401
+                or "NO_ROOT_SESSION_COOKIE" in str(orders.error or "")
+                or "HTTP_401" in str(orders.error or "")
             ):
                 ok = await self._relogin()
                 if ok:
-                    bal = await self._api.get_balance_any()
+                    orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
 
-            orders: Optional[ApiGetResult] = None
-            if placer:
-                orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
-                if (not orders.ok) and (
-                    int(orders.http_status or 0) == 401
-                    or "NO_ROOT_SESSION_COOKIE" in str(orders.error or "")
-                    or "HTTP_401" in str(orders.error or "")
-                ):
-                    ok = await self._relogin()
-                    if ok:
-                        orders = await self._api.get_orders(placer=placer, page_size=int(page_size), page=1)
-
-            def _extract_orders_list(x: Any) -> list:
-                if isinstance(x, list):
-                    return x
-                if not isinstance(x, dict):
-                    return []
-                for k in ("orders", "results", "data"):
-                    v = x.get(k)
-                    if isinstance(v, list):
-                        return v
-                    if isinstance(v, dict):
-                        for kk in ("orders", "results", "data"):
-                            vv = v.get(kk)
-                            if isinstance(vv, list):
-                                return vv
+        def _extract_orders_list(x: Any) -> list:
+            if isinstance(x, list):
+                return x
+            if not isinstance(x, dict):
                 return []
+            for k in ("orders", "results", "data"):
+                v = x.get(k)
+                if isinstance(v, list):
+                    return v
+                if isinstance(v, dict):
+                    for kk in ("orders", "results", "data"):
+                        vv = v.get(kk)
+                        if isinstance(vv, list):
+                            return vv
+            return []
 
-            pnl = {
-                "orders_ok": bool(orders.ok) if orders else False,
-                "orders_http": int(orders.http_status or 0) if orders else 0,
-                "orders_error": (str(orders.error)[:220] if orders and orders.error else None),
-                "n": 0,
-                "n_open": 0,
-                "n_closed": 0,
-                "pnl_realized_sum": None,
-                "stake_open_sum": None,
-                "stake_total_sum": None,
-                "orders": None,
-            }
-            if orders and orders.data is not None:
-                raw = orders.data
-                if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
-                    raw = raw.get("data")
-                lst = _extract_orders_list(raw)
-                pnl["n"] = int(len(lst))
-                # expõe lista (até page_size) para agregações no relatório (P&L por tipo)
-                try:
-                    pnl["orders"] = lst[: int(page_size)]
-                except Exception:
-                    pnl["orders"] = lst
-                pnl_real = 0.0
-                pnl_have = 0
-                stake_open = 0.0
-                stake_tot = 0.0
-                n_open = 0
-                n_closed = 0
-                for o in lst:
-                    if not isinstance(o, dict):
-                        continue
-                    closed = bool(o.get("closed")) if o.get("closed") is not None else (str(o.get("status") or "").lower() in ("closed", "settled"))
-                    if closed:
-                        n_closed += 1
-                    else:
-                        n_open += 1
-                    ws = o.get("want_stake")
-                    if isinstance(ws, list) and len(ws) >= 2:
-                        try:
-                            st = float(ws[1])
-                            stake_tot += st
-                            if not closed:
-                                stake_open += st
-                        except Exception:
-                            pass
-                    pl = o.get("profit_loss")
-                    if pl is not None:
-                        try:
-                            pnl_real += float(pl)
-                            pnl_have += 1
-                        except Exception:
-                            pass
-                pnl["n_open"] = n_open
-                pnl["n_closed"] = n_closed
-                pnl["stake_open_sum"] = float(stake_open)
-                pnl["stake_total_sum"] = float(stake_tot)
-                pnl["pnl_realized_sum"] = (float(pnl_real) if pnl_have > 0 else None)
+        pnl = {
+            "orders_ok": bool(orders.ok) if orders else False,
+            "orders_http": int(orders.http_status or 0) if orders else 0,
+            "orders_error": (str(orders.error)[:220] if orders and orders.error else None),
+            "n": 0,
+            "n_open": 0,
+            "n_closed": 0,
+            "pnl_realized_sum": None,
+            "stake_open_sum": None,
+            "stake_total_sum": None,
+            "orders": None,
+        }
+        if orders and orders.data is not None:
+            raw = orders.data
+            if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+                raw = raw.get("data")
+            lst = _extract_orders_list(raw)
+            pnl["n"] = int(len(lst))
+            # expõe lista (até page_size) para agregações no relatório (P&L por tipo)
+            try:
+                pnl["orders"] = lst[: int(page_size)]
+            except Exception:
+                pnl["orders"] = lst
+            pnl_real = 0.0
+            pnl_have = 0
+            stake_open = 0.0
+            stake_tot = 0.0
+            n_open = 0
+            n_closed = 0
+            for o in lst:
+                if not isinstance(o, dict):
+                    continue
+                closed = bool(o.get("closed")) if o.get("closed") is not None else (str(o.get("status") or "").lower() in ("closed", "settled"))
+                if closed:
+                    n_closed += 1
+                else:
+                    n_open += 1
+                ws = o.get("want_stake")
+                if isinstance(ws, list) and len(ws) >= 2:
+                    try:
+                        st = float(ws[1])
+                        stake_tot += st
+                        if not closed:
+                            stake_open += st
+                    except Exception:
+                        pass
+                pl = o.get("profit_loss")
+                if pl is not None:
+                    try:
+                        pnl_real += float(pl)
+                        pnl_have += 1
+                    except Exception:
+                        pass
+            pnl["n_open"] = n_open
+            pnl["n_closed"] = n_closed
+            pnl["stake_open_sum"] = float(stake_open)
+            pnl["stake_total_sum"] = float(stake_tot)
+            pnl["pnl_realized_sum"] = (float(pnl_real) if pnl_have > 0 else None)
 
-            return {
-                "ts": _now_utc().isoformat(),
-                "placer": placer or None,
-                "balance_ok": bool(bal.ok),
-                "balance_http": int(bal.http_status or 0),
-                "balance_error": (str(bal.error)[:220] if bal.error else None),
-                "balance": bal.data,
-                "pnl": pnl,
-            }
+        return {
+            "ts": _now_utc().isoformat(),
+            "placer": placer or None,
+            "balance_ok": bool(bal.ok),
+            "balance_http": int(bal.http_status or 0),
+            "balance_error": (str(bal.error)[:220] if bal.error else None),
+            "balance": bal.data,
+            "pnl": pnl,
+        }
 
     async def execute(self, req: ExecutionRequest, received_ts: float) -> ExecutionResult:
         async with (self._op_lock or asyncio.Lock()):
