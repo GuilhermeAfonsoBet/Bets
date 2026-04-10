@@ -556,6 +556,84 @@ def _pick_last_day_with_slippage_vs_roi_raw(per_day: list[dict]) -> Optional[dic
     return None
 
 
+def _bucketize_latency_call_to_done_ms_accounting(rows: list[dict]) -> list[dict]:
+    """
+    rows: {pnl, exposure, lat_ms}
+    Retorna buckets com ROIw = sum(pnl)/sum(exposure)*100.
+    """
+    if not rows:
+        return []
+
+    def _lab(lat_ms: Optional[float]) -> str:
+        if lat_ms is None:
+            return "Desconhecido"
+        x = float(lat_ms)
+        if x < 5000:
+            return "< 5s"
+        if x < 10000:
+            return "5-10s"
+        if x < 20000:
+            return "10-20s"
+        if x < 40000:
+            return "20-40s"
+        return "> 40s"
+
+    order = ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]
+    out = []
+    for lab in order:
+        sub = [r for r in rows if _lab(_safe_float(r.get("lat_ms"))) == lab]
+        if not sub:
+            continue
+        agg = _agg_pnl_exposure(sub)
+        out.append(
+            {
+                "bucket": lab,
+                "n": int(agg.get("n") or 0),
+                "exposure_sum": agg.get("exposure_sum"),
+                "pnl_sum": agg.get("pnl_sum"),
+                "roi_weighted": agg.get("roi_weighted"),
+            }
+        )
+    return out
+
+
+def _bucketize_slip_raw_3way_accounting(rows: list[dict]) -> list[dict]:
+    """
+    rows: {pnl, exposure, slip_raw_pct}
+    Buckets com sinal: <=-2%, (-2,2], >2%, e "Desconhecido" quando slip_raw_pct=None.
+    """
+    if not rows:
+        return []
+
+    def _lab(slip: Optional[float]) -> str:
+        if slip is None:
+            return "Desconhecido"
+        x = float(slip)
+        if x <= -2.0:
+            return "<= -2%"
+        if x <= 2.0:
+            return "(-2, 2]"
+        return "> 2%"
+
+    order = ["<= -2%", "(-2, 2]", "> 2%", "Desconhecido"]
+    out = []
+    for lab in order:
+        sub = [r for r in rows if _lab(_safe_float(r.get("slip_raw_pct"))) == lab]
+        if not sub:
+            continue
+        agg = _agg_pnl_exposure(sub)
+        out.append(
+            {
+                "bucket": lab,
+                "n": int(agg.get("n") or 0),
+                "exposure_sum": agg.get("exposure_sum"),
+                "pnl_sum": agg.get("pnl_sum"),
+                "roi_weighted": agg.get("roi_weighted"),
+            }
+        )
+    return out
+
+
 def _slip_raw_3bucket_rows(buckets: list[dict]) -> list[dict]:
     """
     Normaliza para sempre retornar 3 buckets: <=-2%, (-2,2], >2%.
@@ -608,6 +686,52 @@ def _fmt_roi_mean_se_ci_pct(row: dict) -> str:
         return base
     except Exception:
         return "—"
+
+
+def _acct_pnl_by_order_total_from_balance_csv(
+    path: Path,
+    *,
+    only_type_bet: bool = True,
+) -> Dict[str, float]:
+    """
+    Retorna: order_id -> pnl_total (soma de amount) no balance.csv.
+    Usado para auditoria de ROI por ordem (accounting).
+    """
+    out: Dict[str, float] = {}
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return out
+            dt_col = _pick_col(cols, ("post date", "post_date", "date", "settled", "closed", "time"))
+            pnl_col = _pick_col(cols, ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"))
+            typ_col = _pick_col(cols, ("type",))
+            oid_col = _pick_col(cols, ("order_id", "order id", "order", "bet id", "bet_id", "id"))
+            if not oid_col or not pnl_col:
+                return out
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                if only_type_bet and typ_col:
+                    typ = str(row.get(typ_col) or "").strip().lower()
+                    if typ and typ != "bet":
+                        continue
+                oid = str(row.get(oid_col) or "").strip()
+                if not oid or not oid.isdigit():
+                    continue
+                pnl = _safe_float(row.get(pnl_col))
+                if pnl is None:
+                    continue
+                # dt_col não é usado no total, mas mantemos a checagem para evitar formatos estranhos
+                if dt_col:
+                    _ = _parse_dt_any(str(row.get(dt_col) or ""))
+                out[oid] = float(out.get(oid) or 0.0) + float(pnl)
+    except Exception:
+        return out
+    return out
 
 
 def _fmt_ctx_suffix(row: dict) -> str:
