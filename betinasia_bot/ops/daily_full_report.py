@@ -3439,10 +3439,21 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     days_utc_cf = {str(it.get("day") or "") for it in (adh_day.get("per_day") or []) if isinstance(it, dict) and str(it.get("day") or "")}
                 except Exception:
                     days_utc_cf = set()
+                # Preferir mapa com `type` para capturar void/refund/cancel quando existirem como tipos separados.
+                acct_by_oid_day_typ = _acct_amount_by_order_day_by_type_from_balance_csv(bal_csv, days_utc=set(days_utc_cf)) if days_utc_cf else {}
+                # Fallback legado: apenas type=bet (quando não há coluna type/order_id adequada).
                 acct_by_oid_day = _acct_amount_by_order_day_from_balance_csv(bal_csv, days_utc=set(days_utc_cf), only_type_bet=True) if days_utc_cf else {}
 
-                if exec_by_oid and acct_by_oid_day:
+                def _acct_type_excl(tl: str) -> bool:
+                    t = str(tl or "").strip().lower()
+                    return any(k in t for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+
+                if exec_by_oid and (acct_by_oid_day_typ or acct_by_oid_day):
                     s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back)**\n\n")
+                    s1.append(
+                        "_Nota: P&L aqui vem do ledger por `order_id`. Quando o CSV expõe `type`, incluímos todos os tipos **P&L-like** (exclui dep/saque/transfer/etc.), "
+                        "para capturar void/refund/cancel se existirem. Caso contrário, cai no legado `type=bet`._\n\n"
+                    )
                     s1.append(
                         "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders com acct no dia) |\n"
                     )
@@ -3458,17 +3469,30 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         for oid, em in (exec_by_oid or {}).items():
                             if not isinstance(em, dict):
                                 continue
-                            amt_by_day = acct_by_oid_day.get(str(oid)) if isinstance(acct_by_oid_day.get(str(oid)), dict) else None
-                            if not amt_by_day or dayk not in amt_by_day:
+                            pnl_amt = None
+                            # caminho preferencial: type-aware
+                            if isinstance(acct_by_oid_day_typ, dict) and str(oid) in acct_by_oid_day_typ:
+                                dmap = acct_by_oid_day_typ.get(str(oid)) if isinstance(acct_by_oid_day_typ.get(str(oid)), dict) else None
+                                tmap = dmap.get(dayk) if isinstance(dmap, dict) and isinstance(dmap.get(dayk), dict) else None
+                                if isinstance(tmap, dict) and tmap:
+                                    try:
+                                        pnl_amt = float(sum(float(v or 0.0) for k, v in tmap.items() if not _acct_type_excl(str(k))))
+                                    except Exception:
+                                        pnl_amt = None
+                            # fallback legado: bet-only
+                            if pnl_amt is None and isinstance(acct_by_oid_day, dict) and str(oid) in acct_by_oid_day:
+                                amt_by_day = acct_by_oid_day.get(str(oid)) if isinstance(acct_by_oid_day.get(str(oid)), dict) else None
+                                if isinstance(amt_by_day, dict) and dayk in amt_by_day:
+                                    try:
+                                        pnl_amt = float(amt_by_day.get(dayk) or 0.0)
+                                    except Exception:
+                                        pnl_amt = None
+                            if pnl_amt is None:
                                 continue
                             n_with_acct += 1
-                            try:
-                                pnl_amt = float(amt_by_day.get(dayk) or 0.0)
-                            except Exception:
-                                pnl_amt = 0.0
                             rows0.append(
                                 {
-                                    "pnl": pnl_amt,
+                                    "pnl": float(pnl_amt),
                                     "exposure": em.get("exposure"),
                                     "slip_raw_pct": em.get("slip_raw_pct"),
                                     "lat_ms": em.get("lat_ms"),
@@ -3495,6 +3519,78 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             f"{int(n_with_acct)} |\n"
                         )
                     s1.append("\n")
+
+                    # Versão 1b: somente Back In (exclui Back Pre)
+                    try:
+                        s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back In somente)**\n\n")
+                        s1.append(
+                            "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders Back In com acct no dia) |\n"
+                        )
+                        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                        for it in adh_day.get("per_day") or []:
+                            if not isinstance(it, dict):
+                                continue
+                            dayk = str(it.get("day") or "")
+                            if not dayk:
+                                continue
+                            rows0 = []
+                            n_with_acct = 0
+                            for oid, em in (exec_by_oid or {}).items():
+                                if not isinstance(em, dict):
+                                    continue
+                                # filtro Back In (is_live=True)
+                                if not bool(em.get("is_live") or False):
+                                    continue
+                                pnl_amt = None
+                                if isinstance(acct_by_oid_day_typ, dict) and str(oid) in acct_by_oid_day_typ:
+                                    dmap = acct_by_oid_day_typ.get(str(oid)) if isinstance(acct_by_oid_day_typ.get(str(oid)), dict) else None
+                                    tmap = dmap.get(dayk) if isinstance(dmap, dict) and isinstance(dmap.get(dayk), dict) else None
+                                    if isinstance(tmap, dict) and tmap:
+                                        try:
+                                            pnl_amt = float(sum(float(v or 0.0) for k, v in tmap.items() if not _acct_type_excl(str(k))))
+                                        except Exception:
+                                            pnl_amt = None
+                                if pnl_amt is None and isinstance(acct_by_oid_day, dict) and str(oid) in acct_by_oid_day:
+                                    amt_by_day = acct_by_oid_day.get(str(oid)) if isinstance(acct_by_oid_day.get(str(oid)), dict) else None
+                                    if isinstance(amt_by_day, dict) and dayk in amt_by_day:
+                                        try:
+                                            pnl_amt = float(amt_by_day.get(dayk) or 0.0)
+                                        except Exception:
+                                            pnl_amt = None
+                                if pnl_amt is None:
+                                    continue
+                                n_with_acct += 1
+                                rows0.append(
+                                    {
+                                        "pnl": float(pnl_amt),
+                                        "exposure": em.get("exposure"),
+                                        "slip_raw_pct": em.get("slip_raw_pct"),
+                                        "lat_ms": em.get("lat_ms"),
+                                    }
+                                )
+                            if not rows0:
+                                continue
+                            cf_acct = _counterfactual_filters_back(
+                                rows0,
+                                slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                                lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                                slip_missing_pass=True,
+                                lat_missing_fail_closed=True,
+                            )
+                            base = cf_acct.get("base") if isinstance(cf_acct.get("base"), dict) else {}
+                            a_slip = cf_acct.get("after_slip") if isinstance(cf_acct.get("after_slip"), dict) else {}
+                            a_lat = cf_acct.get("after_lat") if isinstance(cf_acct.get("after_lat"), dict) else {}
+                            a_both = cf_acct.get("after_both") if isinstance(cf_acct.get("after_both"), dict) else {}
+                            s1.append(
+                                f"| {dayk} | {_fmt_num(base.get('pnl_sum'),2)} | {_fmt_pct(base.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_slip.get('pnl_sum'),2)} | {_fmt_pct(a_slip.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_lat.get('pnl_sum'),2)} | {_fmt_pct(a_lat.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_both.get('pnl_sum'),2)} | {_fmt_pct(a_both.get('roi_weighted'))} | "
+                                f"{int(n_with_acct)} |\n"
+                            )
+                        s1.append("\n")
+                    except Exception:
+                        pass
 
             # Versão 2 (placar; cobertura): mantém como diagnóstico, mas NÃO é accounting.
             s1.append("**Contrafactual (placar; somente cobertos por ROI): filtros operacionais (Back)**\n\n")
