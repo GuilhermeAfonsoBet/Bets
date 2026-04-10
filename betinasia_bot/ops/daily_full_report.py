@@ -1066,6 +1066,205 @@ def _acct_pnl_by_order_total_from_balance_csv(
     return out
 
 
+def _acct_pnl_like_by_order_total_from_balance_csv(path: Path) -> Dict[str, float]:
+    """
+    Retorna: order_id -> pnl_total (soma de amount) no balance.csv, incluindo todos os tipos "P&L-like".
+    Exclui depósitos/saques/transferências/top-ups/pagamentos/ajustes/bonus.
+
+    Usado para:
+    - atribuição por **dia de execução** (created_at UTC no executor_jsonl)
+    - detecção robusta de "void/push-like" (pnl≈0 por ordem) independente do `type`
+    """
+    out: Dict[str, float] = {}
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return out
+            dt_col = _pick_col(cols, ("post date", "post_date", "date", "settled", "closed", "time"))
+            pnl_col = _pick_col(cols, ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"))
+            typ_col = _pick_col(cols, ("type",))
+            oid_col = _pick_col(cols, ("order_id", "order id", "order", "bet id", "bet_id", "id"))
+            if not oid_col or not pnl_col:
+                return out
+
+            def _excl_type(tl: str) -> bool:
+                t = str(tl or "").strip().lower()
+                return any(k in t for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get(oid_col) or "").strip()
+                if not oid or not oid.isdigit():
+                    continue
+                pnl = _safe_float(row.get(pnl_col))
+                if pnl is None:
+                    continue
+                if typ_col:
+                    tl = str(row.get(typ_col) or "").strip().lower()
+                    if tl and _excl_type(tl):
+                        continue
+                # dt_col não é usado no total; mantemos parse para evitar formatos estranhos
+                if dt_col:
+                    _ = _parse_dt_any(str(row.get(dt_col) or ""))
+                out[oid] = float(out.get(oid) or 0.0) + float(pnl)
+    except Exception:
+        return out
+    return out
+
+
+def _exec_day_split_back_pre_in_from_order_pnls(
+    *,
+    exec_by_oid_back: Dict[str, Dict[str, Any]],
+    acct_pnl_by_oid_total: Dict[str, float],
+    day_exec_utc: str,
+    pnl_zero_eps: float = 1e-9,
+) -> Dict[str, Any]:
+    """
+    Agrega P&L do accounting por **dia de execução** (created_at UTC do executor_jsonl), split Pre vs In.
+    - exec_by_oid_back: retorna apenas Back LIVE_OK, com `created_at` e `is_live`
+    - acct_pnl_by_oid_total: P&L total por ordem no ledger (tipos P&L-like)
+
+    Também retorna contagem de ordens "void/push-like" (|pnl|<=eps) como diagnóstico.
+    """
+    dayk = str(day_exec_utc or "").strip()
+    if not dayk:
+        return {
+            "pnl_pre": None,
+            "pnl_in": None,
+            "pnl_total": None,
+            "n_pre": 0,
+            "n_in": 0,
+            "n_total": 0,
+            "coverage_n_pct": None,
+            "n_pnl_zero": 0,
+            "pnl_zero_eps": float(pnl_zero_eps),
+        }
+
+    pnl_pre = pnl_in = pnl_tot = 0.0
+    exp_pre = exp_in = exp_tot = 0.0
+    n_pre = n_in = n_tot = 0
+    n_exec_day = 0
+    n_zero = 0
+
+    for oid, em in (exec_by_oid_back or {}).items():
+        if not isinstance(em, dict):
+            continue
+        dt = em.get("created_at")
+        if not isinstance(dt, datetime):
+            continue
+        d = dt.astimezone(timezone.utc).date().isoformat()
+        if d != dayk:
+            continue
+        n_exec_day += 1
+        if str(oid) not in acct_pnl_by_oid_total:
+            continue
+        try:
+            pnl = float(acct_pnl_by_oid_total.get(str(oid)) or 0.0)
+        except Exception:
+            continue
+        try:
+            exp = float(em.get("exposure") or 0.0) if em.get("exposure") is not None else 0.0
+        except Exception:
+            exp = 0.0
+        if abs(float(pnl)) <= float(pnl_zero_eps):
+            n_zero += 1
+        if bool(em.get("is_live") or False):
+            pnl_in += pnl
+            exp_in += exp
+            n_in += 1
+        else:
+            pnl_pre += pnl
+            exp_pre += exp
+            n_pre += 1
+        pnl_tot += pnl
+        exp_tot += exp
+        n_tot += 1
+
+    try:
+        denom = int(n_exec_day)
+        cov = (float(n_tot) / float(denom) * 100.0) if denom > 0 else None
+    except Exception:
+        cov = None
+
+    return {
+        "pnl_pre": pnl_pre,
+        "pnl_in": pnl_in,
+        "pnl_total": pnl_tot,
+        "exp_pre": exp_pre,
+        "exp_in": exp_in,
+        "exp_total": exp_tot,
+        "n_pre": int(n_pre),
+        "n_in": int(n_in),
+        "n_total": int(n_tot),
+        "n_exec_day": int(n_exec_day),
+        "coverage_n_pct": cov,
+        "n_pnl_zero": int(n_zero),
+        "pnl_zero_eps": float(pnl_zero_eps),
+    }
+
+
+def _counterfactual_rows_for_exec_day(
+    *,
+    exec_by_oid_back: Dict[str, Dict[str, Any]],
+    acct_pnl_by_oid_total: Dict[str, float],
+    day_exec_utc: str,
+    only_inplay: bool,
+    pnl_zero_eps: float = 1e-9,
+) -> Dict[str, Any]:
+    """
+    Monta rows [{pnl, exposure, slip_raw_pct, lat_ms}] para aplicar contrafactual, bucketizando por **dia de execução**.
+    Retorna também métricas de cobertura e void-like.
+    """
+    dayk = str(day_exec_utc or "").strip()
+    rows0: list[dict] = []
+    n_exec_day = 0
+    n_with_acct = 0
+    n_zero = 0
+    for oid, em in (exec_by_oid_back or {}).items():
+        if not isinstance(em, dict):
+            continue
+        dt = em.get("created_at")
+        if not isinstance(dt, datetime):
+            continue
+        d = dt.astimezone(timezone.utc).date().isoformat()
+        if d != dayk:
+            continue
+        n_exec_day += 1
+        if only_inplay and (not bool(em.get("is_live") or False)):
+            continue
+        if str(oid) not in acct_pnl_by_oid_total:
+            continue
+        try:
+            pnl = float(acct_pnl_by_oid_total.get(str(oid)) or 0.0)
+        except Exception:
+            continue
+        if abs(float(pnl)) <= float(pnl_zero_eps):
+            n_zero += 1
+        n_with_acct += 1
+        rows0.append(
+            {
+                "pnl": float(pnl),
+                "exposure": em.get("exposure"),
+                "slip_raw_pct": em.get("slip_raw_pct"),
+                "lat_ms": em.get("lat_ms"),
+            }
+        )
+    cov = (float(n_with_acct) / float(n_exec_day) * 100.0) if n_exec_day > 0 else None
+    return {
+        "rows": rows0,
+        "n_exec_day": int(n_exec_day),
+        "n_with_acct": int(n_with_acct),
+        "coverage_n_pct": cov,
+        "n_pnl_zero": int(n_zero),
+        "pnl_zero_eps": float(pnl_zero_eps),
+    }
+
+
 def _fmt_ctx_suffix(row: dict) -> str:
     """
     Sufixo opcional com contexto para interpretar ROIs extremos:
@@ -3315,6 +3514,41 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "`P&L Back Pre/In (acct; order_id)` é **Back-only** via join `order_id` (ledger ↔ executor_jsonl) e inclui tipos P&L-like (ex.: void/refund) quando existirem. "
             "Se o CSV não tiver `order_id`, esses campos podem ficar vazios._\n\n"
         )
+
+        # Accounting por dia de execução (created_at UTC): atribui P&L total por ordem (ledger) ao dia em que a ordem foi enviada.
+        # Isso reduz a confusão "post date != exec date" e permite auditoria operacional realista.
+        try:
+            if bal_csv and bal_csv.exists() and exec_by_oid_back:
+                acct_pnl_by_oid_total = _acct_pnl_like_by_order_total_from_balance_csv(bal_csv)
+                if acct_pnl_by_oid_total:
+                    s1.append("**Accounting (por order_id): P&L por dia de execução (created_at UTC; Back Pre/In)**\n\n")
+                    s1.append(
+                        "| Dia (exec UTC) | P&L Back Pre | P&L Back In | P&L Total | ROIw Total | Cobertura oids% (no dia) | #ordens c/ P&L≈0 (void-like) |\n"
+                    )
+                    s1.append("|---|---:|---:|---:|---:|---:|---:|\n")
+                    for dayk2 in sorted(list(days_utc_exec))[-10:]:
+                        sp2 = _exec_day_split_back_pre_in_from_order_pnls(
+                            exec_by_oid_back=exec_by_oid_back,
+                            acct_pnl_by_oid_total=acct_pnl_by_oid_total,
+                            day_exec_utc=str(dayk2),
+                            pnl_zero_eps=float(os.getenv("DAILY_VOID_LIKE_PNL_EPS", "1e-9") or 1e-9),
+                        )
+                        if not isinstance(sp2, dict) or int(sp2.get("n_exec_day") or 0) <= 0:
+                            continue
+                        roiw = None
+                        try:
+                            exp = float(sp2.get("exp_total") or 0.0)
+                            pnl = float(sp2.get("pnl_total") or 0.0)
+                            roiw = (pnl / exp * 100.0) if exp > 0 else None
+                        except Exception:
+                            roiw = None
+                        s1.append(
+                            f"| {dayk2} | {_fmt_num(sp2.get('pnl_pre'),2)} | {_fmt_num(sp2.get('pnl_in'),2)} | {_fmt_num(sp2.get('pnl_total'),2)} | "
+                            f"{_fmt_pct(roiw)} | {_fmt_pct(sp2.get('coverage_n_pct'),1)} | {int(sp2.get('n_pnl_zero') or 0)} |\n"
+                        )
+                    s1.append("\n")
+        except Exception:
+            pass
 
         # Diagnóstico explícito de void/refund/cancel por dia (UTC), quando há ledger.
         try:
