@@ -534,6 +534,338 @@ def _acct_amount_by_order_day_from_balance_csv(
     return out
 
 
+def _acct_amount_by_order_day_by_type_from_balance_csv(
+    path: Path,
+    *,
+    days_utc: Optional[set[str]] = None,
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Retorna: order_id -> day(UTC) -> type_lower -> amount_sum.
+
+    Útil para:
+    - métricas de void/refund/cancel (quando aparecem como `type` ≠ bet)
+    - P&L por ordem mais fiel (incluindo ajustes relacionados à ordem, se existirem)
+
+    Observação: o CSV pode NÃO ter coluna `order_id` ou `type`. Nesses casos retorna {}.
+    """
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return out
+            dt_col = None
+            for k in ("post date", "post_date", "date", "settled", "closed", "time"):
+                for c in cols:
+                    cl = c.lower()
+                    if cl == k or cl.startswith(k) or k in cl:
+                        dt_col = c
+                        break
+                if dt_col:
+                    break
+            pnl_col = None
+            for k in ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"):
+                for c in cols:
+                    cl = c.lower()
+                    if cl == k or cl.startswith(k) or k in cl:
+                        pnl_col = c
+                        break
+                if pnl_col:
+                    break
+            typ_col = None
+            for c in cols:
+                cl = c.lower()
+                if cl == "type" or cl.startswith("type"):
+                    typ_col = c
+                    break
+            oid_col = None
+            for k in ("order_id", "order id", "order", "bet id", "bet_id", "id"):
+                for c in cols:
+                    cl = c.lower()
+                    if cl == k or cl.startswith(k) or k in cl:
+                        oid_col = c
+                        break
+                if oid_col:
+                    break
+            if not oid_col or not pnl_col or not dt_col:
+                return out
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get(oid_col) or "").strip()
+                if not oid or not oid.isdigit():
+                    continue
+                dt = _parse_dt_any(str(row.get(dt_col) or ""))
+                if dt is None:
+                    continue
+                day = dt.date().isoformat()
+                if days_utc is not None and day not in days_utc:
+                    continue
+                amt = _safe_float(row.get(pnl_col))
+                if amt is None:
+                    continue
+                typ = str(row.get(typ_col) or "").strip().lower() if typ_col else ""
+                if not typ:
+                    typ = "unknown"
+                blk = out.setdefault(oid, {}).setdefault(day, {})
+                blk[typ] = float(blk.get(typ) or 0.0) + float(amt)
+    except Exception:
+        return {}
+    return out
+
+
+def _summarize_accounting_types(
+    acct_type_sums: Dict[str, float],
+    *,
+    exclude_pred=None,
+) -> Dict[str, Any]:
+    """
+    Recebe mapa: type_lower -> amount_sum e produz resumo focado em void/refund/cancel.
+    Heurísticas:
+    - void/refund/push/cancel normalmente aparecem como movimentos "não resultado" (muitas vezes 0 ou reversões).
+    - aqui apenas agregamos; interpretação é contextual e depende do provider.
+    """
+    try:
+        items = []
+        for k, v in (acct_type_sums or {}).items():
+            try:
+                kk = str(k)
+                if exclude_pred is not None:
+                    try:
+                        if bool(exclude_pred(str(kk).lower())):
+                            continue
+                    except Exception:
+                        pass
+                items.append((kk, float(v)))
+            except Exception:
+                continue
+        items.sort(key=lambda x: abs(float(x[1])), reverse=True)
+    except Exception:
+        items = []
+
+    def _sum_if(pred) -> float:
+        s = 0.0
+        for k, v in items:
+            try:
+                if pred(str(k).lower()):
+                    s += float(v)
+            except Exception:
+                continue
+        return float(s)
+
+    void_sum = _sum_if(lambda t: ("void" in t) or ("push" in t))
+    refund_sum = _sum_if(lambda t: "refund" in t)
+    cancel_sum = _sum_if(lambda t: ("cancel" in t) or ("canceled" in t) or ("cancelled" in t))
+    bet_sum = _sum_if(lambda t: t == "bet" or t.startswith("bet"))
+    other_sum = float(sum(float(v) for _, v in items)) - float(void_sum + refund_sum + cancel_sum + bet_sum)
+
+    top = [{"type": k, "amount_sum": v} for k, v in items[:10]]
+    return {
+        "bet_sum": bet_sum,
+        "void_push_sum": void_sum,
+        "refund_sum": refund_sum,
+        "cancel_sum": cancel_sum,
+        "other_sum": other_sum,
+        "top_types": top,
+    }
+
+
+def _acct_amount_by_day_type_from_balance_csv(
+    path: Path,
+    *,
+    days_utc: Optional[set[str]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Retorna: day(UTC) -> type_lower -> {amount_sum, n_rows}
+    Para diagnóstico de void/refund/cancel e para P&L por post date UTC consistente com o daily (aderência usa UTC).
+    """
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return out
+            dt_col = None
+            for k in ("post date", "post_date", "date", "settled", "closed", "time"):
+                for c in cols:
+                    cl = c.lower()
+                    if cl == k or cl.startswith(k) or k in cl:
+                        dt_col = c
+                        break
+                if dt_col:
+                    break
+            pnl_col = None
+            for k in ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"):
+                for c in cols:
+                    cl = c.lower()
+                    if cl == k or cl.startswith(k) or k in cl:
+                        pnl_col = c
+                        break
+                if pnl_col:
+                    break
+            typ_col = None
+            for c in cols:
+                cl = c.lower()
+                if cl == "type" or cl.startswith("type"):
+                    typ_col = c
+                    break
+            if not dt_col or not pnl_col:
+                return out
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                dt = _parse_dt_any(str(row.get(dt_col) or ""))
+                if dt is None:
+                    continue
+                day = dt.date().isoformat()
+                if days_utc is not None and day not in days_utc:
+                    continue
+                amt = _safe_float(row.get(pnl_col))
+                if amt is None:
+                    continue
+                typ = str(row.get(typ_col) or "").strip().lower() if typ_col else ""
+                if not typ:
+                    typ = "unknown"
+                blk = out.setdefault(day, {}).setdefault(typ, {"amount_sum": 0.0, "n_rows": 0})
+                blk["amount_sum"] = float(blk.get("amount_sum") or 0.0) + float(amt)
+                blk["n_rows"] = int(blk.get("n_rows") or 0) + 1
+    except Exception:
+        return {}
+    return out
+
+
+def _split_back_acct_pnl_pre_in_by_order_id(
+    *,
+    exec_by_oid: Dict[str, Dict[str, Any]],
+    acct_by_oid_day_typ: Dict[str, Dict[str, Dict[str, float]]],
+    day_utc: str,
+    include_types: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Particiona o P&L do accounting por dia (UTC, post date) em Back Pre vs Back In usando join por order_id.
+
+    - exec_by_oid: order_id -> {created_at, is_live (bool), ...}
+      (hoje vem de `_parse_executor_jsonl_back_live_orders`, portanto apenas Back+LIVE_OK)
+    - acct_by_oid_day_typ: order_id -> day -> type_lower -> amount_sum (de balance.csv)
+    - include_types: quais `type` do ledger entram no P&L da ordem. Default = {"bet"} para manter semântica antiga.
+
+    Retorna:
+      {
+        pnl_pre, pnl_in, pnl_total, n_pre, n_in, n_total,
+        coverage_n_pct, missing_orders_n, types_included, types_excluded_top
+      }
+
+    Observação importante:
+    - Isso é “exato” apenas no sentido de ledger por order_id.
+      Se void/refund for registrado como type≠bet, você pode incluir esses types via include_types.
+    """
+    # Se include_types=None: inclui todos os `type` “P&L-like” e exclui depósitos/saques/transferências/etc.
+    # Se include_types=set(...): usa allowlist exata.
+    dayk = str(day_utc or "").strip()
+    if not dayk:
+        return {
+            "pnl_pre": None,
+            "pnl_in": None,
+            "pnl_total": None,
+            "n_pre": 0,
+            "n_in": 0,
+            "n_total": 0,
+            "coverage_n_pct": None,
+            "missing_orders_n": 0,
+            "types_included": (sorted(list(include_types)) if include_types is not None else ["__PNL_LIKE__"]),
+            "types_excluded_top": [],
+        }
+
+    pnl_pre = 0.0
+    pnl_in = 0.0
+    pnl_tot = 0.0
+    n_pre = 0
+    n_in = 0
+    n_tot = 0
+    missing = 0
+    excluded_types_sum: Dict[str, float] = defaultdict(float)
+
+    for oid, ex in (exec_by_oid or {}).items():
+        if not isinstance(ex, dict):
+            continue
+        amt_day = acct_by_oid_day_typ.get(str(oid)) if isinstance(acct_by_oid_day_typ.get(str(oid)), dict) else None
+        if not amt_day or dayk not in amt_day:
+            continue
+        typ_map = amt_day.get(dayk) if isinstance(amt_day.get(dayk), dict) else {}
+        if not typ_map:
+            missing += 1
+            continue
+
+        # soma tipos incluídos; também registramos “outros/excluídos” para diagnóstico
+        s_incl = 0.0
+        got_any = False
+        for typ, amt in (typ_map or {}).items():
+            tl = str(typ or "").strip().lower() or "unknown"
+            try:
+                v = float(amt)
+            except Exception:
+                continue
+            got_any = True
+            if include_types is not None:
+                if tl in include_types:
+                    s_incl += float(v)
+                else:
+                    excluded_types_sum[tl] += float(v)
+            else:
+                # filtro “P&L-like” consistente com accounting_report.compute_pnl_report()
+                excl = any(k in tl for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+                if excl:
+                    excluded_types_sum[tl] += float(v)
+                else:
+                    s_incl += float(v)
+        if not got_any:
+            missing += 1
+            continue
+
+        is_in = bool(ex.get("is_live") or False)
+        if is_in:
+            pnl_in += float(s_incl)
+            n_in += 1
+        else:
+            pnl_pre += float(s_incl)
+            n_pre += 1
+        pnl_tot += float(s_incl)
+        n_tot += 1
+
+    # cobertura: % de ordens do exec_by_oid que aparecem no ledger no dia
+    try:
+        denom = int(len(exec_by_oid or {}))
+        cov = (float(n_tot) / float(denom) * 100.0) if denom > 0 else None
+    except Exception:
+        cov = None
+
+    # top tipos excluídos por |impacto|
+    try:
+        top_ex = sorted([(k, float(v)) for k, v in excluded_types_sum.items()], key=lambda x: abs(float(x[1])), reverse=True)[:8]
+        top_ex = [{"type": k, "amount_sum": v} for k, v in top_ex]
+    except Exception:
+        top_ex = []
+
+    return {
+        "pnl_pre": pnl_pre,
+        "pnl_in": pnl_in,
+        "pnl_total": pnl_tot,
+        "n_pre": int(n_pre),
+        "n_in": int(n_in),
+        "n_total": int(n_tot),
+        "coverage_n_pct": cov,
+        "missing_orders_n": int(missing),
+        "types_included": (sorted(list(include_types)) if include_types is not None else ["__PNL_LIKE__"]),
+        "types_excluded_top": top_ex,
+    }
+
+
 def _pick_last_day_with_slippage_vs_roi_raw(per_day: list[dict]) -> Optional[dict]:
     """
     O bloco slippage×ROI depende de ROI (placar disponível). Em dias recentes pode estar vazio.
@@ -2855,10 +3187,46 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
     if isinstance(adh_day, dict) and isinstance(adh_day.get("per_day"), list) and adh_day.get("per_day"):
         s1.append("**Execução (últimos dias; executor_jsonl + placares quando disponíveis)**\n\n")
+        # Preparação (best-effort) para:
+        # - P&L total por dia consistente com "post date UTC" (ledger)
+        # - split Back Pre/In via join por order_id (Back LIVE_OK)
+        try:
+            days_utc_exec = {str(it.get("day") or "") for it in (adh_day.get("per_day") or []) if isinstance(it, dict) and str(it.get("day") or "")}
+        except Exception:
+            days_utc_exec = set()
+        try:
+            bal_csv = Path(str(acct.get("balance_csv") or "")).expanduser() if isinstance(acct, dict) else None
+        except Exception:
+            bal_csv = None
+
+        acct_day_typ: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        acct_by_oid_day_typ: Dict[str, Dict[str, Dict[str, float]]] = {}
+        exec_by_oid_back: Dict[str, Dict[str, Any]] = {}
+        if bal_csv and days_utc_exec and bal_csv.exists():
+            try:
+                acct_day_typ = _acct_amount_by_day_type_from_balance_csv(bal_csv, days_utc=set(days_utc_exec))
+            except Exception:
+                acct_day_typ = {}
+            try:
+                acct_by_oid_day_typ = _acct_amount_by_order_day_by_type_from_balance_csv(bal_csv, days_utc=set(days_utc_exec))
+            except Exception:
+                acct_by_oid_day_typ = {}
+        if cfg.executor_jsonl.exists():
+            try:
+                exec_by_oid_back = _parse_executor_jsonl_back_live_orders(Path(str(cfg.executor_jsonl)))
+            except Exception:
+                exec_by_oid_back = {}
+
+        def _acct_is_excluded_type(tl: str) -> bool:
+            t = str(tl or "").strip().lower()
+            return any(k in t for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+
         s1.append(
-            "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | P&L total (acct) | ROI/$ (acct) | P&L Back Pre (acct, aloc.) | P&L Back In (acct, aloc.) | P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
+            "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | "
+            "P&L total (acct; post date UTC) | ROI/$ (acct) | P&L Back Pre (acct; order_id) | P&L Back In (acct; order_id) | Cobertura oids% (Back) | "
+            "P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
         )
-        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for it in adh_day.get("per_day") or []:
             if not isinstance(it, dict):
                 continue
@@ -2878,18 +3246,30 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             st_total_cov = (float(st_back_cov or 0.0) + float(st_lay_cov or 0.0)) if (st_back_cov is not None or st_lay_cov is not None) else None
             roi_dol = (float(pnl_total_placar) / float(st_total_cov) * 100.0) if (pnl_total_placar is not None and st_total_cov and float(st_total_cov) > 0) else None
 
-            # P&L real (accounting) por dia, quando disponível (evita P&L "falso" em dias sem cobertura de ROI)
+            # P&L real (accounting) por dia:
+            # 1) Preferir ledger por post date UTC (para casar com dayk do adherence em UTC)
+            # 2) Fallback: mapa do accounting_daily_report (pode estar em outro TZ)
             dayk = str(it.get("day") or "")
             pnl_acct = None
             try:
-                if isinstance(acct, dict):
-                    mp = acct.get("pnl_by_day_filtered_recent") if isinstance(acct.get("pnl_by_day_filtered_recent"), dict) else (
-                        acct.get("pnl_by_day_recent") if isinstance(acct.get("pnl_by_day_recent"), dict) else {}
-                    )
-                    if isinstance(mp, dict) and dayk in mp:
-                        pnl_acct = float(mp.get(dayk) or 0.0)
+                if dayk and isinstance(acct_day_typ, dict) and dayk in acct_day_typ:
+                    blk = acct_day_typ.get(dayk) if isinstance(acct_day_typ.get(dayk), dict) else {}
+                    if blk:
+                        pnl_acct = float(
+                            sum(float(v.get("amount_sum") or 0.0) for k, v in blk.items() if isinstance(v, dict) and (not _acct_is_excluded_type(str(k))))
+                        )
             except Exception:
                 pnl_acct = None
+            if pnl_acct is None:
+                try:
+                    if isinstance(acct, dict):
+                        mp = acct.get("pnl_by_day_filtered_recent") if isinstance(acct.get("pnl_by_day_filtered_recent"), dict) else (
+                            acct.get("pnl_by_day_recent") if isinstance(acct.get("pnl_by_day_recent"), dict) else {}
+                        )
+                        if isinstance(mp, dict) and dayk in mp:
+                            pnl_acct = float(mp.get(dayk) or 0.0)
+                except Exception:
+                    pnl_acct = None
 
             # Accounting ROI/$: usa stake_total do Back como denominador (operacional), porque o balance.csv não expõe stake/liability por lado.
             roi_acct_dol = None
@@ -2899,35 +3279,78 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             except Exception:
                 roi_acct_dol = None
 
-            # P&L accounting alocado por regime (proxy) usando share de stake enviado (Back) em Pre vs In.
+            # Split Back Pre/In (accounting) por join em order_id (Back LIVE_OK).
+            # Isso deixa de “alocar” o P&L total do dia e passa a medir Back-only por regime.
             pnl_acct_back_pre = None
             pnl_acct_back_in = None
+            cov_oid_pct = None
             try:
-                st_pre = float(back.get("stake_sum_pre") or 0.0)
-                st_in = float(back.get("stake_sum_in") or 0.0)
-                st_tot = float(st_pre + st_in)
-                if pnl_acct is not None and st_tot > 0:
-                    w_pre = st_pre / st_tot
-                    w_in = st_in / st_tot
-                    pnl_acct_back_pre = float(pnl_acct) * float(w_pre)
-                    pnl_acct_back_in = float(pnl_acct) * float(w_in)
+                if dayk and exec_by_oid_back and acct_by_oid_day_typ:
+                    sp = _split_back_acct_pnl_pre_in_by_order_id(
+                        exec_by_oid=exec_by_oid_back,
+                        acct_by_oid_day_typ=acct_by_oid_day_typ,
+                        day_utc=dayk,
+                        include_types=None,  # P&L-like: inclui void/refund/cancel quando existirem; exclui depósitos/saques/etc.
+                    )
+                    if isinstance(sp, dict) and int(sp.get("n_total") or 0) > 0:
+                        pnl_acct_back_pre = sp.get("pnl_pre")
+                        pnl_acct_back_in = sp.get("pnl_in")
+                        cov_oid_pct = sp.get("coverage_n_pct")
             except Exception:
                 pnl_acct_back_pre = None
                 pnl_acct_back_in = None
+                cov_oid_pct = None
             s1.append(
                 f"| {it.get('day')} | {int(ex.get('n_exec_rows') or 0)} | {int(ex.get('n_exec_success') or 0)} | {int(sc.get('LIVE_OK') or 0)} | {int(sc.get('DRY_OK') or 0)} | "
                 f"{int(sc.get('API_FAILED') or 0)} | {int(back.get('n_success') or 0)} | {int(lay.get('n_success') or 0)} | "
                 f"{_fmt_num(st_back,2)} | {_fmt_num(st_lay,2)} | {_fmt_num(liab_lay,2)} | "
-                f"{_fmt_num(pnl_acct,2)} | {_fmt_pct(roi_acct_dol)} | {_fmt_num(pnl_acct_back_pre,2)} | {_fmt_num(pnl_acct_back_in,2)} | "
+                f"{_fmt_num(pnl_acct,2)} | {_fmt_pct(roi_acct_dol)} | {_fmt_num(pnl_acct_back_pre,2)} | {_fmt_num(pnl_acct_back_in,2)} | {_fmt_pct(cov_oid_pct,1)} | "
                 f"{_fmt_num(pnl_total_placar,2)} | {_fmt_pct(roi_dol)} | {_fmt_num(pnl_back,2)} | {_fmt_pct(back.get('roi_pct'))} | "
                 f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
         s1.append("\n")
 
         s1.append(
-            "_Nota: `ROI/$ (acct)` e `P&L Back Pre/In (acct)` usam `stake_sum` do Back (executor_jsonl) como denominador e alocação por share Pre/In. "
-            "Isso é um **proxy**: o accounting (balance.csv) não expõe stake/liability por lado/regime._\n\n"
+            "_Nota: `P&L total (acct)` é calculado por **post date UTC** diretamente do `balance.csv` quando disponível (exclui depósitos/saques/etc.). "
+            "`P&L Back Pre/In (acct; order_id)` é **Back-only** via join `order_id` (ledger ↔ executor_jsonl) e inclui tipos P&L-like (ex.: void/refund) quando existirem. "
+            "Se o CSV não tiver `order_id`, esses campos podem ficar vazios._\n\n"
         )
+
+        # Diagnóstico explícito de void/refund/cancel por dia (UTC), quando há ledger.
+        try:
+            if isinstance(acct_day_typ, dict) and acct_day_typ:
+                s1.append("**Accounting ledger: Voids/Refunds/Cancels por dia (post date UTC)**\n\n")
+                s1.append("| Dia | Bet (∑amount) | Void/Push (∑amount) | Refund (∑amount) | Cancel (∑amount) | Excluídos (dep/saque/etc.) | Top types (|amt|) |\n")
+                s1.append("|---|---:|---:|---:|---:|---:|---|\n")
+                for dayk in [str(it.get("day") or "") for it in (adh_day.get("per_day") or []) if isinstance(it, dict)]:
+                    if not dayk or dayk not in acct_day_typ:
+                        continue
+                    blk = acct_day_typ.get(dayk) if isinstance(acct_day_typ.get(dayk), dict) else {}
+                    if not blk:
+                        continue
+                    sums: Dict[str, float] = {}
+                    excl: Dict[str, float] = {}
+                    for typ, rec in blk.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        try:
+                            amt = float(rec.get("amount_sum") or 0.0)
+                        except Exception:
+                            continue
+                        tl = str(typ or "").strip().lower() or "unknown"
+                        if _acct_is_excluded_type(tl):
+                            excl[tl] = float(excl.get(tl) or 0.0) + float(amt)
+                        else:
+                            sums[tl] = float(sums.get(tl) or 0.0) + float(amt)
+                    summ = _summarize_accounting_types(sums)
+                    top = ", ".join([f"`{x.get('type')}`({_fmt_num(x.get('amount_sum'),2)})" for x in (summ.get("top_types") or []) if isinstance(x, dict)])
+                    s1.append(
+                        f"| {dayk} | {_fmt_num(summ.get('bet_sum'),2)} | {_fmt_num(summ.get('void_push_sum'),2)} | {_fmt_num(summ.get('refund_sum'),2)} | "
+                        f"{_fmt_num(summ.get('cancel_sum'),2)} | {_fmt_num(sum(excl.values()) if excl else 0.0,2)} | {top or '—'} |\n"
+                    )
+                s1.append("\n")
+        except Exception:
+            pass
 
         # Cobertura de placar entre execuções bem-sucedidas (por n, stake e por jogo/event_id).
         # Isso é crucial para interpretar gaps entre P&L (acct) e P&L/ROI (placar),
