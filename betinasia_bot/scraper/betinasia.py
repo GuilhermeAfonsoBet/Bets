@@ -293,6 +293,16 @@ class BetinAsiaScraper:
     async def is_session_valid(self) -> bool:
         """Verifica se a sessão atual ainda é válida."""
         try:
+            # Em LIVE (executor confirmando aposta real), NÃO podemos aceitar heurística de UI
+            # como "sessão válida" se a checagem de API falhar. Isso gera falsos positivos
+            # e leva a HTTP_401 (auth_error) em /v1/betslips/ e /v1/orders/.
+            require_api_ok = str(os.getenv("BETINASIA_REQUIRE_API_AUTH", "") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+            try:
+                if not require_api_ok and (os.getenv("EXECUTOR_ALLOW_LIVE", "0").strip() in ("1", "true", "True", "yes", "YES")):
+                    require_api_ok = True
+            except Exception:
+                pass
+
             # 1) Cookie root-session (pré-requisito)
             if not await self._has_root_session_cookie():
                 logger.info("Sessão sem cookie root-session (API não autenticará) — necessário novo login")
@@ -305,6 +315,15 @@ class BetinAsiaScraper:
                 logger.info("Sessão válida (API auth OK)")
                 self._logged_in = True
                 return True
+            if require_api_ok:
+                try:
+                    logger.info(
+                        f"Sessão inválida (API auth required) api_status={int(chk.get('status') or 0)} api_ok={bool(chk.get('ok'))} "
+                        f"api_prefix={str(chk.get('prefix') or '')[:140]!r}"
+                    )
+                except Exception:
+                    logger.info("Sessão inválida (API auth required) — necessário novo login")
+                return False
 
             # 3) Fallback: tentativa rápida de navegação (commit), só para detectar redirect para /login
             try:

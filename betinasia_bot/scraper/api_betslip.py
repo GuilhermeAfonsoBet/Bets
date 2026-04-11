@@ -523,16 +523,25 @@ class ApiBetslipClient:
                 except Exception:
                     return 0
 
-            try:
-                # === 1. POST /v1/betslips/ via browser fetch ===
-                session_token = await self._get_root_session_token()
-                result.has_session_token = bool(session_token)
-                if not session_token:
-                    result.error = "NO_ROOT_SESSION_COOKIE"
-                    return result
+            def _is_transient_eval_error(msg: str) -> bool:
+                s = (msg or "").lower()
+                return (
+                    "execution context was destroyed" in s
+                    or "failed to fetch" in s
+                    or "aborterror" in s
+                    or "target closed" in s
+                    or "page closed" in s
+                )
 
-                t_post = time.time()
-                response = await self.page.evaluate(
+            async def _sleep_jitter(base_s: float) -> None:
+                try:
+                    import random
+                    await asyncio.sleep(max(0.0, float(base_s)) + random.random() * 0.35)
+                except Exception:
+                    await asyncio.sleep(max(0.0, float(base_s)))
+
+            async def _post_betslip_once(session_token: str) -> dict:
+                return await self.page.evaluate(
                     """
                     async (params) => {
                         try {
@@ -585,6 +594,26 @@ class ApiBetslipClient:
                         "timeoutMs": int(self._betslip_post_timeout_ms or 0),
                     },
                 )
+
+            try:
+                # === 1. POST /v1/betslips/ via browser fetch ===
+                session_token = await self._get_root_session_token()
+                result.has_session_token = bool(session_token)
+                if not session_token:
+                    result.error = "NO_ROOT_SESSION_COOKIE"
+                    return result
+
+                t_post = time.time()
+                response = await _post_betslip_once(session_token)
+                # Retry em erros transitórios de evaluate/fetch (Playwright navega/recarrega às vezes).
+                try:
+                    if isinstance(response, dict) and (not bool(response.get("ok"))) and int(response.get("status") or 0) == 0:
+                        err0 = str(response.get("error") or "")
+                        if _is_transient_eval_error(err0):
+                            await _sleep_jitter(0.4)
+                            response = await _post_betslip_once(session_token)
+                except Exception:
+                    pass
 
                 result.request_time_ms = int((time.time() - t_post) * 1000)
                 result.http_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
@@ -997,26 +1026,8 @@ class ApiBetslipClient:
             exchange_mode=str(exchange_mode),
         )
         t0 = time.time()
-        try:
-            session_token = await self._get_root_session_token()
-            if not session_token:
-                res.error = "NO_ROOT_SESSION_COOKIE"
-                return res
-
-            req_uuid = str(uuid4())
-            payload = {
-                "betslip_id": str(betslip_id),
-                "price": float(price),
-                "stake": [str(stake_ccy), float(stake)],
-                "duration": int(duration_sec),
-                "keep_open_ir": bool(keep_open_ir),
-                "adaptive_bookies": [],
-                "accounts": [],
-                "exchange_mode": str(exchange_mode),
-                "request_uuid": req_uuid,
-            }
-
-            response = await self.page.evaluate(
+        async def _place_once(session_token: str) -> dict:
+            return await self.page.evaluate(
                 """
                 async (params) => {
                     try {
@@ -1055,6 +1066,37 @@ class ApiBetslipClient:
                 """,
                 {"sessionToken": session_token, "clientName": self.MOLLY_CLIENT_NAME, "clientVersion": self.MOLLY_CLIENT_VERSION, "payload": payload, "timeoutMs": int(self._orders_timeout_ms or 0)},
             )
+
+        try:
+            session_token = await self._get_root_session_token()
+            if not session_token:
+                res.error = "NO_ROOT_SESSION_COOKIE"
+                return res
+
+            req_uuid = str(uuid4())
+            payload = {
+                "betslip_id": str(betslip_id),
+                "price": float(price),
+                "stake": [str(stake_ccy), float(stake)],
+                "duration": int(duration_sec),
+                "keep_open_ir": bool(keep_open_ir),
+                "adaptive_bookies": [],
+                "accounts": [],
+                "exchange_mode": str(exchange_mode),
+                "request_uuid": req_uuid,
+            }
+
+            response = await _place_once(session_token)
+            # Retry em falhas transitórias (fetch/abort/context destroyed) — útil quando a página recarrega.
+            try:
+                if isinstance(response, dict) and (not bool(response.get("ok"))) and int(response.get("status") or 0) == 0:
+                    err0 = str(response.get("error") or "")
+                    # reutiliza heurística simples
+                    if "execution context was destroyed" in err0.lower() or "failed to fetch" in err0.lower() or "aborterror" in err0.lower():
+                        await asyncio.sleep(0.4)
+                        response = await _place_once(session_token)
+            except Exception:
+                pass
             res.request_time_ms = int((time.time() - t0) * 1000)
 
             if not response or not isinstance(response, dict):
