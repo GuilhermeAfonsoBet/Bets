@@ -2677,6 +2677,70 @@ class H3bApiAudit:
     async def _save_result(self, r: dict):
         if not self.db:
             return None
+        def _clip(s: Any, max_len: int) -> Any:
+            try:
+                if s is None:
+                    return None
+                if isinstance(s, str):
+                    ss = s.strip()
+                    return ss[:max_len] if len(ss) > max_len else ss
+                # deixa outros tipos passarem; o SQLAlchemy cuidará ou vai falhar
+                return s
+            except Exception:
+                return None
+
+        def _safe_float(v: Any) -> Optional[float]:
+            try:
+                if v is None:
+                    return None
+                x = float(v)
+                # evita NaN/inf que quebram em PG/JSON
+                if x != x or x in (float("inf"), float("-inf")):
+                    return None
+                return x
+            except Exception:
+                return None
+
+        def _safe_json(obj: Any) -> Any:
+            """
+            Sanitiza payload para JSONB/JSON:
+            - converte datetime para isoformat
+            - remove NaN/inf
+            - força chaves para string
+            """
+            try:
+                if obj is None:
+                    return None
+                if isinstance(obj, datetime):
+                    return obj.astimezone(timezone.utc).isoformat()
+                if isinstance(obj, (int, bool, str)):
+                    return obj
+                if isinstance(obj, float):
+                    return _safe_float(obj)
+                if isinstance(obj, dict):
+                    out: Dict[str, Any] = {}
+                    for k, v in obj.items():
+                        kk = str(k)
+                        out[kk] = _safe_json(v)
+                    return out
+                if isinstance(obj, (list, tuple)):
+                    return [_safe_json(x) for x in obj]
+                # fallback: tenta stringificar (evita quebrar commit por tipo não-serializável)
+                return str(obj)
+            except Exception:
+                return None
+
+        def _log_save_error(e: Exception, *, stage: str, context: Dict[str, Any]) -> None:
+            try:
+                logger.opt(exception=True).warning(
+                    f"Erro salvando (stage={stage}) type={type(e).__name__} msg={str(e)[:240]} ctx={json.dumps(context, ensure_ascii=False)[:1200]}"
+                )
+            except Exception:
+                try:
+                    logger.warning(f"Erro salvando (stage={stage}) type={type(e).__name__} msg={str(e)[:240]}")
+                except Exception:
+                    pass
+
         try:
             detected_ts = r.get('detected_at')
             detected_dt = datetime.fromtimestamp(detected_ts, tz=timezone.utc) if detected_ts else None
@@ -2804,19 +2868,19 @@ class H3bApiAudit:
 
             record = BetslipAuditResult(
                 hypothesis_type="H3B",
-                event_id=r['event_id'],
+                event_id=_clip(r.get('event_id'), 100),
                 sport="football",
-                league=r.get('league', ''),
-                home_team=r['home_team'],
-                away_team=r['away_team'],
-                match_info=f"{r['home_team']} vs {r['away_team']}",
-                match_start_time=r.get('kickoff'),
+                league=_clip(r.get('league', ''), 100),
+                home_team=_clip(r.get('home_team'), 100),
+                away_team=_clip(r.get('away_team'), 100),
+                match_info=_clip(f"{r.get('home_team','')} vs {r.get('away_team','')}", 200),
+                match_start_time=(r.get('kickoff') if isinstance(r.get('kickoff'), datetime) else None),
                 market_type=r['market_type'],
                 market_period=r.get('market_period', 'full_time'),
-                line=r['line'],
-                side=r['side'],
-                bet_description=f"{r['market_type']} {r['line']} {r['side']}",
-                websocket_odd=r['ws_odd'],
+                line=_clip(r.get('line'), 20),
+                side=_clip(r.get('side'), 10),
+                bet_description=_clip(f"{r.get('market_type','')} {r.get('line','')} {r.get('side','')}", 100),
+                websocket_odd=float(r['ws_odd']),
                 betslip_odd=float(bs_odd) if has_bs else None,
                 difference_pct=float(diff_pct) if isinstance(diff_pct, (int, float)) else None,
                 difference_absolute=float(diff_abs) if isinstance(diff_abs, (int, float)) else None,
@@ -2830,14 +2894,81 @@ class H3bApiAudit:
                 lag_click_to_betslip_ms=r.get('pmm_ms', 0),
                 audit_total_duration_ms=telemetry.get('pipeline_total_ms_pre_db', telemetry.get('pipeline_total_ms', r.get('total_ms', 0))),
                 audit_version=str(r.get("audit_version") or "v4.0-api"),
-                hypothesis_details=hypothesis_details or None,
+                hypothesis_details=_safe_json(hypothesis_details or None),
             )
-            async with self.db.async_session() as session:
-                session.add(record)
-                await session.commit()
-                return record.id
+            try:
+                async with self.db.async_session() as session:
+                    session.add(record)
+                    await session.commit()
+                    return record.id
+            except Exception as e:
+                # fallback: salvar um registro mínimo para não perder fluxo operacional
+                _log_save_error(
+                    e,
+                    stage="commit_full",
+                    context={
+                        "audit_version": str(r.get("audit_version") or ""),
+                        "mode": str(getattr(self, "mode", "") or ""),
+                        "event_id": str(r.get("event_id") or ""),
+                        "market_type": str(r.get("market_type") or ""),
+                        "line": str(r.get("line") or ""),
+                        "side": str(r.get("side") or ""),
+                        "status": str(status),
+                    },
+                )
+                try:
+                    minimal_details = {
+                        "audit_version": str(r.get("audit_version") or "v4.0-api"),
+                        "exec_side_hint": str((r.get("exec_side_hint") or hypothesis_details.get("exec_side_hint") or "")).strip() or None,
+                        "api_error": str((hypothesis_details or {}).get("api_error") or "")[:240] if isinstance(hypothesis_details, dict) else None,
+                    }
+                    rec2 = BetslipAuditResult(
+                        hypothesis_type="H3B",
+                        event_id=_clip(r.get("event_id"), 100),
+                        sport="football",
+                        league=_clip(r.get("league", ""), 100),
+                        home_team=_clip(r.get("home_team"), 100),
+                        away_team=_clip(r.get("away_team"), 100),
+                        match_info=_clip(f"{r.get('home_team','')} vs {r.get('away_team','')}", 200),
+                        match_start_time=(r.get('kickoff') if isinstance(r.get('kickoff'), datetime) else None),
+                        market_type=str(r.get("market_type") or "AH"),
+                        market_period=str(r.get("market_period") or "full_time"),
+                        line=_clip(r.get("line"), 20) or "0",
+                        side=_clip(r.get("side"), 10) or "home",
+                        bet_description=_clip(f"{r.get('market_type','')} {r.get('line','')} {r.get('side','')}", 100),
+                        websocket_odd=float(r.get("ws_odd") or r.get("websocket_odd") or 0.0) or 0.01,
+                        betslip_odd=None,
+                        difference_pct=None,
+                        difference_absolute=None,
+                        betslip_limit=0.0,
+                        status=str(status or "OK"),
+                        is_valid_opportunity=bool(r.get("is_valid_opportunity") or False),
+                        is_live=r.get("is_live"),
+                        reversal_direction=str(r.get("direction", "up") or "up"),
+                        hypothesis_detected_at=detected_dt,
+                        lag_detection_to_click_ms=int((telemetry or {}).get("queue_wait_ms") or 0),
+                        lag_click_to_betslip_ms=int(r.get("pmm_ms") or 0),
+                        audit_total_duration_ms=int((telemetry or {}).get("pipeline_total_ms_pre_db") or r.get("total_ms") or 0),
+                        audit_version=str(r.get("audit_version") or "v4.0-api"),
+                        hypothesis_details=_safe_json(minimal_details),
+                    )
+                    async with self.db.async_session() as session:
+                        session.add(rec2)
+                        await session.commit()
+                        return rec2.id
+                except Exception as e2:
+                    _log_save_error(
+                        e2,
+                        stage="commit_fallback",
+                        context={
+                            "audit_version": str(r.get("audit_version") or ""),
+                            "event_id": str(r.get("event_id") or ""),
+                            "status": str(status),
+                        },
+                    )
+                    return None
         except Exception as e:
-            logger.warning(f"Erro salvando: {e}")
+            _log_save_error(e, stage="build_record", context={"audit_version": str(r.get("audit_version") or ""), "event_id": str(r.get("event_id") or "")})
         return None
 
     # ================================================================
