@@ -432,21 +432,29 @@ def _bucketize_3way_raw_with_context(rows: List[Dict[str, Any]]) -> List[Dict[st
     return outb
 
 
-def _slip_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime, exec_is_live: bool) -> str:
+def _slip_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime) -> str:
     """
     Regime Pre/In para slippage×ROI (placar).
-    Preferimos inferência por kickoff_time quando disponível; caso contrário, fallback para is_live do executor.
+    Preferimos inferência por kickoff_time quando disponível; caso contrário,
+    usamos `betslip_audit_results.is_live` (quando não-NULL).
+
+    Nota: `ExecutionRequest.is_live` do executor significa "modo LIVE (apostar de verdade)",
+    não "in-play". Portanto NÃO deve ser usado para separar Pre/In.
     """
     try:
         ko = a.get("kickoff_time")
+        if isinstance(ko, str):
+            ko = _parse_iso(ko)
         if isinstance(ko, datetime):
             return "In" if exec_created_at >= ko else "Pre"
     except Exception:
         pass
     try:
-        return "In" if bool(exec_is_live) else "Pre"
+        if a.get("is_live") is not None:
+            return "In" if bool(a.get("is_live")) else "Pre"
     except Exception:
-        return "Pre"
+        pass
+    return "Pre"
 
 
 def _agg_pnl_exposure(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -562,6 +570,8 @@ def _combo_regime_from_audit(a: Dict[str, Any], *, exec_created_at: datetime) ->
     """
     try:
         ko = a.get("kickoff_time")
+        if isinstance(ko, str):
+            ko = _parse_iso(ko)
         if isinstance(ko, datetime):
             return "In" if exec_created_at >= ko else "Pre"
     except Exception:
@@ -1124,7 +1134,7 @@ async def run_report(
                         total_pairs_raw_back.append((float(raw_pct), float(roi)))
                         total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
                         try:
-                            slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                            slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at)
                             if str(slip_reg).strip().lower() == "in":
                                 total_rows_ctx_back_in.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
                             else:
@@ -1462,7 +1472,7 @@ async def run_report(
                         reg = None
                         a0 = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
                         if isinstance(a0, dict) and a0:
-                            reg = _slip_regime_from_audit(a0, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                            reg = _slip_regime_from_audit(a0, exec_created_at=e.created_at)
                         if reg is None:
                             reg = ("In" if bool(e.is_live) else "Pre")
                         if str(reg).strip().lower() == "in":
@@ -1593,7 +1603,7 @@ async def run_report(
                     pairs_raw_back.append((float(raw_pct), float(roi)))
                     total_rows_ctx_back.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
                     try:
-                        slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at, exec_is_live=bool(e.is_live))
+                        slip_reg = _slip_regime_from_audit(a, exec_created_at=e.created_at)
                         if str(slip_reg).strip().lower() == "in":
                             total_rows_ctx_back_in.append({"slip_raw_pct": float(raw_pct), "roi": float(roi), "odd": float(odd), "exposure": float(stake)})
                         else:

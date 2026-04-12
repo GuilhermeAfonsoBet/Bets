@@ -56,6 +56,74 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _pick_col(cols: list[str], needles: tuple[str, ...] | list[str]) -> Optional[str]:
+    """
+    Seleciona uma coluna por heurística, preferindo:
+    1) match exato (case-insensitive)
+    2) prefix match
+    3) contains (fallback)
+    """
+    try:
+        cols = list(cols or [])
+        cols_map = {str(c).lower(): str(c) for c in cols if str(c)}
+        cols_l = list(cols_map.keys())
+        for n0 in (needles or []):
+            n = str(n0).lower()
+            if not n:
+                continue
+            if n in cols_map:
+                return cols_map[n]
+            for cl in cols_l:
+                if cl.startswith(n):
+                    return cols_map[cl]
+            for cl in cols_l:
+                if n in cl:
+                    return cols_map[cl]
+    except Exception:
+        return None
+    return None
+
+
+def _to_utc_dt(x: Any) -> Optional[datetime]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            dt = x
+        else:
+            dt = _parse_dt_any(str(x))
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_inplay_from_audit_row(a: Optional[Dict[str, Any]], *, exec_created_at_utc: datetime) -> bool:
+    """
+    Determina Pre/In para uma execução usando:
+    1) kickoff_time (preferencial): exec_created_at >= kickoff => In
+    2) audit.is_live quando não-NULL
+    3) fallback: False (Pre)
+    """
+    if not isinstance(a, dict) or not a:
+        return False
+    try:
+        ko = _to_utc_dt(a.get("kickoff_time"))
+        if isinstance(ko, datetime):
+            return bool(exec_created_at_utc >= ko)
+    except Exception:
+        pass
+    try:
+        if a.get("is_live") is not None:
+            return bool(a.get("is_live"))
+    except Exception:
+        pass
+    return False
+
+
 def _fmt_pct(x: Any, nd: int = 2) -> str:
     try:
         if x is None:
@@ -125,6 +193,40 @@ def _parse_dt_any(s: Any) -> Optional[datetime]:
     except Exception:
         return None
     return None
+
+
+async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Busca metadados do audit necessários para classificar Pre/In corretamente no report diário.
+    Usa `kickoff_time` (matches) e `betslip_audit_results.is_live` (quando presente).
+    """
+    if not ids:
+        return {}
+    try:
+        from sqlalchemy import text  # type: ignore
+    except Exception:
+        return {}
+    q = text(
+        """
+        SELECT
+          a.id AS audit_id,
+          a.is_live,
+          a.audited_at,
+          m.kickoff_time
+        FROM betslip_audit_results a
+        LEFT JOIN matches m ON m.external_id = a.event_id
+        WHERE a.id = ANY(:ids)
+        """
+    )
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        async with db.async_session() as session:
+            r = await session.execute(q, {"ids": list(ids)})
+            for x in r.fetchall() or []:
+                out[int(x._mapping["audit_id"])] = dict(x._mapping)
+    except Exception:
+        return {}
+    return out
 
 
 def _pct(num: Any, den: Any) -> Optional[float]:
@@ -404,7 +506,7 @@ def _counterfactual_filters_back(
 def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, Any]]:
     """
     Lê executor_jsonl e retorna order_id -> métricas para Back LIVE_OK:
-      {created_at_utc, slip_raw_pct, lat_ms, stake_sent, is_inplay_guess}
+      {created_at, slip_raw_pct, lat_ms, exposure, audit_id, is_live_mode}
     """
     out: Dict[str, Dict[str, Any]] = {}
     if not path.exists():
@@ -432,6 +534,11 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
         oid = _extract_order_id_from_raw(raw)
         if not oid or not str(oid).isdigit():
             continue
+        audit_id = None
+        try:
+            audit_id = _safe_int(res.get("audit_id")) if res.get("audit_id") is not None else (_safe_int(req.get("audit_id")) if req.get("audit_id") is not None else None)
+        except Exception:
+            audit_id = None
         sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
         stake = _safe_float(sent.get("stake"))
         if stake is None:
@@ -443,14 +550,16 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
         odd_dec = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
         odd_fin = _safe_float(res.get("odd_final"))
         slip = _slip_raw_pct(odd_dec=odd_dec, odd_fin=odd_fin)
-        is_live = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
+        # IMPORTANTE: no executor, `is_live` significa "modo LIVE (apostar de verdade)", não "in-play".
+        is_live_mode = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
         rec = {
             "order_id": str(oid),
             "created_at": created.astimezone(timezone.utc),
             "slip_raw_pct": slip,
             "lat_ms": (float(lat_ms_i) if lat_ms_i is not None else None),
             "exposure": (float(stake) if stake is not None else None),
-            "is_live": bool(is_live) if is_live is not None else False,
+            "audit_id": (int(audit_id) if audit_id is not None else None),
+            "is_live_mode": bool(is_live_mode) if is_live_mode is not None else False,
         }
         prev = out.get(str(oid))
         if prev is None or rec["created_at"] >= prev.get("created_at"):
@@ -657,7 +766,9 @@ def _summarize_accounting_types(
         return float(s)
 
     void_sum = _sum_if(lambda t: ("void" in t) or ("push" in t))
-    refund_sum = _sum_if(lambda t: "refund" in t)
+    # Alguns providers usam `voided`/`refunded`
+    refund_sum = _sum_if(lambda t: ("refund" in t) or ("refunded" in t))
+    # "Cancel" pode aparecer como "cancelled"/"canceled" e variações
     cancel_sum = _sum_if(lambda t: ("cancel" in t) or ("canceled" in t) or ("cancelled" in t))
     bet_sum = _sum_if(lambda t: t == "bet" or t.startswith("bet"))
     other_sum = float(sum(float(v) for _, v in items)) - float(void_sum + refund_sum + cancel_sum + bet_sum)
@@ -745,13 +856,15 @@ def _split_back_acct_pnl_pre_in_by_order_id(
     exec_by_oid: Dict[str, Dict[str, Any]],
     acct_by_oid_day_typ: Dict[str, Dict[str, Dict[str, float]]],
     day_utc: str,
+    audit_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
     include_types: Optional[set[str]] = None,
 ) -> Dict[str, Any]:
     """
     Particiona o P&L do accounting por dia (UTC, post date) em Back Pre vs Back In usando join por order_id.
 
-    - exec_by_oid: order_id -> {created_at, is_live (bool), ...}
+    - exec_by_oid: order_id -> {created_at, exposure, slip_raw_pct, lat_ms, audit_id, is_live_mode, ...}
       (hoje vem de `_parse_executor_jsonl_back_live_orders`, portanto apenas Back+LIVE_OK)
+    - audit_by_id: audit_id -> {kickoff_time, is_live, audited_at, ...} para classificar Pre/In corretamente.
     - acct_by_oid_day_typ: order_id -> day -> type_lower -> amount_sum (de balance.csv)
     - include_types: quais `type` do ledger entram no P&L da ordem. Default = {"bet"} para manter semântica antiga.
 
@@ -828,7 +941,14 @@ def _split_back_acct_pnl_pre_in_by_order_id(
             missing += 1
             continue
 
-        is_in = bool(ex.get("is_live") or False)
+        # IMPORTANTE: `is_live_mode` do executor significa "modo LIVE", não "in-play".
+        # Para Pre/In (prematch/inplay), usamos audit.kickoff_time quando disponível; senão audit.is_live quando não-NULL.
+        try:
+            aid = ex.get("audit_id")
+            arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+            is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=ex.get("created_at")))
+        except Exception:
+            is_in = False
         if is_in:
             pnl_in += float(s_incl)
             n_in += 1
@@ -864,6 +984,21 @@ def _split_back_acct_pnl_pre_in_by_order_id(
         "types_included": (sorted(list(include_types)) if include_types is not None else ["__PNL_LIKE__"]),
         "types_excluded_top": top_ex,
     }
+
+
+def _extract_audit_ids_from_exec_by_oid(exec_by_oid: Dict[str, Dict[str, Any]]) -> list[int]:
+    out: set[int] = set()
+    for _, ex in (exec_by_oid or {}).items():
+        if not isinstance(ex, dict):
+            continue
+        aid = ex.get("audit_id")
+        if aid is None:
+            continue
+        try:
+            out.add(int(aid))
+        except Exception:
+            continue
+    return sorted(list(out))
 
 
 def _pick_last_day_with_slippage_vs_roi_raw(per_day: list[dict]) -> Optional[dict]:
@@ -1122,11 +1257,13 @@ def _exec_day_split_back_pre_in_from_order_pnls(
     exec_by_oid_back: Dict[str, Dict[str, Any]],
     acct_pnl_by_oid_total: Dict[str, float],
     day_exec_utc: str,
+    audit_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
     pnl_zero_eps: float = 1e-9,
 ) -> Dict[str, Any]:
     """
     Agrega P&L do accounting por **dia de execução** (created_at UTC do executor_jsonl), split Pre vs In.
-    - exec_by_oid_back: retorna apenas Back LIVE_OK, com `created_at` e `is_live`
+    - exec_by_oid_back: retorna apenas Back LIVE_OK, com `created_at` e `audit_id`
+      (atenção: o flag `is_live` do executor é "modo LIVE", não "in-play")
     - acct_pnl_by_oid_total: P&L total por ordem no ledger (tipos P&L-like)
 
     Também retorna contagem de ordens "void/push-like" (|pnl|<=eps) como diagnóstico.
@@ -1173,7 +1310,13 @@ def _exec_day_split_back_pre_in_from_order_pnls(
             exp = 0.0
         if abs(float(pnl)) <= float(pnl_zero_eps):
             n_zero += 1
-        if bool(em.get("is_live") or False):
+        try:
+            aid = em.get("audit_id")
+            arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+            is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=dt))
+        except Exception:
+            is_in = False
+        if bool(is_in):
             pnl_in += pnl
             exp_in += exp
             n_in += 1
@@ -1214,6 +1357,7 @@ def _counterfactual_rows_for_exec_day(
     acct_pnl_by_oid_total: Dict[str, float],
     day_exec_utc: str,
     only_inplay: bool,
+    audit_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
     pnl_zero_eps: float = 1e-9,
 ) -> Dict[str, Any]:
     """
@@ -1235,8 +1379,15 @@ def _counterfactual_rows_for_exec_day(
         if d != dayk:
             continue
         n_exec_day += 1
-        if only_inplay and (not bool(em.get("is_live") or False)):
-            continue
+        if only_inplay:
+            try:
+                aid = em.get("audit_id")
+                arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=dt))
+            except Exception:
+                is_in = False
+            if not bool(is_in):
+                continue
         if str(oid) not in acct_pnl_by_oid_total:
             continue
         try:
@@ -1362,6 +1513,11 @@ def _append_slippage_vs_roi_raw_section(
         out_lines.append(
             "- Nota: `ROIw` é o **ROI ponderado por exposição** (peso=stake no Back; peso=liability no Lay). "
             "Em prática, dentro de um bucket, `ROIw ≈ (∑P&L)/(∑exposição)`; já o `ROI mean` é a média simples por linha/sinal.\n\n"
+        )
+        out_lines.append(
+            "- Nota importante (reconciliação): as tabelas **Slippage × ROI** usam **somente execuções cobertas por ROI via placar** (precisa audit+placar+odd). "
+            "Isso é um subconjunto e pode ter viés (ex.: jogos ainda não liquidaram, falta de odds finais, etc.). "
+            "Já o **accounting ledger** inclui todo o resultado financeiro (incluindo void/refund/cancel quando existirem) por `post date`.\n\n"
         )
 
         # Lay também em ROI por stake (bounded; sanity-check)
@@ -3401,6 +3557,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         acct_day_typ: Dict[str, Dict[str, Dict[str, Any]]] = {}
         acct_by_oid_day_typ: Dict[str, Dict[str, Dict[str, float]]] = {}
         exec_by_oid_back: Dict[str, Dict[str, Any]] = {}
+        audit_by_id: Dict[int, Dict[str, Any]] = {}
         if bal_csv and days_utc_exec and bal_csv.exists():
             try:
                 acct_day_typ = _acct_amount_by_day_type_from_balance_csv(bal_csv, days_utc=set(days_utc_exec))
@@ -3415,6 +3572,25 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 exec_by_oid_back = _parse_executor_jsonl_back_live_orders(Path(str(cfg.executor_jsonl)))
             except Exception:
                 exec_by_oid_back = {}
+        # Para separar Back Pre vs Back In corretamente, precisamos de kickoff_time/is_live do audit (DB).
+        # Sem isso, `ExecutionRequest.is_live` do executor NÃO é in-play (é "modo LIVE").
+        try:
+            if exec_by_oid_back:
+                from storage.database import Database  # local import para não exigir DB em modo "report-only"
+
+                audit_ids = _extract_audit_ids_from_exec_by_oid(exec_by_oid_back)
+                if audit_ids:
+                    db = Database()
+                    await db.connect()
+                    try:
+                        audit_by_id = await _fetch_audit_rows_for_ids_daily(db, audit_ids)
+                    finally:
+                        try:
+                            await db.close()
+                        except Exception:
+                            pass
+        except Exception:
+            audit_by_id = {}
 
         def _acct_is_excluded_type(tl: str) -> bool:
             t = str(tl or "").strip().lower()
@@ -3489,6 +3665,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         exec_by_oid=exec_by_oid_back,
                         acct_by_oid_day_typ=acct_by_oid_day_typ,
                         day_utc=dayk,
+                        audit_by_id=(audit_by_id or None),
                         include_types=None,  # P&L-like: inclui void/refund/cancel quando existirem; exclui depósitos/saques/etc.
                     )
                     if isinstance(sp, dict) and int(sp.get("n_total") or 0) > 0:
@@ -3531,6 +3708,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             exec_by_oid_back=exec_by_oid_back,
                             acct_pnl_by_oid_total=acct_pnl_by_oid_total,
                             day_exec_utc=str(dayk2),
+                            audit_by_id=(audit_by_id or None),
                             pnl_zero_eps=float(os.getenv("DAILY_VOID_LIKE_PNL_EPS", "1e-9") or 1e-9),
                         )
                         if not isinstance(sp2, dict) or int(sp2.get("n_exec_day") or 0) <= 0:
@@ -3772,8 +3950,14 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             for oid, em in (exec_by_oid or {}).items():
                                 if not isinstance(em, dict):
                                     continue
-                                # filtro Back In (is_live=True)
-                                if not bool(em.get("is_live") or False):
+                                # filtro Back In (in-play): usa kickoff_time/is_live do audit (DB), não o flag `is_live` do executor.
+                                try:
+                                    aid = em.get("audit_id")
+                                    arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                                    is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=em.get("created_at")))
+                                except Exception:
+                                    is_in = False
+                                if not bool(is_in):
                                     continue
                                 pnl_amt = None
                                 if isinstance(acct_by_oid_day_typ, dict) and str(oid) in acct_by_oid_day_typ:
