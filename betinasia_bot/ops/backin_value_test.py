@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,62 @@ def _parse_day(s: str) -> Optional[str]:
         return None
  
  
+def _repo_roots() -> List[Path]:
+    """
+    Retorna possíveis roots para resolver paths relativos (repo e package).
+    """
+    roots: List[Path] = []
+    try:
+        roots.append(Path(__file__).resolve().parents[2])  # .../Bets
+    except Exception:
+        pass
+    try:
+        roots.append(Path(__file__).resolve().parents[1])  # .../Bets/betinasia_bot
+    except Exception:
+        pass
+    try:
+        roots.append(Path.cwd())
+    except Exception:
+        pass
+    out: List[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            rr = r.resolve()
+            if str(rr) not in seen:
+                out.append(rr)
+                seen.add(str(rr))
+        except Exception:
+            continue
+    return out
+
+
+def _resolve_rel_path(p: Path, *, extra_roots: Optional[List[Path]] = None) -> Path:
+    """
+    Resolve um path potencialmente relativo usando roots plausíveis do repo/package.
+    """
+    try:
+        if p.is_absolute():
+            return p
+    except Exception:
+        pass
+    roots = list(_repo_roots())
+    for r in (extra_roots or []):
+        try:
+            roots.insert(0, Path(r).resolve())
+        except Exception:
+            continue
+    for root in roots:
+        cand = (root / p).resolve()
+        if cand.exists():
+            return cand
+    # fallback: primeiro root + p
+    try:
+        return (roots[0] / p).resolve() if roots else p
+    except Exception:
+        return p
+
+
 def _bucket_slip_raw_3way(slip_raw_pct: Any) -> str:
     x = _safe_float(slip_raw_pct)
     if x is None:
@@ -205,6 +262,8 @@ async def _run(
     end_day: Optional[str],
     lat_bucket: str,
     slip_bucket: str,
+    database_url_override: Optional[str],
+    balance_csv_override: Optional[str],
     n_boot: int,
     seed: int,
 ) -> Dict[str, Any]:
@@ -427,34 +486,55 @@ async def _run(
         return out
  
     _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
- 
-    database_url = str(os.getenv("DATABASE_URL", "") or "").strip()
+
+    def _pick_database_url() -> str:
+        # 1) override explícito
+        if database_url_override:
+            return str(database_url_override).strip()
+        # 2) env
+        u = str(os.getenv("DATABASE_URL", "") or "").strip()
+        if u:
+            return u
+        # 3) fallback: settings do package (carrega betinasia_bot/.env por padrão)
+        try:
+            from betinasia_bot.config import settings  # type: ignore
+
+            u2 = str(getattr(settings, "database_url", "") or "").strip()
+            if u2:
+                return u2
+        except Exception:
+            pass
+        return ""
+
+    database_url = _pick_database_url()
     if not database_url:
-        raise SystemExit("DATABASE_URL não está definido (no ENV_FILE/.env).")
+        raise SystemExit(
+            "DATABASE_URL não está definido. "
+            "Passe `--database-url` ou exporte DATABASE_URL, ou aponte ENV_FILE para um .env que contenha DATABASE_URL."
+        )
 
     acct_json = day_dir / "accounting_daily_report.json"
     if not acct_json.exists():
         raise SystemExit(f"Não achei `{acct_json}`. Passe `--day-dir` correto (o day_dir impresso pelo daily).")
     acct = json.loads(acct_json.read_text(encoding="utf-8", errors="ignore") or "{}")
-    bal_csv = Path(str(acct.get("balance_csv") or "")).expanduser()
+    # balance.csv: pode ser relativo ao repo OU ao package (dependendo do cwd em que o daily rodou).
+    bal_csv_raw = str(acct.get("balance_csv") or "").strip()
+    if balance_csv_override:
+        bal_csv_raw = str(balance_csv_override).strip()
+    bal_csv = Path(bal_csv_raw).expanduser() if bal_csv_raw else Path("")
+    if not str(bal_csv):
+        raise SystemExit(f"`balance_csv` ausente em `{acct_json}`. Rode o daily com accounting habilitado ou passe `--balance-csv`.")
+    bal_csv = _resolve_rel_path(bal_csv, extra_roots=[day_dir, day_dir.parent, day_dir.parent.parent])
     if not bal_csv.exists():
-        raise SystemExit(f"Não achei balance.csv em `{bal_csv}` (de `{acct_json}`).")
+        raise SystemExit(
+            f"Não achei balance.csv em `{bal_csv_raw}` (resolvido para `{bal_csv}`) "
+            f"(de `{acct_json}`). Passe `--balance-csv` apontando para o arquivo correto."
+        )
  
     executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     if not executor_jsonl.is_absolute():
         # Tenta resolver relativo ao root do repo (…/Bets) e ao root do package (…/Bets/betinasia_bot).
-        try:
-            repo_root = Path(__file__).resolve().parents[2]
-        except Exception:
-            repo_root = Path.cwd()
-        bot_root = Path(__file__).resolve().parents[1]  # .../betinasia_bot
-        cand = [(repo_root / executor_jsonl).resolve(), (bot_root / executor_jsonl).resolve(), (Path.cwd() / executor_jsonl).resolve()]
-        picked = None
-        for p in cand:
-            if p.exists():
-                picked = p
-                break
-        executor_jsonl = picked or cand[0]
+        executor_jsonl = _resolve_rel_path(executor_jsonl, extra_roots=[day_dir, day_dir.parent, day_dir.parent.parent])
     if not executor_jsonl.exists():
         raise SystemExit(f"Não achei executor_jsonl em `{executor_jsonl}`. Sete `EXECUTOR_JSONL` (absoluto) ou rode do repo.")
  
@@ -645,6 +725,16 @@ def main() -> int:
     ap.add_argument("--day-dir", required=True, help="Pasta do dia (ex.: .../20260413) gerada pelo daily_full_report.")
     ap.add_argument("--start-day", default="2026-04-04", help="Filtra por created_at UTC (YYYY-MM-DD). Default=2026-04-04.")
     ap.add_argument("--end-day", default="", help="Opcional: fim do filtro por created_at UTC (YYYY-MM-DD).")
+    ap.add_argument(
+        "--database-url",
+        default="",
+        help="Override do DATABASE_URL (se não estiver no ENV_FILE). Ex.: postgresql://user:pass@host:5432/db",
+    )
+    ap.add_argument(
+        "--balance-csv",
+        default="",
+        help="Override do caminho do balance.csv (se o path do accounting_daily_report.json estiver relativo a outro cwd).",
+    )
     ap.add_argument("--lat-bucket", default="< 5s", help="Bucket de latência alvo. Default='< 5s'.")
     # argparse interpola '%' na help string; evite aspas e/ou escape.
     ap.add_argument("--slip-bucket", default="> 2%", help="Bucket de slippage alvo. Default=> 2%%.")
@@ -664,6 +754,8 @@ def main() -> int:
             end_day=end_day,
             lat_bucket=str(args.lat_bucket),
             slip_bucket=str(args.slip_bucket),
+            database_url_override=(str(args.database_url).strip() or None),
+            balance_csv_override=(str(args.balance_csv).strip() or None),
             n_boot=int(args.n_boot),
             seed=int(args.seed),
         )
