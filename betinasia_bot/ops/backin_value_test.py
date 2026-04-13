@@ -219,13 +219,212 @@ async def _run(
     except Exception as e:
         raise SystemExit(f"Dependência faltando: SQLAlchemy. Erro: {e}")
 
-    from .daily_full_report import (  # type: ignore
-        _acct_pnl_like_by_order_total_from_balance_csv,
-        _extract_audit_ids_from_exec_by_oid,
-        _is_inplay_from_audit_row,
-        _load_env_file,
-        _parse_executor_jsonl_back_live_orders,
-    )
+    # Evitar importar `ops.daily_full_report` aqui porque ele puxa `accounting_monitor` (scraper/Playwright),
+    # o que não é necessário para este teste e pode quebrar em ambientes sem `scraper`.
+    from datetime import timedelta
+    import csv
+    import re
+
+    def _parse_dt_any(s: Any) -> Optional[datetime]:
+        try:
+            t = str(s or "").strip()
+            if not t:
+                return None
+            if t.endswith("Z"):
+                t = t[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(t)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(t, fmt).replace(tzinfo=timezone.utc)
+                    return dt
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _to_utc_dt(x: Any) -> Optional[datetime]:
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x.astimezone(timezone.utc) if x.tzinfo else x.replace(tzinfo=timezone.utc)
+        return _parse_dt_any(x)
+
+    def _is_inplay_from_audit_row(a: Optional[Dict[str, Any]], *, exec_created_at_utc: datetime) -> bool:
+        try:
+            if not isinstance(exec_created_at_utc, datetime):
+                return False
+            if a and a.get("kickoff_time") is not None:
+                ko = _to_utc_dt(a.get("kickoff_time"))
+                if isinstance(ko, datetime):
+                    return exec_created_at_utc.astimezone(timezone.utc) >= ko.astimezone(timezone.utc)
+        except Exception:
+            pass
+        try:
+            if a and a.get("is_live") is not None:
+                return bool(a.get("is_live"))
+        except Exception:
+            pass
+        return False
+
+    def _extract_order_id_from_raw(raw: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(raw, dict):
+            return None
+        for k in ("order_id", "orderId", "bet_id", "betId", "id"):
+            v = raw.get(k)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s.isdigit():
+                return s
+        # fallback: scan strings
+        try:
+            s = json.dumps(raw, ensure_ascii=False)
+            m = re.search(r"\"order[_ ]?id\"\\s*:\\s*\"?(\\d+)\"?", s, flags=re.IGNORECASE)
+            if m:
+                return str(m.group(1))
+        except Exception:
+            pass
+        return None
+
+    def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        if not path.exists():
+            return out
+        for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+            res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+            st = str(res.get("status") or "").strip()
+            if st != "LIVE_OK":
+                continue
+            exec_side = str(res.get("exec_side") or req.get("exec_side") or "").strip().lower()
+            if exec_side != "back":
+                continue
+            created = _parse_dt_any(str(res.get("created_at") or req.get("created_at") or ""))
+            if created is None:
+                continue
+            raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+            oid = _extract_order_id_from_raw(raw)
+            if not oid or not str(oid).isdigit():
+                continue
+            # audit_id
+            audit_id = None
+            try:
+                v = res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+                audit_id = int(v) if v is not None else None
+            except Exception:
+                audit_id = None
+            # stake (exposure)
+            sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
+            stake = _safe_float(sent.get("stake"))
+            if stake is None:
+                pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
+                stake = _safe_float((pol or {}).get("stake_requested"))
+            timing = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+            lat_ms = _safe_float(timing.get("call_to_done_ms"))
+            lat_ms_i = int(lat_ms) if lat_ms is not None else None
+            odd_dec = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
+            odd_fin = _safe_float(res.get("odd_final"))
+            slip = None
+            try:
+                if odd_dec is not None and odd_fin is not None and float(odd_dec) != 0.0:
+                    slip = (float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0
+            except Exception:
+                slip = None
+            rec = {
+                "order_id": str(oid),
+                "created_at": created.astimezone(timezone.utc),
+                "slip_raw_pct": slip,
+                "lat_ms": (float(lat_ms_i) if lat_ms_i is not None else None),
+                "exposure": (float(stake) if stake is not None else None),
+                "audit_id": (int(audit_id) if audit_id is not None else None),
+            }
+            prev = out.get(str(oid))
+            if prev is None or rec["created_at"] >= prev.get("created_at"):
+                out[str(oid)] = rec
+        return out
+
+    def _extract_audit_ids_from_exec_by_oid(exec_by_oid: Dict[str, Dict[str, Any]]) -> List[int]:
+        out: set[int] = set()
+        for _, ex in (exec_by_oid or {}).items():
+            if not isinstance(ex, dict):
+                continue
+            aid = ex.get("audit_id")
+            if aid is None:
+                continue
+            try:
+                out.add(int(aid))
+            except Exception:
+                continue
+        return sorted(list(out))
+
+    def _load_env_file(path: Path) -> None:
+        # loader minimalista .env (sem dependências)
+        try:
+            if not path.exists():
+                return
+            for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = ln.strip()
+                if (not s) or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'").strip('"')
+                if k and (k not in os.environ):
+                    os.environ[k] = v
+        except Exception:
+            return
+
+    def _acct_pnl_like_by_order_total_from_balance_csv(path: Path) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if not path.exists():
+            return out
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return out
+            # colunas
+            def _pick(keys: Tuple[str, ...]) -> Optional[str]:
+                for k in keys:
+                    for c in cols:
+                        cl = c.lower()
+                        if cl == k or cl.startswith(k) or k in cl:
+                            return c
+                return None
+
+            pnl_col = _pick(("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"))
+            oid_col = _pick(("order_id", "order id", "order", "bet id", "bet_id", "id"))
+            typ_col = _pick(("type",))
+            if not pnl_col or not oid_col:
+                return out
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get(oid_col) or "").strip()
+                if not oid or not oid.isdigit():
+                    continue
+                amt = _safe_float(row.get(pnl_col))
+                if amt is None:
+                    continue
+                tl = str(row.get(typ_col) or "").strip().lower() if typ_col else ""
+                # inclui tudo P&L-like: exclui depósitos/saques/etc.
+                if any(k in tl for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus")):
+                    continue
+                out[oid] = float(out.get(oid) or 0.0) + float(amt)
+        return out
  
     _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
  
