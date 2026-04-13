@@ -268,6 +268,28 @@ def _bucket_label_min_since_kickoff(mins: Optional[int]) -> str:
     return ">60m"
 
 
+def _bucket_label_call_to_done_ms(lat_ms: Any) -> str:
+    """
+    Buckets de latência de efetivação (tempo total) usando `call_to_done_ms` do executor.
+    """
+    x = _safe_float(lat_ms)
+    if x is None:
+        return "Desconhecido"
+    try:
+        v = float(x)
+    except Exception:
+        return "Desconhecido"
+    if v < 5000:
+        return "< 5s"
+    if v < 10000:
+        return "5-10s"
+    if v < 20000:
+        return "10-20s"
+    if v < 40000:
+        return "20-40s"
+    return "> 40s"
+
+
 def _summarize_rows_pnl_exp(rows: list[dict]) -> dict:
     """
     rows: [{pnl, exposure, event_id?}] — agrega P&L, exposição, ROIw e contagem de jogos únicos (event_id).
@@ -3819,7 +3841,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Back In × tempo desde kickoff (robustez): usa P&L do ledger por order_id (realizado) e timing do audit.
+        # Back In × tempo no jogo (min desde kickoff; robustez): usa P&L do ledger por order_id (realizado) e timing do audit.
         try:
             if acct_pnl_by_oid_total and exec_by_oid_back and audit_by_id:
                 # universo: execuções Back In cujas created_at caem nos dias mostrados em Execução
@@ -3868,10 +3890,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         }
                     )
                 if order_rows_by_bucket:
-                    s1.append("**Back In (acct; order_id): P&L × tempo desde kickoff (robusto)**\n\n")
+                    s1.append("**Back In (acct; order_id): P&L × tempo no jogo (min desde kickoff; robusto)**\n\n")
                     s1.append(
                         "_Definição: `min_since_kickoff = created_at_utc − kickoff_time_utc` (minutos). "
                         "Classificação **Back In** usa `kickoff_time` quando disponível; senão `betslip_audit_results.is_live` (quando não-NULL). "
+                        "Isto mede **tempo dentro do jogo**, não a latência para efetivar a aposta. "
                         "`ROIw = (∑P&L ledger)/(∑stake do executor)`._\n\n"
                     )
                     covp = _pct(n_in_with_acct, n_in_total)
@@ -3881,6 +3904,78 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     bucket_order = ["0-5m", "5-15m", "15-30m", "30-60m", ">60m", "Pre (<0)", "Desconhecido"]
                     for b in bucket_order:
                         summ = _summarize_rows_pnl_exp(order_rows_by_bucket.get(b) or [])
+                        if int(summ.get("n_orders") or 0) <= 0:
+                            continue
+                        s1.append(
+                            f"| {b} | {int(summ.get('n_orders') or 0)} | {int(summ.get('n_events') or 0)} | "
+                            f"{_fmt_num(summ.get('exposure_sum'),2)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_pct(summ.get('roi_weighted'))} |\n"
+                        )
+                    s1.append("\n")
+        except Exception:
+            pass
+
+        # Back In × latência de efetivação (call_to_done_ms; robustez): P&L do ledger por order_id vs tempo total de execução.
+        try:
+            if acct_pnl_by_oid_total and exec_by_oid_back and audit_by_id:
+                order_rows_by_bucket_lat: Dict[str, list[dict]] = defaultdict(list)
+                n_in_total = 0
+                n_in_with_acct = 0
+                for oid, em in (exec_by_oid_back or {}).items():
+                    if not isinstance(em, dict):
+                        continue
+                    created = em.get("created_at")
+                    if not isinstance(created, datetime):
+                        continue
+                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
+                        continue
+
+                    # in-play?
+                    try:
+                        aid = em.get("audit_id")
+                        arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                        is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=created))
+                    except Exception:
+                        is_in = False
+                        arow = None
+                    if not bool(is_in):
+                        continue
+
+                    n_in_total += 1
+                    pnl = acct_pnl_by_oid_total.get(str(oid))
+                    if pnl is None:
+                        continue
+                    n_in_with_acct += 1
+
+                    ev_id = None
+                    try:
+                        if isinstance(arow, dict):
+                            ev_id = str(arow.get("event_id") or "").strip() or None
+                    except Exception:
+                        ev_id = None
+
+                    lab = _bucket_label_call_to_done_ms(em.get("lat_ms"))
+                    order_rows_by_bucket_lat[lab].append(
+                        {
+                            "pnl": float(pnl),
+                            "exposure": em.get("exposure"),
+                            "event_id": ev_id,
+                        }
+                    )
+
+                if order_rows_by_bucket_lat:
+                    s1.append("**Back In (acct; order_id): P&L × latência de efetivação (call_to_done_ms; robusto)**\n\n")
+                    s1.append(
+                        "_Definição: `call_to_done_ms` vem do `executor_jsonl` (tempo total do request até finalizar). "
+                        "Isto mede **tempo para efetivar a aposta** (latência), não o minuto do jogo. "
+                        "`ROIw = (∑P&L ledger)/(∑stake do executor)`._\n\n"
+                    )
+                    covp = _pct(n_in_with_acct, n_in_total)
+                    s1.append(f"- Universo: Back In nos dias exibidos: n_orders=`{n_in_total}`; com ledger por `order_id`: `{n_in_with_acct}` ({_fmt_pct(covp,1)}).\n\n")
+                    s1.append("| Bucket call_to_done_ms | n_ordens | n_jogos | Exposição (∑stake) | P&L (∑acct) | ROIw |\n")
+                    s1.append("|---|---:|---:|---:|---:|---:|\n")
+                    bucket_order = ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]
+                    for b in bucket_order:
+                        summ = _summarize_rows_pnl_exp(order_rows_by_bucket_lat.get(b) or [])
                         if int(summ.get("n_orders") or 0) <= 0:
                             continue
                         s1.append(
