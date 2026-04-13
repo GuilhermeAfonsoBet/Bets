@@ -209,7 +209,13 @@ async def _run(
     seed: int,
 ) -> Dict[str, Any]:
     # imports tardios (DB + helpers do daily)
-    from storage.database import Database  # type: ignore
+    # `storage` é um módulo dentro de `betinasia_bot/`. Se rodar com `python -m ops...` (cwd=betinasia_bot),
+    # `storage` resolve como top-level; se rodar com `python -m betinasia_bot.ops...` (cwd=repo root),
+    # precisamos do import qualificado.
+    try:
+        from betinasia_bot.storage.database import Database  # type: ignore
+    except Exception:
+        from storage.database import Database  # type: ignore
     from .daily_full_report import (  # type: ignore
         _acct_pnl_like_by_order_total_from_balance_csv,
         _extract_audit_ids_from_exec_by_oid,
@@ -231,12 +237,14 @@ async def _run(
  
     executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     if not executor_jsonl.is_absolute():
-        executor_jsonl = (day_dir.parent.parent / executor_jsonl).resolve()  # tenta relativo ao repo
+        # resolve relativo ao root do repo (…/Bets)
+        try:
+            repo_root = Path(__file__).resolve().parents[2]
+        except Exception:
+            repo_root = Path.cwd()
+        executor_jsonl = (repo_root / executor_jsonl).resolve()
     if not executor_jsonl.exists():
-        # fallback: relativo ao repo atual
-        executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
-    if not executor_jsonl.exists():
-        raise SystemExit(f"Não achei executor_jsonl em `{executor_jsonl}`. Sete `EXECUTOR_JSONL`.")
+        raise SystemExit(f"Não achei executor_jsonl em `{executor_jsonl}`. Sete `EXECUTOR_JSONL` (absoluto) ou rode do repo.")
  
     start_day2 = _parse_day(start_day)
     end_day2 = _parse_day(end_day) if end_day else None
