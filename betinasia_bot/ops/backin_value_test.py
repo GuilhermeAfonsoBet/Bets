@@ -209,17 +209,19 @@ async def _run(
     seed: int,
 ) -> Dict[str, Any]:
     # imports tardios (DB + helpers do daily)
-    # `storage` é um módulo dentro de `betinasia_bot/`. Se rodar com `python -m ops...` (cwd=betinasia_bot),
-    # `storage` resolve como top-level; se rodar com `python -m betinasia_bot.ops...` (cwd=repo root),
-    # precisamos do import qualificado.
+    #
+    # IMPORTANTE: não use `betinasia_bot.storage.Database` aqui.
+    # Ele depende de um import top-level `config`, que quebra dependendo do cwd/PYTHONPATH no VPS.
+    # Para este teste, basta um SELECT simples via SQLAlchemy usando DATABASE_URL.
     try:
-        from betinasia_bot.storage.database import Database  # type: ignore
-    except Exception:
-        from storage.database import Database  # type: ignore
+        from sqlalchemy import text  # type: ignore
+        from sqlalchemy.ext.asyncio import create_async_engine  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"Dependência faltando: SQLAlchemy. Erro: {e}")
+
     from .daily_full_report import (  # type: ignore
         _acct_pnl_like_by_order_total_from_balance_csv,
         _extract_audit_ids_from_exec_by_oid,
-        _fetch_audit_rows_for_ids_daily,
         _is_inplay_from_audit_row,
         _load_env_file,
         _parse_executor_jsonl_back_live_orders,
@@ -227,6 +229,10 @@ async def _run(
  
     _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
  
+    database_url = str(os.getenv("DATABASE_URL", "") or "").strip()
+    if not database_url:
+        raise SystemExit("DATABASE_URL não está definido (no ENV_FILE/.env).")
+
     acct_json = day_dir / "accounting_daily_report.json"
     if not acct_json.exists():
         raise SystemExit(f"Não achei `{acct_json}`. Passe `--day-dir` correto (o day_dir impresso pelo daily).")
@@ -237,12 +243,19 @@ async def _run(
  
     executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     if not executor_jsonl.is_absolute():
-        # resolve relativo ao root do repo (…/Bets)
+        # Tenta resolver relativo ao root do repo (…/Bets) e ao root do package (…/Bets/betinasia_bot).
         try:
             repo_root = Path(__file__).resolve().parents[2]
         except Exception:
             repo_root = Path.cwd()
-        executor_jsonl = (repo_root / executor_jsonl).resolve()
+        bot_root = Path(__file__).resolve().parents[1]  # .../betinasia_bot
+        cand = [(repo_root / executor_jsonl).resolve(), (bot_root / executor_jsonl).resolve(), (Path.cwd() / executor_jsonl).resolve()]
+        picked = None
+        for p in cand:
+            if p.exists():
+                picked = p
+                break
+        executor_jsonl = picked or cand[0]
     if not executor_jsonl.exists():
         raise SystemExit(f"Não achei executor_jsonl em `{executor_jsonl}`. Sete `EXECUTOR_JSONL` (absoluto) ou rode do repo.")
  
@@ -255,13 +268,50 @@ async def _run(
  
     exec_by_oid = _parse_executor_jsonl_back_live_orders(executor_jsonl)
     audit_ids = _extract_audit_ids_from_exec_by_oid(exec_by_oid)
- 
-    db = Database()
-    await db.connect()
-    try:
-        audit_by_id = await _fetch_audit_rows_for_ids_daily(db, audit_ids)
-    finally:
-        await db.close()
+
+    async def _fetch_audit_rows_for_ids(*, ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not ids:
+            return {}
+        q = text(
+            """
+            SELECT
+              a.id AS audit_id,
+              a.event_id,
+              a.is_live,
+              a.audited_at,
+              m.kickoff_time
+            FROM betslip_audit_results a
+            LEFT JOIN matches m ON m.external_id = a.event_id
+            WHERE a.id = ANY(:ids)
+            """
+        )
+        out: Dict[int, Dict[str, Any]] = {}
+        # chunk para evitar arrays gigantes no driver
+        CH = 5000
+        # normaliza url asyncpg
+        url = database_url
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        eng = create_async_engine(url, echo=False, pool_pre_ping=True)
+        try:
+            async with eng.begin() as conn:
+                for i in range(0, len(ids), CH):
+                    part = ids[i : i + CH]
+                    res = await conn.execute(q, {"ids": list(part)})
+                    for row in res.fetchall() or []:
+                        mp = dict(row._mapping)
+                        try:
+                            out[int(mp.get("audit_id"))] = mp
+                        except Exception:
+                            continue
+        finally:
+            try:
+                await eng.dispose()
+            except Exception:
+                pass
+        return out
+
+    audit_by_id = await _fetch_audit_rows_for_ids(ids=audit_ids)
  
     pnl_by_oid = _acct_pnl_like_by_order_total_from_balance_csv(bal_csv)
  
