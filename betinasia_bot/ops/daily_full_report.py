@@ -210,6 +210,7 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
         """
         SELECT
           a.id AS audit_id,
+          a.event_id,
           a.is_live,
           a.audited_at,
           m.kickoff_time
@@ -227,6 +228,78 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
     except Exception:
         return {}
     return out
+
+
+def _bucket_min_to_kickoff(exec_created_at_utc: datetime, kickoff_time: Optional[datetime]) -> Optional[int]:
+    """
+    Retorna minutos desde kickoff (>=0) quando exec >= kickoff; ou minutos até kickoff (<0) se exec < kickoff.
+    """
+    try:
+        if not isinstance(exec_created_at_utc, datetime) or not isinstance(kickoff_time, datetime):
+            return None
+        dt = exec_created_at_utc.astimezone(timezone.utc)
+        ko = kickoff_time.astimezone(timezone.utc)
+        return int(round((dt - ko).total_seconds() / 60.0))
+    except Exception:
+        return None
+
+
+def _bucket_label_min_since_kickoff(mins: Optional[int]) -> str:
+    """
+    mins: minutos desde kickoff (pode ser <0 se pre-match).
+    Buckets focados em in-play para análise de timing (0-5, 5-15, 15-30, 30-60, >60).
+    """
+    if mins is None:
+        return "Desconhecido"
+    try:
+        m = int(mins)
+    except Exception:
+        return "Desconhecido"
+    if m < 0:
+        return "Pre (<0)"
+    if m <= 5:
+        return "0-5m"
+    if m <= 15:
+        return "5-15m"
+    if m <= 30:
+        return "15-30m"
+    if m <= 60:
+        return "30-60m"
+    return ">60m"
+
+
+def _summarize_rows_pnl_exp(rows: list[dict]) -> dict:
+    """
+    rows: [{pnl, exposure, event_id?}] — agrega P&L, exposição, ROIw e contagem de jogos únicos (event_id).
+    """
+    try:
+        n = int(len(rows or []))
+    except Exception:
+        n = 0
+    pnl = 0.0
+    exp = 0.0
+    evs: set[str] = set()
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            if r.get("pnl") is not None:
+                pnl += float(r.get("pnl") or 0.0)
+        except Exception:
+            pass
+        try:
+            if r.get("exposure") is not None:
+                exp += float(r.get("exposure") or 0.0)
+        except Exception:
+            pass
+        try:
+            eid = str(r.get("event_id") or "").strip()
+            if eid:
+                evs.add(eid)
+        except Exception:
+            pass
+    roiw = (pnl / exp * 100.0) if exp > 0 else None
+    return {"n_orders": n, "n_events": int(len(evs)), "pnl_sum": float(pnl), "exposure_sum": float(exp), "roi_weighted": roiw}
 
 
 def _pct(num: Any, den: Any) -> Optional[float]:
@@ -2306,7 +2379,9 @@ class DailyReportCfg:
     out_dir: Path = Path("logs/daily_reports")
     report_tz: str = "America/Sao_Paulo"
     # Alinhar com o relatório “v38” por default
-    versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.0-ws-only,v5.1-ws-gate-lay")
+    # Default atualizado: inclui Back API moderno (v5.2) e mantém Lay gate (v5.1).
+    # Isso evita OOS truncar (ex.: parar em 03/04) quando as versões antigas não têm histórico recente.
+    versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.2-api-back,v5.1-ws-gate-lay")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
     lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
@@ -3556,6 +3631,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
         acct_day_typ: Dict[str, Dict[str, Dict[str, Any]]] = {}
         acct_by_oid_day_typ: Dict[str, Dict[str, Dict[str, float]]] = {}
+        acct_pnl_by_oid_total: Dict[str, float] = {}
         exec_by_oid_back: Dict[str, Dict[str, Any]] = {}
         audit_by_id: Dict[int, Dict[str, Any]] = {}
         if bal_csv and days_utc_exec and bal_csv.exists():
@@ -3567,6 +3643,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 acct_by_oid_day_typ = _acct_amount_by_order_day_by_type_from_balance_csv(bal_csv, days_utc=set(days_utc_exec))
             except Exception:
                 acct_by_oid_day_typ = {}
+        # P&L por ordem (order_id) acumulado no ledger (inclui tipos P&L-like; exclui dep/saque/etc.)
+        if bal_csv and bal_csv.exists():
+            try:
+                acct_pnl_by_oid_total = _acct_pnl_like_by_order_total_from_balance_csv(bal_csv)
+            except Exception:
+                acct_pnl_by_oid_total = {}
         if cfg.executor_jsonl.exists():
             try:
                 exec_by_oid_back = _parse_executor_jsonl_back_live_orders(Path(str(cfg.executor_jsonl)))
@@ -3598,7 +3680,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
         s1.append(
             "| Dia | Exec rows | Sucessos | LIVE_OK | DRY_OK | API_FAILED | N Back | N Lay | Apostado Back ($) | Apostado Lay stake ($) | Apostado Lay liab ($) | "
-            "P&L total (acct; post date UTC) | ROI/$ (acct) | P&L Back Pre (acct; order_id) | P&L Back In (acct; order_id) | Cobertura oids% (Back) | "
+            "P&L total (acct; post date UTC) | ROI/$ (acct) | P&L Back (acct; oid join) | P&L Back Pre (acct; oid) | P&L Back In (acct; oid) | Δ (acct_total - acct_back_oid) | Cobertura oids% (Back) | "
             "P&L (placar) | ROI/$ (placar) | P&L Back | ROI Back | P&L Lay | ROI Lay/liab | ROI Lay/stake |\n"
         )
         s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
@@ -3656,8 +3738,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
 
             # Split Back Pre/In (accounting) por join em order_id (Back LIVE_OK).
             # Isso deixa de “alocar” o P&L total do dia e passa a medir Back-only por regime.
+            pnl_acct_back_oid = None
             pnl_acct_back_pre = None
             pnl_acct_back_in = None
+            pnl_acct_back_delta = None
             cov_oid_pct = None
             try:
                 if dayk and exec_by_oid_back and acct_by_oid_day_typ:
@@ -3669,18 +3753,26 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         include_types=None,  # P&L-like: inclui void/refund/cancel quando existirem; exclui depósitos/saques/etc.
                     )
                     if isinstance(sp, dict) and int(sp.get("n_total") or 0) > 0:
+                        pnl_acct_back_oid = sp.get("pnl_total")
                         pnl_acct_back_pre = sp.get("pnl_pre")
                         pnl_acct_back_in = sp.get("pnl_in")
                         cov_oid_pct = sp.get("coverage_n_pct")
+                        try:
+                            if pnl_acct is not None and pnl_acct_back_oid is not None:
+                                pnl_acct_back_delta = float(pnl_acct) - float(pnl_acct_back_oid)
+                        except Exception:
+                            pnl_acct_back_delta = None
             except Exception:
+                pnl_acct_back_oid = None
                 pnl_acct_back_pre = None
                 pnl_acct_back_in = None
+                pnl_acct_back_delta = None
                 cov_oid_pct = None
             s1.append(
                 f"| {it.get('day')} | {int(ex.get('n_exec_rows') or 0)} | {int(ex.get('n_exec_success') or 0)} | {int(sc.get('LIVE_OK') or 0)} | {int(sc.get('DRY_OK') or 0)} | "
                 f"{int(sc.get('API_FAILED') or 0)} | {int(back.get('n_success') or 0)} | {int(lay.get('n_success') or 0)} | "
                 f"{_fmt_num(st_back,2)} | {_fmt_num(st_lay,2)} | {_fmt_num(liab_lay,2)} | "
-                f"{_fmt_num(pnl_acct,2)} | {_fmt_pct(roi_acct_dol)} | {_fmt_num(pnl_acct_back_pre,2)} | {_fmt_num(pnl_acct_back_in,2)} | {_fmt_pct(cov_oid_pct,1)} | "
+                f"{_fmt_num(pnl_acct,2)} | {_fmt_pct(roi_acct_dol)} | {_fmt_num(pnl_acct_back_oid,2)} | {_fmt_num(pnl_acct_back_pre,2)} | {_fmt_num(pnl_acct_back_in,2)} | {_fmt_num(pnl_acct_back_delta,2)} | {_fmt_pct(cov_oid_pct,1)} | "
                 f"{_fmt_num(pnl_total_placar,2)} | {_fmt_pct(roi_dol)} | {_fmt_num(pnl_back,2)} | {_fmt_pct(back.get('roi_pct'))} | "
                 f"{_fmt_num(pnl_lay,2)} | {_fmt_pct(lay.get('roi_pct_per_liability'))} | {_fmt_pct(ex.get('lay_roi_pct_per_stake'))} |\n"
             )
@@ -3696,7 +3788,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         # Isso reduz a confusão "post date != exec date" e permite auditoria operacional realista.
         try:
             if bal_csv and bal_csv.exists() and exec_by_oid_back:
-                acct_pnl_by_oid_total = _acct_pnl_like_by_order_total_from_balance_csv(bal_csv)
                 if acct_pnl_by_oid_total:
                     s1.append("**Accounting (por order_id): P&L por dia de execução (created_at UTC; Back Pre/In)**\n\n")
                     s1.append(
@@ -3725,6 +3816,140 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                             f"{_fmt_pct(roiw)} | {_fmt_pct(sp2.get('coverage_n_pct'),1)} | {int(sp2.get('n_pnl_zero') or 0)} |\n"
                         )
                     s1.append("\n")
+        except Exception:
+            pass
+
+        # Back In × tempo desde kickoff (robustez): usa P&L do ledger por order_id (realizado) e timing do audit.
+        try:
+            if acct_pnl_by_oid_total and exec_by_oid_back and audit_by_id:
+                # universo: execuções Back In cujas created_at caem nos dias mostrados em Execução
+                order_rows_by_bucket: Dict[str, list[dict]] = defaultdict(list)
+                n_in_total = 0
+                n_in_with_acct = 0
+                for oid, em in (exec_by_oid_back or {}).items():
+                    if not isinstance(em, dict):
+                        continue
+                    created = em.get("created_at")
+                    if not isinstance(created, datetime):
+                        continue
+                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
+                        continue
+                    # in-play?
+                    try:
+                        aid = em.get("audit_id")
+                        arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                        is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=created))
+                    except Exception:
+                        is_in = False
+                        arow = None
+                    if not bool(is_in):
+                        continue
+                    n_in_total += 1
+                    pnl = acct_pnl_by_oid_total.get(str(oid))
+                    if pnl is None:
+                        continue
+                    n_in_with_acct += 1
+                    ko = None
+                    ev_id = None
+                    try:
+                        if isinstance(arow, dict):
+                            ko = _to_utc_dt(arow.get("kickoff_time"))
+                            ev_id = str(arow.get("event_id") or "").strip() or None
+                    except Exception:
+                        ko = None
+                        ev_id = None
+                    mins = _bucket_min_to_kickoff(created, ko) if ko else None
+                    lab = _bucket_label_min_since_kickoff(mins)
+                    order_rows_by_bucket[lab].append(
+                        {
+                            "pnl": float(pnl),
+                            "exposure": em.get("exposure"),
+                            "event_id": ev_id,
+                        }
+                    )
+                if order_rows_by_bucket:
+                    s1.append("**Back In (acct; order_id): P&L × tempo desde kickoff (robusto)**\n\n")
+                    s1.append(
+                        "_Definição: `min_since_kickoff = created_at_utc − kickoff_time_utc` (minutos). "
+                        "Classificação **Back In** usa `kickoff_time` quando disponível; senão `betslip_audit_results.is_live` (quando não-NULL). "
+                        "`ROIw = (∑P&L ledger)/(∑stake do executor)`._\n\n"
+                    )
+                    covp = _pct(n_in_with_acct, n_in_total)
+                    s1.append(f"- Universo: Back In nos dias exibidos: n_orders=`{n_in_total}`; com ledger por `order_id`: `{n_in_with_acct}` ({_fmt_pct(covp,1)}).\n\n")
+                    s1.append("| Bucket min_since_kickoff | n_ordens | n_jogos | Exposição (∑stake) | P&L (∑acct) | ROIw |\n")
+                    s1.append("|---|---:|---:|---:|---:|---:|\n")
+                    bucket_order = ["0-5m", "5-15m", "15-30m", "30-60m", ">60m", "Pre (<0)", "Desconhecido"]
+                    for b in bucket_order:
+                        summ = _summarize_rows_pnl_exp(order_rows_by_bucket.get(b) or [])
+                        if int(summ.get("n_orders") or 0) <= 0:
+                            continue
+                        s1.append(
+                            f"| {b} | {int(summ.get('n_orders') or 0)} | {int(summ.get('n_events') or 0)} | "
+                            f"{_fmt_num(summ.get('exposure_sum'),2)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_pct(summ.get('roi_weighted'))} |\n"
+                        )
+                    s1.append("\n")
+        except Exception:
+            pass
+
+        # Slippage × ROI (accounting; por order_id): compara com "Slippage × ROI" via placar (subamostra coberta).
+        try:
+            if acct_pnl_by_oid_total and exec_by_oid_back:
+                rows_all: list[dict] = []
+                rows_pre: list[dict] = []
+                rows_in: list[dict] = []
+                rows_all_post: list[dict] = []
+                rows_pre_post: list[dict] = []
+                rows_in_post: list[dict] = []
+                post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
+                for oid, em in (exec_by_oid_back or {}).items():
+                    if not isinstance(em, dict):
+                        continue
+                    created = em.get("created_at")
+                    if not isinstance(created, datetime):
+                        continue
+                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
+                        continue
+                    pnl = acct_pnl_by_oid_total.get(str(oid))
+                    if pnl is None:
+                        continue
+                    row = {"pnl": float(pnl), "exposure": em.get("exposure"), "slip_raw_pct": em.get("slip_raw_pct")}
+                    rows_all.append(row)
+                    # classifica Pre/In via audit quando possível
+                    try:
+                        aid = em.get("audit_id")
+                        arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                        is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=created))
+                    except Exception:
+                        is_in = False
+                    (rows_in if is_in else rows_pre).append(row)
+                    # corte pós-início (por created_at UTC)
+                    try:
+                        if post_start and str(created.date().isoformat()) >= post_start:
+                            rows_all_post.append(row)
+                            (rows_in_post if is_in else rows_pre_post).append(row)
+                    except Exception:
+                        pass
+
+                def _render(rows: list[dict], *, title: str) -> None:
+                    buckets = _bucketize_slip_raw_3way_accounting(rows)
+                    if not any(int(b.get("n") or 0) > 0 for b in buckets):
+                        return
+                    s1.append(f"**{title}**\n\n")
+                    s1.append("| Bucket slippage_raw_pct | n | Exposição (∑stake) | P&L (∑acct) | ROIw |\n")
+                    s1.append("|---|---:|---:|---:|---:|\n")
+                    for b in buckets:
+                        s1.append(
+                            f"| {b.get('bucket')} | {int(b.get('n') or 0)} | {_fmt_num(b.get('exposure_sum'),2)} | {_fmt_num(b.get('pnl_sum'),2)} | {_fmt_pct(b.get('roi_weighted'))} |\n"
+                        )
+                    s1.append("\n")
+
+                _render(rows_all, title="Slippage × ROI (accounting; order_id) — Back (janela Execução)")
+                _render(rows_pre, title="Slippage × ROI (accounting; order_id) — Back Pre (janela Execução)")
+                _render(rows_in, title="Slippage × ROI (accounting; order_id) — Back In (janela Execução)")
+                if rows_all_post:
+                    _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (pós-início >= {post_start})")
+                    _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (pós-início >= {post_start})")
+                    _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (pós-início >= {post_start})")
         except Exception:
             pass
 

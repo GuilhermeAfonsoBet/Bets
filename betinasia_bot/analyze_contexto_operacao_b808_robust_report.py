@@ -565,8 +565,8 @@ async def main() -> int:
     parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
     parser.add_argument(
         "--versions",
-        default="v4.0-api,v5.0-ws-only,v5.1-ws-gate-lay",
-        help="Lista de audit_version separada por vírgula (default: v4.0-api,v5.0-ws-only,v5.1-ws-gate-lay)",
+        default="v4.0-api,v5.2-api-back,v5.1-ws-gate-lay",
+        help="Lista de audit_version separada por vírgula (default: v4.0-api,v5.2-api-back,v5.1-ws-gate-lay)",
     )
     parser.add_argument(
         "--database-url",
