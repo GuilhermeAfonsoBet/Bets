@@ -859,6 +859,91 @@ class ExecutorWorker:
             dry.error = f"BAD_PRICE price={price}"
             return dry
 
+        # ------------------------------------------------------------
+        # Value sizing (Back In) — operacionalização do subset:
+        # - tempo até imediatamente antes de efetivar (pre_submit_ms) <= 5s
+        # - slippage_pre_pct (odd_pre_submit vs odd_at_decision) >= 2%
+        # Se elegível: stake=20; senão: stake=2 (somente BACK).
+        # ------------------------------------------------------------
+        try:
+            value_enabled = str(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_ENABLE", "0") or "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        except Exception:
+            value_enabled = False
+
+        value_pre_submit_ms = None
+        try:
+            value_pre_submit_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+        except Exception:
+            value_pre_submit_ms = None
+
+        value_slip_pre_pct = None
+        try:
+            if req.odd_at_decision is not None and float(req.odd_at_decision) > 0 and price is not None:
+                value_slip_pre_pct = (float(price) - float(req.odd_at_decision)) / float(req.odd_at_decision) * 100.0
+        except Exception:
+            value_slip_pre_pct = None
+
+        # persistir métricas no JSONL para auditoria/analytics
+        try:
+            dry.raw = dict(dry.raw or {})
+            dry.raw["value_sizing"] = {
+                "enabled": bool(value_enabled),
+                "pre_submit_ms": (int(value_pre_submit_ms) if value_pre_submit_ms is not None else None),
+                "odd_pre_submit": (float(price) if price is not None else None),
+                "odd_at_decision": (float(req.odd_at_decision) if req.odd_at_decision is not None else None),
+                "slippage_pre_pct": (float(value_slip_pre_pct) if value_slip_pre_pct is not None else None),
+            }
+        except Exception:
+            pass
+
+        if value_enabled and req.exec_side == ExecSide.BACK:
+            try:
+                t_max_ms = float(os.getenv("EXECUTOR_BACKIN_VALUE_MAX_PRE_SUBMIT_MS", "5000"))
+            except Exception:
+                t_max_ms = 5000.0
+            try:
+                slip_min = float(os.getenv("EXECUTOR_BACKIN_VALUE_MIN_SLIP_PCT", "2.0"))
+            except Exception:
+                slip_min = 2.0
+            try:
+                stake_hi = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_HI", "20"))
+            except Exception:
+                stake_hi = 20.0
+            try:
+                stake_lo = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_LO", "2"))
+            except Exception:
+                stake_lo = 2.0
+
+            ok_time = (value_pre_submit_ms is not None) and (float(value_pre_submit_ms) <= float(t_max_ms))
+            ok_slip = (value_slip_pre_pct is not None) and (float(value_slip_pre_pct) >= float(slip_min))
+            is_eligible = bool(ok_time and ok_slip)
+            stake = float(stake_hi if is_eligible else stake_lo)
+            try:
+                dry.raw = dict(dry.raw or {})
+                vs = dict(dry.raw.get("value_sizing") or {})
+                vs.update(
+                    {
+                        "eligible": bool(is_eligible),
+                        "rule": "stake_hi_if(pre_submit_ms<=max && slip_pre_pct>=min) else stake_lo",
+                        "params": {
+                            "max_pre_submit_ms": float(t_max_ms),
+                            "min_slippage_pre_pct": float(slip_min),
+                            "stake_hi": float(stake_hi),
+                            "stake_lo": float(stake_lo),
+                        },
+                        "stake_chosen": float(stake),
+                    }
+                )
+                dry.raw["value_sizing"] = vs
+            except Exception:
+                pass
+
         if req.exec_side == ExecSide.LAY and stake is None:
             try:
                 if req.policy and req.policy.liability_requested is not None:
@@ -980,6 +1065,10 @@ class ExecutorWorker:
             dry.status = ExecStatus.LIVE_OK
             dry.http_status = int(place.http_status or 0) or 200
             dry.timing.post_ms = post_ms
+            try:
+                dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+            except Exception:
+                pass
             dry.raw = dict(dry.raw or {})
             oid = _extract_order_id(place.response)
             dry.raw.update(
@@ -999,6 +1088,10 @@ class ExecutorWorker:
         dry.http_status = int(place.http_status or 0) or None
         dry.error = f"LIVE_PLACE_FAILED: {place.error or 'unknown'}"
         dry.timing.post_ms = post_ms
+        try:
+            dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+        except Exception:
+            pass
         dry.raw = dict(dry.raw or {})
         oid = _extract_order_id(place.response)
         dry.raw.update(
