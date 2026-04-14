@@ -74,6 +74,35 @@ def _read_last_jsonl(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str
         return None, "READ_ERROR"
 
 
+def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg: str) -> Path:
+    """
+    Melhor UX: quando o usuário troca `--audit-service` (ex.: betinasia-audit-api-back),
+    mas esquece de trocar `--audit-telemetry`, tentamos inferir um default consistente.
+    Regra:
+      - se o argumento explícito veio do usuário, respeita;
+      - se está no default "logs/audit_api_telemetry.jsonl", e o service contém "-back",
+        preferimos "logs/audit_api_back_telemetry.jsonl" (se existir).
+    Observação: o `audit_h3b_api.py` atual escreve em `logs/audit_api_telemetry.jsonl` por default,
+    mas alguns deployments podem ter sido customizados via symlink/override.
+    """
+    try:
+        svc = str(audit_service or "").strip()
+        arg = str(audit_telemetry_arg or "").strip()
+        if not arg:
+            arg = "logs/audit_api_telemetry.jsonl"
+        p = Path(arg)
+        # se usuário já passou algo não-default, não mexe
+        if str(p) != "logs/audit_api_telemetry.jsonl":
+            return p
+        if "-back" in svc:
+            alt = Path("logs/audit_api_back_telemetry.jsonl")
+            if alt.exists():
+                return alt
+        return p
+    except Exception:
+        return Path(str(audit_telemetry_arg or "logs/audit_api_telemetry.jsonl"))
+
+
 def _parse_iso_ts(ts: Any) -> Optional[datetime]:
     if not ts:
         return None
@@ -498,6 +527,13 @@ def main() -> int:
     ap.add_argument("--cooldown-sec", type=int, default=int(os.getenv("OPS_RESTART_COOLDOWN_SEC", "1800")))
     ap.add_argument("--max-restarts-per-hour", type=int, default=int(os.getenv("OPS_MAX_RESTARTS_PER_HOUR", "2")))
     args = ap.parse_args()
+
+    # Se o user customizou --audit-service mas não customizou --audit-telemetry,
+    # tenta inferir um default consistente.
+    try:
+        args.audit_telemetry = str(_audit_telemetry_default_for_service(str(args.audit_service), str(args.audit_telemetry)))
+    except Exception:
+        pass
 
     results, code, meta = asyncio.run(
         run_checks(
