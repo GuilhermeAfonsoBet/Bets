@@ -774,7 +774,12 @@ def _rollup_by_day(rows: List[dict]) -> List[Dict[str, Any]]:
         try:
             eid = str(r.get("event_id") or "").strip()
             if eid:
-                (rec.get("_evs") or set()).add(eid)
+                evs = rec.get("_evs")
+                # atenção: set() vazio é falsy; não use `or set()` aqui, senão perde os adds
+                if not isinstance(evs, set):
+                    evs = set()
+                    rec["_evs"] = evs
+                evs.add(eid)
         except Exception:
             pass
     out: List[Dict[str, Any]] = []
