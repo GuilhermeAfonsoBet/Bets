@@ -767,6 +767,7 @@ def _walkforward_by_day(
     start_day: str,
     end_day: Optional[str],
     train_days: int,
+    min_games: int,
 ) -> Dict[str, Any]:
     """
     Walk-forward simples por dia (created_at UTC):
@@ -808,6 +809,13 @@ def _walkforward_by_day(
         sub_d = by_day_sub.get(d) or []
         if not base_d:
             continue
+        # mínimo de jogos no dia (evita dias ruidosos)
+        try:
+            games_d = {str(r.get("event_id") or "").strip() for r in base_d if str(r.get("event_id") or "").strip()}
+            if int(len(games_d)) < int(max(0, min_games)):
+                continue
+        except Exception:
+            pass
         rb = _roi_w_from_rows(base_d)
         rs = _roi_w_from_rows(sub_d) if sub_d else None
         delta = (float(rs - rb) if (rb is not None and rs is not None) else None)
@@ -827,6 +835,7 @@ def _walkforward_by_day(
         )
     return {
         "train_days": int(train_days),
+        "min_games": int(min_games),
         "days_considered": int(len(days)),
         "days_evaluated": int(n_eval),
         "days_delta_pos": int(n_pos),
@@ -863,6 +872,7 @@ def main() -> int:
         help="Além do bootstrap por jogo, roda um walk-forward simples por dia (OOS por dia) e reporta sign-test do delta.",
     )
     ap.add_argument("--wf-train-days", type=int, default=3, help="Dias de treino (histórico mínimo) para começar o walk-forward. Default=3.")
+    ap.add_argument("--wf-min-games", type=int, default=0, help="Mínimo de jogos (event_id) no dia para avaliar no walk-forward. Default=0 (off).")
     args = ap.parse_args()
  
     # normaliza end-day
@@ -885,13 +895,19 @@ def main() -> int:
     )
     if bool(getattr(args, "walkforward_by_day", False)):
         try:
-            # reconstruir rows_base/sub do output seria caro; então o _run já tem isso,
-            # mas para manter simples sem reestruturar agora: reusa o cálculo via bootstrap inputs não expostos.
-            # Fallback pragmático: carregamos a saída via meta e re-executamos internamente com n_boot=0 e seed fixo,
-            # mas isso duplicaria custo de I/O/DB. Para evitar isso, o _run já inclui "debug_rows" quando WF ligado.
-            pass
-        except Exception:
-            pass
+            rows_base = list(out.get("debug_rows_base") or [])
+            rows_sub = list(out.get("debug_rows_subset") or [])
+            wf = _walkforward_by_day(
+                rows_base=rows_base,
+                rows_sub=rows_sub,
+                start_day=str(out.get("meta", {}).get("start_day") or str(args.start_day)),
+                end_day=(str(out.get("meta", {}).get("end_day")) if out.get("meta", {}).get("end_day") else None),
+                train_days=int(getattr(args, "wf_train_days", 3)),
+                min_games=int(getattr(args, "wf_min_games", 0)),
+            )
+            out["walkforward_by_day"] = wf
+        except Exception as e:
+            out["walkforward_by_day_error"] = str(e)[:200]
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
  
