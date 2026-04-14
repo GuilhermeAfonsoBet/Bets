@@ -292,6 +292,8 @@ async def _run(
     balance_csv_override: Optional[str],
     n_boot: int,
     seed: int,
+    limit_stake_factor: float,
+    limit_stake_cap: float,
 ) -> Dict[str, Any]:
     # imports tardios (DB + helpers do daily)
     #
@@ -584,6 +586,8 @@ async def _run(
               a.event_id,
               a.is_live,
               a.audited_at,
+              a.betslip_limit,
+              a.hypothesis_details,
               m.kickoff_time
             FROM betslip_audit_results a
             LEFT JOIN matches m ON m.external_id = a.event_id
@@ -625,6 +629,7 @@ async def _run(
     missing_slip = 0
     missing_lat = 0
     missing_event = 0
+    missing_limit = 0
     for oid, em in (exec_by_oid or {}).items():
         if not isinstance(em, dict):
             continue
@@ -659,6 +664,14 @@ async def _run(
             # ainda dá para testar por order_id, mas sem cluster por jogo fica ruim
             continue
  
+        lim = None
+        try:
+            lim = _safe_float((arow or {}).get("betslip_limit"))
+        except Exception:
+            lim = None
+        if lim is None or float(lim) <= 0:
+            missing_limit += 1
+ 
         lat = em.get("lat_ms")
         slip = em.get("slip_raw_pct")
         if _safe_float(lat) is None:
@@ -674,6 +687,7 @@ async def _run(
             "exposure": _safe_float(em.get("exposure")) or 0.0,
             "lat_ms": _safe_float(lat),
             "slip_raw_pct": _safe_float(slip),
+            "betslip_limit": (float(lim) if lim is not None else None),
         }
         rows_base.append(row)
  
@@ -706,6 +720,137 @@ async def _run(
  
     daily_rollup = {"base": _rollup_by_day(rows_base), "subset": _rollup_by_day(rows_sub)}
 
+    def _stats(xs: List[float]) -> Dict[str, Any]:
+        try:
+            xs2 = [float(x) for x in (xs or []) if x is not None]
+        except Exception:
+            xs2 = []
+        if not xs2:
+            return {"n": 0, "mean": None, "p50": None, "p90": None, "p99": None, "min": None, "max": None}
+        xs2s = sorted(xs2)
+        try:
+            mean = float(sum(xs2s) / float(len(xs2s)))
+        except Exception:
+            mean = None
+        return {
+            "n": int(len(xs2s)),
+            "mean": mean,
+            "p50": _quantile(xs2s, 0.50),
+            "p90": _quantile(xs2s, 0.90),
+            "p99": _quantile(xs2s, 0.99),
+            "min": float(xs2s[0]),
+            "max": float(xs2s[-1]),
+        }
+
+    # Estimativa de capacidade/turnover usando limit (betslip_limit) do auditor (máximo disponível no ticket)
+    # Atenção: assume linearidade (pnl escala ~ linear com stake) e que "limit" é comparável à unidade de stake do executor.
+    lim_factor = float(limit_stake_factor)
+    lim_factor = max(0.0, lim_factor)
+    lim_cap = float(limit_stake_cap)
+    lim_cap = max(0.0, lim_cap)
+    lims_all = [(_safe_float(r.get("betslip_limit")) if isinstance(r, dict) else None) for r in (rows_sub or [])]
+    lims_pos = [float(x) for x in lims_all if x is not None and float(x) > 0.0]
+    lim_mean_pos = None
+    try:
+        lim_mean_pos = float(sum(lims_pos) / float(len(lims_pos))) if lims_pos else None
+    except Exception:
+        lim_mean_pos = None
+
+    def _stake_from_limit(limit_value: Optional[float], *, impute_mean: Optional[float]) -> Optional[float]:
+        try:
+            v = float(limit_value) if (limit_value is not None) else None
+        except Exception:
+            v = None
+        if v is None or v <= 0:
+            if impute_mean is None:
+                return None
+            v = float(impute_mean)
+        st = max(0.0, v) * lim_factor
+        if lim_cap > 0:
+            st = min(st, lim_cap)
+        return float(st)
+
+    stake_targets_obs = []
+    stake_targets_imp = []
+    for x in lims_all:
+        st_obs = _stake_from_limit(x, impute_mean=None)
+        if st_obs is not None:
+            stake_targets_obs.append(float(st_obs))
+        st_imp = _stake_from_limit(x, impute_mean=lim_mean_pos)
+        if st_imp is not None:
+            stake_targets_imp.append(float(st_imp))
+
+    # média por dia (dias com base >0 no período)
+    days_base = [str(d.get("day") or "") for d in (daily_rollup.get("base") or []) if isinstance(d, dict) and str(d.get("day") or "")]
+    n_days = int(len(days_base)) if days_base else 0
+    sub_orders_total = int(len(rows_sub))
+    avg_sub_orders_per_day = (float(sub_orders_total) / float(n_days)) if n_days > 0 else None
+
+    # turnover alvo/dia (observado vs imputado)
+    try:
+        turnover_day_obs = (float(sum(stake_targets_obs)) / float(n_days)) if (n_days > 0 and stake_targets_obs) else None
+    except Exception:
+        turnover_day_obs = None
+    try:
+        turnover_day_imp = (float(sum(stake_targets_imp)) / float(n_days)) if (n_days > 0 and stake_targets_imp) else None
+    except Exception:
+        turnover_day_imp = None
+
+    roi_sub = summ_sub.roi_w
+    roi_ci = (boot or {}).get("roi_sub_ci90") if isinstance(boot, dict) else None
+    roi_lb = _safe_float((roi_ci or {}).get("lb")) if isinstance(roi_ci, dict) else None
+    roi_ub = _safe_float((roi_ci or {}).get("ub")) if isinstance(roi_ci, dict) else None
+
+    def _profit(turnover: Optional[float], roi_pct: Optional[float]) -> Optional[float]:
+        try:
+            if turnover is None or roi_pct is None:
+                return None
+            return float(turnover) * float(roi_pct) / 100.0
+        except Exception:
+            return None
+
+    capacity_estimate = {
+        "note": "Usa betslip_limit (máximo no ticket) e aplica stake = factor*limit (com cap opcional). Assume linearidade.",
+        "limit_factor": lim_factor,
+        "limit_cap_abs": (lim_cap if lim_cap > 0 else None),
+        "subset_days_in_range": n_days,
+        "subset_orders_total": sub_orders_total,
+        "subset_orders_per_day_avg": avg_sub_orders_per_day,
+        "betslip_limit": {
+            "n_total": int(len([x for x in lims_all if x is not None])),
+            "n_pos": int(len(lims_pos)),
+            "pos_pct": _pct(len(lims_pos), len([x for x in lims_all if x is not None])),
+            "stats_pos": _stats(lims_pos),
+        },
+        "stake_target_from_limit": {
+            "stats_observed": _stats(stake_targets_obs),
+            "stats_imputed_missing_as_mean_pos": _stats(stake_targets_imp),
+        },
+        "turnover_target_per_day": {"observed": turnover_day_obs, "imputed": turnover_day_imp},
+        "roi_subset_pct": roi_sub,
+        "roi_subset_ci90": {"lb": roi_lb, "ub": roi_ub},
+        "monthly_30d": {
+            "orders": (float(avg_sub_orders_per_day) * 30.0 if avg_sub_orders_per_day is not None else None),
+            "turnover": (float(turnover_day_obs) * 30.0 if turnover_day_obs is not None else None),
+            "turnover_imputed": (float(turnover_day_imp) * 30.0 if turnover_day_imp is not None else None),
+            "profit": _profit((float(turnover_day_obs) * 30.0 if turnover_day_obs is not None else None), roi_sub),
+            "profit_ci90": {
+                "lb": _profit((float(turnover_day_obs) * 30.0 if turnover_day_obs is not None else None), roi_lb),
+                "ub": _profit((float(turnover_day_obs) * 30.0 if turnover_day_obs is not None else None), roi_ub),
+            },
+        },
+        "monthly_22d": {
+            "orders": (float(avg_sub_orders_per_day) * 22.0 if avg_sub_orders_per_day is not None else None),
+            "turnover": (float(turnover_day_obs) * 22.0 if turnover_day_obs is not None else None),
+            "turnover_imputed": (float(turnover_day_imp) * 22.0 if turnover_day_imp is not None else None),
+            "profit": _profit((float(turnover_day_obs) * 22.0 if turnover_day_obs is not None else None), roi_sub),
+            "profit_ci90": {
+                "lb": _profit((float(turnover_day_obs) * 22.0 if turnover_day_obs is not None else None), roi_lb),
+                "ub": _profit((float(turnover_day_obs) * 22.0 if turnover_day_obs is not None else None), roi_ub),
+            },
+        },
+    }
+
     out = {
         "meta": {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -715,8 +860,10 @@ async def _run(
             "start_day": start_day2,
             "end_day": end_day2,
             "subset": {"lat_bucket": str(lat_bucket), "slip_bucket": str(slip_bucket)},
+            "capacity": {"limit_factor": lim_factor, "limit_cap_abs": (lim_cap if lim_cap > 0 else None)},
         },
         "daily_rollup": daily_rollup,
+        "capacity_estimate": capacity_estimate,
         "coverage": {
             "orders_base": summ_base.n_orders,
             "games_base": summ_base.n_games,
@@ -727,6 +874,7 @@ async def _run(
             "missing_event_skipped": int(missing_event),
             "missing_lat_seen": int(missing_lat),
             "missing_slip_seen": int(missing_slip),
+            "missing_betslip_limit_seen": int(missing_limit),
         },
         "base": {
             "pnl_sum": summ_base.pnl_sum,
@@ -948,6 +1096,18 @@ def main() -> int:
     ap.add_argument("--n-boot", type=int, default=2000, help="Bootstrap por jogo (recom.: 2000+).")
     ap.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap.")
     ap.add_argument(
+        "--limit-stake-factor",
+        type=float,
+        default=0.5,
+        help="Para estimar capacidade: stake_alvo = factor * betslip_limit (máximo no ticket). Default=0.5.",
+    )
+    ap.add_argument(
+        "--limit-stake-cap",
+        type=float,
+        default=0.0,
+        help="Cap absoluto opcional do stake_alvo derivado do limit (0=sem cap).",
+    )
+    ap.add_argument(
         "--walkforward-by-day",
         action="store_true",
         help="Além do bootstrap por jogo, roda um walk-forward simples por dia (OOS por dia) e reporta sign-test do delta.",
@@ -972,6 +1132,8 @@ def main() -> int:
             balance_csv_override=(str(args.balance_csv).strip() or None),
             n_boot=int(args.n_boot),
             seed=int(args.seed),
+            limit_stake_factor=float(getattr(args, "limit_stake_factor", 0.5)),
+            limit_stake_cap=float(getattr(args, "limit_stake_cap", 0.0)),
         )
     )
     if bool(getattr(args, "walkforward_by_day", False)):
