@@ -257,8 +257,9 @@ def _bootstrap_by_game(
  
 def _sign_test_p(n_pos: int, n_total: int) -> Optional[float]:
     """
-    Sign test bicaudal: P( X >= n_pos | Binom(n_total, 0.5) ) * 2 (cap em 1.0).
-    Usa soma direta (n_total pequeno por dia; total de dias também é pequeno).
+    Sign test bicaudal exato.
+    H0: p=0.5 para "dia com delta>0".
+    Retorna p-value (2-sided), com cap em 1.0.
     """
     try:
         import math
@@ -266,16 +267,16 @@ def _sign_test_p(n_pos: int, n_total: int) -> Optional[float]:
         return None
     try:
         n = int(n_total)
-        k = int(n_pos)
         if n <= 0:
             return None
-        k = max(0, min(n, k))
-        # P(X >= k)
+        k = max(0, min(n, int(n_pos)))
+        # 2-sided: 2 * min( P(X<=k), P(X>=k) ).
+        # Forma equivalente: use k' = min(k, n-k) e some a cauda inferior.
+        k2 = min(k, n - k)
         p = 0.0
-        for i in range(k, n + 1):
+        for i in range(0, k2 + 1):
             p += math.comb(n, i) * (0.5**n)
-        p2 = min(1.0, 2.0 * p)
-        return float(p2)
+        return float(min(1.0, 2.0 * p))
     except Exception:
         return None
 
@@ -703,6 +704,8 @@ async def _run(
  
     boot = _bootstrap_by_game(by_game=by_game, n_boot=int(n_boot), seed=int(seed))
  
+    daily_rollup = {"base": _rollup_by_day(rows_base), "subset": _rollup_by_day(rows_sub)}
+
     out = {
         "meta": {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -713,6 +716,7 @@ async def _run(
             "end_day": end_day2,
             "subset": {"lat_bucket": str(lat_bucket), "slip_bucket": str(slip_bucket)},
         },
+        "daily_rollup": daily_rollup,
         "coverage": {
             "orders_base": summ_base.n_orders,
             "games_base": summ_base.n_games,
@@ -743,27 +747,59 @@ async def _run(
     return out
  
  
-def _roi_w_from_rows(rows: List[dict]) -> Optional[float]:
-    pnl = 0.0
-    exp = 0.0
+def _rollup_by_day(rows: List[dict]) -> List[Dict[str, Any]]:
+    """
+    Agrega ordens em stats por dia (created_at UTC) para evitar output gigante.
+    """
+    by: Dict[str, Dict[str, Any]] = {}
     for r in rows or []:
         if not isinstance(r, dict):
             continue
+        day = str(r.get("created_at") or "")[:10]
+        if not _parse_day(day):
+            continue
+        rec = by.get(day)
+        if rec is None:
+            rec = {"day": day, "n_orders": 0, "pnl_sum": 0.0, "exposure_sum": 0.0, "_evs": set()}
+            by[day] = rec
+        rec["n_orders"] = int(rec.get("n_orders") or 0) + 1
         try:
-            pnl += float(r.get("pnl") or 0.0)
+            rec["pnl_sum"] = float(rec.get("pnl_sum") or 0.0) + float(r.get("pnl") or 0.0)
         except Exception:
             pass
         try:
-            exp += float(r.get("exposure") or 0.0)
+            rec["exposure_sum"] = float(rec.get("exposure_sum") or 0.0) + float(r.get("exposure") or 0.0)
         except Exception:
             pass
-    return _roi_weighted(pnl, exp)
+        try:
+            eid = str(r.get("event_id") or "").strip()
+            if eid:
+                (rec.get("_evs") or set()).add(eid)
+        except Exception:
+            pass
+    out: List[Dict[str, Any]] = []
+    for day in sorted(by.keys()):
+        rec = by.get(day) or {}
+        evs = rec.get("_evs") or set()
+        pnl = float(rec.get("pnl_sum") or 0.0)
+        exp = float(rec.get("exposure_sum") or 0.0)
+        out.append(
+            {
+                "day": str(day),
+                "n_orders": int(rec.get("n_orders") or 0),
+                "n_games": int(len(evs)),
+                "pnl_sum": float(pnl),
+                "exposure_sum": float(exp),
+                "roi_w_pct": _roi_weighted(pnl, exp),
+            }
+        )
+    return out
 
 
 def _walkforward_by_day(
     *,
-    rows_base: List[dict],
-    rows_sub: List[dict],
+    daily_base: List[dict],
+    daily_sub: List[dict],
     start_day: str,
     end_day: Optional[str],
     train_days: int,
@@ -771,66 +807,106 @@ def _walkforward_by_day(
 ) -> Dict[str, Any]:
     """
     Walk-forward simples por dia (created_at UTC):
-    - Para cada dia d, usa janela anterior [d-train_days, d-1] apenas como "treino" de referência
-      (não estimamos parâmetros aqui; a regra já está definida pelo subset lat×slip).
-    - Avalia no dia d: ROIw(subset) vs ROIw(base), e acumula por dia.
+    - Para cada dia d, usa janela anterior [d-train_days, d-1] como "treino" (apenas referência; regra do subset já é fixa).
+    - Avalia no dia d (OOS): ROIw(subset) vs ROIw(base), e acumula por dia.
     """
-    # indexa por dia
-    by_day_base: Dict[str, List[dict]] = {}
-    by_day_sub: Dict[str, List[dict]] = {}
-    for r in rows_base:
-        try:
-            day = str(r.get("created_at") or "")[:10]
-            if _parse_day(day):
-                by_day_base.setdefault(day, []).append(r)
-        except Exception:
+    base_by_day: Dict[str, Dict[str, Any]] = {}
+    sub_by_day: Dict[str, Dict[str, Any]] = {}
+    for r in daily_base or []:
+        if not isinstance(r, dict):
             continue
-    for r in rows_sub:
-        try:
-            day = str(r.get("created_at") or "")[:10]
-            if _parse_day(day):
-                by_day_sub.setdefault(day, []).append(r)
-        except Exception:
+        d = str(r.get("day") or "")[:10]
+        if _parse_day(d):
+            base_by_day[d] = r
+    for r in daily_sub or []:
+        if not isinstance(r, dict):
             continue
+        d = str(r.get("day") or "")[:10]
+        if _parse_day(d):
+            sub_by_day[d] = r
 
-    days = sorted({d for d in by_day_base.keys() if d >= start_day and (not end_day or d <= end_day)})
+    days = sorted({d for d in base_by_day.keys() if d >= start_day and (not end_day or d <= end_day)})
     out_rows: List[Dict[str, Any]] = []
     n_pos = 0
     n_eval = 0
-    for d in days:
-        # exige histórico mínimo para treinar
+
+    # prefix sums (para o "treino" como referência)
+    def _f(x: Any) -> float:
         try:
-            idx = days.index(d)
+            return float(x)
         except Exception:
-            idx = None
-        if idx is None or idx < int(max(1, train_days)):
-            continue
-        base_d = by_day_base.get(d) or []
-        sub_d = by_day_sub.get(d) or []
-        if not base_d:
-            continue
-        # mínimo de jogos no dia (evita dias ruidosos)
+            return 0.0
+
+    base_pnl = [_f((base_by_day.get(d) or {}).get("pnl_sum")) for d in days]
+    base_exp = [_f((base_by_day.get(d) or {}).get("exposure_sum")) for d in days]
+    sub_pnl = [_f((sub_by_day.get(d) or {}).get("pnl_sum")) for d in days]
+    sub_exp = [_f((sub_by_day.get(d) or {}).get("exposure_sum")) for d in days]
+    p_base_pnl = [0.0]
+    p_base_exp = [0.0]
+    p_sub_pnl = [0.0]
+    p_sub_exp = [0.0]
+    for i in range(len(days)):
+        p_base_pnl.append(p_base_pnl[-1] + base_pnl[i])
+        p_base_exp.append(p_base_exp[-1] + base_exp[i])
+        p_sub_pnl.append(p_sub_pnl[-1] + sub_pnl[i])
+        p_sub_exp.append(p_sub_exp[-1] + sub_exp[i])
+
+    td = int(max(1, train_days))
+    mg = int(max(0, min_games))
+    for idx, d in enumerate(days):
+        rec_b = base_by_day.get(d) or {}
+        rec_s = sub_by_day.get(d) or {}
+        n_base_games = int(rec_b.get("n_games") or 0)
+        skipped_reason = None
+        if idx < td:
+            skipped_reason = "burn_in"
+        elif mg and n_base_games < mg:
+            skipped_reason = "min_games"
+
+        rb = rec_b.get("roi_w_pct")
+        rs = rec_s.get("roi_w_pct") if rec_s else None
         try:
-            games_d = {str(r.get("event_id") or "").strip() for r in base_d if str(r.get("event_id") or "").strip()}
-            if int(len(games_d)) < int(max(0, min_games)):
-                continue
+            rb = float(rb) if rb is not None else None
         except Exception:
-            pass
-        rb = _roi_w_from_rows(base_d)
-        rs = _roi_w_from_rows(sub_d) if sub_d else None
+            rb = None
+        try:
+            rs = float(rs) if rs is not None else None
+        except Exception:
+            rs = None
         delta = (float(rs - rb) if (rb is not None and rs is not None) else None)
-        if delta is not None:
+
+        # treino (janela anterior)
+        i0 = max(0, idx - td)
+        i1 = idx
+        tr_base_pnl = float(p_base_pnl[i1] - p_base_pnl[i0])
+        tr_base_exp = float(p_base_exp[i1] - p_base_exp[i0])
+        tr_sub_pnl = float(p_sub_pnl[i1] - p_sub_pnl[i0])
+        tr_sub_exp = float(p_sub_exp[i1] - p_sub_exp[i0])
+        tr_rb = _roi_weighted(tr_base_pnl, tr_base_exp)
+        tr_rs = _roi_weighted(tr_sub_pnl, tr_sub_exp)
+        tr_delta = (float(tr_rs - tr_rb) if (tr_rb is not None and tr_rs is not None) else None)
+
+        evaluated = bool(skipped_reason is None and delta is not None)
+        if evaluated:
             n_eval += 1
-            if delta > 0:
+            if float(delta) > 0:
                 n_pos += 1
         out_rows.append(
             {
                 "day": d,
-                "n_base_orders": int(len(base_d)),
-                "n_sub_orders": int(len(sub_d)),
+                "evaluated": evaluated,
+                "skipped_reason": skipped_reason,
+                "n_base_orders": int(rec_b.get("n_orders") or 0),
+                "n_sub_orders": int(rec_s.get("n_orders") or 0),
+                "n_base_games": n_base_games,
+                "n_sub_games": int(rec_s.get("n_games") or 0),
                 "roi_w_base_pct": rb,
                 "roi_w_sub_pct": rs,
                 "delta_roi_w_pct": delta,
+                "train_window_days": int(td),
+                "roi_w_train_base_pct": tr_rb,
+                "roi_w_train_sub_pct": tr_rs,
+                "delta_roi_w_train_pct": tr_delta,
             }
         )
     return {
@@ -895,11 +971,12 @@ def main() -> int:
     )
     if bool(getattr(args, "walkforward_by_day", False)):
         try:
-            rows_base = list(out.get("debug_rows_base") or [])
-            rows_sub = list(out.get("debug_rows_subset") or [])
+            daily = out.get("daily_rollup") or {}
+            daily_base = list(daily.get("base") or [])
+            daily_sub = list(daily.get("subset") or [])
             wf = _walkforward_by_day(
-                rows_base=rows_base,
-                rows_sub=rows_sub,
+                daily_base=daily_base,
+                daily_sub=daily_sub,
                 start_day=str(out.get("meta", {}).get("start_day") or str(args.start_day)),
                 end_day=(str(out.get("meta", {}).get("end_day")) if out.get("meta", {}).get("end_day") else None),
                 train_days=int(getattr(args, "wf_train_days", 3)),
