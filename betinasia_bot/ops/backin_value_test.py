@@ -185,6 +185,68 @@ def _summ(rows: List[dict]) -> Summary:
         pnl_sum=float(pnl),
         roi_w=_roi_weighted(pnl, exp),
     )
+
+
+def _breakdown_by_bucket(rows: List[dict], *, key: str, order: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Retorna breakdown por bucket (ex.: lat_bucket, slip_bucket):
+      [{bucket, n_orders, n_games, exposure_sum, pnl_sum, roi_w_pct}]
+    """
+    by: Dict[str, List[dict]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        b = str(r.get(key) or "Desconhecido")
+        by.setdefault(b, []).append(r)
+    buckets = list(by.keys())
+    if order:
+        buckets = [b for b in order if b in by] + [b for b in buckets if b not in set(order)]
+    else:
+        buckets = sorted(buckets)
+    out: List[Dict[str, Any]] = []
+    for b in buckets:
+        summ = _summ(by.get(b) or [])
+        out.append(
+            {
+                "bucket": b,
+                "n_orders": int(summ.n_orders),
+                "n_games": int(summ.n_games),
+                "exposure_sum": float(summ.exposure_sum),
+                "pnl_sum": float(summ.pnl_sum),
+                "roi_w_pct": summ.roi_w,
+            }
+        )
+    return out
+
+
+def _breakdown_by_combo(rows: List[dict], *, lat_key: str, slip_key: str) -> List[Dict[str, Any]]:
+    """
+    2D breakdown lat×slip:
+      [{lat_bucket, slip_bucket, n_orders, n_games, exposure_sum, pnl_sum, roi_w_pct}]
+    """
+    by: Dict[Tuple[str, str], List[dict]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        lb = str(r.get(lat_key) or "Desconhecido")
+        sb = str(r.get(slip_key) or "Desconhecido")
+        by.setdefault((lb, sb), []).append(r)
+    keys = sorted(by.keys(), key=lambda x: (x[0], x[1]))
+    out: List[Dict[str, Any]] = []
+    for (lb, sb) in keys:
+        summ = _summ(by.get((lb, sb)) or [])
+        out.append(
+            {
+                "lat_bucket": lb,
+                "slip_bucket": sb,
+                "n_orders": int(summ.n_orders),
+                "n_games": int(summ.n_games),
+                "exposure_sum": float(summ.exposure_sum),
+                "pnl_sum": float(summ.pnl_sum),
+                "roi_w_pct": summ.roi_w,
+            }
+        )
+    return out
  
  
 def _quantile(xs: List[float], q: float) -> Optional[float]:
@@ -286,6 +348,7 @@ async def _run(
     day_dir: Path,
     start_day: str,
     end_day: Optional[str],
+    regime: str,
     lat_bucket: str,
     slip_bucket: str,
     database_url_override: Optional[str],
@@ -651,7 +714,13 @@ async def _run(
         except Exception:
             arow = None
         is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=created))
-        if not is_in:
+        # regime filter (Pre/In/All)
+        sc = (str(regime or "") or "in").strip().lower()
+        if sc not in ("in", "pre", "all"):
+            sc = "in"
+        if sc == "in" and (not bool(is_in)):
+            continue
+        if sc == "pre" and bool(is_in):
             continue
  
         event_id = None
@@ -859,10 +928,19 @@ async def _run(
             "balance_csv": str(bal_csv),
             "start_day": start_day2,
             "end_day": end_day2,
+            "regime": (sc if "sc" in locals() else str(regime or "in")),
             "subset": {"lat_bucket": str(lat_bucket), "slip_bucket": str(slip_bucket)},
             "capacity": {"limit_factor": lim_factor, "limit_cap_abs": (lim_cap if lim_cap > 0 else None)},
         },
         "daily_rollup": daily_rollup,
+        "breakdowns": {
+            "base_by_slip_bucket": _breakdown_by_bucket(rows_base, key="slip_bucket", order=["<= -2%", "(-2, 2]", "> 2%", "Desconhecido"]),
+            "base_by_lat_bucket": _breakdown_by_bucket(rows_base, key="lat_bucket", order=["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]),
+            "base_by_lat_x_slip": _breakdown_by_combo(rows_base, lat_key="lat_bucket", slip_key="slip_bucket"),
+            "subset_by_slip_bucket": _breakdown_by_bucket(rows_sub, key="slip_bucket", order=["<= -2%", "(-2, 2]", "> 2%", "Desconhecido"]),
+            "subset_by_lat_bucket": _breakdown_by_bucket(rows_sub, key="lat_bucket", order=["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]),
+            "subset_by_lat_x_slip": _breakdown_by_combo(rows_sub, lat_key="lat_bucket", slip_key="slip_bucket"),
+        },
         "capacity_estimate": capacity_estimate,
         "coverage": {
             "orders_base": summ_base.n_orders,
@@ -1075,11 +1153,12 @@ def _walkforward_by_day(
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Teste estatístico (ledger) de hipótese Back In: subset por latência (call_to_done_ms) × slippage_raw_pct, com bootstrap por jogo."
+        description="Teste estatístico (ledger) de hipótese Back (Pre/In): subset por latência (call_to_done_ms) × slippage_raw_pct, com bootstrap por jogo."
     )
     ap.add_argument("--day-dir", required=True, help="Pasta do dia (ex.: .../20260413) gerada pelo daily_full_report.")
     ap.add_argument("--start-day", default="2026-04-04", help="Filtra por created_at UTC (YYYY-MM-DD). Default=2026-04-04.")
     ap.add_argument("--end-day", default="", help="Opcional: fim do filtro por created_at UTC (YYYY-MM-DD).")
+    ap.add_argument("--regime", default="in", help="Regime a analisar: in|pre|all. Default=in.")
     ap.add_argument(
         "--database-url",
         default="",
@@ -1126,6 +1205,7 @@ def main() -> int:
             day_dir=Path(str(args.day_dir)),
             start_day=str(args.start_day),
             end_day=end_day,
+            regime=str(getattr(args, "regime", "in")),
             lat_bucket=str(args.lat_bucket),
             slip_bucket=str(args.slip_bucket),
             database_url_override=(str(args.database_url).strip() or None),
