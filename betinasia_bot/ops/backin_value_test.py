@@ -748,6 +748,10 @@ async def _run(
         if _safe_float(slip) is None:
             missing_slip += 1
  
+        # buckets (para breakdowns e filtros)
+        lab_lat = _bucket_call_to_done_ms(_safe_float(lat))
+        lab_slip = _bucket_slip_raw_3way(_safe_float(slip))
+ 
         row = {
             "order_id": str(oid),
             "event_id": str(event_id),
@@ -756,12 +760,11 @@ async def _run(
             "exposure": _safe_float(em.get("exposure")) or 0.0,
             "lat_ms": _safe_float(lat),
             "slip_raw_pct": _safe_float(slip),
+            "lat_bucket": str(lab_lat),
+            "slip_bucket": str(lab_slip),
             "betslip_limit": (float(lim) if lim is not None else None),
         }
         rows_base.append(row)
- 
-        lab_lat = _bucket_call_to_done_ms(row.get("lat_ms"))
-        lab_slip = _bucket_slip_raw_3way(row.get("slip_raw_pct"))
         if (lab_lat == str(lat_bucket)) and (lab_slip == str(slip_bucket)):
             rows_sub.append(row)
  
