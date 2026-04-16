@@ -476,7 +476,9 @@ async def _run(
             exec_side = str(res.get("exec_side") or req.get("exec_side") or "").strip().lower()
             if exec_side != "back":
                 continue
-            created = _parse_dt_any(str(res.get("created_at") or req.get("created_at") or ""))
+            req_created = _parse_dt_any(str(req.get("created_at") or ""))
+            res_created = _parse_dt_any(str(res.get("created_at") or ""))
+            created = res_created or req_created
             if created is None:
                 continue
             raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
@@ -496,6 +498,19 @@ async def _run(
             if stake is None:
                 pol = res.get("policy") if isinstance(res.get("policy"), dict) else (req.get("policy") if isinstance(req.get("policy"), dict) else {})
                 stake = _safe_float((pol or {}).get("stake_requested"))
+            sent_price = None
+            try:
+                sent_price = _safe_float(
+                    sent.get("price")
+                    if sent.get("price") is not None
+                    else (
+                        sent.get("odd")
+                        if sent.get("odd") is not None
+                        else (sent.get("odds") if sent.get("odds") is not None else sent.get("odds_decimal"))
+                    )
+                )
+            except Exception:
+                sent_price = None
             timing = res.get("timing") if isinstance(res.get("timing"), dict) else {}
             lat_ms = _safe_float(timing.get("call_to_done_ms"))
             lat_ms_i = int(lat_ms) if lat_ms is not None else None
@@ -512,6 +527,36 @@ async def _run(
             pre_submit_ms = _safe_float(vs.get("pre_submit_ms")) if isinstance(vs, dict) else None
             slip_pre_pct = _safe_float(vs.get("slippage_pre_pct")) if isinstance(vs, dict) else None
             odd_pre_submit = _safe_float(vs.get("odd_pre_submit")) if isinstance(vs, dict) else None
+            if pre_submit_ms is None:
+                try:
+                    pre_submit_ms = _safe_float(
+                        timing.get("pre_submit_ms")
+                        if timing.get("pre_submit_ms") is not None
+                        else (
+                            timing.get("call_to_submit_ms")
+                            if timing.get("call_to_submit_ms") is not None
+                            else (
+                                timing.get("call_to_place_ms")
+                                if timing.get("call_to_place_ms") is not None
+                                else (timing.get("call_to_sent_ms") if timing.get("call_to_sent_ms") is not None else timing.get("call_to_send_ms"))
+                            )
+                        )
+                    )
+                except Exception:
+                    pre_submit_ms = None
+            if pre_submit_ms is None and req_created is not None and res_created is not None:
+                try:
+                    pre_submit_ms = max(0.0, (res_created - req_created).total_seconds() * 1000.0)
+                except Exception:
+                    pre_submit_ms = None
+            if odd_pre_submit is None:
+                odd_pre_submit = sent_price
+            if slip_pre_pct is None:
+                try:
+                    if odd_dec is not None and odd_pre_submit is not None and float(odd_dec) != 0.0:
+                        slip_pre_pct = (float(odd_pre_submit) - float(odd_dec)) / float(odd_dec) * 100.0
+                except Exception:
+                    slip_pre_pct = None
             rec = {
                 "order_id": str(oid),
                 "created_at": created.astimezone(timezone.utc),
