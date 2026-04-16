@@ -351,6 +351,8 @@ async def _run(
     regime: str,
     lat_bucket: str,
     slip_bucket: str,
+    lat_min_ms: Optional[float],
+    lat_max_ms: Optional[float],
     database_url_override: Optional[str],
     balance_csv_override: Optional[str],
     n_boot: int,
@@ -743,14 +745,16 @@ async def _run(
  
         lat = em.get("lat_ms")
         slip = em.get("slip_raw_pct")
-        if _safe_float(lat) is None:
+        lat_v = _safe_float(lat)
+        slip_v = _safe_float(slip)
+        if lat_v is None:
             missing_lat += 1
-        if _safe_float(slip) is None:
+        if slip_v is None:
             missing_slip += 1
  
         # buckets (para breakdowns e filtros)
-        lab_lat = _bucket_call_to_done_ms(_safe_float(lat))
-        lab_slip = _bucket_slip_raw_3way(_safe_float(slip))
+        lab_lat = _bucket_call_to_done_ms(lat_v)
+        lab_slip = _bucket_slip_raw_3way(slip_v)
  
         row = {
             "order_id": str(oid),
@@ -758,14 +762,28 @@ async def _run(
             "created_at": created.astimezone(timezone.utc).isoformat(),
             "pnl": float(pnl),
             "exposure": _safe_float(em.get("exposure")) or 0.0,
-            "lat_ms": _safe_float(lat),
-            "slip_raw_pct": _safe_float(slip),
+            "lat_ms": lat_v,
+            "slip_raw_pct": slip_v,
             "lat_bucket": str(lab_lat),
             "slip_bucket": str(lab_slip),
             "betslip_limit": (float(lim) if lim is not None else None),
         }
         rows_base.append(row)
-        if (lab_lat == str(lat_bucket)) and (lab_slip == str(slip_bucket)):
+        # subset filter:
+        # - slippage sempre por bucket (3-way) para manter consistência
+        # - latência pode ser por bucket OU por faixa numérica (ms) se lat_min_ms/lat_max_ms forem fornecidos
+        lat_use_range = (lat_min_ms is not None) or (lat_max_ms is not None)
+        ok_lat = False
+        if lat_use_range:
+            ok_lat = lat_v is not None
+            if ok_lat and lat_min_ms is not None:
+                ok_lat = bool(float(lat_v) >= float(lat_min_ms))
+            if ok_lat and lat_max_ms is not None:
+                ok_lat = bool(float(lat_v) <= float(lat_max_ms))
+        else:
+            ok_lat = bool(lab_lat == str(lat_bucket))
+        ok_slip = bool(lab_slip == str(slip_bucket))
+        if ok_lat and ok_slip:
             rows_sub.append(row)
  
     summ_base = _summ(rows_base)
@@ -932,7 +950,12 @@ async def _run(
             "start_day": start_day2,
             "end_day": end_day2,
             "regime": (sc if "sc" in locals() else str(regime or "in")),
-            "subset": {"lat_bucket": str(lat_bucket), "slip_bucket": str(slip_bucket)},
+            "subset": {
+                "lat_bucket": str(lat_bucket),
+                "slip_bucket": str(slip_bucket),
+                "lat_min_ms": (float(lat_min_ms) if lat_min_ms is not None else None),
+                "lat_max_ms": (float(lat_max_ms) if lat_max_ms is not None else None),
+            },
             "capacity": {"limit_factor": lim_factor, "limit_cap_abs": (lim_cap if lim_cap > 0 else None)},
         },
         "daily_rollup": daily_rollup,
@@ -1173,6 +1196,18 @@ def main() -> int:
         help="Override do caminho do balance.csv (se o path do accounting_daily_report.json estiver relativo a outro cwd).",
     )
     ap.add_argument("--lat-bucket", default="< 5s", help="Bucket de latência alvo. Default='< 5s'.")
+    ap.add_argument(
+        "--lat-min-ms",
+        type=float,
+        default=None,
+        help="Opcional: em vez de filtrar latência por bucket, filtre o subset por faixa numérica (ms). Ex.: --lat-min-ms 0",
+    )
+    ap.add_argument(
+        "--lat-max-ms",
+        type=float,
+        default=None,
+        help="Opcional: em vez de filtrar latência por bucket, filtre o subset por faixa numérica (ms). Ex.: --lat-max-ms 3000 (equivale a <3s).",
+    )
     # argparse interpola '%' na help string; evite aspas e/ou escape.
     ap.add_argument("--slip-bucket", default="> 2%", help="Bucket de slippage alvo. Default=> 2%%.")
     ap.add_argument("--n-boot", type=int, default=2000, help="Bootstrap por jogo (recom.: 2000+).")
@@ -1211,6 +1246,8 @@ def main() -> int:
             regime=str(getattr(args, "regime", "in")),
             lat_bucket=str(args.lat_bucket),
             slip_bucket=str(args.slip_bucket),
+            lat_min_ms=(float(args.lat_min_ms) if args.lat_min_ms is not None else None),
+            lat_max_ms=(float(args.lat_max_ms) if args.lat_max_ms is not None else None),
             database_url_override=(str(args.database_url).strip() or None),
             balance_csv_override=(str(args.balance_csv).strip() or None),
             n_boot=int(args.n_boot),
