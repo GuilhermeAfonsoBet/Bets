@@ -52,6 +52,14 @@ def _parse_day(s: str) -> Optional[str]:
         return None
  
  
+def _is_wildcard_bucket(s: Any) -> bool:
+    try:
+        t = str(s or "").strip().lower()
+    except Exception:
+        return False
+    return t in ("*", "any", "all", "todos", "todas", "qualquer")
+
+
 def _repo_roots() -> List[Path]:
     """
     Retorna possíveis roots para resolver paths relativos (repo e package).
@@ -353,6 +361,10 @@ async def _run(
     slip_bucket: str,
     lat_min_ms: Optional[float],
     lat_max_ms: Optional[float],
+    pre_submit_min_ms: Optional[float],
+    pre_submit_max_ms: Optional[float],
+    slip_pre_min_pct: Optional[float],
+    slip_pre_max_pct: Optional[float],
     database_url_override: Optional[str],
     balance_csv_override: Optional[str],
     n_boot: int,
@@ -495,11 +507,19 @@ async def _run(
                     slip = (float(odd_fin) - float(odd_dec)) / float(odd_dec) * 100.0
             except Exception:
                 slip = None
+            # value_sizing (Back In): métricas pré-envio para alinhar com OOS/execução
+            vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
+            pre_submit_ms = _safe_float(vs.get("pre_submit_ms")) if isinstance(vs, dict) else None
+            slip_pre_pct = _safe_float(vs.get("slippage_pre_pct")) if isinstance(vs, dict) else None
+            odd_pre_submit = _safe_float(vs.get("odd_pre_submit")) if isinstance(vs, dict) else None
             rec = {
                 "order_id": str(oid),
                 "created_at": created.astimezone(timezone.utc),
                 "slip_raw_pct": slip,
                 "lat_ms": (float(lat_ms_i) if lat_ms_i is not None else None),
+                "pre_submit_ms": (float(pre_submit_ms) if pre_submit_ms is not None else None),
+                "slip_pre_pct": (float(slip_pre_pct) if slip_pre_pct is not None else None),
+                "odd_pre_submit": (float(odd_pre_submit) if odd_pre_submit is not None else None),
                 "exposure": (float(stake) if stake is not None else None),
                 "audit_id": (int(audit_id) if audit_id is not None else None),
             }
@@ -693,6 +713,8 @@ async def _run(
     rows_sub: List[dict] = []
     missing_slip = 0
     missing_lat = 0
+    missing_pre_submit = 0
+    missing_slip_pre = 0
     missing_event = 0
     missing_limit = 0
     for oid, em in (exec_by_oid or {}).items():
@@ -751,6 +773,12 @@ async def _run(
             missing_lat += 1
         if slip_v is None:
             missing_slip += 1
+        pre_submit_v = _safe_float(em.get("pre_submit_ms"))
+        slip_pre_v = _safe_float(em.get("slip_pre_pct"))
+        if pre_submit_v is None:
+            missing_pre_submit += 1
+        if slip_pre_v is None:
+            missing_slip_pre += 1
  
         # buckets (para breakdowns e filtros)
         lab_lat = _bucket_call_to_done_ms(lat_v)
@@ -764,6 +792,8 @@ async def _run(
             "exposure": _safe_float(em.get("exposure")) or 0.0,
             "lat_ms": lat_v,
             "slip_raw_pct": slip_v,
+            "pre_submit_ms": pre_submit_v,
+            "slip_pre_pct": slip_pre_v,
             "lat_bucket": str(lab_lat),
             "slip_bucket": str(lab_slip),
             "betslip_limit": (float(lim) if lim is not None else None),
@@ -781,9 +811,28 @@ async def _run(
             if ok_lat and lat_max_ms is not None:
                 ok_lat = bool(float(lat_v) <= float(lat_max_ms))
         else:
-            ok_lat = bool(lab_lat == str(lat_bucket))
-        ok_slip = bool(lab_slip == str(slip_bucket))
-        if ok_lat and ok_slip:
+            ok_lat = True if _is_wildcard_bucket(lat_bucket) else bool(lab_lat == str(lat_bucket))
+        ok_slip_raw = True if _is_wildcard_bucket(slip_bucket) else bool(lab_slip == str(slip_bucket))
+
+        pre_use_range = (pre_submit_min_ms is not None) or (pre_submit_max_ms is not None)
+        ok_pre = True
+        if pre_use_range:
+            ok_pre = pre_submit_v is not None
+            if ok_pre and pre_submit_min_ms is not None:
+                ok_pre = bool(float(pre_submit_v) >= float(pre_submit_min_ms))
+            if ok_pre and pre_submit_max_ms is not None:
+                ok_pre = bool(float(pre_submit_v) <= float(pre_submit_max_ms))
+
+        slip_pre_use_range = (slip_pre_min_pct is not None) or (slip_pre_max_pct is not None)
+        ok_slip_pre = True
+        if slip_pre_use_range:
+            ok_slip_pre = slip_pre_v is not None
+            if ok_slip_pre and slip_pre_min_pct is not None:
+                ok_slip_pre = bool(float(slip_pre_v) >= float(slip_pre_min_pct))
+            if ok_slip_pre and slip_pre_max_pct is not None:
+                ok_slip_pre = bool(float(slip_pre_v) <= float(slip_pre_max_pct))
+
+        if ok_lat and ok_slip_raw and ok_pre and ok_slip_pre:
             rows_sub.append(row)
  
     summ_base = _summ(rows_base)
@@ -955,6 +1004,10 @@ async def _run(
                 "slip_bucket": str(slip_bucket),
                 "lat_min_ms": (float(lat_min_ms) if lat_min_ms is not None else None),
                 "lat_max_ms": (float(lat_max_ms) if lat_max_ms is not None else None),
+                "pre_submit_min_ms": (float(pre_submit_min_ms) if pre_submit_min_ms is not None else None),
+                "pre_submit_max_ms": (float(pre_submit_max_ms) if pre_submit_max_ms is not None else None),
+                "slip_pre_min_pct": (float(slip_pre_min_pct) if slip_pre_min_pct is not None else None),
+                "slip_pre_max_pct": (float(slip_pre_max_pct) if slip_pre_max_pct is not None else None),
             },
             "capacity": {"limit_factor": lim_factor, "limit_cap_abs": (lim_cap if lim_cap > 0 else None)},
         },
@@ -978,6 +1031,8 @@ async def _run(
             "missing_event_skipped": int(missing_event),
             "missing_lat_seen": int(missing_lat),
             "missing_slip_seen": int(missing_slip),
+            "missing_pre_submit_seen": int(missing_pre_submit),
+            "missing_slip_pre_seen": int(missing_slip_pre),
             "missing_betslip_limit_seen": int(missing_limit),
         },
         "base": {
@@ -1208,8 +1263,36 @@ def main() -> int:
         default=None,
         help="Opcional: em vez de filtrar latência por bucket, filtre o subset por faixa numérica (ms). Ex.: --lat-max-ms 3000 (equivale a <3s).",
     )
+    ap.add_argument(
+        "--pre-submit-min-ms",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por pre_submit_ms (ms) quando a métrica estiver disponível no executor_jsonl (raw.value_sizing).",
+    )
+    ap.add_argument(
+        "--pre-submit-max-ms",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por pre_submit_ms (ms) quando a métrica estiver disponível no executor_jsonl (raw.value_sizing). Ex.: 5000.",
+    )
+    ap.add_argument(
+        "--slip-pre-min-pct",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por slippage_pre_pct (%%) quando disponível (raw.value_sizing). Ex.: 2.0.",
+    )
+    ap.add_argument(
+        "--slip-pre-max-pct",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por slippage_pre_pct (%%) quando disponível (raw.value_sizing). Ex.: 0.5.",
+    )
     # argparse interpola '%' na help string; evite aspas e/ou escape.
-    ap.add_argument("--slip-bucket", default="> 2%", help="Bucket de slippage alvo. Default=> 2%%.")
+    ap.add_argument(
+        "--slip-bucket",
+        default="> 2%",
+        help="Bucket de slippage_raw_pct alvo (3-way). Use '*'/any para não filtrar por bucket. Default=> 2%%.",
+    )
     ap.add_argument("--n-boot", type=int, default=2000, help="Bootstrap por jogo (recom.: 2000+).")
     ap.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap.")
     ap.add_argument(
@@ -1248,6 +1331,10 @@ def main() -> int:
             slip_bucket=str(args.slip_bucket),
             lat_min_ms=(float(args.lat_min_ms) if args.lat_min_ms is not None else None),
             lat_max_ms=(float(args.lat_max_ms) if args.lat_max_ms is not None else None),
+            pre_submit_min_ms=(float(args.pre_submit_min_ms) if args.pre_submit_min_ms is not None else None),
+            pre_submit_max_ms=(float(args.pre_submit_max_ms) if args.pre_submit_max_ms is not None else None),
+            slip_pre_min_pct=(float(args.slip_pre_min_pct) if args.slip_pre_min_pct is not None else None),
+            slip_pre_max_pct=(float(args.slip_pre_max_pct) if args.slip_pre_max_pct is not None else None),
             database_url_override=(str(args.database_url).strip() or None),
             balance_csv_override=(str(args.balance_csv).strip() or None),
             n_boot=int(args.n_boot),
