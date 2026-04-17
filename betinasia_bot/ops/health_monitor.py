@@ -74,6 +74,45 @@ def _read_last_jsonl(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str
         return None, "READ_ERROR"
 
 
+def _read_tail_jsonl(path: Path, *, max_bytes: int, max_lines: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Lê uma janela do final de um JSONL (best-effort) e retorna objetos parseados.
+    Evita carregar arquivos enormes.
+    """
+    if not path.exists():
+        return [], "MISSING"
+    try:
+        mb = int(max(1024, max_bytes))
+    except Exception:
+        mb = 2_000_000
+    try:
+        ml = int(max(1, max_lines))
+    except Exception:
+        ml = 5000
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            end = f.tell()
+            size = min(mb, end)
+            f.seek(max(0, end - size))
+            chunk = f.read().decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        if not lines:
+            return [], "EMPTY"
+        lines = lines[-ml:]
+        out: List[Dict[str, Any]] = []
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                continue
+        return out, None
+    except Exception:
+        return [], "READ_ERROR"
+
+
 def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg: str) -> Path:
     """
     Melhor UX: quando o usuário troca `--audit-service` (ex.: betinasia-audit-api-back),
@@ -239,8 +278,12 @@ async def run_checks(
     telemetry_max_age_sec: int,
     collector_service: str,
     audit_service: str,
+    executor_service: str,
+    bridge_back_service: str,
+    bridge_lay_service: str,
     collector_telemetry: Path,
     audit_telemetry: Path,
+    executor_jsonl: Path,
     restart_on_fail: bool,
 ) -> Tuple[List[CheckResult], int, Dict[str, Any]]:
     now = _utcnow()
@@ -250,7 +293,13 @@ async def run_checks(
     exit_code = 0
 
     # 1) systemd
-    for svc in [collector_service, audit_service]:
+    services = []
+    for svc in [collector_service, audit_service, executor_service, bridge_back_service, bridge_lay_service]:
+        s = str(svc or "").strip()
+        if not s or s.lower() in ("0", "off", "none", "false"):
+            continue
+        services.append(s)
+    for svc in services:
         s = _systemctl_show(svc)
         active = s.get("ActiveState", "unknown")
         sub = s.get("SubState", "unknown")
@@ -394,6 +443,139 @@ async def run_checks(
         # Nunca deixa o monitor quebrar por esse check
         pass
 
+    # 5) Executor activity/health (via JSONL)
+    try:
+        # parâmetros
+        tail_lines = _safe_int(os.getenv("OPS_EXECUTOR_TAIL_LINES", "5000"), 5000)
+        tail_bytes = _safe_int(os.getenv("OPS_EXECUTOR_TAIL_BYTES", "2000000"), 2_000_000)
+        min_events = _safe_int(os.getenv("OPS_EXECUTOR_MIN_EVENTS", "30"), 30)
+        max_nonhb_age = _safe_int(os.getenv("OPS_EXECUTOR_NONHEARTBEAT_MAX_AGE_SEC", "900"), 900)
+        warn_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_WARN", "0.20"))
+        fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
+        min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
+
+        rows, err = _read_tail_jsonl(Path(str(executor_jsonl)), max_bytes=int(tail_bytes), max_lines=int(tail_lines))
+        if err:
+            results.append(CheckResult("FAIL", f"executor: jsonl inválido ({err}) em {executor_jsonl}"))
+            exit_code = max(exit_code, 2)
+        else:
+            # agregação
+            def _get_status(o: Dict[str, Any]) -> str:
+                r = o.get("result") if isinstance(o.get("result"), dict) else {}
+                return str(r.get("status") or "UNKNOWN")
+
+            def _get_ts(o: Dict[str, Any]) -> Optional[datetime]:
+                r = o.get("result") if isinstance(o.get("result"), dict) else {}
+                q = o.get("request") if isinstance(o.get("request"), dict) else {}
+                return _parse_iso_ts(r.get("created_at") or q.get("created_at"))
+
+            def _get_err(o: Dict[str, Any]) -> str:
+                r = o.get("result") if isinstance(o.get("result"), dict) else {}
+                return str(r.get("error") or "")
+
+            recent = []
+            for o in rows:
+                ts = _get_ts(o)
+                if ts is None:
+                    continue
+                if ts >= since:
+                    recent.append(o)
+
+            # se não tiver recorte por janela, usa o tail inteiro (melhor do que "nada")
+            window = recent if recent else rows
+            nonhb = [o for o in window if _get_status(o) != "HEARTBEAT"]
+            hb = [o for o in window if _get_status(o) == "HEARTBEAT"]
+
+            last_any = None
+            last_nonhb = None
+            last_liveok = None
+            for o in window:
+                ts = _get_ts(o)
+                if ts and ((last_any is None) or ts > last_any):
+                    last_any = ts
+            for o in nonhb:
+                ts = _get_ts(o)
+                if ts and ((last_nonhb is None) or ts > last_nonhb):
+                    last_nonhb = ts
+            for o in window:
+                if _get_status(o) == "LIVE_OK":
+                    ts = _get_ts(o)
+                    if ts and ((last_liveok is None) or ts > last_liveok):
+                        last_liveok = ts
+
+            age_nonhb = int((now - last_nonhb).total_seconds()) if last_nonhb else None
+            age_liveok = int((now - last_liveok).total_seconds()) if last_liveok else None
+
+            # taxa de falha (somente em eventos não-heartbeat)
+            fail_statuses = {"API_FAILED", "NO_SESSION", "INTERNAL_ERROR"}
+            fail_n = sum(1 for o in nonhb if _get_status(o) in fail_statuses)
+            ok_n = sum(1 for o in nonhb if _get_status(o) == "LIVE_OK")
+            denom = max(1, len(nonhb))
+            fr = float(fail_n) / float(denom)
+
+            # padrões fatais
+            fatal_n = 0
+            for o in nonhb:
+                if _get_status(o) not in fail_statuses:
+                    continue
+                e = _get_err(o).lower()
+                if ("execution context was destroyed" in e) or ("target closed" in e) or ("no_root_session_cookie" in e) or ("auth_error" in e) or ("http_401" in e):
+                    fatal_n += 1
+
+            # idle: sem non-heartbeat por tempo alto *e* audit gerando oportunidades
+            if age_nonhb is None:
+                results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
+                exit_code = max(exit_code, 1)
+            else:
+                if age_nonhb > int(max_nonhb_age) and int(audits_n) >= int(min_audits_for_idle_fail):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{executor_service or 'betinasia-executor'}: sem execução recente (non_heartbeat_age={age_nonhb}s > {max_nonhb_age}s) "
+                            f"com audits_n={audits_n} desde {since_minutes}m (possível bridge/executor travado).",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"executor: atividade ok (nonhb_n={len(nonhb)} hb_n={len(hb)} nonhb_age={age_nonhb}s live_ok_n={ok_n} fail_n={fail_n})",
+                        )
+                    )
+
+            # fail-rate: só se volume mínimo
+            if len(nonhb) >= int(min_events):
+                if fr >= float(fail_rate):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{executor_service or 'betinasia-executor'}: taxa alta de falhas (fail={fail_n}/{len(nonhb)} {fr:.0%}, fatal={fatal_n}) "
+                            f"(janela~{since_minutes}m; min_events={min_events})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                elif fr >= float(warn_rate):
+                    results.append(
+                        CheckResult(
+                            "WARN",
+                            f"{executor_service or 'betinasia-executor'}: falhas elevadas (fail={fail_n}/{len(nonhb)} {fr:.0%}, fatal={fatal_n}) "
+                            f"(janela~{since_minutes}m)",
+                        )
+                    )
+                    exit_code = max(exit_code, 1)
+            else:
+                # pouca amostra: apenas informativo
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"executor: amostra baixa p/ taxa de falhas (nonhb_n={len(nonhb)} < min_events={min_events}) live_ok_age={age_liveok}s",
+                    )
+                )
+    except Exception as e:
+        results.append(CheckResult("WARN", f"executor: check falhou (ignored) err={str(e)[:120]}"))
+        exit_code = max(exit_code, 1)
+
     return results, exit_code, {
         "now_utc": now.isoformat(),
         "since_utc": since.isoformat(),
@@ -507,8 +689,12 @@ def main() -> int:
     ap.add_argument("--telemetry-max-age-sec", type=int, default=int(os.getenv("OPS_TELEMETRY_MAX_AGE_SEC", "600")))
     ap.add_argument("--collector-service", default=os.getenv("COLLECTOR_SERVICE", "betinasia-collector"))
     ap.add_argument("--audit-service", default=os.getenv("AUDIT_SERVICE", "betinasia-audit-api"))
+    ap.add_argument("--executor-service", default=os.getenv("EXECUTOR_SERVICE", "betinasia-executor"))
+    ap.add_argument("--bridge-back-service", default=os.getenv("BRIDGE_BACK_SERVICE", "betinasia-executor-bridge-back"))
+    ap.add_argument("--bridge-lay-service", default=os.getenv("BRIDGE_LAY_SERVICE", "betinasia-executor-bridge-lay"))
     ap.add_argument("--collector-telemetry", default=os.getenv("COLLECTOR_TELEMETRY_FILE", "logs/collector_telemetry.jsonl"))
     ap.add_argument("--audit-telemetry", default=os.getenv("AUDIT_TELEMETRY_FILE", "logs/audit_api_telemetry.jsonl"))
+    ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--telegram", action="store_true", help="Envia alerta no Telegram em WARN/FAIL")
     ap.add_argument(
         "--telegram-recovery",
@@ -541,8 +727,12 @@ def main() -> int:
             telemetry_max_age_sec=int(args.telemetry_max_age_sec),
             collector_service=str(args.collector_service),
             audit_service=str(args.audit_service),
+            executor_service=str(args.executor_service),
+            bridge_back_service=str(args.bridge_back_service),
+            bridge_lay_service=str(args.bridge_lay_service),
             collector_telemetry=Path(str(args.collector_telemetry)),
             audit_telemetry=Path(str(args.audit_telemetry)),
+            executor_jsonl=Path(str(args.executor_jsonl)),
             restart_on_fail=bool(args.restart_on_fail) and (not bool(args.autopilot)),
         )
     )
@@ -562,8 +752,15 @@ def main() -> int:
     if args.autopilot:
         state["last_run_utc"] = now.isoformat()
 
+        autopilot_svcs = []
+        for svc in [str(args.collector_service), str(args.audit_service), str(args.executor_service), str(args.bridge_back_service), str(args.bridge_lay_service)]:
+            s = str(svc or "").strip()
+            if not s or s.lower() in ("0", "off", "none", "false"):
+                continue
+            autopilot_svcs.append(s)
+
         # marca falhas por serviço
-        for svc in [str(args.collector_service), str(args.audit_service)]:
+        for svc in autopilot_svcs:
             if code >= 2 and _should_restart_from_results(results, svc):
                 nfail = _mark_failure(state, svc)
                 autopilot_actions.append(f"{svc}: consecutive_fail={nfail}")
@@ -571,7 +768,7 @@ def main() -> int:
                 _reset_failure(state, svc)
 
         # decide restarts
-        for svc in [str(args.collector_service), str(args.audit_service)]:
+        for svc in autopilot_svcs:
             svc_state = state.get("services", {}).get(svc, {})
             nfail = _safe_int(svc_state.get("consecutive_fail"), 0)
             if nfail < int(args.consecutive_fails_to_restart):
