@@ -6,7 +6,7 @@ import time
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from loguru import logger
 
@@ -106,6 +106,29 @@ def _is_auth_error(api_result: Optional[BetslipApiResult]) -> bool:
         return False
 
 
+def _err_contains(err: Any, *needles: str) -> bool:
+    try:
+        s = str(err or "")
+    except Exception:
+        return False
+    s = s.lower()
+    return any(n.lower() in s for n in (needles or []) if n)
+
+
+def _is_playwright_context_destroyed(err: Any) -> bool:
+    # erro clássico do Playwright quando a page navega/recarrega durante evaluate/fetch
+    return _err_contains(err, "execution context was destroyed", "most likely because of a navigation")
+
+
+def _is_playwright_target_closed(err: Any) -> bool:
+    return _err_contains(err, "target closed", "browser has been closed", "page closed", "has been closed")
+
+
+def _is_login_navigation_timeout(err: Any) -> bool:
+    # heurística para identificar timeouts de navegação/login
+    return _err_contains(err, "timeout", "navigating to", "/login", "domcontentloaded")
+
+
 @dataclass
 class ExecutorWorker:
     """
@@ -130,6 +153,9 @@ class ExecutorWorker:
     _op_lock: asyncio.Lock = None
     _account_snapshot_cache: Optional[Dict[str, Any]] = None
     _account_snapshot_cache_ts: float = 0.0  # time.monotonic()
+    _auto_restart_lock: asyncio.Lock = None
+    _auto_restart_times: Any = None  # deque[float]
+    _fail_streak: int = 0
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
@@ -137,6 +163,9 @@ class ExecutorWorker:
         from collections import deque, OrderedDict
 
         self._cap_open_times = deque()
+        self._auto_restart_lock = asyncio.Lock()
+        self._auto_restart_times = deque()
+        self._fail_streak = 0
         self._scraper = BetinAsiaScraper()
         await self._scraper.start()
         page = self._scraper._page
@@ -198,6 +227,126 @@ class ExecutorWorker:
             pass
         self._scraper = None
         self._api = None
+
+    def _auto_restart_enabled(self) -> bool:
+        try:
+            return str(os.getenv("EXECUTOR_AUTO_RESTART_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return True
+
+    def _auto_restart_params(self) -> Dict[str, float]:
+        # Defaults conservadores para evitar loops.
+        try:
+            cooldown_sec = float(os.getenv("EXECUTOR_AUTO_RESTART_COOLDOWN_SEC", "120") or 120.0)
+        except Exception:
+            cooldown_sec = 120.0
+        try:
+            max_per_hour = float(os.getenv("EXECUTOR_AUTO_RESTART_MAX_PER_HOUR", "6") or 6.0)
+        except Exception:
+            max_per_hour = 6.0
+        try:
+            fail_streak = float(os.getenv("EXECUTOR_AUTO_RESTART_FAIL_STREAK", "3") or 3.0)
+        except Exception:
+            fail_streak = 3.0
+        return {
+            "cooldown_sec": float(max(0.0, cooldown_sec)),
+            "max_per_hour": float(max(1.0, max_per_hour)),
+            "fail_streak": float(max(1.0, fail_streak)),
+        }
+
+    async def _auto_restart_allowed(self) -> Tuple[bool, str]:
+        try:
+            p = self._auto_restart_params()
+            cooldown = float(p["cooldown_sec"])
+            max_per_hour = int(p["max_per_hour"])
+        except Exception:
+            cooldown = 120.0
+            max_per_hour = 6
+        now = time.time()
+        try:
+            dq = self._auto_restart_times
+            if dq is None:
+                return True, "no_state"
+            while dq and (now - float(dq[0])) > 3600.0:
+                dq.popleft()
+            if dq:
+                age = now - float(dq[-1])
+                if cooldown > 0 and age < cooldown:
+                    return False, f"cooldown age={age:.0f}s < {cooldown:.0f}s"
+            if len(dq) >= int(max_per_hour):
+                return False, f"rate_limit {len(dq)}/{max_per_hour} restarts na última hora"
+        except Exception:
+            return True, "state_err"
+        return True, "ok"
+
+    async def _restart_browser_session(self, *, reason: str) -> bool:
+        """
+        Reinicia Playwright/browser/sessão do worker sem depender de systemd.
+        Se falhar, encerra o processo para o systemd reiniciar o serviço (mais 'limpo').
+        """
+        if not self._auto_restart_enabled():
+            return False
+        async with (self._auto_restart_lock or asyncio.Lock()):
+            allowed, why = await self._auto_restart_allowed()
+            if not allowed:
+                try:
+                    logger.warning(f"[executor:{self.name}] auto-restart bloqueado ({why}) reason={reason}")
+                except Exception:
+                    pass
+                return False
+            try:
+                logger.warning(f"[executor:{self.name}] auto-restart browser/session acionado reason={reason}")
+            except Exception:
+                pass
+            try:
+                if self._auto_restart_times is not None:
+                    self._auto_restart_times.append(time.time())
+            except Exception:
+                pass
+            # caches podem referenciar betslips/sessões antigas
+            try:
+                if self._betslip_cache is not None:
+                    self._betslip_cache.clear()
+            except Exception:
+                pass
+
+            # fecha scraper atual
+            try:
+                if self._scraper is not None:
+                    await self._scraper.close()
+            except Exception:
+                pass
+            self._scraper = None
+            self._api = None
+
+            try:
+                self._scraper = BetinAsiaScraper()
+                await self._scraper.start()
+                page = self._scraper._page
+                self._api = ApiBetslipClient(page)
+                self._api.setup_listener()
+                ok_login = await self._scraper.login(force=True)
+                if not ok_login:
+                    raise RuntimeError("LOGIN_FAILED")
+                # aquecer navegação (best-effort)
+                try:
+                    wait_until = os.getenv("EXECUTOR_GOTO_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
+                    timeout_ms = int(float(os.getenv("EXECUTOR_GOTO_TIMEOUT_MS", "45000") or 45000))
+                    await page.goto(self.football_url, wait_until=wait_until, timeout=timeout_ms)
+                    await page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+                self._fail_streak = 0
+                return True
+            except Exception as e:
+                try:
+                    logger.error(f"[executor:{self.name}] auto-restart falhou: {str(e)[:220]}")
+                except Exception:
+                    pass
+                try:
+                    os._exit(22)
+                except Exception:
+                    raise
 
     async def _cap_allow(self) -> Tuple[bool, Dict[str, Any]]:
         if not self.enable_cap:
@@ -421,9 +570,21 @@ class ExecutorWorker:
             err = snap_err or (api_result.error if api_result else "API_FAILED")
             if _is_auth_error(api_result):
                 status = ExecStatus.NO_SESSION
+        if status in (ExecStatus.API_FAILED, ExecStatus.NO_SESSION):
+            self._fail_streak = int(self._fail_streak or 0) + 1
+            try:
+                streak_thr = int(self._auto_restart_params().get("fail_streak") or 3)
+            except Exception:
+                streak_thr = 3
+            fatal = _is_playwright_context_destroyed(err) or _is_playwright_target_closed(err) or _is_login_navigation_timeout(err)
+            if fatal or int(self._fail_streak) >= int(streak_thr):
+                # Estamos sob _op_lock, então é seguro reiniciar aqui.
+                await self._restart_browser_session(reason=f"{status.value}:{str(err)[:160]}")
         if retry_after > 0:
             status = ExecStatus.RATE_LIMIT
             err = f"RATE_LIMIT retry_after={retry_after}s"
+        if status == ExecStatus.DRY_OK:
+            self._fail_streak = 0
 
         # Telemetria de slippage (sem regra): para análise estatística posterior.
         slip_tel = {
@@ -1087,6 +1248,8 @@ class ExecutorWorker:
         dry.status = ExecStatus.API_FAILED
         dry.http_status = int(place.http_status or 0) or None
         dry.error = f"LIVE_PLACE_FAILED: {place.error or 'unknown'}"
+        if _is_playwright_context_destroyed(dry.error) or _is_playwright_target_closed(dry.error) or _is_login_navigation_timeout(dry.error):
+            await self._restart_browser_session(reason=f"LIVE_PLACE_FAILED:{str(place.error)[:160]}")
         dry.timing.post_ms = post_ms
         try:
             dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
