@@ -136,6 +136,20 @@ sudo systemctl daemon-reload
 sudo systemctl restart betinasia-audit-api
 ```
 
+### Importante (systemd): `ExecStopPost` NÃO é shell
+Alguns deployments usam `ExecStopPost` para matar `chrome-headless-shell`/Playwright ao reiniciar o executor.  
+**Atenção:** `ExecStopPost=` não roda em shell por padrão — então escrever `... || true` vira **argumento** do comando e pode quebrar (ex.: `pkill: only one pattern can be provided`), deixando processos zumbis e piorando travamentos.
+
+O jeito correto é usar o prefixo `-` (ignora erro) ou envolver em `/bin/bash -lc`.
+
+Exemplo recomendado:
+
+```ini
+ExecStopPost=-/usr/bin/pkill -9 -u betbot -f chrome-headless-shell
+ExecStopPost=-/usr/bin/pkill -9 -u betbot -f "playwright/driver"
+ExecStopPost=-/usr/bin/rm -f /tmp/betinasia-exec.sock
+```
+
 ### Frescor (telemetria)
 ```bash
 tail -n 3 logs/collector_telemetry.jsonl

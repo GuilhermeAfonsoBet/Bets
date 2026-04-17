@@ -19,6 +19,13 @@ ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
 # Para testar por HTTP, use: --host 127.0.0.1 --port 8089
 ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers ${EXECUTOR_WORKERS:-1} --jsonl ${EXECUTOR_JSONL:-logs/executor_live.jsonl}; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec /home/betbot/Bets/venv/bin/python run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers ${EXECUTOR_WORKERS:-1} --jsonl ${EXECUTOR_JSONL:-logs/executor_live.jsonl}; else exec /usr/bin/python3 run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers ${EXECUTOR_WORKERS:-1} --jsonl ${EXECUTOR_JSONL:-logs/executor_live.jsonl}; fi'
 
+# Cleanup pós-stop:
+# - IMPORTANTÍSSIMO: ExecStopPost NÃO roda em shell por padrão; evite `|| true` aqui.
+# - Use prefixo "-" para ignorar falhas e não quebrar o restart.
+ExecStopPost=-/usr/bin/pkill -9 -u betbot -f chrome-headless-shell
+ExecStopPost=-/usr/bin/pkill -9 -u betbot -f "playwright/driver"
+ExecStopPost=-/usr/bin/rm -f /tmp/betinasia-exec.sock
+
 Restart=always
 RestartSec=15
 
