@@ -165,6 +165,21 @@ def _parse_iso_ts(ts: Any) -> Optional[datetime]:
         return None
 
 
+def _pctl(xs: List[float], p: float) -> Optional[float]:
+    try:
+        if not xs:
+            return None
+        ys = sorted(float(x) for x in xs)
+        k = (len(ys) - 1) * (float(p) / 100.0)
+        f = int(k)
+        c = min(len(ys) - 1, f + 1)
+        if f == c:
+            return float(ys[f])
+        return float(ys[f] + (k - f) * (ys[c] - ys[f]))
+    except Exception:
+        return None
+
+
 def _systemctl_show(service: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     try:
