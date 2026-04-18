@@ -49,6 +49,42 @@ def _safe_int(x: Any, default: int) -> int:
     except Exception:
         return int(default)
 
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _pctl(xs: List[float], p: float) -> Optional[float]:
+    if not xs:
+        return None
+    xs2 = sorted(xs)
+    k = (len(xs2) - 1) * (float(p) / 100.0)
+    f = int(k)
+    c = min(len(xs2) - 1, f + 1)
+    if f == c:
+        return float(xs2[f])
+    return float(xs2[f] + (k - f) * (xs2[c] - xs2[f]))
+
+
+def _timing_from_exec_jsonl(o: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Extrai métricas timing.* do payload do executor JSONL.
+    Mantém compatibilidade com versões anteriores.
+    """
+    try:
+        r = o.get("result") if isinstance(o.get("result"), dict) else {}
+        timing = r.get("timing") if isinstance(r.get("timing"), dict) else {}
+    except Exception:
+        timing = {}
+    q = _safe_float(timing.get("queue_delay_ms"))
+    c = _safe_float(timing.get("call_to_done_ms"))
+    p = _safe_float(timing.get("post_ms"))
+    return {"queue_delay_ms": q, "call_to_done_ms": c, "post_ms": p}
+
 
 def _read_last_jsonl(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not path.exists():
@@ -161,21 +197,6 @@ def _parse_iso_ts(ts: Any) -> Optional[datetime]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _pctl(xs: List[float], p: float) -> Optional[float]:
-    try:
-        if not xs:
-            return None
-        ys = sorted(float(x) for x in xs)
-        k = (len(ys) - 1) * (float(p) / 100.0)
-        f = int(k)
-        c = min(len(ys) - 1, f + 1)
-        if f == c:
-            return float(ys[f])
-        return float(ys[f] + (k - f) * (ys[c] - ys[f]))
     except Exception:
         return None
 
@@ -468,6 +489,16 @@ async def run_checks(
         warn_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_WARN", "0.20"))
         fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
         min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
+        lat_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_MIN_EVENTS", "30"), 30)
+        lat_call_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_WARN_MS", "12000"), 12000)
+        lat_call_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_FAIL_MS", "20000"), 20000)
+        lat_post_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_POST_P50_WARN_MS", "7000"), 7000)
+        lat_post_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_POST_P50_FAIL_MS", "12000"), 12000)
+        lat_queue_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_QUEUE_P50_WARN_MS", "1000"), 1000)
+        lat_queue_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_QUEUE_P50_FAIL_MS", "3000"), 3000)
+        # Opcional: p90 (mais robusto contra medianas "ok" com cauda explodindo)
+        lat_call_p90_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_WARN_MS", "0"), 0)
+        lat_call_p90_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_FAIL_MS", "0"), 0)
 
         rows, err = _read_tail_jsonl(Path(str(executor_jsonl)), max_bytes=int(tail_bytes), max_lines=int(tail_lines))
         if err:
@@ -587,6 +618,105 @@ async def run_checks(
                         f"executor: amostra baixa p/ taxa de falhas (nonhb_n={len(nonhb)} < min_events={min_events}) live_ok_age={age_liveok}s",
                     )
                 )
+
+            # Latência (p50/p90) em execuções bem-sucedidas
+            try:
+                ok = [o for o in nonhb if _get_status(o) == "LIVE_OK"]
+                # fallback: se quase não tiver LIVE_OK, usa DRY_OK também (shadow)
+                if len(ok) < int(lat_min_events):
+                    ok = [o for o in nonhb if _get_status(o) in ("LIVE_OK", "DRY_OK")]
+                call_ms: List[float] = []
+                post_ms: List[float] = []
+                queue_ms: List[float] = []
+                for o in ok:
+                    t = _timing_from_exec_jsonl(o)
+                    c = t.get("call_to_done_ms")
+                    p = t.get("post_ms")
+                    q = t.get("queue_delay_ms")
+                    if c is not None and c > 0:
+                        call_ms.append(float(c))
+                    if p is not None and p > 0:
+                        post_ms.append(float(p))
+                    if q is not None and q >= 0:
+                        queue_ms.append(float(q))
+
+                # só checa se houver volume mínimo de call_to_done_ms (métrica principal)
+                if len(call_ms) >= int(lat_min_events):
+                    p50_call = _pctl(call_ms, 50) or 0.0
+                    p90_call = _pctl(call_ms, 90) or 0.0
+                    p50_post = _pctl(post_ms, 50) if post_ms else None
+                    p50_queue = _pctl(queue_ms, 50) if queue_ms else None
+
+                    # thresholds p50
+                    hard_fail = False
+                    hard_warn = False
+                    reasons: List[str] = []
+                    if p50_call >= float(lat_call_p50_fail):
+                        hard_fail = True
+                        reasons.append(f"call_p50={int(p50_call)}ms>={int(lat_call_p50_fail)}")
+                    elif p50_call >= float(lat_call_p50_warn):
+                        hard_warn = True
+                        reasons.append(f"call_p50={int(p50_call)}ms>={int(lat_call_p50_warn)}")
+
+                    if p50_post is not None:
+                        if float(p50_post) >= float(lat_post_p50_fail):
+                            hard_fail = True
+                            reasons.append(f"post_p50={int(p50_post)}ms>={int(lat_post_p50_fail)}")
+                        elif float(p50_post) >= float(lat_post_p50_warn):
+                            hard_warn = True
+                            reasons.append(f"post_p50={int(p50_post)}ms>={int(lat_post_p50_warn)}")
+
+                    if p50_queue is not None:
+                        if float(p50_queue) >= float(lat_queue_p50_fail):
+                            hard_fail = True
+                            reasons.append(f"queue_p50={int(p50_queue)}ms>={int(lat_queue_p50_fail)}")
+                        elif float(p50_queue) >= float(lat_queue_p50_warn):
+                            hard_warn = True
+                            reasons.append(f"queue_p50={int(p50_queue)}ms>={int(lat_queue_p50_warn)}")
+
+                    # thresholds p90 (opcional, somente se configurado >0)
+                    if int(lat_call_p90_fail) > 0 and p90_call >= float(lat_call_p90_fail):
+                        hard_fail = True
+                        reasons.append(f"call_p90={int(p90_call)}ms>={int(lat_call_p90_fail)}")
+                    elif int(lat_call_p90_warn) > 0 and p90_call >= float(lat_call_p90_warn):
+                        hard_warn = True
+                        reasons.append(f"call_p90={int(p90_call)}ms>={int(lat_call_p90_warn)}")
+
+                    msg = (
+                        f"{executor_service or 'betinasia-executor'}: latência alta "
+                        f"(n_ok={len(call_ms)} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms"
+                        + (f" p50_post={int(p50_post)}ms" if p50_post is not None else "")
+                        + (f" p50_queue={int(p50_queue)}ms" if p50_queue is not None else "")
+                        + f") [{', '.join(reasons) if reasons else 'no_reasons'}]"
+                    )
+                    if hard_fail:
+                        results.append(CheckResult("FAIL", msg))
+                        exit_code = max(exit_code, 2)
+                    elif hard_warn:
+                        results.append(CheckResult("WARN", msg))
+                        exit_code = max(exit_code, 1)
+                    else:
+                        results.append(
+                            CheckResult(
+                                "PASS",
+                                f"{executor_service or 'betinasia-executor'}: latência ok "
+                                f"(n_ok={len(call_ms)} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms"
+                                + (f" p50_post={int(p50_post)}ms" if p50_post is not None else "")
+                                + (f" p50_queue={int(p50_queue)}ms" if p50_queue is not None else "")
+                                + ")",
+                            )
+                        )
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
+                            f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                        )
+                    )
+            except Exception:
+                # não quebra monitor por esse check
+                pass
     except Exception as e:
         results.append(CheckResult("WARN", f"executor: check falhou (ignored) err={str(e)[:120]}"))
         exit_code = max(exit_code, 1)
