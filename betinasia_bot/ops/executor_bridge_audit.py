@@ -906,6 +906,18 @@ def _build_request(row: Dict[str, Any], cfg: BridgeConfig) -> ExecutionRequest:
     # stake_requested / liability_requested podem ser sobrescritos pelo engine dinâmico (WF budget).
     if cfg.exec_side == ExecSide.BACK:
         req.policy.stake_requested = float(cfg.stake)
+    # regime do mercado (pre/in) para consumo do executor/analytics
+    try:
+        market_is_live = _row_is_live(row, unknown_as_live=False)
+    except Exception:
+        market_is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+    try:
+        req.meta["market"] = {
+            "is_live": bool(market_is_live),
+            "regime": ("in" if bool(market_is_live) else "pre"),
+        }
+    except Exception:
+        pass
     # meta útil para auditoria
     req.meta["bridge"] = {
         "src": "betslip_audit_results",
