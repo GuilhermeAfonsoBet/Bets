@@ -592,6 +592,28 @@ class ExecutorWorker:
             "delta_pct": float(delta_pct) if delta_pct is not None else None,
         }
 
+        # Métricas "pré-aposta" (aprox.) para análise (Back Pre/In):
+        # - pre_submit_ms: tempo desde req.created_at até logo após capturar odd_final (antes de cleanup)
+        # - slippage_pre_pct: (odd_pre_submit - odd_at_decision)/odd_at_decision
+        value_sizing = None
+        try:
+            t_pre = time.time()
+            pre_ms = _ms(max(0.0, t_pre - float(req.created_at.timestamp())))
+            odd_pre = float(odd_final) if odd_final is not None else None
+            slip_pre = None
+            if req.odd_at_decision is not None and float(req.odd_at_decision) > 0 and odd_pre is not None:
+                slip_pre = (float(odd_pre) - float(req.odd_at_decision)) / float(req.odd_at_decision) * 100.0
+            value_sizing = {
+                "enabled": False,
+                "pre_submit_ms": (int(pre_ms) if pre_ms is not None else None),
+                "odd_pre_submit": (float(odd_pre) if odd_pre is not None else None),
+                "odd_at_decision": (float(req.odd_at_decision) if req.odd_at_decision is not None else None),
+                "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+                "source": "dryrun_pre_bet",
+            }
+        except Exception:
+            value_sizing = None
+
         # Cleanup: no shadow/dryrun, tenta reduzir "open betslips" no servidor.
         # Em LIVE (quando for realmente colocar ordem), precisamos manter o betslip aberto até o place_order().
         try:
@@ -643,6 +665,7 @@ class ExecutorWorker:
                 "bet_type": bet_type,
                 "betslip_type": betslip_type,
                 "slippage_telemetry": slip_tel,
+                "value_sizing": value_sizing,
             },
         )
 
@@ -1024,8 +1047,17 @@ class ExecutorWorker:
         # Value sizing (Back In) — operacionalização do subset:
         # - tempo até imediatamente antes de efetivar (pre_submit_ms) <= 5s
         # - slippage_pre_pct (odd_pre_submit vs odd_at_decision) >= 2%
-        # Se elegível: stake=20; senão: stake=2 (somente BACK).
+        # Se elegível: stake=20; senão: stake=2 (somente BACK e somente IN-PLAY).
         # ------------------------------------------------------------
+        market_is_live = False
+        try:
+            mkt = req.meta.get("market") if isinstance(req.meta, dict) else None
+            if isinstance(mkt, dict) and mkt.get("is_live") is not None:
+                market_is_live = bool(mkt.get("is_live"))
+        except Exception:
+            market_is_live = False
+        market_regime = "in" if bool(market_is_live) else "pre"
+
         try:
             value_enabled = str(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_ENABLE", "0") or "0").strip().lower() in (
                 "1",
@@ -1037,73 +1069,22 @@ class ExecutorWorker:
         except Exception:
             value_enabled = False
 
-        value_pre_submit_ms = None
-        try:
-            value_pre_submit_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
-        except Exception:
-            value_pre_submit_ms = None
-
-        value_slip_pre_pct = None
-        try:
-            if req.odd_at_decision is not None and float(req.odd_at_decision) > 0 and price is not None:
-                value_slip_pre_pct = (float(price) - float(req.odd_at_decision)) / float(req.odd_at_decision) * 100.0
-        except Exception:
-            value_slip_pre_pct = None
-
-        # persistir métricas no JSONL para auditoria/analytics
+        # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
+        # imediatamente antes do place_order, mas já escrevemos o "regime" aqui).
         try:
             dry.raw = dict(dry.raw or {})
             dry.raw["value_sizing"] = {
-                "enabled": bool(value_enabled),
-                "pre_submit_ms": (int(value_pre_submit_ms) if value_pre_submit_ms is not None else None),
+                "enabled": bool(value_enabled) and bool(market_is_live) and (req.exec_side == ExecSide.BACK),
+                "market_regime": str(market_regime),
+                "market_is_live": bool(market_is_live),
+                "pre_submit_ms": None,
                 "odd_pre_submit": (float(price) if price is not None else None),
                 "odd_at_decision": (float(req.odd_at_decision) if req.odd_at_decision is not None else None),
-                "slippage_pre_pct": (float(value_slip_pre_pct) if value_slip_pre_pct is not None else None),
+                "slippage_pre_pct": None,
+                "source": "live_stub",
             }
         except Exception:
             pass
-
-        if value_enabled and req.exec_side == ExecSide.BACK:
-            try:
-                t_max_ms = float(os.getenv("EXECUTOR_BACKIN_VALUE_MAX_PRE_SUBMIT_MS", "5000"))
-            except Exception:
-                t_max_ms = 5000.0
-            try:
-                slip_min = float(os.getenv("EXECUTOR_BACKIN_VALUE_MIN_SLIP_PCT", "2.0"))
-            except Exception:
-                slip_min = 2.0
-            try:
-                stake_hi = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_HI", "20"))
-            except Exception:
-                stake_hi = 20.0
-            try:
-                stake_lo = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_LO", "2"))
-            except Exception:
-                stake_lo = 2.0
-
-            ok_time = (value_pre_submit_ms is not None) and (float(value_pre_submit_ms) <= float(t_max_ms))
-            ok_slip = (value_slip_pre_pct is not None) and (float(value_slip_pre_pct) >= float(slip_min))
-            is_eligible = bool(ok_time and ok_slip)
-            stake = float(stake_hi if is_eligible else stake_lo)
-            try:
-                dry.raw = dict(dry.raw or {})
-                vs = dict(dry.raw.get("value_sizing") or {})
-                vs.update(
-                    {
-                        "eligible": bool(is_eligible),
-                        "rule": "stake_hi_if(pre_submit_ms<=max && slip_pre_pct>=min) else stake_lo",
-                        "params": {
-                            "max_pre_submit_ms": float(t_max_ms),
-                            "min_slippage_pre_pct": float(slip_min),
-                            "stake_hi": float(stake_hi),
-                            "stake_lo": float(stake_lo),
-                        },
-                        "stake_chosen": float(stake),
-                    }
-                )
-                dry.raw["value_sizing"] = vs
-            except Exception:
-                pass
 
         if req.exec_side == ExecSide.LAY and stake is None:
             try:
@@ -1184,6 +1165,73 @@ class ExecutorWorker:
                         "fail_closed": bool(fail_closed_lay),
                     }
                 return dry
+        except Exception:
+            pass
+
+        # Atualiza métrica imediatamente antes da aposta (call->pre_submit) e, se aplicável,
+        # recalcula stake dinâmico para Back In.
+        try:
+            t_pre = time.time()
+            pre_ms = _ms(max(0.0, t_pre - float(req.created_at.timestamp())))
+            slip_pre = None
+            if req.odd_at_decision is not None and float(req.odd_at_decision) > 0 and price is not None:
+                slip_pre = (float(price) - float(req.odd_at_decision)) / float(req.odd_at_decision) * 100.0
+            dry.raw = dict(dry.raw or {})
+            vs = dict(dry.raw.get("value_sizing") or {})
+            vs.update(
+                {
+                    "pre_submit_ms": (int(pre_ms) if pre_ms is not None else None),
+                    "odd_pre_submit": (float(price) if price is not None else None),
+                    "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+                    "source": "live_pre_place",
+                }
+            )
+
+            if value_enabled and req.exec_side == ExecSide.BACK and bool(market_is_live):
+                try:
+                    t_max_ms = float(os.getenv("EXECUTOR_BACKIN_VALUE_MAX_PRE_SUBMIT_MS", "5000"))
+                except Exception:
+                    t_max_ms = 5000.0
+                try:
+                    slip_min = float(os.getenv("EXECUTOR_BACKIN_VALUE_MIN_SLIP_PCT", "2.0"))
+                except Exception:
+                    slip_min = 2.0
+                try:
+                    stake_hi = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_HI", "20"))
+                except Exception:
+                    stake_hi = 20.0
+                try:
+                    stake_lo = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_LO", "2"))
+                except Exception:
+                    stake_lo = 2.0
+
+                ok_time = (pre_ms is not None) and (float(pre_ms) <= float(t_max_ms))
+                ok_slip = (slip_pre is not None) and (float(slip_pre) >= float(slip_min))
+                is_eligible = bool(ok_time and ok_slip)
+                stake = float(stake_hi if is_eligible else stake_lo)
+                vs.update(
+                    {
+                        "enabled": True,
+                        "eligible": bool(is_eligible),
+                        "rule": "stake_hi_if(pre_submit_ms<=max && slip_pre_pct>=min) else stake_lo",
+                        "params": {
+                            "max_pre_submit_ms": float(t_max_ms),
+                            "min_slippage_pre_pct": float(slip_min),
+                            "stake_hi": float(stake_hi),
+                            "stake_lo": float(stake_lo),
+                        },
+                        "stake_chosen": float(stake),
+                    }
+                )
+            else:
+                # explicita motivo para não aplicar sizing (útil p/ debug)
+                if req.exec_side != ExecSide.BACK:
+                    vs.setdefault("skip_reason", "not_back")
+                elif not bool(market_is_live):
+                    vs.setdefault("skip_reason", "market_regime_pre")
+                elif not bool(value_enabled):
+                    vs.setdefault("skip_reason", "disabled")
+            dry.raw["value_sizing"] = vs
         except Exception:
             pass
 
