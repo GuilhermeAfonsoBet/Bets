@@ -1044,10 +1044,10 @@ class ExecutorWorker:
             return dry
 
         # ------------------------------------------------------------
-        # Value sizing (Back In) — operacionalização do subset:
-        # - tempo até imediatamente antes de efetivar (pre_submit_ms) <= 5s
-        # - slippage_pre_pct (odd_pre_submit vs odd_at_decision) >= 2%
-        # Se elegível: stake=20; senão: stake=2 (somente BACK e somente IN-PLAY).
+        # Stake sizing (Back Pre/In) — operacionalização:
+        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 12)
+        # - demais BACK (Back Pre lento + Back In) => stake_back_default (default 1.5)
+        # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
         market_is_live = False
         try:
@@ -1058,23 +1058,35 @@ class ExecutorWorker:
             market_is_live = False
         market_regime = "in" if bool(market_is_live) else "pre"
 
-        try:
-            value_enabled = str(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_ENABLE", "0") or "0").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-            )
-        except Exception:
-            value_enabled = False
+        # toggles / params (preferimos nomes do .env.example; mantemos compat com legados)
+        def _env_bool(name: str, default: str = "0") -> bool:
+            try:
+                return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "y", "on")
+            except Exception:
+                return False
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        # Novo modo (recomendado): Back Pre fast => HI, demais Back => LO
+        # envs:
+        # - EXECUTOR_BACKPRE_FAST_STAKE_ENABLE
+        # - EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS
+        # - EXECUTOR_BACKPRE_FAST_STAKE_HI / _LO
+        sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
+        pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
+        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 12.0))
+        stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
 
         # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
         # imediatamente antes do place_order, mas já escrevemos o "regime" aqui).
         try:
             dry.raw = dict(dry.raw or {})
             dry.raw["value_sizing"] = {
-                "enabled": bool(value_enabled) and bool(market_is_live) and (req.exec_side == ExecSide.BACK),
+                "enabled": bool(sizing_enabled) and (req.exec_side == ExecSide.BACK),
                 "market_regime": str(market_regime),
                 "market_is_live": bool(market_is_live),
                 "pre_submit_ms": None,
@@ -1096,11 +1108,9 @@ class ExecutorWorker:
                 stake = None
 
         if stake is None:
+            # Default live stake (global). Se sizing estiver habilitado, vamos sobrescrever abaixo
+            # (antes de aplicar max_stake).
             stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "3.0"))
-
-        if stake > max_stake:
-            dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
-            return dry
 
         # Gate de slippage (opcional): bloqueia LIVE se odds piorarem além do limiar.
         # Caso de uso: in-match, bloquear se odds piorarem além do limiar (Lay: odds sobem; Back: odds caem).
@@ -1168,8 +1178,7 @@ class ExecutorWorker:
         except Exception:
             pass
 
-        # Atualiza métrica imediatamente antes da aposta (call->pre_submit) e, se aplicável,
-        # recalcula stake dinâmico para Back In.
+        # Atualiza métrica imediatamente antes da aposta (call->pre_submit) e aplica sizing para BACK.
         try:
             t_pre = time.time()
             pre_ms = _ms(max(0.0, t_pre - float(req.created_at.timestamp())))
@@ -1187,53 +1196,40 @@ class ExecutorWorker:
                 }
             )
 
-            if value_enabled and req.exec_side == ExecSide.BACK and bool(market_is_live):
-                try:
-                    t_max_ms = float(os.getenv("EXECUTOR_BACKIN_VALUE_MAX_PRE_SUBMIT_MS", "5000"))
-                except Exception:
-                    t_max_ms = 5000.0
-                try:
-                    slip_min = float(os.getenv("EXECUTOR_BACKIN_VALUE_MIN_SLIP_PCT", "2.0"))
-                except Exception:
-                    slip_min = 2.0
-                try:
-                    stake_hi = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_HI", "20"))
-                except Exception:
-                    stake_hi = 20.0
-                try:
-                    stake_lo = float(os.getenv("EXECUTOR_BACKIN_VALUE_STAKE_LO", "2"))
-                except Exception:
-                    stake_lo = 2.0
-
-                ok_time = (pre_ms is not None) and (float(pre_ms) <= float(t_max_ms))
-                ok_slip = (slip_pre is not None) and (float(slip_pre) >= float(slip_min))
-                is_eligible = bool(ok_time and ok_slip)
-                stake = float(stake_hi if is_eligible else stake_lo)
+            if sizing_enabled and req.exec_side == ExecSide.BACK:
+                # regra solicitada:
+                # - pre & pre_submit_ms<=5s => 12
+                # - senão => 1.50
+                is_pre = not bool(market_is_live)
+                ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))
+                is_pre_fast = bool(is_pre and ok_time)
+                stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
                 vs.update(
                     {
                         "enabled": True,
-                        "eligible": bool(is_eligible),
-                        "rule": "stake_hi_if(pre_submit_ms<=max && slip_pre_pct>=min) else stake_lo",
+                        "eligible": bool(is_pre_fast),
+                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max) else stake_back_default",
                         "params": {
-                            "max_pre_submit_ms": float(t_max_ms),
-                            "min_slippage_pre_pct": float(slip_min),
-                            "stake_hi": float(stake_hi),
-                            "stake_lo": float(stake_lo),
+                            "max_pre_submit_ms": float(pre_fast_max_ms),
+                            "stake_pre_fast": float(stake_pre_fast),
+                            "stake_back_default": float(stake_back_default),
                         },
                         "stake_chosen": float(stake),
                     }
                 )
             else:
-                # explicita motivo para não aplicar sizing (útil p/ debug)
                 if req.exec_side != ExecSide.BACK:
                     vs.setdefault("skip_reason", "not_back")
-                elif not bool(market_is_live):
-                    vs.setdefault("skip_reason", "market_regime_pre")
-                elif not bool(value_enabled):
+                elif not bool(sizing_enabled):
                     vs.setdefault("skip_reason", "disabled")
             dry.raw["value_sizing"] = vs
         except Exception:
             pass
+
+        # valida max stake após sizing
+        if stake > max_stake:
+            dry.error = f"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}"
+            return dry
 
         # 3) Place order (com 1 retry via relogin se 401)
         assert self._api is not None

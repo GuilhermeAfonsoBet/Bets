@@ -1204,12 +1204,39 @@ def main() -> int:
             else:
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
                 pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
+                # Alerta chamativo sempre que latência estiver alta (WARN/FAIL), mesmo sem pausar bridges.
+                latency_alert = any((r.level in ("WARN", "FAIL")) and ("latência alta" in str(r.message or "").lower()) for r in (results or []))
+                lat_any_msg = None
+                try:
+                    # Preferimos a mensagem do executor (inclui p50/p90 e reasons). Mesmo em WARN.
+                    key = str(args.executor_service or "").strip().lower()
+                    for r in results:
+                        if r.level not in ("WARN", "FAIL"):
+                            continue
+                        msg = str(r.message or "")
+                        low = msg.lower()
+                        if "latência alta" not in low:
+                            continue
+                        if key and key in low:
+                            lat_any_msg = msg
+                            break
+                        if (not key) and ("executor" in low):
+                            lat_any_msg = msg
+                            break
+                except Exception:
+                    lat_any_msg = None
+
                 lines = []
                 if pause_alert:
                     lat_msg = _get_executor_latency_fail_message(results, str(args.executor_service)) or ""
                     lines.append("!!! ALERTA CRÍTICO: BRIDGES PAUSADOS POR LATÊNCIA (FAIL) !!!")
                     if lat_msg:
                         lines.append(f"Latência: {lat_msg}")
+                elif latency_alert:
+                    lines.append("!!! ALERTA: LATÊNCIA ALTA NO EXECUTOR !!!")
+                    if lat_any_msg:
+                        lines.append(f"Latência: {lat_any_msg}")
+
                 lines.append(f"OPS HEALTH ({level}) @ {meta.get('now_utc')}")
                 for r in results:
                     if r.level in ("WARN", "FAIL"):
