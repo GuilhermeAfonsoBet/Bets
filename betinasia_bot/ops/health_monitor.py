@@ -243,6 +243,25 @@ def _systemctl_restart(service: str) -> bool:
         return False
 
 
+def _systemctl_stop(service: str) -> bool:
+    try:
+        try:
+            is_root = (os.geteuid() == 0)  # type: ignore[attr-defined]
+        except Exception:
+            is_root = False
+        cmd = ["systemctl", "stop", service] if is_root else ["sudo", "-n", "systemctl", "stop", service]
+        p = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
 def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -808,6 +827,73 @@ def _append_restart(state: Dict[str, Any], service: str, now: datetime) -> None:
     svc["restarts"] = restarts[-50:]
 
 
+def _append_action(state: Dict[str, Any], service: str, action: str, now: datetime) -> None:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    acts = svc.setdefault("actions", {})
+    seq: List[str] = list(acts.get(action) or [])
+    seq.append(now.isoformat())
+    acts[action] = seq[-50:]
+
+
+def _rate_limited_action(
+    state: Dict[str, Any],
+    service: str,
+    action: str,
+    *,
+    now: datetime,
+    max_per_hour: int,
+    cooldown_sec: int,
+) -> Tuple[bool, str]:
+    """
+    Rate limit genérico por (service, action).
+    """
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    acts = svc.setdefault("actions", {})
+    seq: List[str] = list(acts.get(action) or [])
+
+    cutoff = now - timedelta(hours=1)
+    kept: List[str] = []
+    last_dt: Optional[datetime] = None
+    for ts in seq:
+        dt = _parse_iso_ts(ts)
+        if not dt:
+            continue
+        if dt >= cutoff:
+            kept.append(dt.isoformat())
+        if (last_dt is None) or (dt > last_dt):
+            last_dt = dt
+    acts[action] = kept
+
+    if last_dt is not None:
+        age = int((now - last_dt).total_seconds())
+        if age < int(cooldown_sec):
+            return False, f"cooldown ({age}s < {cooldown_sec}s)"
+    if len(kept) >= int(max_per_hour):
+        return False, f"rate_limit ({len(kept)}/{max_per_hour} ações na última hora)"
+    return True, "ok"
+
+
+def _set_paused(state: Dict[str, Any], service: str, *, now: datetime, reason: str) -> None:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    svc["paused"] = True
+    svc["paused_utc"] = now.isoformat()
+    svc["paused_reason"] = str(reason)[:240]
+
+
+def _clear_paused(state: Dict[str, Any], service: str) -> None:
+    svc = state.setdefault("services", {}).setdefault(service, {})
+    if "paused" in svc:
+        svc["paused"] = False
+
+
+def _is_paused(state: Dict[str, Any], service: str) -> bool:
+    try:
+        svc = state.get("services", {}).get(service, {}) if isinstance(state, dict) else {}
+        return bool(svc.get("paused"))
+    except Exception:
+        return False
+
+
 def _should_restart_from_results(results: List[CheckResult], service: str) -> bool:
     """
     Heurística conservadora:
@@ -824,6 +910,21 @@ def _should_restart_from_results(results: List[CheckResult], service: str) -> bo
         if "collector" in key.lower() and ("collector" in msg or "best_odds_history" in msg):
             return True
         if "audit" in key.lower() and ("audit" in msg or "betslip_audit_results" in msg):
+            return True
+    return False
+
+
+def _has_executor_latency_fail(results: List[CheckResult], executor_service: str) -> bool:
+    key = str(executor_service or "").strip().lower()
+    for r in results:
+        if r.level != "FAIL":
+            continue
+        msg = str(r.message or "").lower()
+        if "latência alta" not in msg:
+            continue
+        if key and key in msg:
+            return True
+        if (not key) and ("executor" in msg):
             return True
     return False
 
@@ -904,8 +1005,76 @@ def main() -> int:
                 continue
             autopilot_svcs.append(s)
 
+        # Se algum serviço estava "paused" e voltou a ficar ativo, liberamos o pause.
+        # Isso permite unpause manual via `systemctl start ...` sem mexer em state file.
+        try:
+            for r in results:
+                if r.level != "PASS":
+                    continue
+                msg = str(r.message or "")
+                for svc in autopilot_svcs:
+                    if _is_paused(state, svc) and msg.startswith(f"{svc}: ativo"):
+                        _clear_paused(state, svc)
+                        autopilot_actions.append(f"{svc}: unpaused (serviço ativo)")
+        except Exception:
+            pass
+
+        # Ação forte: em degradação de latência, pausar bridges (evita operar em Back Pre/In lento).
+        latency_pause_enabled = str(os.getenv("OPS_LATENCY_FAIL_PAUSE_BRIDGES", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        skip_restart_on_latency_fail = str(os.getenv("OPS_LATENCY_FAIL_SKIP_RESTART", "1") or "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        try:
+            pause_cooldown = int(float(os.getenv("OPS_LATENCY_FAIL_PAUSE_COOLDOWN_SEC", "1800") or 1800))
+        except Exception:
+            pause_cooldown = 1800
+        try:
+            pause_max_per_hour = int(float(os.getenv("OPS_LATENCY_FAIL_PAUSE_MAX_PER_HOUR", "1") or 1))
+        except Exception:
+            pause_max_per_hour = 1
+        latency_fail = _has_executor_latency_fail(results, str(args.executor_service))
+        if latency_pause_enabled and latency_fail:
+            to_pause = []
+            for svc in [str(args.bridge_back_service), str(args.bridge_lay_service)]:
+                s = str(svc or "").strip()
+                if not s or s.lower() in ("0", "off", "none", "false"):
+                    continue
+                to_pause.append(s)
+            for svc in to_pause:
+                allowed, reason = _rate_limited_action(
+                    state,
+                    svc,
+                    "pause_on_latency_fail",
+                    now=now,
+                    max_per_hour=int(pause_max_per_hour),
+                    cooldown_sec=int(pause_cooldown),
+                )
+                if not allowed:
+                    autopilot_actions.append(f"{svc}: pause bloqueado ({reason})")
+                    continue
+                ok = _systemctl_stop(svc)
+                _append_action(state, svc, "pause_on_latency_fail", now)
+                _set_paused(state, svc, now=now, reason="latency_fail")
+                autopilot_actions.append(f"{svc}: paused(stop) por latência FAIL ok={ok}")
+
         # marca falhas por serviço
         for svc in autopilot_svcs:
+            if _is_paused(state, svc):
+                # Se está pausado por decisão operacional, não acumula FAIL (evita loop de restart).
+                continue
+            if latency_fail and skip_restart_on_latency_fail and (str(svc) == str(args.executor_service)):
+                # Evita loop: latência FAIL pode ser externa (site/proxy). Preferimos pausar bridges e investigar.
+                continue
             if code >= 2 and _should_restart_from_results(results, svc):
                 nfail = _mark_failure(state, svc)
                 autopilot_actions.append(f"{svc}: consecutive_fail={nfail}")
@@ -914,6 +1083,10 @@ def main() -> int:
 
         # decide restarts
         for svc in autopilot_svcs:
+            if _is_paused(state, svc):
+                continue
+            if latency_fail and skip_restart_on_latency_fail and (str(svc) == str(args.executor_service)):
+                continue
             svc_state = state.get("services", {}).get(svc, {})
             nfail = _safe_int(svc_state.get("consecutive_fail"), 0)
             if nfail < int(args.consecutive_fails_to_restart):
