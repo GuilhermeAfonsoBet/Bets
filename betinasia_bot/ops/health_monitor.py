@@ -262,6 +262,16 @@ def _systemctl_stop(service: str) -> bool:
         return False
 
 
+def _exit_code_from_results(results: List[CheckResult]) -> int:
+    code = 0
+    for r in results:
+        if r.level == "FAIL":
+            code = max(code, 2)
+        elif r.level == "WARN":
+            code = max(code, 1)
+    return int(code)
+
+
 def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -929,6 +939,22 @@ def _has_executor_latency_fail(results: List[CheckResult], executor_service: str
     return False
 
 
+def _get_executor_latency_fail_message(results: List[CheckResult], executor_service: str) -> Optional[str]:
+    key = str(executor_service or "").strip().lower()
+    for r in results:
+        if r.level != "FAIL":
+            continue
+        msg = str(r.message or "")
+        low = msg.lower()
+        if "latência alta" not in low:
+            continue
+        if key and key in low:
+            return msg
+        if (not key) and ("executor" in low):
+            return msg
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-minutes", type=int, default=30)
@@ -1020,7 +1046,9 @@ def main() -> int:
             pass
 
         # Ação forte: em degradação de latência, pausar bridges (evita operar em Back Pre/In lento).
-        latency_pause_enabled = str(os.getenv("OPS_LATENCY_FAIL_PAUSE_BRIDGES", "0") or "0").strip().lower() in (
+        # Compat: aceita nomes antigos (OPS_LAT_FAIL_PAUSE_BRIDGES_ENABLE).
+        lat_pause_flag = os.getenv("OPS_LATENCY_FAIL_PAUSE_BRIDGES", os.getenv("OPS_LAT_FAIL_PAUSE_BRIDGES_ENABLE", "0"))
+        latency_pause_enabled = str(lat_pause_flag or "0").strip().lower() in (
             "1",
             "true",
             "yes",
@@ -1035,6 +1063,11 @@ def main() -> int:
             "on",
         )
         try:
+            pause_after_fails = int(float(os.getenv("OPS_LATENCY_FAIL_PAUSE_BRIDGES_FAILS", "1") or 1))
+        except Exception:
+            pause_after_fails = 1
+        pause_after_fails = max(1, int(pause_after_fails))
+        try:
             pause_cooldown = int(float(os.getenv("OPS_LATENCY_FAIL_PAUSE_COOLDOWN_SEC", "1800") or 1800))
         except Exception:
             pause_cooldown = 1800
@@ -1043,7 +1076,20 @@ def main() -> int:
         except Exception:
             pause_max_per_hour = 1
         latency_fail = _has_executor_latency_fail(results, str(args.executor_service))
-        if latency_pause_enabled and latency_fail:
+        # streak de FAIL de latência (por executor_service) para evitar pausar por spikes únicos
+        try:
+            exsvc = str(args.executor_service or "").strip() or "betinasia-executor"
+            ex_state = state.setdefault("services", {}).setdefault(exsvc, {})
+            if latency_fail:
+                ex_state["latency_fail_streak"] = _safe_int(ex_state.get("latency_fail_streak"), 0) + 1
+            else:
+                ex_state["latency_fail_streak"] = 0
+            latency_fail_streak = _safe_int(ex_state.get("latency_fail_streak"), 0)
+        except Exception:
+            latency_fail_streak = 0
+
+        paused_now: List[str] = []
+        if latency_pause_enabled and latency_fail and int(latency_fail_streak) >= int(pause_after_fails):
             to_pause = []
             for svc in [str(args.bridge_back_service), str(args.bridge_lay_service)]:
                 s = str(svc or "").strip()
@@ -1066,6 +1112,11 @@ def main() -> int:
                 _append_action(state, svc, "pause_on_latency_fail", now)
                 _set_paused(state, svc, now=now, reason="latency_fail")
                 autopilot_actions.append(f"{svc}: paused(stop) por latência FAIL ok={ok}")
+                paused_now.append(str(svc))
+        elif latency_pause_enabled and latency_fail:
+            autopilot_actions.append(
+                f"pause_on_latency_fail: aguardando streak (latency_fail_streak={int(latency_fail_streak)}/{int(pause_after_fails)})"
+            )
 
         # marca falhas por serviço
         for svc in autopilot_svcs:
@@ -1152,7 +1203,14 @@ def main() -> int:
                 _telegram_send(token, chat_id, "\n".join(lines))
             else:
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
-                lines = [f"OPS HEALTH ({level}) @ {meta.get('now_utc')}"]
+                pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
+                lines = []
+                if pause_alert:
+                    lat_msg = _get_executor_latency_fail_message(results, str(args.executor_service)) or ""
+                    lines.append("!!! ALERTA CRÍTICO: BRIDGES PAUSADOS POR LATÊNCIA (FAIL) !!!")
+                    if lat_msg:
+                        lines.append(f"Latência: {lat_msg}")
+                lines.append(f"OPS HEALTH ({level}) @ {meta.get('now_utc')}")
                 for r in results:
                     if r.level in ("WARN", "FAIL"):
                         lines.append(f"- [{r.level}] {r.message}")
