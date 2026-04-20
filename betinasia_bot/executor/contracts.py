@@ -83,6 +83,10 @@ class ExecutionTiming(BaseModel):
     call_to_done_ms: Optional[int] = None
     post_ms: Optional[int] = None
     total_ms: Optional[int] = None
+    # Tempo (ms) para receber PMMs via WS após criação/refresh do betslip.
+    pmm_wait_ms: Optional[int] = None
+    # Tempo (ms) do POST de place_order (somente LIVE).
+    order_post_ms: Optional[int] = None
     # Decomposição (API/WS): tempo de espera por PMMs (parte do total_ms).
     pmm_wait_ms: Optional[int] = None
 

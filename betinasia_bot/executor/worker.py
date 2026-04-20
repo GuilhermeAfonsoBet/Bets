@@ -554,7 +554,8 @@ class ExecutorWorker:
         try:
             pmm_wait_s = getattr(api_result, "pmm_wait_s", None)
             if pmm_wait_s is not None:
-                timing.pmm_wait_ms = _ms(max(0.0, float(pmm_wait_s)))
+                # pmm_wait_s está em segundos; timing.* é em ms
+                timing.pmm_wait_ms = _ms(max(0.0, float(pmm_wait_s) * 1000.0))
         except Exception:
             pass
         timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
