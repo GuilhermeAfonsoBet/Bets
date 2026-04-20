@@ -125,8 +125,16 @@ def main() -> int:
     ap.add_argument("--stake-hi", type=float, default=12.0)
     ap.add_argument("--stake-lo", type=float, default=1.5)
     ap.add_argument("--eps", type=float, default=1e-6)
-    ap.add_argument("--max-print", type=int, default=40)
+    ap.add_argument("--max-print", type=int, default=40, help="Quantas violações imprimir.")
+    ap.add_argument(
+        "--print-violations",
+        type=int,
+        default=None,
+        help="Alias de --max-print (compatibilidade).",
+    )
     args = ap.parse_args()
+    if args.print_violations is not None:
+        args.max_print = int(args.print_violations)
 
     path = Path(str(args.jsonl))
     if not path.exists():
