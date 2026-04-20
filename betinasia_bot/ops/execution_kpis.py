@@ -87,6 +87,10 @@ def compute_kpis_from_lines(
     t_call: List[float] = []
     t_post: List[float] = []
     t_queue: List[float] = []
+    t_total: List[float] = []
+    t_pmm_wait: List[float] = []
+    t_total_minus_post: List[float] = []
+    t_call_minus_total: List[float] = []
     slip_abs: List[float] = []
     slip_pct: List[float] = []
     slip_by_side: Dict[str, Dict[str, List[float]]] = {}
@@ -126,12 +130,22 @@ def compute_kpis_from_lines(
         q = _safe_int(timing.get("queue_delay_ms"))
         c = _safe_int(timing.get("call_to_done_ms"))
         p = _safe_int(timing.get("post_ms"))
+        tot = _safe_int(timing.get("total_ms"))
+        pmm = _safe_int(timing.get("pmm_wait_ms"))
         if q is not None:
             t_queue.append(float(q))
         if c is not None and c > 0:
             t_call.append(float(c))
         if p is not None and p > 0:
             t_post.append(float(p))
+        if tot is not None and tot > 0:
+            t_total.append(float(tot))
+        if pmm is not None and pmm >= 0:
+            t_pmm_wait.append(float(pmm))
+        if tot is not None and p is not None and tot > 0 and p > 0:
+            t_total_minus_post.append(float(max(0.0, float(tot) - float(p))))
+        if c is not None and tot is not None and c > 0 and tot > 0:
+            t_call_minus_total.append(float(max(0.0, float(c) - float(tot))))
 
         odd_dec = _safe_float(res.get("odd_at_decision"))
         if odd_dec is None and isinstance(req, dict):
@@ -174,6 +188,10 @@ def compute_kpis_from_lines(
             "queue_delay": _agg(t_queue).__dict__,
             "call_to_done": _agg(t_call).__dict__,
             "post": _agg(t_post).__dict__,
+            "total_api": _agg(t_total).__dict__,
+            "pmm_wait": _agg(t_pmm_wait).__dict__,
+            "total_minus_post": _agg(t_total_minus_post).__dict__,
+            "call_minus_total": _agg(t_call_minus_total).__dict__,
         },
         "slippage": {
             "abs": _agg(slip_abs).__dict__,
@@ -192,6 +210,8 @@ def compute_kpis_from_lines(
             "slippage usa apenas linhas com odd_at_decision e odd_final presentes",
             "slippage.abs/pct são (odd_final - odd_at_decision); sinal não é comparável entre Back e Lay",
             "slippage_by_side.cost_* sempre representa movimento adverso (>=0) por lado",
+            "timing.total_api é timing.total_ms do ApiBetslipClient (POST + espera PMMs); pmm_wait usa timing.pmm_wait_ms quando disponível",
+            "total_minus_post ≈ espera de PMMs/WS (proxy); call_minus_total ≈ overhead fora do ApiBetslipClient (fila/scheduler/outros)",
             "ROI/Lucro real depende de settlement; aqui só KPIs de execução",
         ],
     }

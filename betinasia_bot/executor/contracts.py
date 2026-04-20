@@ -83,6 +83,8 @@ class ExecutionTiming(BaseModel):
     call_to_done_ms: Optional[int] = None
     post_ms: Optional[int] = None
     total_ms: Optional[int] = None
+    # Decomposição (API/WS): tempo de espera por PMMs (parte do total_ms).
+    pmm_wait_ms: Optional[int] = None
 
 
 class ExecutionResult(BaseModel):
