@@ -1,0 +1,4 @@
+market,dow,thr_min,oos_n,oos_meanROI,oos_p_one,rule
+FT,Ter,0.50,166,0.331889,2.54952e-06,apostar se score>=thr
+FT,Seg,0.20,48,0.294167,0.0185774,apostar se score>=thr
+FT,Sex,0.20,189,0.103815,0.062767,apostar se score>=thr

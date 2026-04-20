@@ -1,0 +1,3 @@
+market,dow,thr_min,rule
+FT,Seg,0.20,apostar se score>=thr
+FT,Ter,0.50,apostar se score>=thr

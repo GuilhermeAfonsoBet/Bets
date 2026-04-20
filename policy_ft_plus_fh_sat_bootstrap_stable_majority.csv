@@ -1,0 +1,6 @@
+role,priority,market,dow,thr_min,rule
+core,1,FT,Seg,0.20,aplicar por prioridade; primeira regra que bater
+sat,1,FH,Sáb,0.30,aplicar por prioridade; primeira regra que bater
+core,1,FT,Ter,0.50,aplicar por prioridade; primeira regra que bater
+sat,1,FH,Ter,0.60,aplicar por prioridade; primeira regra que bater
+core,2,FT,Ter,0.50,aplicar por prioridade; primeira regra que bater

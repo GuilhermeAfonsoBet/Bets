@@ -1,0 +1,6 @@
+enabled,role,priority,market,dow,thr_min,rule,note
+True,core,1,FT,Seg,0.20,aplicar por prioridade; primeira regra que bater,
+False,core,1,FT,Sex,0.20,aplicar por prioridade; primeira regra que bater,instável acima do corte (ROI muda de sinal)
+True,sat,1,FH,Sáb,0.30,aplicar por prioridade; primeira regra que bater,
+True,sat,1,FH,Ter,0.60,aplicar por prioridade; primeira regra que bater,
+True,core,2,FT,Ter,0.50,aplicar por prioridade; primeira regra que bater,
