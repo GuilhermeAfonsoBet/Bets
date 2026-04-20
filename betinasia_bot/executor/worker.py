@@ -156,6 +156,13 @@ class ExecutorWorker:
     _auto_restart_lock: asyncio.Lock = None
     _auto_restart_times: Any = None  # deque[float]
     _fail_streak: int = 0
+    # housekeeping (redução de overhead/latência em run longo)
+    _hk_last_light_ts: float = 0.0
+    _hk_last_ui_ts: float = 0.0
+    _hk_last_cache_close_ts: float = 0.0
+    _hk_last_strong_ts: float = 0.0
+    _hk_overhead_local_ms: Any = None  # deque[int]
+    _hk_call_minus_total_ms: Any = None  # deque[int]
 
     async def start(self) -> None:
         self._cap_lock = asyncio.Lock()
@@ -166,6 +173,18 @@ class ExecutorWorker:
         self._auto_restart_lock = asyncio.Lock()
         self._auto_restart_times = deque()
         self._fail_streak = 0
+        # housekeeping state (best-effort; tunável via env)
+        try:
+            hk_n = int(float(os.getenv("EXECUTOR_HOUSEKEEP_STRONG_WINDOW_N", "50") or 50))
+        except Exception:
+            hk_n = 50
+        hk_n = int(max(10, hk_n))
+        self._hk_overhead_local_ms = deque(maxlen=hk_n)
+        self._hk_call_minus_total_ms = deque(maxlen=hk_n)
+        self._hk_last_light_ts = 0.0
+        self._hk_last_ui_ts = 0.0
+        self._hk_last_cache_close_ts = 0.0
+        self._hk_last_strong_ts = 0.0
         self._scraper = BetinAsiaScraper()
         await self._scraper.start()
         page = self._scraper._page
@@ -347,6 +366,211 @@ class ExecutorWorker:
                     os._exit(22)
                 except Exception:
                     raise
+
+    def _housekeep_enabled(self) -> bool:
+        try:
+            return str(os.getenv("EXECUTOR_HOUSEKEEP_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return True
+
+    def _housekeep_params(self) -> Dict[str, Any]:
+        def _b(name: str, default: str) -> bool:
+            try:
+                return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "y", "on")
+            except Exception:
+                return str(default).strip().lower() in ("1", "true", "yes", "y", "on")
+
+        def _f(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        def _i(name: str, default: int) -> int:
+            try:
+                return int(float(os.getenv(name, str(default)) or default))
+            except Exception:
+                return int(default)
+
+        return {
+            # light
+            "light_every_sec": float(max(0.0, _f("EXECUTOR_HOUSEKEEP_LIGHT_EVERY_SEC", 10.0))),
+            "light_gc_enable": bool(_b("EXECUTOR_HOUSEKEEP_LIGHT_GC_ENABLE", "1")),
+            "light_ui_close_enable": bool(_b("EXECUTOR_HOUSEKEEP_LIGHT_UI_CLOSE_ENABLE", "0")),
+            "light_ui_every_sec": float(max(1.0, _f("EXECUTOR_HOUSEKEEP_LIGHT_UI_EVERY_SEC", 60.0))),
+            "light_ui_timeout_sec": float(max(0.05, _f("EXECUTOR_HOUSEKEEP_LIGHT_UI_CLOSE_TIMEOUT_SEC", 0.35))),
+            "light_close_cache_enable": bool(_b("EXECUTOR_HOUSEKEEP_LIGHT_CLOSE_CACHE_ENABLE", "0")),
+            "light_close_cache_every_sec": float(max(1.0, _f("EXECUTOR_HOUSEKEEP_LIGHT_CLOSE_CACHE_EVERY_SEC", 120.0))),
+            "light_close_cache_max": int(max(0, _i("EXECUTOR_HOUSEKEEP_LIGHT_CLOSE_CACHE_MAX", 6))),
+            "light_close_cache_timeout_sec": float(max(0.05, _f("EXECUTOR_HOUSEKEEP_LIGHT_CLOSE_CACHE_TIMEOUT_SEC", 0.9))),
+            # strong
+            "strong_enable": bool(_b("EXECUTOR_HOUSEKEEP_STRONG_ENABLE", "0")),
+            "strong_min_events": int(max(3, _i("EXECUTOR_HOUSEKEEP_STRONG_MIN_EVENTS", 20))),
+            "strong_overhead_p50_ms": float(max(0.0, _f("EXECUTOR_HOUSEKEEP_STRONG_OVERHEAD_P50_MS", 6000.0))),
+            "strong_call_minus_total_p50_ms": float(max(0.0, _f("EXECUTOR_HOUSEKEEP_STRONG_CALL_MINUS_TOTAL_P50_MS", 10000.0))),
+            "strong_cooldown_sec": float(max(0.0, _f("EXECUTOR_HOUSEKEEP_STRONG_COOLDOWN_SEC", 900.0))),
+        }
+
+    def _pctl(self, xs: List[float], p: float) -> Optional[float]:
+        if not xs:
+            return None
+        xs2 = sorted(xs)
+        k = (len(xs2) - 1) * (float(p) / 100.0)
+        f = int(k)
+        c = min(len(xs2) - 1, f + 1)
+        if f == c:
+            return float(xs2[f])
+        return float(xs2[f] + (k - f) * (xs2[c] - xs2[f]))
+
+    async def _housekeep_light_maybe(self, *, allow_ui: bool, allow_close_cache: bool, reason: str) -> Dict[str, Any]:
+        if not self._housekeep_enabled():
+            return {"skipped": True, "why": "disabled", "reason": reason}
+        if self._api is None:
+            return {"skipped": True, "why": "no_api", "reason": reason}
+
+        p = self._housekeep_params()
+        now = time.time()
+        if (now - float(self._hk_last_light_ts or 0.0)) < float(p["light_every_sec"]):
+            return {"skipped": True, "why": "interval", "reason": reason}
+        self._hk_last_light_ts = now
+
+        out: Dict[str, Any] = {"skipped": False, "reason": reason}
+
+        # 1) GC de caches internas do ApiBetslipClient (sync; bem barato)
+        if bool(p.get("light_gc_enable")):
+            t0 = time.time()
+            ok = True
+            try:
+                self._api._gc()
+            except Exception:
+                ok = False
+            out["gc"] = {"ok": bool(ok), "ms": _ms(max(0.0, time.time() - t0))}
+
+        # 2) (opcional) fechar betslips cacheados e limpar cache local
+        if allow_close_cache and bool(p.get("light_close_cache_enable")) and self._betslip_cache is not None:
+            every = float(p.get("light_close_cache_every_sec") or 0.0)
+            if every <= 0 or (now - float(self._hk_last_cache_close_ts or 0.0)) >= every:
+                self._hk_last_cache_close_ts = now
+                bids: List[str] = []
+                try:
+                    bids = [str(x) for x in list(self._betslip_cache.values()) if str(x)]
+                except Exception:
+                    bids = []
+                uniq = list(dict.fromkeys(bids))
+                mx = int(p.get("light_close_cache_max") or 0)
+                if mx > 0:
+                    uniq = uniq[:mx]
+                n_ok = 0
+                n = 0
+                ms_sum = 0
+                ms_max = 0
+                for bid in uniq:
+                    n += 1
+                    t1 = time.time()
+                    ok = True
+                    try:
+                        await asyncio.wait_for(self._api.close_betslip(bid), timeout=float(p.get("light_close_cache_timeout_sec") or 0.9))
+                    except Exception:
+                        ok = False
+                    dt = _ms(max(0.0, time.time() - t1))
+                    ms_sum += int(dt)
+                    ms_max = max(int(ms_max), int(dt))
+                    if ok:
+                        n_ok += 1
+                try:
+                    self._betslip_cache.clear()
+                except Exception:
+                    pass
+                out["close_cache"] = {"n": int(n), "n_ok": int(n_ok), "ms_sum": int(ms_sum), "ms_max": int(ms_max)}
+
+        # 3) (opcional) fechar o betslip visível no UI (Playwright evaluate)
+        if allow_ui and bool(p.get("light_ui_close_enable")):
+            ui_every = float(p.get("light_ui_every_sec") or 60.0)
+            if (now - float(self._hk_last_ui_ts or 0.0)) >= ui_every:
+                self._hk_last_ui_ts = now
+                t2 = time.time()
+                ok = False
+                try:
+                    ok = bool(await asyncio.wait_for(self._api.close_visible_betslip_ui(), timeout=float(p.get("light_ui_timeout_sec") or 0.35)))
+                except Exception:
+                    ok = False
+                out["close_ui"] = {"ok": bool(ok), "ms": _ms(max(0.0, time.time() - t2))}
+
+        return out
+
+    async def _housekeep_post_request(
+        self,
+        *,
+        res: ExecutionResult,
+        allow_ui: bool,
+        allow_close_cache: bool,
+        allow_strong: bool,
+        overhead_local_ms: Optional[int],
+        call_minus_total_ms: Optional[int],
+        reason: str,
+    ) -> None:
+        """
+        Housekeeping pós-request:
+        - leve: GC / fechar UI / fechar cache (intervalado)
+        - forte: restart de sessão quando overhead degrada (p50 em janela local)
+        """
+        try:
+            res.raw = dict(res.raw or {})
+        except Exception:
+            return
+
+        hk: Dict[str, Any] = {}
+        try:
+            hk["light"] = await self._housekeep_light_maybe(allow_ui=bool(allow_ui), allow_close_cache=bool(allow_close_cache), reason=str(reason))
+        except Exception:
+            hk["light"] = {"skipped": True, "why": "error", "reason": str(reason)}
+
+        if allow_strong and self._housekeep_enabled():
+            p = self._housekeep_params()
+            if bool(p.get("strong_enable")):
+                now = time.time()
+                if (now - float(self._hk_last_strong_ts or 0.0)) >= float(p.get("strong_cooldown_sec") or 0.0):
+                    try:
+                        if overhead_local_ms is not None:
+                            self._hk_overhead_local_ms.append(int(overhead_local_ms))
+                        if call_minus_total_ms is not None:
+                            self._hk_call_minus_total_ms.append(int(call_minus_total_ms))
+                    except Exception:
+                        pass
+                    xs_ov = [float(x) for x in list(self._hk_overhead_local_ms or []) if x is not None and float(x) >= 0]
+                    xs_cm = [float(x) for x in list(self._hk_call_minus_total_ms or []) if x is not None and float(x) >= 0]
+                    ov_p50 = self._pctl(xs_ov, 50) if xs_ov else None
+                    cm_p50 = self._pctl(xs_cm, 50) if xs_cm else None
+                    hk["strong_window"] = {"n_overhead": int(len(xs_ov)), "overhead_p50_ms": ov_p50, "n_call_minus_total": int(len(xs_cm)), "call_minus_total_p50_ms": cm_p50}
+                    min_n = int(p.get("strong_min_events") or 20)
+                    over_thr = (ov_p50 is not None) and (float(p.get("strong_overhead_p50_ms") or 0.0) > 0) and (float(ov_p50) >= float(p["strong_overhead_p50_ms"]))
+                    call_thr = (cm_p50 is not None) and (float(p.get("strong_call_minus_total_p50_ms") or 0.0) > 0) and (float(cm_p50) >= float(p["strong_call_minus_total_p50_ms"]))
+                    should = (int(len(xs_ov)) >= min_n and over_thr) or (int(len(xs_cm)) >= min_n and call_thr)
+                    if should:
+                        self._hk_last_strong_ts = now
+                        ok = await self._restart_browser_session(reason=f"HK_STRONG:{str(reason)[:160]}")
+                        hk["strong"] = {"triggered": True, "restart_ok": bool(ok), "reason": str(reason)}
+                        try:
+                            # evita retrigger imediato em janela “ruim”
+                            if self._hk_overhead_local_ms is not None:
+                                self._hk_overhead_local_ms.clear()
+                            if self._hk_call_minus_total_ms is not None:
+                                self._hk_call_minus_total_ms.clear()
+                        except Exception:
+                            pass
+                    else:
+                        hk["strong"] = {"triggered": False}
+                else:
+                    hk["strong"] = {"triggered": False, "why": "cooldown"}
+            else:
+                hk["strong"] = {"triggered": False, "why": "disabled"}
+        else:
+            hk["strong"] = {"triggered": False, "why": ("skipped_live_critical" if not allow_strong else "disabled")}
+
+        try:
+            res.raw["housekeeping"] = hk
+        except Exception:
+            pass
 
     async def _cap_allow(self) -> Tuple[bool, Dict[str, Any]]:
         if not self.enable_cap:
@@ -558,7 +782,6 @@ class ExecutorWorker:
                 timing.pmm_wait_ms = _ms(max(0.0, float(pmm_wait_s)))
         except Exception:
             pass
-        timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
 
         retry_after = int(getattr(api_result, "rate_limit_retry_after_sec", 0) or 0)
         if retry_after > 0:
@@ -623,12 +846,19 @@ class ExecutorWorker:
 
         # Cleanup: no shadow/dryrun, tenta reduzir "open betslips" no servidor.
         # Em LIVE (quando for realmente colocar ordem), precisamos manter o betslip aberto até o place_order().
+        close_betslip_cleanup = None
         try:
             bid = str(getattr(api_result, "betslip_id", "") or "")
             if bid and (not bool(will_place_live)):
                 # se cache está desligado: fecha sempre
                 if self._betslip_cache is None:
-                    await self._api.close_betslip(bid)
+                    t_cl = time.time()
+                    ok_cl = True
+                    try:
+                        await self._api.close_betslip(bid)
+                    except Exception:
+                        ok_cl = False
+                    close_betslip_cleanup = {"ok": bool(ok_cl), "ms": _ms(max(0.0, time.time() - t_cl))}
                 else:
                     # eviction LRU: fecha os expulsos (vale para Pre e In)
                     while self._betslip_cache_max_keys > 0 and len(self._betslip_cache) > self._betslip_cache_max_keys:
@@ -640,7 +870,7 @@ class ExecutorWorker:
         except Exception:
             pass
 
-        return ExecutionResult(
+        res = ExecutionResult(
             execution_id=req.execution_id,
             status=status,
             created_at=req.created_at,
@@ -675,6 +905,65 @@ class ExecutorWorker:
                 "value_sizing": value_sizing,
             },
         )
+
+        # Instrumentação: tempo no worker e overhead local vs ApiBetslipClient.
+        try:
+            res.raw = dict(res.raw or {})
+            bd = dict(res.raw.get("timing_breakdown") or {})
+            worker_ms = _ms(max(0.0, time.time() - float(t0)))
+            tot_ms = int(res.timing.total_ms) if res.timing and res.timing.total_ms is not None else None
+            overhead_local_ms = int(max(0, worker_ms - int(tot_ms))) if tot_ms is not None else None
+            bd.update(
+                {
+                    "worker_ms": int(worker_ms),
+                    "overhead_local_ms": overhead_local_ms,
+                    "queue_delay_ms": (int(res.timing.queue_delay_ms) if res.timing and res.timing.queue_delay_ms is not None else None),
+                    "total_api_ms": tot_ms,
+                }
+            )
+            res.raw["timing_breakdown"] = bd
+            if close_betslip_cleanup is not None:
+                cl = dict((res.raw.get("cleanup") or {}))
+                cl["close_betslip"] = close_betslip_cleanup
+                res.raw["cleanup"] = cl
+        except Exception:
+            pass
+
+        # Housekeeping pós-request:
+        # - se for pré-checagem do LIVE, não pode fechar UI/cache nem disparar restart.
+        try:
+            tot_ms2 = int(res.timing.total_ms) if res.timing and res.timing.total_ms is not None else None
+            worker_ms2 = _ms(max(0.0, time.time() - float(t0)))
+            overhead_local_ms2 = int(max(0, worker_ms2 - int(tot_ms2))) if tot_ms2 is not None else None
+            call_minus_total_ms2 = None
+            try:
+                # call_minus_total é “global” (created_at), mas é útil como proxy de overhead fora do ApiBetslipClient
+                # quando temos total_ms disponível.
+                ctd = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+                if tot_ms2 is not None:
+                    call_minus_total_ms2 = int(max(0, int(ctd) - int(tot_ms2)))
+            except Exception:
+                call_minus_total_ms2 = None
+
+            await self._housekeep_post_request(
+                res=res,
+                allow_ui=(not bool(will_place_live)),
+                allow_close_cache=(not bool(will_place_live)),
+                allow_strong=(not bool(will_place_live)),
+                overhead_local_ms=overhead_local_ms2,
+                call_minus_total_ms=call_minus_total_ms2,
+                reason=("dryrun_precheck_live" if bool(will_place_live) else "dryrun"),
+            )
+        except Exception:
+            pass
+
+        # call_to_done no final (inclui cleanup/housekeeping)
+        try:
+            res.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+        except Exception:
+            pass
+        res.finished_at = _now_utc()
+        return res
 
     async def _relogin(self) -> bool:
         """
@@ -1034,6 +1323,8 @@ class ExecutorWorker:
             dry.error = (dry.error or "") + " | LIVE_PRECHECK_FAILED"
             return dry
 
+        t_live0 = time.time()
+
         # 2) Definir stake e preço a enviar
         stake = None
         try:
@@ -1248,7 +1539,7 @@ class ExecutorWorker:
             stake=float(stake),
             exchange_mode=str(os.getenv("EXECUTOR_LIVE_EXCHANGE_MODE", "make_and_take")),
         )
-        post_ms = _ms(max(0.0, time.time() - t_place0))
+        order_post_ms = _ms(max(0.0, time.time() - t_place0))
 
         if (not place.success) and (
             int(place.http_status or 0) == 401
@@ -1265,24 +1556,43 @@ class ExecutorWorker:
                     stake=float(stake),
                     exchange_mode=str(os.getenv("EXECUTOR_LIVE_EXCHANGE_MODE", "make_and_take")),
                 )
-                post_ms = _ms(max(0.0, time.time() - t_place1))
+                order_post_ms = _ms(max(0.0, time.time() - t_place1))
 
         # 4) Montar resultado LIVE + cleanup do betslip (evita too_many_open_betslips)
+        close_betslip_live = None
         try:
-            await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+            t_cl = time.time()
+            ok_cl = True
+            try:
+                await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+            except Exception:
+                ok_cl = False
+            close_betslip_live = {"ok": bool(ok_cl), "ms": _ms(max(0.0, time.time() - t_cl))}
         except Exception:
             pass
 
         if place.success:
             dry.status = ExecStatus.LIVE_OK
             dry.http_status = int(place.http_status or 0) or 200
-            dry.timing.post_ms = post_ms
+            try:
+                # Mantém timing.post_ms do dryrun (betslip) e separa o POST do place_order.
+                dry.timing.order_post_ms = int(order_post_ms)
+            except Exception:
+                pass
             try:
                 dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
             except Exception:
                 pass
             dry.raw = dict(dry.raw or {})
             oid = _extract_order_id(place.response)
+            # instrumentação: cleanup e decomposição local
+            try:
+                cl = dict((dry.raw.get("cleanup") or {}))
+                if close_betslip_live is not None:
+                    cl["close_betslip_live"] = close_betslip_live
+                dry.raw["cleanup"] = cl
+            except Exception:
+                pass
             dry.raw.update(
                 {
                     "live": True,
@@ -1294,6 +1604,48 @@ class ExecutorWorker:
                     "sent": {"stake_ccy": stake_ccy, "stake": float(stake), "price": float(price)},
                 }
             )
+            try:
+                bd = dict(dry.raw.get("timing_breakdown") or {})
+                live_worker_ms = _ms(max(0.0, time.time() - float(t_live0)))
+                bd["live_worker_ms"] = int(live_worker_ms)
+                bd["order_post_ms"] = int(order_post_ms)
+                bd["close_betslip_live_ms"] = (int(close_betslip_live.get("ms")) if isinstance(close_betslip_live, dict) and close_betslip_live.get("ms") is not None else None)
+                # overhead aproximado: call_to_done - total_api - order_post
+                try:
+                    ctd = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+                    tot_api = int(dry.timing.total_ms) if dry.timing and dry.timing.total_ms is not None else None
+                    if tot_api is not None:
+                        bd["overhead_ex_order_ms"] = int(max(0, int(ctd) - int(tot_api) - int(order_post_ms)))
+                except Exception:
+                    pass
+                dry.raw["timing_breakdown"] = bd
+            except Exception:
+                pass
+
+            # Housekeeping pós-LIVE: agora é seguro (aposta já foi enviada e betslip fechado)
+            try:
+                ctd2 = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+                tot_api2 = int(dry.timing.total_ms) if dry.timing and dry.timing.total_ms is not None else None
+                call_minus_total2 = int(max(0, int(ctd2) - int(tot_api2))) if tot_api2 is not None else None
+                overhead_ex_order2 = int(max(0, int(ctd2) - int(tot_api2) - int(order_post_ms))) if tot_api2 is not None else None
+                await self._housekeep_post_request(
+                    res=dry,
+                    allow_ui=True,
+                    allow_close_cache=True,
+                    allow_strong=True,
+                    overhead_local_ms=overhead_ex_order2,
+                    call_minus_total_ms=call_minus_total2,
+                    reason="live",
+                )
+            except Exception:
+                pass
+
+            # call_to_done no final (inclui cleanup/housekeeping)
+            try:
+                dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+            except Exception:
+                pass
+            dry.finished_at = _now_utc()
             return dry
 
         dry.status = ExecStatus.API_FAILED
@@ -1301,13 +1653,23 @@ class ExecutorWorker:
         dry.error = f"LIVE_PLACE_FAILED: {place.error or 'unknown'}"
         if _is_playwright_context_destroyed(dry.error) or _is_playwright_target_closed(dry.error) or _is_login_navigation_timeout(dry.error):
             await self._restart_browser_session(reason=f"LIVE_PLACE_FAILED:{str(place.error)[:160]}")
-        dry.timing.post_ms = post_ms
+        try:
+            dry.timing.order_post_ms = int(order_post_ms)
+        except Exception:
+            pass
         try:
             dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
         except Exception:
             pass
         dry.raw = dict(dry.raw or {})
         oid = _extract_order_id(place.response)
+        try:
+            cl = dict((dry.raw.get("cleanup") or {}))
+            if close_betslip_live is not None:
+                cl["close_betslip_live"] = close_betslip_live
+            dry.raw["cleanup"] = cl
+        except Exception:
+            pass
         dry.raw.update(
             {
                 "live": True,
@@ -1318,5 +1680,38 @@ class ExecutorWorker:
                 "sent": {"stake_ccy": stake_ccy, "stake": float(stake), "price": float(price)},
             }
         )
+        try:
+            bd = dict(dry.raw.get("timing_breakdown") or {})
+            live_worker_ms = _ms(max(0.0, time.time() - float(t_live0)))
+            bd["live_worker_ms"] = int(live_worker_ms)
+            bd["order_post_ms"] = int(order_post_ms)
+            dry.raw["timing_breakdown"] = bd
+        except Exception:
+            pass
+
+        # Housekeeping pós-LIVE (falha): ainda é seguro após close_betslip best-effort.
+        try:
+            ctd2 = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+            tot_api2 = int(dry.timing.total_ms) if dry.timing and dry.timing.total_ms is not None else None
+            call_minus_total2 = int(max(0, int(ctd2) - int(tot_api2))) if tot_api2 is not None else None
+            overhead_ex_order2 = int(max(0, int(ctd2) - int(tot_api2) - int(order_post_ms))) if tot_api2 is not None else None
+            await self._housekeep_post_request(
+                res=dry,
+                allow_ui=True,
+                allow_close_cache=True,
+                allow_strong=True,
+                overhead_local_ms=overhead_ex_order2,
+                call_minus_total_ms=call_minus_total2,
+                reason="live_failed",
+            )
+        except Exception:
+            pass
+
+        # call_to_done no final (inclui cleanup/housekeeping)
+        try:
+            dry.timing.call_to_done_ms = _ms(max(0.0, time.time() - float(req.created_at.timestamp())))
+        except Exception:
+            pass
+        dry.finished_at = _now_utc()
         return dry
 
