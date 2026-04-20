@@ -1,0 +1,4895 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gera relatório estatístico ROBUSTO (cluster por jogo) no estilo do:
+  docs/analise_h3b_resultados_v4_somente.md
+
+Foco: H3B (reversal_direction), comparando modelos por audit_version.
+
+Robustez adicionada:
+- métricas reportadas com N_eventos e N_jogos
+- IC via bootstrap por cluster (jogo/match_id), reduzindo viés por correlação intra-jogo
+
+Uso:
+  # (requer .env com DATABASE_URL; BETINASIA_USERNAME/PASSWORD podem ser dummy p/ Settings)
+  python analyze_contexto_operacao_b808_robust_report.py --out docs/analise_contexto_operacao_b808_robusta.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter
+
+import numpy as np
+from sqlalchemy import Integer, bindparam, text
+
+# Mantém padrão dos scripts existentes
+import sys
+
+sys.path.insert(0, ".")
+
+from storage.database import Database
+
+
+Z_90 = 1.645
+Z_95 = 1.960
+
+
+@dataclass(frozen=True)
+class MetricSummary:
+    n_events: int
+    n_matches: int
+    mean_event: Optional[float]
+    ci90_event: Optional[Tuple[float, float]]
+    mean_cluster: Optional[float]
+    ci90_cluster: Optional[Tuple[float, float]]
+    median_event: Optional[float]
+    p25_event: Optional[float]
+    p75_event: Optional[float]
+    hit_rate_event: Optional[float]  # % valores > 0 (exclui zeros)
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return None
+        return xf
+    except Exception:
+        return None
+
+
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        xi = int(x)
+        return xi
+    except Exception:
+        return None
+
+
+def _as_dict(x: Any) -> Optional[dict]:
+    """
+    Normaliza hypothesis_details: pode vir como dict (JSON/JSONB) ou string JSON.
+    """
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, (str, bytes)):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def _get_path(d: Optional[dict], path: Sequence[str]) -> Any:
+    cur: Any = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _pctl(xs: Sequence[float], q: float) -> Optional[float]:
+    if not xs:
+        return None
+    return float(np.percentile(np.asarray(xs, dtype=float), q))
+
+
+def _es_tail(xs: Sequence[float], q: float = 95.0) -> Optional[float]:
+    """
+    Expected Shortfall (média da cauda acima do percentil q).
+    Usado para risco (ex.: ES95 de liability).
+    """
+    if not xs:
+        return None
+    arr = np.asarray(xs, dtype=float)
+    thr = np.percentile(arr, q)
+    tail = arr[arr >= thr]
+    return float(np.mean(tail)) if tail.size else None
+
+
+def _mean(xs: Sequence[float]) -> Optional[float]:
+    if not xs:
+        return None
+    return float(sum(xs) / len(xs))
+
+
+def _std(xs: Sequence[float]) -> Optional[float]:
+    if len(xs) < 2:
+        return None
+    m = _mean(xs)
+    assert m is not None
+    var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+    return float(math.sqrt(var))
+
+
+def _normal_ci(mean: Optional[float], std: Optional[float], n: int, z: float) -> Optional[Tuple[float, float]]:
+    if mean is None or std is None or n < 2:
+        return None
+    se = std / math.sqrt(n)
+    return (float(mean - z * se), float(mean + z * se))
+
+
+def _percentiles(xs: Sequence[float], ps: Sequence[float]) -> List[Optional[float]]:
+    if not xs:
+        return [None for _ in ps]
+    arr = np.asarray(xs, dtype=float)
+    return [float(np.percentile(arr, p)) for p in ps]
+
+
+def cluster_bootstrap_ci(
+    values_by_match: Dict[int, List[float]],
+    n_boot: int = 4000,
+    alpha: float = 0.10,
+    seed: int = 1337,
+) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+    """
+    Bootstrap por cluster (match_id).
+    Estimador: média dos MEANS por match (cada jogo pesa 1).
+    """
+    match_ids = list(values_by_match.keys())
+    if not match_ids:
+        return None, None
+
+    # mean por match
+    per_match_means: Dict[int, float] = {}
+    for mid, vals in values_by_match.items():
+        if not vals:
+            continue
+        per_match_means[mid] = float(sum(vals) / len(vals))
+
+    match_ids = list(per_match_means.keys())
+    if len(match_ids) < 2:
+        m = per_match_means[match_ids[0]] if match_ids else None
+        return m, None
+
+    rng = random.Random(seed)
+    boot = []
+    for _ in range(int(n_boot)):
+        sample = [per_match_means[rng.choice(match_ids)] for _ in range(len(match_ids))]
+        boot.append(float(sum(sample) / len(sample)))
+
+    boot_arr = np.asarray(boot, dtype=float)
+    mean_hat = float(np.mean(boot_arr))
+    lo = float(np.quantile(boot_arr, alpha / 2))
+    hi = float(np.quantile(boot_arr, 1 - alpha / 2))
+    return mean_hat, (lo, hi)
+
+
+def cluster_bootstrap_quantile(
+    values_by_match: Dict[int, List[float]],
+    q: float,
+    *,
+    n_boot: int = 4000,
+    seed: int = 1337,
+) -> Optional[float]:
+    """
+    Quantil bootstrap por cluster (match_id) do estimador "média dos means por jogo".
+    Útil para decisões one-sided (ex.: p10/p30/p90).
+    """
+    try:
+        qf = float(q)
+    except Exception:
+        return None
+    qf = min(1.0, max(0.0, qf))
+    match_ids = list(values_by_match.keys())
+    if not match_ids:
+        return None
+
+    per_match_means: Dict[int, float] = {}
+    for mid, vals in values_by_match.items():
+        if not vals:
+            continue
+        per_match_means[mid] = float(sum(vals) / len(vals))
+    match_ids = list(per_match_means.keys())
+    if not match_ids:
+        return None
+    if len(match_ids) < 2:
+        return per_match_means[match_ids[0]]
+
+    rng = random.Random(int(seed))
+    boot = []
+    for _ in range(int(n_boot)):
+        sample = [per_match_means[rng.choice(match_ids)] for _ in range(len(match_ids))]
+        boot.append(float(sum(sample) / len(sample)))
+    boot_arr = np.asarray(boot, dtype=float)
+    return float(np.quantile(boot_arr, qf))
+
+
+def summarize_metric(
+    values: Sequence[float],
+    match_ids: Sequence[int],
+    clip_low: Optional[float] = None,
+    clip_high: Optional[float] = None,
+) -> MetricSummary:
+    # filtro + sanity
+    v = []
+    mids = []
+    for x, mid in zip(values, match_ids):
+        xf = _safe_float(x)
+        if xf is None:
+            continue
+        if clip_low is not None and xf < clip_low:
+            continue
+        if clip_high is not None and xf > clip_high:
+            continue
+        v.append(float(xf))
+        mids.append(int(mid))
+
+    n_events = len(v)
+    n_matches = len(set(mids))
+
+    mean_event = _mean(v)
+    std_event = _std(v)
+    ci90_event = _normal_ci(mean_event, std_event, n_events, Z_90)
+
+    median_event, p25_event, p75_event = _percentiles(v, [50, 25, 75])
+
+    # hit rate (exclui zeros, como no log)
+    pos = sum(1 for x in v if x > 0)
+    neg = sum(1 for x in v if x < 0)
+    hit_rate_event = (pos / (pos + neg) * 100.0) if (pos + neg) > 0 else None
+
+    by_match: Dict[int, List[float]] = {}
+    for x, mid in zip(v, mids):
+        by_match.setdefault(mid, []).append(x)
+
+    mean_cluster, ci90_cluster = cluster_bootstrap_ci(by_match, n_boot=4000, alpha=0.10)
+
+    return MetricSummary(
+        n_events=n_events,
+        n_matches=n_matches,
+        mean_event=mean_event,
+        ci90_event=ci90_event,
+        mean_cluster=mean_cluster,
+        ci90_cluster=ci90_cluster,
+        median_event=median_event,
+        p25_event=p25_event,
+        p75_event=p75_event,
+        hit_rate_event=hit_rate_event,
+    )
+
+
+def _sig_label(ci: Optional[Tuple[float, float]]) -> str:
+    if not ci:
+        return "N/A"
+    if ci[0] > 0:
+        return "sig. positivo"
+    if ci[1] < 0:
+        return "sig. negativo"
+    return "NS"
+
+
+def _fmt_pct(x: Optional[float], digits: int = 3) -> str:
+    if x is None:
+        return "—"
+    return f"{x:+.{digits}f}%"
+
+
+def _fmt_num(x: Optional[float], digits: int = 1) -> str:
+    if x is None:
+        return "—"
+    return f"{x:.{digits}f}"
+
+
+def _fmt_ci(ci: Optional[Tuple[float, float]], digits: int = 3, suffix: str = "%") -> str:
+    if not ci:
+        return "—"
+    return f"[{ci[0]:+.{digits}f}{suffix}, {ci[1]:+.{digits}f}{suffix}]"
+
+
+def _redact_db_url(db_url: str) -> str:
+    """
+    Remove senha de uma URL tipo postgresql://user:pass@host:port/db.
+    """
+    try:
+        sp = urlsplit(db_url)
+        if "@" not in (sp.netloc or ""):
+            return db_url
+        creds, host = sp.netloc.rsplit("@", 1)
+        if ":" in creds:
+            user, _ = creds.split(":", 1)
+            netloc = f"{user}:***@{host}"
+        else:
+            netloc = f"{creds}@{host}"
+        return urlunsplit((sp.scheme, netloc, sp.path, sp.query, sp.fragment))
+    except Exception:
+        return "<database_url_redacted>"
+
+
+def classify_model(audit_version: str) -> str:
+    v = (audit_version or "").strip()
+    if v == "v4.0-api":
+        return "API (2-4s)"
+    if v in ("v1.0", "v1.0-recovered"):
+        return "DOM (15-30s)"
+    return f"Outro ({v})" if v else "Outro"
+
+
+def diff_bucket(diff_pct: Optional[float]) -> Optional[str]:
+    if diff_pct is None:
+        return None
+    if diff_pct < -10:
+        return "BS < WS (-10% a -2%)"  # fora do confiável, mas mantemos label macro
+    if diff_pct < -2:
+        return "BS < WS (-10% a -2%)"
+    if diff_pct <= 2:
+        return "BS ~ WS (-2% a +2%)"
+    if diff_pct <= 10:
+        return "BS > WS (+2% a +10%)"
+    return "BS > WS (+2% a +10%)"
+
+
+def line_bucket(line_str: str) -> str:
+    try:
+        x = abs(float(str(line_str).replace(",", ".")))
+    except Exception:
+        return "Outro"
+    if x <= 1:
+        return "AH 0-1 (líquida)"
+    if x <= 2:
+        return "AH 1-2 (média)"
+    return "AH 2+ (extrema)"
+
+
+def lag_bucket(ms: Optional[int]) -> str:
+    if not ms or ms <= 0:
+        return "Desconhecido"
+    if ms < 10000:
+        return "< 10s"
+    if ms < 20000:
+        return "10-20s"
+    if ms < 30000:
+        return "20-30s"
+    return "> 30s"
+
+
+def exec_time_bucket(ms: Optional[float]) -> str:
+    """Buckets operacionais por tempo total (ms)."""
+    if ms is None or ms <= 0:
+        return "Desconhecido"
+    if ms < 5000:
+        return "< 5s"
+    if ms < 10000:
+        return "5-10s"
+    if ms < 20000:
+        return "10-20s"
+    if ms < 40000:
+        return "20-40s"
+    return "> 40s"
+
+
+async def fetch_h3b_audit_rows(
+    db: Database,
+    direction: str,
+    versions: List[str],
+    lookback_days: Optional[int] = None,
+) -> List[Tuple[Any, ...]]:
+    """
+    Traz a base principal:
+    - betslip_audit_results (H3B, direction) + match (kickoff passado)
+    - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
+    """
+    # OBS importante de performance:
+    # A versão antiga calculava `closing_odd` via subquery correlacionada em `best_odds_history`
+    # para CADA auditoria. Isso explode o tempo para janelas maiores (ex.: 14 dias).
+    #
+    # Aqui buscamos a base "audit + match" primeiro (rápido) e calculamos `closing_odd` em batch depois.
+    q = (
+        text(
+            """
+            SELECT
+                a.id,
+                a.event_id,
+                a.home_team,
+                a.away_team,
+                a.league,
+                a.market_type,
+                a.line,
+                a.side,
+                a.websocket_odd,
+                a.betslip_odd,
+                a.difference_pct,
+                a.betslip_limit,
+                a.status,
+                a.is_live,
+                a.audit_total_duration_ms,
+                a.lag_detection_to_click_ms,
+                a.lag_click_to_betslip_ms,
+                a.hypothesis_detected_at,
+                a.audited_at,
+                a.reversal_direction,
+                a.market_period,
+                a.audit_version,
+                a.hypothesis_details,
+                m.id AS match_id,
+                m.kickoff_time,
+                m.home_score,
+                m.away_score,
+                m.status AS match_status
+            FROM betslip_audit_results a
+            JOIN matches m ON m.external_id = a.event_id
+            WHERE a.hypothesis_type = 'H3B'
+              AND a.reversal_direction = :direction
+              AND m.kickoff_time < NOW()
+              AND a.audit_version = ANY(:versions)
+              AND (
+                :lookback_days IS NULL
+                OR a.audited_at >= NOW() - make_interval(days => :lookback_days)
+              )
+            """
+        )
+        .bindparams(bindparam("lookback_days", type_=Integer))
+    )
+    async with db.async_session() as session:
+        res = await session.execute(q, {"direction": direction, "versions": versions, "lookback_days": lookback_days})
+        return list(res.fetchall())
+
+
+def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optional[float], hs: Any, aws: Any) -> Tuple[Optional[float], Optional[float]]:
+    """
+    ROI em % para stake=1 (compatível com analyze_h3b_comprehensive.py).
+    """
+    if hs is None or aws is None:
+        return None, None
+
+    try:
+        goal_diff = int(hs) - int(aws)
+    except Exception:
+        return None, None
+
+    try:
+        ah_line = float(str(line).replace(",", "."))
+    except Exception:
+        return None, None
+
+    if (side or "").strip() == "home":
+        adjusted = goal_diff + ah_line
+    else:
+        adjusted = -goal_diff - ah_line
+
+    # win/loss/push/half
+    if adjusted > 0.25:
+        mult = 1.0
+    elif adjusted == 0.25:
+        mult = 0.5
+    elif adjusted == 0:
+        mult = 0.0
+    elif adjusted == -0.25:
+        mult = -0.5
+    else:
+        mult = -1.0
+
+    roi_ws = None
+    roi_bs = None
+
+    if mult > 0:
+        if ws_odd and ws_odd > 0:
+            roi_ws = (ws_odd - 1.0) * mult * 100.0
+        if bs_odd and bs_odd > 0:
+            roi_bs = (bs_odd - 1.0) * mult * 100.0
+    elif mult < 0:
+        roi_ws = mult * 100.0
+        roi_bs = mult * 100.0
+    else:
+        roi_ws = 0.0
+        roi_bs = 0.0
+
+    return roi_ws, roi_bs
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
+    parser.add_argument(
+        "--versions",
+        default="v4.0-api,v1.0,v1.0-recovered",
+        help="Lista de audit_version separada por vírgula (default: v4.0-api,v1.0,v1.0-recovered)",
+    )
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Override do DATABASE_URL (útil se o .env não estiver sendo carregado ou para apontar outro host)",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=None,
+        help="Se definido, filtra auditorias por janela móvel (a.audited_at >= NOW() - N dias).",
+    )
+    parser.add_argument(
+        "--exec-bucket",
+        default=None,
+        help="Opcional. Filtra o relatório para um (ou mais) regimes operacionais por tempo total. "
+        "Ex.: \"< 5s\" ou \"< 5s,5-10s\".",
+    )
+    parser.add_argument("--out", required=True, help="Caminho do markdown de saída (relativo a betinasia_bot/)")
+    parser.add_argument(
+        "--pdf",
+        default=None,
+        help="Se definido, renderiza o markdown para PDF (requer reportlab). Ex.: docs/relatorio.pdf",
+    )
+    parser.add_argument(
+        "--exclude-audited-days",
+        default=os.getenv("EXCLUDE_AUDITED_DAYS", ""),
+        help="CSV de dias UTC (YYYY-MM-DD) a excluir do recorte antes de todas as métricas "
+        "(útil para dias com falha operacional que parecem 'sem apostas'). Ex.: 2026-02-17,2026-02-18",
+    )
+    parser.add_argument("--back-diff-min", type=float, default=2.0, help="Corte de edge Back (default: 2.0)")
+    parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
+    # OBS: argparse usa interpolação estilo `%` na help string; por isso `%` precisa ser escapado como `%%`.
+    parser.add_argument("--stake-pct-of-limit", type=float, default=0.25, help="Stake fallback (%% do limite), default 0.25")
+    parser.add_argument("--stake-cap", type=float, default=0.0, help="Cap opcional para stake fallback (0=sem cap)")
+    parser.add_argument(
+        "--fx-usdbrl",
+        type=float,
+        default=5.20,
+        help="Taxa de conversão para reportar valores em R$ (default: 5.20).",
+    )
+    parser.add_argument(
+        "--git-commit",
+        action="store_true",
+        help="Se definido, adiciona o .md/.pdf gerados ao git e cria um commit local (não faz push).",
+    )
+    parser.add_argument(
+        "--git-push",
+        action="store_true",
+        help="Se definido junto com --git-commit, faz push após o commit (usa remote/branch atuais).",
+    )
+    parser.add_argument(
+        "--git-message",
+        default=None,
+        help="Mensagem do commit (opcional). Se omitida, usa uma mensagem padrão.",
+    )
+    parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
+    # Sizing / oportunidade (Kelly + capacidade)
+    parser.add_argument(
+        "--kelly-fractions",
+        default="0.10,0.25,0.50,1.00",
+        help="Frações de Kelly a reportar (CSV). Default: 0.10,0.25,0.50,1.00",
+    )
+    parser.add_argument(
+        "--kelly-bankroll",
+        type=float,
+        default=None,
+        help="Se definido (>0), usa esta banca (em USD/unidade do relatório) como escala do Kelly (em vez de p99 proxy).",
+    )
+    parser.add_argument(
+        "--kelly-back-cap-frac",
+        type=float,
+        default=float(os.getenv("KELLY_BACK_CAP_FRAC", "0.02")),
+        help="Cap por aposta Back como fração da banca de referência do Kelly. Default: 0.02 (2%%).",
+    )
+    parser.add_argument(
+        "--kelly-lay-cap-frac",
+        type=float,
+        default=float(os.getenv("KELLY_LAY_CAP_FRAC", "0.01")),
+        help="Cap por aposta Lay (liability) como fração da banca de referência do Kelly. Default: 0.01 (1%%).",
+    )
+    parser.add_argument(
+        "--max-stake-pct-of-limit",
+        type=float,
+        default=float(os.getenv("MAX_STAKE_PCT_OF_LIMIT", "1.0")),
+        help="Cap por evento via limit (stake máximo como %% do limit). Default: 1.0 (100%%).",
+    )
+    parser.add_argument(
+        "--max-stake-cap",
+        type=float,
+        default=float(os.getenv("MAX_STAKE_CAP", "0.0")),
+        help="Cap absoluto adicional para stake máximo por evento (0=sem cap).",
+    )
+    parser.add_argument(
+        "--walkforward",
+        action="store_true",
+        help="Habilita estudo OOS rolling-forward (walk-forward) por dia, com seleção de estratégias por IC90/p90.",
+    )
+    parser.add_argument("--wf-train-days", type=int, default=int(os.getenv("WF_TRAIN_DAYS", "3")), help="Dias de treino por passo (default 3).")
+    parser.add_argument("--wf-test-days", type=int, default=int(os.getenv("WF_TEST_DAYS", "1")), help="Dias de teste OOS por passo (default 1).")
+    parser.add_argument(
+        "--wf-train-mode",
+        default=os.getenv("WF_TRAIN_MODE", "rolling"),
+        choices=["rolling", "expanding"],
+        help="Modo de janela de treino no walk-forward: rolling (últimos N dias) ou expanding (tudo até t-1). Default: rolling.",
+    )
+    parser.add_argument(
+        "--wf-min-matches",
+        type=int,
+        default=int(os.getenv("WF_MIN_MATCHES", "20")),
+        help="Mínimo de jogos por combinação para ser elegível (default 20).",
+    )
+    parser.add_argument(
+        "--wf-scheme-pre",
+        default=os.getenv("WF_SCHEME_PRE", "KELLY_0.25"),
+        help="Scheme de sizing para OOS pre-match (default KELLY_0.25). Ex.: PROXY, FLAT, KELLY_0.10",
+    )
+    parser.add_argument(
+        "--wf-scheme-in",
+        default=os.getenv("WF_SCHEME_IN", "FLAT"),
+        help="Scheme de sizing para OOS in-match (default FLAT). Ex.: FLAT, PROXY",
+    )
+    parser.add_argument(
+        "--wf-expand-missing-roi",
+        action="store_true",
+        default=(os.getenv("WF_EXPAND_MISSING_ROI", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Expande lucro observado (com ROI) para população elegível via scaling por exposição/turnover (default=on).",
+    )
+    parser.add_argument(
+        "--wf-match-budget",
+        action="store_true",
+        default=(os.getenv("WF_MATCH_BUDGET", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Inclui simulação de governança por jogo (budget por match_id) na seção OOS (default=on).",
+    )
+    parser.add_argument("--wf-budget-back-frac", type=float, default=float(os.getenv("WF_BUDGET_BACK_FRAC", "0.01")), help="Budget Back por jogo (fração da banca ref).")
+    parser.add_argument("--wf-budget-lay-frac", type=float, default=float(os.getenv("WF_BUDGET_LAY_FRAC", "0.005")), help="Budget Lay por jogo (fração da banca ref, em liability).")
+    parser.add_argument("--wf-budget-cap-signal-frac", type=float, default=float(os.getenv("WF_BUDGET_CAP_SIGNAL_FRAC", "0.33")), help="Cap por sinal como fração do budget do jogo.")
+    args = parser.parse_args()
+
+    # seed global para reprodutibilidade do bootstrap
+    random.seed(int(args.seed))
+    np.random.seed(int(args.seed))
+
+    versions = [v.strip() for v in str(args.versions).split(",") if v.strip()]
+    out_path = Path(args.out)
+
+    db = Database(database_url=args.database_url) if args.database_url else Database()
+    try:
+        await db.connect()
+    except Exception as e:
+        # Ajuda diagnóstico do lado do usuário (sem vazar senha)
+        try:
+            from config.settings import settings
+
+            effective = args.database_url or settings.database_url
+            print("\n[ERRO] Falha ao conectar no banco.")
+            print(f"- DATABASE_URL efetivo: {_redact_db_url(str(effective))}")
+            print(f"- Erro: {e}\n")
+        except Exception:
+            pass
+        raise
+
+    try:
+        print(
+            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, lookback_days={args.lookback_days})...",
+            flush=True,
+        )
+        t0 = time.perf_counter()
+        rows = await fetch_h3b_audit_rows(
+            db,
+            direction=str(args.direction),
+            versions=versions,
+            lookback_days=args.lookback_days,
+        )
+        dt = time.perf_counter() - t0
+        print(f"[INFO] Linhas carregadas: {len(rows)} (tempo: {dt:.1f}s)", flush=True)
+
+        # dataset em dicts (compatível com análise original)
+        # OBS: `closing_odd` é calculado em batch após carregar as auditorias.
+        all_data: List[Dict[str, Any]] = []
+        for r in rows:
+            d: Dict[str, Any] = {
+                "id": r[0],
+                "event_id": r[1],
+                "home_team": r[2],
+                "away_team": r[3],
+                "league": r[4] or "",
+                "market_type": r[5],
+                "line": r[6],
+                "side": r[7],
+                "ws_odd": r[8],
+                "bs_odd": r[9],
+                "diff_pct": r[10],
+                "limit": r[11] or 0.0,
+                "status": r[12],
+                "is_live": r[13],
+                # timing/lag (em ms)
+                "audit_total_ms": r[14],
+                "lag_det_to_click_ms": r[15],
+                "lag_click_to_betslip_ms": r[16],
+                "hypothesis_detected_at": r[17],
+                "audited_at": r[18],
+                "direction": r[19],
+                "period": r[20],
+                "version": r[21],
+                "hypothesis_details": _as_dict(r[22]),
+                "match_id": int(r[23]),
+                "kickoff": r[24],
+                "home_score": r[25],
+                "away_score": r[26],
+                "match_status": r[27],
+                "closing_odd": None,
+            }
+
+            # Lag fim-a-fim (proxy) e overhead:
+            # - fim-a-fim = detecção->click + click->betslip
+            # - overhead = duração_total - fim-a-fim (sugere fila/retries/esperas adicionais)
+            det_ms = _safe_float(d.get("lag_det_to_click_ms"))
+            bs_ms = _safe_float(d.get("lag_click_to_betslip_ms"))
+            total_ms = _safe_float(d.get("audit_total_ms"))
+            if det_ms is not None and det_ms > 0 and bs_ms is not None and bs_ms > 0:
+                d["lag_e2e_ms"] = float(det_ms + bs_ms)
+            else:
+                d["lag_e2e_ms"] = None
+
+            # Lag "total" em parede (se timestamps existem): audited_at - detected_at
+            d["lag_wall_ms"] = None
+            try:
+                det_at = d.get("hypothesis_detected_at")
+                aud_at = d.get("audited_at")
+                if det_at and aud_at:
+                    d["lag_wall_ms"] = float((aud_at - det_at).total_seconds() * 1000.0)
+            except Exception:
+                d["lag_wall_ms"] = None
+
+            # Lag total operacional: preferimos wall_ms; fallback = audit_total_ms
+            d["lag_total_ms"] = _safe_float(d.get("lag_wall_ms")) or _safe_float(d.get("audit_total_ms")) or None
+
+            # Overhead operacional: total_observado - e2e_instrumentado
+            # (usa lag_total_ms, não audit_total_ms; audit_total pode ter janela diferente em alguns regimes/versões)
+            if d.get("lag_total_ms") is not None and d.get("lag_e2e_ms") is not None:
+                d["lag_overhead_ms"] = float(d["lag_total_ms"]) - float(d["lag_e2e_ms"])
+            elif total_ms is not None and total_ms > 0 and d.get("lag_e2e_ms") is not None:
+                # fallback
+                d["lag_overhead_ms"] = float(total_ms - float(d["lag_e2e_ms"]))
+            else:
+                d["lag_overhead_ms"] = None
+
+            # ROI
+            roi_ws, roi_bs = compute_roi_pct(
+                line=str(d["line"]),
+                side=str(d["side"]),
+                ws_odd=_safe_float(d["ws_odd"]),
+                bs_odd=_safe_float(d["bs_odd"]),
+                hs=d["home_score"],
+                aws=d["away_score"],
+            )
+            d["roi_ws"] = roi_ws
+            d["roi_bs"] = roi_bs
+
+            # Buckets auxiliares
+            d["model"] = classify_model(str(d.get("version", "")))
+            d["diff_bucket"] = diff_bucket(_safe_float(d.get("diff_pct")))
+            d["line_bucket"] = line_bucket(str(d.get("line", "")))
+            d["lag_bucket"] = lag_bucket(int(d.get("lag_total_ms") or 0))
+            d["exec_bucket"] = exec_time_bucket(_safe_float(d.get("lag_total_ms")))
+
+            all_data.append(d)
+
+        # ------------------------------------------------------------
+        # Exclusão de dias (audited_at UTC) para evitar distorções
+        # ------------------------------------------------------------
+        exclude_days = {x.strip() for x in str(getattr(args, "exclude_audited_days", "") or "").split(",") if x.strip()}
+        if exclude_days:
+            def _day_utc(ts: Any) -> Optional[str]:
+                if isinstance(ts, datetime):
+                    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                return None
+
+            before_n = len(all_data)
+            all_data = [d for d in all_data if (_day_utc(d.get("audited_at")) not in exclude_days)]
+            after_n = len(all_data)
+            if before_n != after_n:
+                print(f"[INFO] Excluídos {before_n - after_n} registros por exclude_audited_days={sorted(exclude_days)}")
+
+        # ------------------------------------------------------------
+        # Closing odds em batch (melhora muito performance em janelas longas)
+        # ------------------------------------------------------------
+        from sqlalchemy.dialects.postgresql import ARRAY
+
+        def _line_variants(line: Any) -> List[str]:
+            s = str(line).strip().replace(",", ".")
+            out = {s}
+            try:
+                f = float(s)
+            except Exception:
+                return list(out)
+            # formatações comuns
+            out.add(f"{f:.1f}")
+            if f > 0:
+                out.add(f"+{f:.1f}")
+                if float(int(f)) == f:
+                    out.add(f"+{int(f)}")
+                    out.add(str(int(f)))
+            else:
+                if float(int(f)) == f:
+                    out.add(str(int(f)))
+            # remove/insere + e .0
+            if s.startswith("+"):
+                out.add(s[1:])
+            if "." not in s:
+                out.add(s + ".0")
+                if not s.startswith(("+", "-")):
+                    out.add("+" + s)
+                    out.add("+" + s + ".0")
+            return list(out)
+
+        async def _fetch_closing_by_match_line(db_in: Database, match_ids: List[int]) -> Dict[Tuple[int, str], Tuple[Optional[float], Optional[float]]]:
+            if not match_ids:
+                return {}
+            q_clo = (
+                text(
+                    """
+                    SELECT match_id, ah_line, best_home_odds, best_away_odds
+                    FROM (
+                      SELECT
+                        boh.match_id,
+                        boh.ah_line,
+                        boh.best_home_odds,
+                        boh.best_away_odds,
+                        row_number() OVER (PARTITION BY boh.match_id, boh.ah_line ORDER BY boh.scraped_at DESC) AS rn
+                      FROM best_odds_history boh
+                      JOIN matches m ON m.id = boh.match_id
+                      WHERE boh.match_id = ANY(:match_ids)
+                        AND boh.scraped_at < m.kickoff_time
+                        AND (boh.best_home_odds > 0 OR boh.best_away_odds > 0)
+                    ) t
+                    WHERE rn = 1
+                    """
+                )
+                .bindparams(bindparam("match_ids", type_=ARRAY(Integer)))
+            )
+            async with db_in.async_session() as session:
+                res = await session.execute(q_clo, {"match_ids": match_ids})
+                rows2 = list(res.fetchall())
+            out: Dict[Tuple[int, str], Tuple[Optional[float], Optional[float]]] = {}
+            for mid, ah_line, bho, bao in rows2:
+                out[(int(mid), str(ah_line))] = (_safe_float(bho), _safe_float(bao))
+            return out
+
+        # busca closing odds apenas para matches do recorte
+        match_ids_all = sorted({int(d["match_id"]) for d in all_data})
+        closing_map = await _fetch_closing_by_match_line(db, match_ids_all)
+
+        # aplica closing_odd e calcula CLV (somente AH)
+        for d in all_data:
+            closing = None
+            try:
+                if str(d.get("market_type")) != "AH":
+                    closing = None
+                else:
+                    mid = int(d["match_id"])
+                    side = str(d.get("side") or "")
+                    for lv in _line_variants(d.get("line")):
+                        key = (mid, str(lv))
+                        if key not in closing_map:
+                            continue
+                        bho, bao = closing_map[key]
+                        if side == "home" and bho and bho > 0:
+                            closing = float(bho)
+                            break
+                        if side != "home" and bao and bao > 0:
+                            closing = float(bao)
+                            break
+            except Exception:
+                closing = None
+            d["closing_odd"] = closing
+
+            # CLV (bruto) depende do closing_odd
+            if closing and closing > 0:
+                ws = _safe_float(d.get("ws_odd"))
+                bs = _safe_float(d.get("bs_odd"))
+                d["clv_ws"] = (ws - closing) / closing * 100.0 if ws else None
+                d["clv_bs"] = (bs - closing) / closing * 100.0 if bs and bs > 0 else None
+            else:
+                d["clv_ws"] = None
+                d["clv_bs"] = None
+
+        # Filtro opcional por regime de execução (tempo total) — aplicado ANTES de qualquer métrica,
+        # para não misturar regimes em CLV adicional, buckets, finanças, etc.
+        if args.exec_bucket:
+            wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
+            all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
+
+        # Diagnóstico de cobertura do closing e distribuição de mercado (após filtros de recorte)
+        mt_counts = Counter(str(d.get("market_type") or "NA") for d in all_data)
+        ah_rows = [d for d in all_data if str(d.get("market_type")) == "AH"]
+        ah_unique_matches = len({int(d["match_id"]) for d in ah_rows}) if ah_rows else 0
+        ah_rows_with_closing = [
+            d for d in ah_rows if d.get("closing_odd") is not None and float(d["closing_odd"]) > 0
+        ]
+        ah_unique_matches_with_closing = (
+            len({int(d["match_id"]) for d in ah_rows_with_closing}) if ah_rows_with_closing else 0
+        )
+        ah_closing_coverage_pct = (
+            100.0 * ah_unique_matches_with_closing / ah_unique_matches if ah_unique_matches else None
+        )
+
+        # Filtro qualidade betslip (igual ao script: -10 a +10)
+        with_bs_raw = [d for d in all_data if d.get("bs_odd") and d["bs_odd"] > 0]
+        with_bs = [d for d in with_bs_raw if d.get("diff_pct") is not None and -10 <= float(d["diff_pct"]) <= 10]
+
+        unique_matches_all = len(set(d["match_id"] for d in all_data))
+        unique_matches_bs = len(set(d["match_id"] for d in with_bs))
+        avg_obs_per_match = (len(all_data) / unique_matches_all) if unique_matches_all else 0.0
+
+        # Janela efetiva do recorte (audited_at) — ajuda a validar lookback e explicar N "parecido"
+        audited_ts = [d.get("audited_at") for d in all_data if isinstance(d.get("audited_at"), datetime)]
+        audited_min = min(audited_ts) if audited_ts else None
+        audited_max = max(audited_ts) if audited_ts else None
+        audited_unique_days = len({t.date() for t in audited_ts}) if audited_ts else 0
+        audited_span_days = None
+        if audited_min and audited_max:
+            try:
+                audited_span_days = max(0.0, float((audited_max - audited_min).total_seconds()) / 86400.0)
+            except Exception:
+                audited_span_days = None
+
+        # Cobertura de resultados (diagnóstico de ROI)
+        matches_with_scores = len(
+            {d["match_id"] for d in all_data if d.get("home_score") is not None and d.get("away_score") is not None}
+        )
+        matches_finished_flag = len({d["match_id"] for d in all_data if str(d.get("match_status", "")).lower() == "finished"})
+
+        # Coortes operacionais e coberturas (sem depender de ROI/closing)
+        back_cut = float(args.back_diff_min)
+        lay_cut = float(args.lay_diff_max)
+
+        ok_bs = [d for d in with_bs if str(d.get("status", "")).upper() == "OK" and d.get("diff_pct") is not None]
+        back_edge = [d for d in ok_bs if float(d["diff_pct"]) >= back_cut]
+        lay_edge = [d for d in ok_bs if float(d["diff_pct"]) <= lay_cut]
+        back_edge_ids = {int(d["id"]) for d in back_edge if d.get("id") is not None}
+        lay_edge_ids = {int(d["id"]) for d in lay_edge if d.get("id") is not None}
+
+        def _is_nonempty_array(x: Any) -> bool:
+            return isinstance(x, list) and len(x) > 0
+
+        n_temporal = sum(
+            1
+            for d in ok_bs
+            if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["temporal"]))
+        )
+        n_lay_temporal = sum(
+            1
+            for d in ok_bs
+            if _is_nonempty_array(_get_path(d.get("hypothesis_details") or {}, ["lay_temporal"]))
+        )
+        n_finance = sum(
+            1
+            for d in ok_bs
+            if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
+
+        # CLV adicional (baseline por jogo: média das outras observações WS do jogo)
+        by_match: Dict[int, List[Dict[str, Any]]] = {}
+        for d in all_data:
+            if d.get("clv_ws") is not None:
+                by_match.setdefault(d["match_id"], []).append(d)
+        for mid, entries in by_match.items():
+            if len(entries) < 2:
+                for e in entries:
+                    e["clv_baseline"] = None
+                    e["clv_ws_adicional"] = e.get("clv_ws")
+                    e["clv_bs_adicional"] = e.get("clv_bs")
+                continue
+            for e in entries:
+                others = [x["clv_ws"] for x in entries if x["id"] != e["id"] and x.get("clv_ws") is not None]
+                if others:
+                    e["clv_baseline"] = float(sum(others) / len(others))
+                    e["clv_ws_adicional"] = float(e["clv_ws"] - e["clv_baseline"])
+                    e["clv_bs_adicional"] = float(e["clv_bs"] - e["clv_baseline"]) if e.get("clv_bs") is not None else None
+                else:
+                    e["clv_baseline"] = None
+                    e["clv_ws_adicional"] = e.get("clv_ws")
+                    e["clv_bs_adicional"] = e.get("clv_bs")
+
+        # Helpers para métricas por modelo
+        def subset_model(model_name: str) -> List[Dict[str, Any]]:
+            return [d for d in all_data if d.get("model") == model_name]
+
+        def subset_bs_model(model_name: str) -> List[Dict[str, Any]]:
+            return [d for d in with_bs if d.get("model") == model_name]
+
+        models = ["API (2-4s)", "DOM (15-30s)"]
+
+        # --- relatório markdown ---
+        now_utc = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        lines: List[str] = []
+        title = "Análise Estatística Robusta — Contexto Operação (b808)"
+        if args.exec_bucket:
+            title += f" — Regime(s): {args.exec_bucket}"
+        lines.append(f"# {title}\n")
+        lines.append(f"**Data da execução:** {now_utc}  \n")
+        lines.append("**Escopo:** H3B (auditoria), com comparação por `audit_version` e inferência robusta por jogo (cluster bootstrap).  \n")
+        lines.append("**Nota:** a robustez aqui significa que intervalos de confiança consideram correlação intra-jogo (múltiplas auditorias por partida).\n")
+        lines.append("---\n")
+
+        # 1) Contexto
+        lines.append("## 1) Contexto do corte (b808)\n")
+        lines.append("| Indicador | Valor |\n|---|---:|\n")
+        lines.append(f"| Auditorias H3B `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n")
+        lines.append(f"| Betslip bruto | {len(with_bs_raw)} |\n")
+        lines.append(f"| Betslip confiável (diff -10% a +10%) | {len(with_bs)} |\n")
+        lines.append(f"| Descartados no filtro de qualidade | {len(with_bs_raw) - len(with_bs)} |\n")
+        lines.append(f"| Jogos únicos (geral) | {unique_matches_all} |\n")
+        lines.append(f"| Média de observações por jogo | {avg_obs_per_match:.1f} |\n")
+        lines.append(f"| Jogos únicos com betslip confiável | {unique_matches_bs} |\n")
+        lines.append(
+            "| Distribuição por market_type | "
+            + ", ".join([f"{k}={mt_counts.get(k,0)}" for k in ["AH", "OU", "1X2", "NA"] if mt_counts.get(k, 0)])
+            + " |\n"
+        )
+        lines.append(f"| Jogos únicos (AH) no recorte | {ah_unique_matches} |\n")
+        lines.append(f"| Jogos únicos (AH) com closing_odd disponível | {ah_unique_matches_with_closing} |\n")
+        lines.append(f"| Cobertura closing_odd (AH) | {_fmt_num(ah_closing_coverage_pct,1)}% |\n")
+        lines.append("\n---\n")
+
+        # 2) Base comparativa
+        lines.append("## 2) Base comparativa: API vs DOM\n")
+        lines.append("| Métrica | API (v4.0-api) | DOM (v1.0) |\n|---|---:|---:|\n")
+        for m in models:
+            pass
+        # total obs
+        api_all = subset_model("API (2-4s)")
+        dom_all = subset_model("DOM (15-30s)")
+        api_bs = subset_bs_model("API (2-4s)")
+        dom_bs = subset_bs_model("DOM (15-30s)")
+        # Tempo total observado (preferindo wall_ms quando disponível)
+        api_lag_total = _mean([float(d["lag_total_ms"]) for d in api_all if d.get("lag_total_ms") is not None])
+        dom_lag_total = _mean([float(d["lag_total_ms"]) for d in dom_all if d.get("lag_total_ms") is not None])
+        # Decomposição instrumentada (não inclui tudo, mas ajuda a identificar gargalo)
+        api_lag_e2e = _mean([float(d["lag_e2e_ms"]) for d in api_all if d.get("lag_e2e_ms") is not None])
+        dom_lag_e2e = _mean([float(d["lag_e2e_ms"]) for d in dom_all if d.get("lag_e2e_ms") is not None])
+        api_clv_pm_n = len([d for d in api_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
+        dom_clv_pm_n = len([d for d in dom_bs if d.get("clv_bs") is not None and d.get("is_live") is False and -50 < float(d["clv_bs"]) < 50])
+        api_roi_n = len([d for d in api_bs if d.get("roi_bs") is not None])
+        dom_roi_n = len([d for d in dom_bs if d.get("roi_bs") is not None])
+        lines.append(f"| Total de observações | {len(api_all)} | {len(dom_all)} |\n")
+        lines.append(f"| Com betslip confiável | {len(api_bs)} | {len(dom_bs)} |\n")
+        lines.append(f"| Com CLV pre-match (betslip) | {api_clv_pm_n} | {dom_clv_pm_n} |\n")
+        lines.append(f"| Com ROI (betslip) | {api_roi_n} | {dom_roi_n} |\n")
+        lines.append(f"| Tempo total observado (detecção→betslip, wall/total) | {_fmt_num(api_lag_total, 0)} ms | {_fmt_num(dom_lag_total, 0)} ms |\n")
+        lines.append(f"| Tempo instrumentado (detecção→clique→betslip) | {_fmt_num(api_lag_e2e, 0)} ms | {_fmt_num(dom_lag_e2e, 0)} ms |\n")
+        lines.append("\n---\n")
+
+        # 2.0a) Glossário (métricas-chave)
+        lines.append("### 2.0a Glossário de métricas (definições operacionais)\n")
+        lines.append(
+            "Este glossário existe para eliminar ambiguidades entre **tempo total**, **tempos instrumentados** e **overhead**.\n\n"
+        )
+        lines.append("- **`hypothesis_detected_at`**: timestamp (UTC) de detecção do evento que gerou a auditoria.\n")
+        lines.append("- **`audited_at`**: timestamp (UTC) em que a auditoria foi concluída/persistida.\n")
+        lines.append("- **`lag_total_ms` (tempo total observado / wall)**: proxy de tempo “de parede” do pipeline do evento até o betslip; quando disponível usa wall time (ex.: `audited_at - detected_at`).\n")
+        lines.append("- **`lag_det_to_click_ms` (detecção→clique)**: tempo até o robô executar o clique/ação de betslip.\n")
+        lines.append("- **`lag_click_to_betslip_ms` (clique→betslip)**: tempo até carregar/obter o payload do betslip após o clique.\n")
+        lines.append("- **`lag_e2e_ms` (tempo instrumentado)**: `lag_det_to_click_ms + lag_click_to_betslip_ms`.\n")
+        lines.append("- **`audit_total_ms` (duração da auditoria)**: duração instrumentada do ciclo de auditoria (pode diferir de `lag_total_ms` se houver esperas fora do escopo instrumentado).\n")
+        lines.append("- **`lag_overhead_ms` (overhead)**: `lag_total_ms - lag_e2e_ms`; agrega espera fora das duas etapas instrumentadas (ex.: fila, retries, pausas, latência externa).\n")
+        lines.append(
+            "- **`diff_pct` (BS vs WS)**: diferença percentual entre a odd do **betslip no momento da execução** (BS) e a odd do **WebSocket no momento da detecção** (WS): "
+            "`(BS - WS) / WS * 100`. Importante: **BS e WS são medidos em instantes diferentes**, então este número mede principalmente "
+            "**drift durante a execução + slippage/atualização** (e não “mispricing contemporâneo”).\n"
+        )
+        lines.append("- **Betslip confiável**: filtro de qualidade `diff_pct ∈ [-10%, +10%]` para reduzir casos de mismatch/parse incorreto.\n")
+        lines.append("\n---\n")
+
+        # 2.0b) Decomposição de latência (foco: fila/overhead)
+        lines.append("### 2.0b Decomposição do tempo (detecção→clique→betslip vs. overhead)\n")
+        lines.append(
+            "Interpretação: `lag_e2e` é o **tempo fim-a-fim** (detecção→clique + clique→betslip). "
+            "`overhead` = `lag_total` − `lag_e2e` (proxy de fila/retries/esperas fora das 2 etapas instrumentadas).\n\n"
+        )
+
+        def _stage_stats(rows_in: List[Dict[str, Any]], key: str) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+            vals: List[float] = []
+            for d in rows_in:
+                v = _safe_float(d.get(key))
+                if v is None:
+                    continue
+                vals.append(float(v))
+            # remove zeros e negativos para tempos, exceto overhead (pode ser <0 por inconsistência de medição)
+            if key != "lag_overhead_ms":
+                vals = [v for v in vals if v > 0]
+            if not vals:
+                return None, None, None, 0
+            return float(np.mean(vals)), float(np.median(vals)), float(np.quantile(vals, 0.95)), len(vals)
+
+        lines.append("| Modelo | Métrica | mean (ms) | p50 (ms) | p95 (ms) | N |\n|---|---|---:|---:|---:|---:|\n")
+        for model_name, rows_in in [("API (2-4s)", api_all), ("DOM (15-30s)", dom_all)]:
+            for label, key in [
+                ("lag_det→click", "lag_det_to_click_ms"),
+                ("lag_click→betslip", "lag_click_to_betslip_ms"),
+                ("lag_e2e (soma)", "lag_e2e_ms"),
+                ("audit_total (duração)", "audit_total_ms"),
+                ("overhead (total - e2e)", "lag_overhead_ms"),
+            ]:
+                mu, p50, p95, n = _stage_stats(rows_in, key)
+                lines.append(f"| {model_name} | {label} | {_fmt_num(mu,0)} | {_fmt_num(p50,0)} | {_fmt_num(p95,0)} | {n} |\n")
+
+        # Diagnóstico de cauda (% acima de thresholds) e consistência do overhead
+        def _pct_gt(rows_in: List[Dict[str, Any]], key: str, thr_ms: float) -> Optional[float]:
+            vals = [_safe_float(d.get(key)) for d in rows_in]
+            vals = [float(v) for v in vals if v is not None]
+            if not vals:
+                return None
+            return 100.0 * sum(1 for v in vals if v > thr_ms) / len(vals)
+
+        def _pct_lt(rows_in: List[Dict[str, Any]], key: str, thr_ms: float) -> Optional[float]:
+            vals = [_safe_float(d.get(key)) for d in rows_in]
+            vals = [float(v) for v in vals if v is not None]
+            if not vals:
+                return None
+            return 100.0 * sum(1 for v in vals if v < thr_ms) / len(vals)
+
+        lines.append("\n**Diagnóstico de cauda (percentual acima do limiar)**\n\n")
+        lines.append("| Modelo | % det→click > 5s | % det→click > 20s | % total > 10s | % total > 40s | % overhead < 0 |\n|---|---:|---:|---:|---:|---:|\n")
+        for model_name, rows_in in [("API (2-4s)", api_all), ("DOM (15-30s)", dom_all)]:
+            p1 = _pct_gt(rows_in, "lag_det_to_click_ms", 5000)
+            p2 = _pct_gt(rows_in, "lag_det_to_click_ms", 20000)
+            p3 = _pct_gt(rows_in, "lag_total_ms", 10000)
+            p4 = _pct_gt(rows_in, "lag_total_ms", 40000)
+            p5 = _pct_lt(rows_in, "lag_overhead_ms", 0)
+            lines.append(f"| {model_name} | {_fmt_num(p1,1)}% | {_fmt_num(p2,1)}% | {_fmt_num(p3,1)}% | {_fmt_num(p4,1)}% | {_fmt_num(p5,1)}% |\n")
+        lines.append("\n---\n")
+
+        # 2.1) Pre vs in
+        lines.append("### 2.1 Cobertura temporal (pre-match vs in-match)\n")
+        pm = [d for d in all_data if d.get("is_live") is False]
+        im = [d for d in all_data if d.get("is_live") is True]
+        lines.append("| Métrica | Pre-match | In-match | Observação |\n|---|---:|---:|---|\n")
+        lines.append(f"| Observações totais com classificação temporal | {len(pm)} | {len(im)} | Contagem bruta do corte |\n")
+        lines.append(
+            f"| ROI Betslip | {len([d for d in with_bs if d.get('is_live') is False and d.get('roi_bs') is not None])} | {len([d for d in with_bs if d.get('is_live') is True and d.get('roi_bs') is not None])} | Amostra com resultado do jogo |\n"
+        )
+        lines.append(
+            f"| ROI WebSocket | {len([d for d in all_data if d.get('is_live') is False and d.get('roi_ws') is not None])} | {len([d for d in all_data if d.get('is_live') is True and d.get('roi_ws') is not None])} | Referência de mercado |\n"
+        )
+        lines.append(
+            f"| CLV (apenas pre-match) | {len([d for d in with_bs if d.get('is_live') is False and d.get('clv_bs') is not None and -50 < float(d['clv_bs']) < 50])} | — | CLV vs closing pré-jogo não é interpretável in-match |\n"
+        )
+        lines.append("\n---\n")
+
+        # 2.2) Performance por regime (pre vs in)
+        lines.append("### 2.2 Performance por regime (pre-match vs in-match)\n")
+        lines.append("| Regime | N auditorias | N betslip conf. | N OK | Back edge | Lay edge | Diff médio (OK) |\n|---|---:|---:|---:|---:|---:|---:|\n")
+        for label, is_live_val in [("PRE_MATCH", False), ("IN_MATCH", True)]:
+            sub_all = [d for d in all_data if d.get("is_live") is is_live_val]
+            sub_bs = [d for d in with_bs if d.get("is_live") is is_live_val]
+            sub_ok = [d for d in ok_bs if d.get("is_live") is is_live_val]
+            sub_back = [d for d in back_edge if d.get("is_live") is is_live_val]
+            sub_lay = [d for d in lay_edge if d.get("is_live") is is_live_val]
+            diff_mean = _mean([float(d["diff_pct"]) for d in sub_ok]) if sub_ok else None
+            lines.append(
+                f"| {label} | {len(sub_all)} | {len(sub_bs)} | {len(sub_ok)} | {len(sub_back)} | {len(sub_lay)} | {_fmt_pct(diff_mean)} |\n"
+            )
+        lines.append("\n---\n")
+
+        if not args.exec_bucket:
+            # 2.3) Regimes operacionais por bucket de tempo total (lag_total_ms)
+            lines.append("### 2.3 Regimes operacionais por tempo total (bucket)\n")
+            lines.append(
+                "Objetivo: separar a amostra em **regimes de execução** (tempo total) e medir performance em cada regime. "
+                "Use isso para detectar **fila/saturação**: regimes lentos tendem a ter edge menor e pior ROI.\n\n"
+            )
+            lines.append("| Bucket (tempo total) | N OK | Jogos | lag_total mean (ms) | lag_total p95 (ms) | overhead p95 (ms) | Back edge | Lay edge | CLV PM (mean; IC90) | ROI (mean; IC90) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
+                sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
+                if not sub:
+                    lines.append(f"| {b} | 0 | 0 | — | — | — | 0 | 0 | — | — |\n")
+                    continue
+                lags = [float(x) for x in [(_safe_float(d.get("lag_total_ms"))) for d in sub] if x is not None and x > 0]
+                over = [float(x) for x in [(_safe_float(d.get("lag_overhead_ms"))) for d in sub] if x is not None]
+                lag_mean = float(np.mean(lags)) if lags else None
+                lag_p95 = float(np.quantile(lags, 0.95)) if lags else None
+                ov_p95 = float(np.quantile(over, 0.95)) if over else None
+
+                n_matches = len({int(d["match_id"]) for d in sub})
+                n_back = sum(1 for d in sub if int(d["id"]) in back_edge_ids)
+                n_lay = sum(1 for d in sub if int(d["id"]) in lay_edge_ids)
+
+                clv_pm = summarize_metric(
+                    [d.get("clv_bs") for d in sub if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                roi_all = summarize_metric(
+                    [d.get("roi_bs") for d in sub],
+                    [d.get("match_id") for d in sub],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                clv_txt = f"{_fmt_pct(clv_pm.mean_cluster,2)} {_fmt_ci(clv_pm.ci90_cluster,2)}" if clv_pm.n_events else "—"
+                roi_txt = f"{_fmt_pct(roi_all.mean_cluster,2)} {_fmt_ci(roi_all.ci90_cluster,2)}" if roi_all.n_events else "—"
+                lines.append(
+                    f"| {b} | {len(sub)} | {n_matches} | {_fmt_num(lag_mean,0)} | {_fmt_num(lag_p95,0)} | {_fmt_num(ov_p95,0)} | {n_back} | {n_lay} | {clv_txt} | {roi_txt} |\n"
+                )
+            lines.append("\n---\n")
+
+            # 2.3b) Mesmo bucket, mas separando coortes por delta BS vs WS (diff buckets)
+            lines.append("### 2.3b Regimes por tempo total — separando coortes por `diff_pct` (BS vs WS)\n")
+            lines.append(
+                "Nesta tabela, separamos duas coortes operacionais por **delta de execução**: "
+                "`BS > WS` (diff_pct >= +2%) e `BS < WS` (diff_pct <= -2%). "
+                "Isso **não** é (por si só) “Back vs Lay”; é um recorte por **melhora/piora do preço** entre detecção (WS) e execução (BS). "
+                "CLV é reportado apenas em pre‑match.\n\n"
+            )
+            lines.append("| Bucket | N OK | N (BS>WS +2%) | N (BS<WS -2%) | CLV PM (BS>WS) | CLV PM (BS<WS) | ROI (BS>WS) | ROI (BS<WS) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+            for b in ["< 5s", "5-10s", "10-20s", "20-40s", "> 40s", "Desconhecido"]:
+                sub = [d for d in ok_bs if str(d.get("exec_bucket")) == b]
+                if not sub:
+                    lines.append(f"| {b} | 0 | 0 | 0 | — | — | — | — |\n")
+                    continue
+
+                sub_back = [d for d in sub if int(d["id"]) in back_edge_ids]
+                sub_lay = [d for d in sub if int(d["id"]) in lay_edge_ids]
+
+                clv_back = summarize_metric(
+                    [d.get("clv_bs") for d in sub_back if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub_back if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                clv_lay = summarize_metric(
+                    [d.get("clv_bs") for d in sub_lay if d.get("is_live") is False],
+                    [d.get("match_id") for d in sub_lay if d.get("is_live") is False],
+                    clip_low=-50,
+                    clip_high=50,
+                )
+                roi_back = summarize_metric(
+                    [d.get("roi_bs") for d in sub_back],
+                    [d.get("match_id") for d in sub_back],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                roi_lay = summarize_metric(
+                    [d.get("roi_bs") for d in sub_lay],
+                    [d.get("match_id") for d in sub_lay],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+
+                clv_back_txt = f"{_fmt_pct(clv_back.mean_cluster,2)} {_fmt_ci(clv_back.ci90_cluster,2)}" if clv_back.n_events else "—"
+                clv_lay_txt = f"{_fmt_pct(clv_lay.mean_cluster,2)} {_fmt_ci(clv_lay.ci90_cluster,2)}" if clv_lay.n_events else "—"
+                roi_back_txt = f"{_fmt_pct(roi_back.mean_cluster,2)} {_fmt_ci(roi_back.ci90_cluster,2)}" if roi_back.n_events else "—"
+                roi_lay_txt = f"{_fmt_pct(roi_lay.mean_cluster,2)} {_fmt_ci(roi_lay.ci90_cluster,2)}" if roi_lay.n_events else "—"
+                lines.append(
+                    f"| {b} | {len(sub)} | {len(sub_back)} | {len(sub_lay)} | {clv_back_txt} | {clv_lay_txt} | {roi_back_txt} | {roi_lay_txt} |\n"
+                )
+            lines.append("\n---\n")
+
+            # 2.3c) Estabilidade temporal (time-dependent) — por dia
+            lines.append("### 2.3c Estabilidade temporal (por dia, `audited_at`)\n")
+            lines.append(
+                "Objetivo: checar se o regime de edge/execução é **time‑dependent**. "
+                "Se houver dias com comportamento distinto (ex.: collector intermitente, horários/ligas), isso aparecerá aqui.\n\n"
+            )
+            # Foco na amostra executável (OK + betslip confiável). Por padrão mostramos API; se DOM existir, aparece em outra linha.
+            lines.append(
+                "| Dia (UTC) | Modelo | N OK | Jogos | % BS>WS +2% | % BS<WS -2% | lag_total p50 (ms) | CLV PM (BS>WS) | CLV PM (BS<WS) |\n"
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+            )
+
+            def _day_key(dt: Any) -> Optional[str]:
+                if not isinstance(dt, datetime):
+                    return None
+                try:
+                    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                except Exception:
+                    return None
+
+            day_keys = sorted({k for k in (_day_key(d.get("audited_at")) for d in ok_bs) if k})
+            for ds in day_keys[-14:]:  # último ~14 dias no máximo
+                for model_name in ["API (2-4s)", "DOM (15-30s)"]:
+                    sub = [d for d in ok_bs if str(d.get("model")) == model_name and _day_key(d.get("audited_at")) == ds]
+                    if not sub:
+                        continue
+                    sub_back = [d for d in sub if int(d["id"]) in back_edge_ids]
+                    sub_lay = [d for d in sub if int(d["id"]) in lay_edge_ids]
+                    share_back = (100.0 * len(sub_back) / len(sub)) if sub else None
+                    share_lay = (100.0 * len(sub_lay) / len(sub)) if sub else None
+                    n_matches = len({int(d["match_id"]) for d in sub})
+                    lags = [float(v) for v in (_safe_float(d.get("lag_total_ms")) for d in sub) if v is not None and float(v) > 0]
+                    lag_p50 = float(np.median(lags)) if lags else None
+
+                    clv_back = summarize_metric(
+                        [d.get("clv_bs") for d in sub_back if d.get("is_live") is False],
+                        [d.get("match_id") for d in sub_back if d.get("is_live") is False],
+                        clip_low=-50,
+                        clip_high=50,
+                    )
+                    clv_lay = summarize_metric(
+                        [d.get("clv_bs") for d in sub_lay if d.get("is_live") is False],
+                        [d.get("match_id") for d in sub_lay if d.get("is_live") is False],
+                        clip_low=-50,
+                        clip_high=50,
+                    )
+                    clv_back_txt = f"{_fmt_pct(clv_back.mean_cluster,2)}" if clv_back.n_events else "—"
+                    clv_lay_txt = f"{_fmt_pct(clv_lay.mean_cluster,2)}" if clv_lay.n_events else "—"
+
+                    lines.append(
+                        f"| {ds} | {model_name} | {len(sub)} | {n_matches} | {_fmt_num(share_back,1)}% | {_fmt_num(share_lay,1)}% | "
+                        f"{_fmt_num(lag_p50,0)} | {clv_back_txt} | {clv_lay_txt} |\n"
+                    )
+            lines.append("\n---\n")
+
+        # 3) CLV pre-match (robusto)
+        lines.append("## 3) CLV pre-match (núcleo)\n")
+        lines.append("### 3.1 CLV com odd do Betslip (execução real)\n")
+        lines.append(
+            "| Métrica | API | DOM |\n|---|---:|---:|\n"
+        )
+
+        def model_metric(model_name: str, key: str, prematch_only: bool = True) -> MetricSummary:
+            subset = subset_bs_model(model_name)  # apenas betslip confiável
+            if prematch_only:
+                subset = [d for d in subset if d.get("is_live") is False]
+            vals = [d.get(key) for d in subset]
+            mids = [d.get("match_id") for d in subset]
+            # IMPORTANTE:
+            # - CLV é % vs closing e pode ser sanity-clipped (evita lixo/parse errado).
+            # - ROI pode assumir -100% em loss e >50% em wins (principalmente odds altas),
+            #   então NÃO pode herdar o clip de CLV, senão distorce N e win rate.
+            if "clv" in str(key).lower():
+                return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+            if "roi" in str(key).lower():
+                return summarize_metric(vals, mids, clip_low=-100, clip_high=500)
+            return summarize_metric(vals, mids)
+
+        api_clv = model_metric("API (2-4s)", "clv_bs", prematch_only=True)
+        dom_clv = model_metric("DOM (15-30s)", "clv_bs", prematch_only=True)
+        api_clv_ad = model_metric("API (2-4s)", "clv_bs_adicional", prematch_only=True)
+        dom_clv_ad = model_metric("DOM (15-30s)", "clv_bs_adicional", prematch_only=True)
+
+        lines.append(
+            f"| CLV Bruto BS Pre-Match | {_fmt_pct(api_clv.mean_event)} ({_sig_label(api_clv.ci90_cluster)}, N={api_clv.n_events}, jogos={api_clv.n_matches}) | {_fmt_pct(dom_clv.mean_event)} ({_sig_label(dom_clv.ci90_cluster)}, N={dom_clv.n_events}, jogos={dom_clv.n_matches}) |\n"
+        )
+        lines.append(
+            f"| CLV Adicional BS Pre-Match | {_fmt_pct(api_clv_ad.mean_event)} ({_sig_label(api_clv_ad.ci90_cluster)}, N={api_clv_ad.n_events}, jogos={api_clv_ad.n_matches}) | {_fmt_pct(dom_clv_ad.mean_event)} ({_sig_label(dom_clv_ad.ci90_cluster)}, N={dom_clv_ad.n_events}, jogos={dom_clv_ad.n_matches}) |\n"
+        )
+        lines.append(
+            f"| Taxa de CLV > 0 (bruto) | {_fmt_num(api_clv.hit_rate_event, 1)}% | {_fmt_num(dom_clv.hit_rate_event, 1)}% |\n"
+        )
+        lines.append(
+            f"| Taxa de CLV > 0 (adicional) | {_fmt_num(api_clv_ad.hit_rate_event, 1)}% | {_fmt_num(dom_clv_ad.hit_rate_event, 1)}% |\n"
+        )
+        lines.append("\nNotas de robustez (IC 90% por jogo):  \n")
+        lines.append(f"- API CLV bruto (cluster): média {_fmt_pct(api_clv.mean_cluster)}; IC90 {_fmt_ci(api_clv.ci90_cluster)}  \n")
+        lines.append(f"- DOM CLV bruto (cluster): média {_fmt_pct(dom_clv.mean_cluster)}; IC90 {_fmt_ci(dom_clv.ci90_cluster)}  \n")
+        lines.append("\n---\n")
+
+        # 4) ROI por modelo
+        lines.append("## 4) ROI por modelo\n")
+        lines.append("| Métrica | API | DOM |\n|---|---:|---:|\n")
+
+        api_roi = model_metric("API (2-4s)", "roi_bs", prematch_only=False)
+        dom_roi = model_metric("DOM (15-30s)", "roi_bs", prematch_only=False)
+        api_roi_ws = summarize_metric(
+            [d.get("roi_ws") for d in api_all],
+            [d.get("match_id") for d in api_all],
+            clip_low=-100,
+            clip_high=500,  # ROI pode ser alto; limitamos só para evitar infinito
+        )
+        dom_roi_ws = summarize_metric(
+            [d.get("roi_ws") for d in dom_all],
+            [d.get("match_id") for d in dom_all],
+            clip_low=-100,
+            clip_high=500,
+        )
+
+        lines.append(
+            f"| ROI Betslip | {_fmt_pct(api_roi.mean_event)} ({_sig_label(api_roi.ci90_cluster)}, N={api_roi.n_events}) | {_fmt_pct(dom_roi.mean_event)} ({_sig_label(dom_roi.ci90_cluster)}, N={dom_roi.n_events}) |\n"
+        )
+        lines.append(
+            f"| ROI WebSocket | {_fmt_pct(api_roi_ws.mean_event)} ({_sig_label(api_roi_ws.ci90_cluster)}, N={api_roi_ws.n_events}) | {_fmt_pct(dom_roi_ws.mean_event)} ({_sig_label(dom_roi_ws.ci90_cluster)}, N={dom_roi_ws.n_events}) |\n"
+        )
+        lines.append(
+            f"| Win rate ROI Betslip | {_fmt_num(api_roi.hit_rate_event, 1)}% | {_fmt_num(dom_roi.hit_rate_event, 1)}% |\n"
+        )
+        lines.append(
+            f"| Win rate ROI WS | {_fmt_num(api_roi_ws.hit_rate_event, 1)}% | {_fmt_num(dom_roi_ws.hit_rate_event, 1)}% |\n"
+        )
+        lines.append("\nNotas de robustez (IC 90% por jogo):  \n")
+        lines.append(f"- API ROI betslip (cluster): média {_fmt_pct(api_roi.mean_cluster)}; IC90 {_fmt_ci(api_roi.ci90_cluster)}  \n")
+        lines.append(f"- API ROI WS (cluster): média {_fmt_pct(api_roi_ws.mean_cluster)}; IC90 {_fmt_ci(api_roi_ws.ci90_cluster)}  \n")
+        lines.append("\n---\n")
+
+        # 5) Diferença de preço BS vs WS
+        lines.append("## 5) Diferença de preço BS vs WS\n")
+        lines.append("| Métrica | API | DOM |\n|---|---:|---:|\n")
+
+        def model_diff(model_name: str) -> MetricSummary:
+            subset = subset_bs_model(model_name)
+            vals = [d.get("diff_pct") for d in subset]
+            mids = [d.get("match_id") for d in subset]
+            return summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+
+        api_diff = model_diff("API (2-4s)")
+        dom_diff = model_diff("DOM (15-30s)")
+        api_bs_gt_ws = len([d for d in api_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 0])
+        dom_bs_gt_ws = len([d for d in dom_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 0])
+        api_bs_gt_ws_2 = len([d for d in api_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 2])
+        dom_bs_gt_ws_2 = len([d for d in dom_bs if d.get("diff_pct") is not None and float(d["diff_pct"]) > 2])
+
+        lines.append(
+            f"| Diff BS vs WS (média) | {_fmt_pct(api_diff.mean_event)} ({_sig_label(api_diff.ci90_cluster)}, N={api_diff.n_events}) | {_fmt_pct(dom_diff.mean_event)} ({_sig_label(dom_diff.ci90_cluster)}, N={dom_diff.n_events}) |\n"
+        )
+        lines.append(f"| BS > WS | {_fmt_num(api_bs_gt_ws / len(api_bs) * 100 if api_bs else None, 1)}% ({api_bs_gt_ws}/{len(api_bs)}) | {_fmt_num(dom_bs_gt_ws / len(dom_bs) * 100 if dom_bs else None, 1)}% ({dom_bs_gt_ws}/{len(dom_bs)}) |\n")
+        lines.append(f"| BS > WS +2% | {_fmt_num(api_bs_gt_ws_2 / len(api_bs) * 100 if api_bs else None, 1)}% ({api_bs_gt_ws_2}/{len(api_bs)}) | {_fmt_num(dom_bs_gt_ws_2 / len(dom_bs) * 100 if dom_bs else None, 1)}% ({dom_bs_gt_ws_2}/{len(dom_bs)}) |\n")
+        lines.append("\n---\n")
+
+        # 6) Combinações (buckets / linha / lag)
+        lines.append("## 6) Combinações de valor\n")
+
+        # 6.1 buckets
+        bucket_clv_pm: Dict[str, MetricSummary] = {}
+        lines.append("### 6.1 Buckets por diferença BS vs WS\n")
+        lines.append(
+            "Nota de leitura:\n"
+            "- `BS > WS (+2% a +10%)`: preço no betslip ficou **melhor** do que o WS observado na detecção (delta positivo entre instantes).\n"
+            "- `BS < WS (-10% a -2%)`: preço no betslip ficou **pior** do que o WS observado na detecção (delta negativo entre instantes).\n"
+            "- O ROI abaixo é calculado **dentro do bucket** (não mistura buckets), mas ainda é sensível à cobertura de placar.\n\n"
+        )
+        lines.append("| Bucket | N bucket | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) |\n|---|---:|---:|---|---:|---:|---:|---|\n")
+        for bucket in ["BS < WS (-10% a -2%)", "BS ~ WS (-2% a +2%)", "BS > WS (+2% a +10%)"]:
+            subset = [d for d in with_bs if d.get("diff_bucket") == bucket]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            bucket_clv_pm[bucket] = clv_pm
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            lines.append(
+                f"| {bucket} | {len(subset)} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {clv_pm.n_events} | {clv_pm.n_matches} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 6.2 linha AH
+        lines.append("### 6.2 Combinação por faixa de linha AH\n")
+        lines.append("| Faixa AH | CLV BS PM (média) | IC90 (cluster) | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---|---:|\n")
+        for lb in ["AH 0-1 (líquida)", "AH 1-2 (média)", "AH 2+ (extrema)"]:
+            subset = [d for d in with_bs if d.get("line_bucket") == lb]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            diff_all = summarize_metric(
+                [d.get("diff_pct") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-50,
+                clip_high=50,
+            )
+            lines.append(
+                f"| {lb} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # 6.3 lag
+        lag_clv_pm: Dict[str, MetricSummary] = {}
+        lines.append("### 6.3 Combinação por faixa de lag\n")
+        lines.append("| Faixa de lag | CLV BS PM (média) | IC90 (cluster) | N CLV PM | Jogos CLV PM | ROI BS (todos) | IC90 (cluster) | Diff BS vs WS (média) |\n|---|---:|---|---:|---:|---:|---|---:|\n")
+        for lag in ["< 10s", "10-20s", "20-30s", "> 30s"]:
+            subset = [d for d in with_bs if d.get("lag_bucket") == lag]
+            clv_pm = summarize_metric(
+                [d.get("clv_bs") for d in subset if d.get("is_live") is False],
+                [d.get("match_id") for d in subset if d.get("is_live") is False],
+                clip_low=-50,
+                clip_high=50,
+            )
+            lag_clv_pm[lag] = clv_pm
+            roi_all = summarize_metric(
+                [d.get("roi_bs") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-100,
+                clip_high=500,
+            )
+            diff_all = summarize_metric(
+                [d.get("diff_pct") for d in subset],
+                [d.get("match_id") for d in subset],
+                clip_low=-50,
+                clip_high=50,
+            )
+            lines.append(
+                f"| {lag} | {_fmt_pct(clv_pm.mean_event)} | {_fmt_ci(clv_pm.ci90_cluster)} | {clv_pm.n_events} | {clv_pm.n_matches} | {_fmt_pct(roi_all.mean_event)} | {_fmt_ci(roi_all.ci90_cluster)} | {_fmt_pct(diff_all.mean_event)} |\n"
+            )
+        lines.append("\n---\n")
+
+        # ============================================================
+        # Insere sumário executivo no topo (após header)
+        # ============================================================
+        summary_lines: List[str] = []
+        summary_lines.append("## 0) Sumário executivo (leitura rápida)\n")
+        summary_lines.append(f"- **Recorte**: direction=`{args.direction}`, lookback_days=`{args.lookback_days}`, versions=`{','.join(versions)}`.\n")
+        summary_lines.append(
+            f"- **Amostra**: {len(all_data)} auditorias (jogos únicos={unique_matches_all}, média={avg_obs_per_match:.1f} obs/jogo); betslip confiável={len(with_bs)}.\n"
+        )
+        if audited_min and audited_max:
+            span_label = f"{audited_span_days:.1f}d" if audited_span_days is not None else "—"
+            summary_lines.append(
+                f"- **Janela efetiva (audited_at)**: {audited_min.strftime('%d/%m %H:%M')} → {audited_max.strftime('%d/%m %H:%M')} UTC "
+                f"(span≈{span_label}; dias com dados={audited_unique_days}).\n"
+            )
+            if args.lookback_days and audited_span_days is not None and audited_span_days < (0.70 * float(args.lookback_days)):
+                summary_lines.append(
+                    f"- **Alerta**: lookback_days={args.lookback_days}, mas a janela efetiva observada foi menor (span≈{span_label}). "
+                    "Isso costuma indicar falta de auditorias antigas para essas `audit_version` (ou recorte por regime/qualidade).\n"
+                )
+        summary_lines.append(
+            f"- **Coortes (status=OK, betslip confiável)**: `BS>WS` (diff>={back_cut:.1f}%): **{len(back_edge)}**; `BS<WS` (diff<={lay_cut:.1f}%): **{len(lay_edge)}**.\n"
+        )
+        summary_lines.append(
+            f"- **Coberturas em `hypothesis_details` (OK)**: temporal(back)={n_temporal}/{len(ok_bs)}; lay_temporal={n_lay_temporal}/{len(ok_bs)}; finance={n_finance}/{len(ok_bs)}.\n"
+        )
+        summary_lines.append(
+            f"- **Cobertura de placar (ROI)**: jogos com placar={matches_with_scores}/{unique_matches_all} (status finished={matches_finished_flag}).\n"
+        )
+        if ah_unique_matches:
+            summary_lines.append(
+                f"- **Cobertura de closing_odd (AH)**: jogos com closing={ah_unique_matches_with_closing}/{ah_unique_matches} "
+                f"({_fmt_num(ah_closing_coverage_pct,1)}%). CLV pre‑match depende disso.\n"
+            )
+            if ah_closing_coverage_pct is not None and ah_closing_coverage_pct < 80.0:
+                summary_lines.append(
+                    "- **Alerta**: cobertura de closing_odd está baixa. Isso tende a reduzir N de CLV e pode enviesar a leitura "
+                    "(os jogos “sem odds” ficam fora do CLV). Priorize estabilizar o collector e/ou condicionar análises a jogos com closing.\n"
+                )
+        if len(dom_all) == 0:
+            summary_lines.append("- **DOM**: sem dados no recorte atual (N=0), então não há comparação API vs DOM aqui.\n")
+        # CLV foco
+        summary_lines.append(
+            f"- **CLV pre-match (Betslip, API)**: média robusta por jogo {_fmt_pct(api_clv.mean_cluster)} (IC90 {_fmt_ci(api_clv.ci90_cluster)}), "
+            f"com N={api_clv.n_events} eventos (jogos={api_clv.n_matches}).\n"
+        )
+        # Buckets
+        b_neg = bucket_clv_pm.get("BS < WS (-10% a -2%)")
+        b_neu = bucket_clv_pm.get("BS ~ WS (-2% a +2%)")
+        b_pos = bucket_clv_pm.get("BS > WS (+2% a +10%)")
+        if b_neg and b_neu and b_pos:
+            summary_lines.append(
+                "- **Padrão por bucket (CLV PM)**: "
+                f"`BS < WS` {_fmt_pct(b_neg.mean_event)} ({_sig_label(b_neg.ci90_cluster)}), "
+                f"`BS ~ WS` {_fmt_pct(b_neu.mean_event)} ({_sig_label(b_neu.ci90_cluster)}), "
+                f"`BS > WS` {_fmt_pct(b_pos.mean_event)} ({_sig_label(b_pos.ci90_cluster)}).\n"
+            )
+        # ROI coverage
+        if api_roi.n_events == 0 and dom_roi.n_events == 0:
+            summary_lines.append(
+                "- **ROI**: sem cobertura no recorte (N=0). Isso normalmente acontece quando os placares ainda não foram sincronizados para esses jogos.\n"
+            )
+        summary_lines.append(
+            "- **Leitura recomendada**: use este relatório para validar **qualidade de execução/CLV**. Para concluir sobre **ROI**, rode após atualizar resultados "
+            "e/ou use uma janela com jogos já liquidados.\n"
+        )
+        summary_lines.append("\n---\n")
+
+        # Header atual tem 5 linhas: título, data, escopo, nota, '---'
+        # Inserimos o sumário logo depois disso.
+        lines[5:5] = summary_lines
+
+        # ============================================================
+        # 7) Estimativa financeira (proxy) + risco
+        # ============================================================
+        lines.append("## 7) Estimativa financeira (proxy) e risco\n")
+        lines.append("Este bloco usa `hypothesis_details.finance` quando existe; se não existir, usa stake fallback = `stake_pct_of_limit × limit`.\n\n")
+
+        stake_pct = max(0.0, float(args.stake_pct_of_limit))
+        stake_cap = max(0.0, float(args.stake_cap))
+
+        lines.append("**Política de stake (proxy)**\n\n")
+        lines.append("| Parâmetro | Valor |\n|---|---:|\n")
+        lines.append(f"| stake_pct_of_limit | {stake_pct:.2f} |\n")
+        lines.append(f"| stake_cap | {stake_cap:.2f} |\n")
+        lines.append(f"| Cobertura finance (OK, betslip conf.) | {n_finance}/{len(ok_bs)} |\n")
+        lines.append("\n")
+
+        def stake_from_limit(limit_value: float) -> float:
+            s = max(0.0, limit_value) * stake_pct
+            if stake_cap > 0:
+                s = min(s, stake_cap)
+            return s
+
+        def finance_for_row(d: dict) -> Tuple[float, float, float, float]:
+            """
+            Retorna (back_stake, back_profit_if_win, lay_stake, lay_liability).
+            """
+            h = d.get("hypothesis_details") or {}
+            fin = h.get("finance") if isinstance(h, dict) else None
+            bs = bp = ls = ll = None
+            if isinstance(fin, dict):
+                bs = _safe_float(_get_path(fin, ["back", "suggested_stake"]))
+                bp = _safe_float(_get_path(fin, ["back", "profit_if_win"]))
+                ls = _safe_float(_get_path(fin, ["lay", "suggested_stake"]))
+                ll = _safe_float(_get_path(fin, ["lay", "liability_if_lose"]))
+
+            if bs is None:
+                bs = stake_from_limit(float(d.get("limit") or 0.0))
+            if bp is None:
+                odd = _safe_float(d.get("bs_odd")) or 0.0
+                bp = bs * max(0.0, odd - 1.0) if (bs and odd > 1.0) else 0.0
+
+            if ls is None:
+                # tenta usar lay.available_limit
+                lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                ls = stake_from_limit(float(lay_lim if lay_lim is not None else (d.get("limit") or 0.0)))
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or 0.0
+            if lay_odd <= 0:
+                lay_odd = _safe_float(d.get("bs_odd")) or 0.0  # proxy
+            if ll is None:
+                ll = ls * max(0.0, lay_odd - 1.0) if (ls and lay_odd > 1.0) else 0.0
+
+            return float(bs), float(bp), float(ls), float(ll)
+
+        back_stakes = []
+        back_profit_if_win = []
+        lay_stakes = []
+        lay_liability = []
+        for d in ok_bs:
+            bs, bp, ls, ll = finance_for_row(d)
+            if int(d["id"]) in back_edge_ids:
+                back_stakes.append(bs)
+                back_profit_if_win.append(bp)
+            if int(d["id"]) in lay_edge_ids:
+                lay_stakes.append(ls)
+                lay_liability.append(ll)
+
+        lines.append("### 7.1 Back (BS >> WS)\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Corte (diff_pct) | >= {back_cut:.1f}% |\n")
+        lines.append(f"| N eventos | {len(back_edge)} |\n")
+        back_finance_cov = sum(
+            1 for d in back_edge if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
+        lines.append(f"| Cobertura finance (na coorte) | {back_finance_cov}/{len(back_edge)} |\n")
+        lines.append(f"| Stake total (estimado) | {_fmt_num(sum(back_stakes) if back_stakes else None, 2)} |\n")
+        lines.append(f"| Stake médio | {_fmt_num(_mean(back_stakes), 2)} |\n")
+        lines.append(f"| Profit_if_win total (estimado) | {_fmt_num(sum(back_profit_if_win) if back_profit_if_win else None, 2)} |\n")
+        lines.append(f"| Profit_if_win médio | {_fmt_num(_mean(back_profit_if_win), 2)} |\n")
+
+        # ROI realizado (quando houver placar)
+        back_realized = []
+        back_realized_stakes = []
+        back_realized_roi = []
+        back_realized_mids = []
+        for d in back_edge:
+            roi = _safe_float(d.get("roi_bs"))
+            if roi is None:
+                continue
+            bs, _, _, _ = finance_for_row(d)
+            back_realized.append(float(bs) * float(roi) / 100.0)
+            back_realized_stakes.append(float(bs))
+            back_realized_roi.append(float(roi))
+            back_realized_mids.append(int(d.get("match_id")))
+        if back_realized:
+            roi_weighted = (sum(back_realized) / sum(back_realized_stakes) * 100.0) if sum(back_realized_stakes) > 0 else None
+            lines.append(f"| N com ROI realizado | {len(back_realized)} |\n")
+            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(back_realized), 2)} |\n")
+            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_weighted, 2)}% |\n")
+
+            roi_sum = summarize_metric(back_realized_roi, back_realized_mids, clip_low=-100, clip_high=500)
+            lines.append(f"| ROI realizado (robusto por jogo, mean; IC90) | {_fmt_pct(roi_sum.mean_cluster,2)} {_fmt_ci(roi_sum.ci90_cluster,2)} |\n")
+
+            # IC90 também para ROI ponderado por stake (agrega por jogo e bootstrap)
+            by_match_w: Dict[int, Tuple[float, float]] = {}
+            for d in back_edge:
+                roi = _safe_float(d.get("roi_bs"))
+                if roi is None:
+                    continue
+                mid = int(d.get("match_id"))
+                bs, _, _, _ = finance_for_row(d)
+                pnl = float(bs) * float(roi) / 100.0
+                s, w = by_match_w.get(mid, (0.0, 0.0))
+                by_match_w[mid] = (s + pnl, w + float(bs))
+            per_match_roi = {mid: (pnl / w * 100.0) for mid, (pnl, w) in by_match_w.items() if w > 0}
+            mean_w, ci_w = cluster_bootstrap_ci({mid: [val] for mid, val in per_match_roi.items()}, n_boot=4000, alpha=0.10)
+            lines.append(f"| ROI ponderado por stake (robusto por jogo, mean; IC90) | {_fmt_pct(mean_w,2)} {_fmt_ci(ci_w,2)} |\n")
+        else:
+            lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
+        lines.append(
+            "\n**Como ler as 3 linhas de ROI (Back)**\n\n"
+            "- **ROI realizado (ponderado por stake)**: \u03a3P&L / \u03a3stake (pode ser dominado por stakes grandes).\n"
+            "- **ROI realizado (robusto por jogo)**: média por jogo (cada jogo pesa parecido; reduz dominância de outliers).\n"
+            "- **ROI ponderado por stake (robusto por jogo)**: calcula ROI ponderado dentro do jogo e depois faz média/IC por jogo.\n"
+        )
+        lines.append(
+            "\nObservação: a Seção 4 reporta ROI médio no **recorte completo** (betslip confiável). "
+            "Aqui (7.1) é apenas a coorte **Back edge** (diff>=corte) e o ROI também é mostrado ponderado por stake; "
+            "por isso sinais podem divergir.\n"
+        )
+
+        lines.append("\n### 7.2 Lay (BS << WS) — risco de cauda\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Corte (diff_pct) | <= {lay_cut:.1f}% |\n")
+        lines.append(f"| N eventos | {len(lay_edge)} |\n")
+        lay_finance_cov = sum(
+            1 for d in lay_edge if isinstance(_get_path(d.get("hypothesis_details") or {}, ["finance"]), dict)
+        )
+        lines.append(f"| Cobertura finance (na coorte) | {lay_finance_cov}/{len(lay_edge)} |\n")
+        lines.append(f"| Stake total (estimado) | {_fmt_num(sum(lay_stakes) if lay_stakes else None, 2)} |\n")
+        lines.append(f"| Liability total (estimada) | {_fmt_num(sum(lay_liability) if lay_liability else None, 2)} |\n")
+        lines.append(f"| Liability média | {_fmt_num(_mean(lay_liability), 2)} |\n")
+        lines.append(f"| Liability p95 | {_fmt_num(_pctl(lay_liability, 95), 2)} |\n")
+        lines.append(f"| Liability p99 | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
+        lines.append(f"| ES95 (liability) | {_fmt_num(_es_tail(lay_liability, 95), 2)} |\n")
+        lines.append(f"| Liability max | {_fmt_num(max(lay_liability) if lay_liability else None, 2)} |\n")
+        lines.append(f"| Proxy de banca (>= p99 liability) | {_fmt_num(_pctl(lay_liability, 99), 2)} |\n")
+
+        # ROI/P&L realizado no Lay (quando houver placar)
+        def _mult_back_from_row(d: dict) -> Optional[float]:
+            hs = d.get("home_score")
+            aws = d.get("away_score")
+            if hs is None or aws is None:
+                return None
+            try:
+                goal_diff = int(hs) - int(aws)
+            except Exception:
+                return None
+            try:
+                ah_line = float(str(d.get("line", "")).replace(",", "."))
+            except Exception:
+                return None
+            side = (str(d.get("side") or "")).strip()
+            if side == "home":
+                adjusted = goal_diff + ah_line
+            else:
+                adjusted = -goal_diff - ah_line
+            if adjusted > 0.25:
+                return 1.0
+            if adjusted == 0.25:
+                return 0.5
+            if adjusted == 0:
+                return 0.0
+            if adjusted == -0.25:
+                return -0.5
+            return -1.0
+
+        lay_realized_pnl = []
+        lay_realized_liab = []
+        lay_realized_stake = []
+        lay_realized_roi_liab = []
+        lay_realized_roi_stake = []
+        lay_realized_mids = []
+        for d in lay_edge:
+            mult = _mult_back_from_row(d)
+            if mult is None:
+                continue
+            h = d.get("hypothesis_details") or {}
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+            if lay_odd is None or lay_odd <= 0:
+                lay_odd = _safe_float(d.get("bs_odd"))
+            if lay_odd is None or lay_odd <= 1.0:
+                continue
+            _, _, ls, ll = finance_for_row(d)
+            ls = float(ls)
+            ll = float(ll)
+            if ls <= 0 or ll <= 0:
+                continue
+            # ROI por stake e por liability
+            roi_stake = (-mult) * 100.0 if mult < 0 else (-mult) * (lay_odd - 1.0) * 100.0 if mult > 0 else 0.0
+            roi_stake = float(roi_stake)
+            roi_liab = (-mult) / (lay_odd - 1.0) * 100.0 if mult < 0 else (-mult) * 100.0 if mult > 0 else 0.0
+            roi_liab = float(roi_liab)
+            pnl = ls * roi_stake / 100.0  # equivale a ll * roi_liab/100
+
+            lay_realized_pnl.append(pnl)
+            lay_realized_liab.append(ll)
+            lay_realized_stake.append(ls)
+            lay_realized_roi_liab.append(roi_liab)
+            lay_realized_roi_stake.append(roi_stake)
+            lay_realized_mids.append(int(d.get("match_id")))
+
+        if lay_realized_pnl:
+            roi_liab_weighted = (sum(lay_realized_pnl) / sum(lay_realized_liab) * 100.0) if sum(lay_realized_liab) > 0 else None
+            roi_stake_weighted = (sum(lay_realized_pnl) / sum(lay_realized_stake) * 100.0) if sum(lay_realized_stake) > 0 else None
+            lines.append(f"| N com ROI realizado | {len(lay_realized_pnl)} |\n")
+            lines.append(f"| P&L realizado total (estimado) | {_fmt_num(sum(lay_realized_pnl), 2)} |\n")
+            lines.append(f"| ROI realizado (ponderado por liability) | {_fmt_num(roi_liab_weighted, 2)}% |\n")
+            lines.append(f"| ROI realizado (ponderado por stake) | {_fmt_num(roi_stake_weighted, 2)}% |\n")
+
+            # robusto por jogo (não ponderado)
+            roi_liab_sum = summarize_metric(lay_realized_roi_liab, lay_realized_mids, clip_low=-200, clip_high=5000)
+            lines.append(f"| ROI/liability (robusto por jogo, mean; IC90) | {_fmt_pct(roi_liab_sum.mean_cluster,2)} {_fmt_ci(roi_liab_sum.ci90_cluster,2)} |\n")
+
+            # robusto por jogo (ponderado por liability)
+            by_match_l: Dict[int, Tuple[float, float]] = {}
+            for d in lay_edge:
+                mult = _mult_back_from_row(d)
+                if mult is None:
+                    continue
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+                if lay_odd is None or lay_odd <= 0:
+                    lay_odd = _safe_float(d.get("bs_odd"))
+                if lay_odd is None or lay_odd <= 1.0:
+                    continue
+                _, _, ls, ll = finance_for_row(d)
+                ls = float(ls)
+                ll = float(ll)
+                if ls <= 0 or ll <= 0:
+                    continue
+                roi_stake = (-mult) * 100.0 if mult < 0 else (-mult) * (lay_odd - 1.0) * 100.0 if mult > 0 else 0.0
+                pnl = ls * float(roi_stake) / 100.0
+                mid = int(d.get("match_id"))
+                s, w = by_match_l.get(mid, (0.0, 0.0))
+                by_match_l[mid] = (s + pnl, w + ll)
+            per_match_roi_l = {mid: (pnl / w * 100.0) for mid, (pnl, w) in by_match_l.items() if w > 0}
+            mean_lw, ci_lw = cluster_bootstrap_ci({mid: [val] for mid, val in per_match_roi_l.items()}, n_boot=4000, alpha=0.10)
+            lines.append(f"| ROI/liability ponderado (robusto por jogo, mean; IC90) | {_fmt_pct(mean_lw,2)} {_fmt_ci(ci_lw,2)} |\n")
+        else:
+            lines.append("| N com ROI realizado | 0 (placares ausentes no recorte) |\n")
+
+        # ============================================================
+        # 7.3) Projeção mensal (30 dias fixo)
+        # ============================================================
+        lines.append("\n### 7.3 Projeção mensal (30 dias fixo) — turnover, lucro e banca\n")
+        lines.append(
+            "Premissas:\n"
+            "- **Mês = 30 dias fixo**.\n"
+            "- Turnover = soma de stakes (Back e Lay). Para Lay, também reportamos exposição por **liability**.\n"
+            "- **Banca por risco (unitária)** = p99/ES95(exposição por aposta).\n"
+            "- **Banca por liquidez (turnover)** = p95/p99 de capital **simultaneamente travado** (stake/liability em aberto até a liquidação), "
+            "capturando distribuição desigual de entradas ao longo do tempo.\n"
+            "- Projeção de lucro usa duas visões: (i) **lucro/dia observado** e (ii) **ROI observado × turnover projetado**.\n\n"
+        )
+
+        def _days_for_rate() -> float:
+            if args.lookback_days and int(args.lookback_days) > 0:
+                return float(args.lookback_days)
+            if audited_span_days is not None and audited_span_days > 0:
+                return float(audited_span_days)
+            return 1.0
+
+        window_days = _days_for_rate()
+        horizon_days = 30.0
+
+        def _proj_turnover(total_turnover: float) -> float:
+            return (float(total_turnover) / max(1e-9, window_days)) * horizon_days
+
+        def _roi_pct(pnl: float, turnover: float) -> Optional[float]:
+            if turnover <= 0:
+                return None
+            return (float(pnl) / float(turnover)) * 100.0
+
+        def _proj_profit_from_roi(turnover_30d: float, roi_pct: Optional[float]) -> Optional[float]:
+            if roi_pct is None:
+                return None
+            return float(turnover_30d) * float(roi_pct) / 100.0
+
+        # Back (realizado)
+        back_turnover_total = float(sum(back_stakes) if back_stakes else 0.0)
+        back_turnover_realized = float(sum(back_realized_stakes) if back_realized_stakes else 0.0)
+        back_pnl_realized = float(sum(back_realized) if back_realized else 0.0)
+        back_roi_realized = _roi_pct(back_pnl_realized, back_turnover_realized) if back_realized else None
+
+        # Lay (realizado)
+        lay_turnover_total = float(sum(lay_stakes) if lay_stakes else 0.0)
+        lay_liab_total = float(sum(lay_liability) if lay_liability else 0.0)
+        lay_turnover_realized = float(sum(lay_realized_stake) if lay_realized_stake else 0.0)
+        lay_liab_realized = float(sum(lay_realized_liab) if lay_realized_liab else 0.0)
+        lay_pnl_realized = float(sum(lay_realized_pnl) if lay_realized_pnl else 0.0)
+        lay_roi_realized_stake = _roi_pct(lay_pnl_realized, lay_turnover_realized) if lay_realized_pnl else None
+        lay_roi_realized_liab = _roi_pct(lay_pnl_realized, lay_liab_realized) if lay_realized_pnl else None
+
+        # Bancas (exposição unitária)
+        back_bank_conservative = _pctl(back_stakes, 99) if back_stakes else None
+        back_bank_aggressive = _es_tail(back_stakes, 95) if back_stakes else None
+        lay_bank_conservative = _pctl(lay_liability, 99) if lay_liability else None
+        lay_bank_aggressive = _es_tail(lay_liability, 95) if lay_liability else None
+
+        # Projeções 30d
+        back_turnover_30d = _proj_turnover(back_turnover_total)
+        lay_turnover_30d = _proj_turnover(lay_turnover_total)
+        lay_liab_30d = _proj_turnover(lay_liab_total)
+
+        back_profit_30d_direct = (back_pnl_realized / max(1e-9, window_days)) * horizon_days if back_realized else None
+        lay_profit_30d_direct = (lay_pnl_realized / max(1e-9, window_days)) * horizon_days if lay_realized_pnl else None
+        back_profit_30d_roi = _proj_profit_from_roi(back_turnover_30d, back_roi_realized) if back_realized else None
+        lay_profit_30d_roi = _proj_profit_from_roi(lay_turnover_30d, lay_roi_realized_stake) if lay_realized_pnl else None
+
+        total_turnover_30d = back_turnover_30d + lay_turnover_30d
+        total_profit_30d_direct = None
+        if back_profit_30d_direct is not None or lay_profit_30d_direct is not None:
+            total_profit_30d_direct = float(back_profit_30d_direct or 0.0) + float(lay_profit_30d_direct or 0.0)
+        total_profit_30d_roi = None
+        if back_profit_30d_roi is not None or lay_profit_30d_roi is not None:
+            total_profit_30d_roi = float(back_profit_30d_roi or 0.0) + float(lay_profit_30d_roi or 0.0)
+
+        total_bank_conservative = None
+        if back_bank_conservative is not None or lay_bank_conservative is not None:
+            total_bank_conservative = float(back_bank_conservative or 0.0) + float(lay_bank_conservative or 0.0)
+        total_bank_aggressive = None
+        if back_bank_aggressive is not None or lay_bank_aggressive is not None:
+            total_bank_aggressive = float(back_bank_aggressive or 0.0) + float(lay_bank_aggressive or 0.0)
+
+        # ------------------------------------------------------------
+        # Banca por liquidez (capital travado ao longo do tempo)
+        # ------------------------------------------------------------
+        LIQUIDITY_SETTLE_BUFFER_HOURS = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+        # Aproximação de tempo até liquidação: duração média do jogo + buffer operacional.
+        # Isso reduz subestimação de liquidez (e “giro de banca” irreal).
+        LIQUIDITY_MATCH_DURATION_HOURS = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
+        LIQUIDITY_GRID_MINUTES = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+        LIQUIDITY_BANK_BUFFER_PCT = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))  # margem extra
+
+        def _exposure_jobs(rows_in: List[dict], mode: str) -> List[Tuple[datetime, datetime, float]]:
+            """
+            mode='back': exposure=stake
+            mode='lay' : exposure=liability
+            """
+            jobs: List[Tuple[datetime, datetime, float]] = []
+            for d in rows_in:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                if isinstance(ko, datetime):
+                    t1 = ko + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
+                else:
+                    t1 = t0 + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
+                if not isinstance(t1, datetime) or t1 <= t0:
+                    t1 = t0 + timedelta(hours=(LIQUIDITY_MATCH_DURATION_HOURS + LIQUIDITY_SETTLE_BUFFER_HOURS))
+
+                bs, _, _, ll = finance_for_row(d)
+                exp = float(bs) if mode == "back" else float(ll)
+                if exp <= 0:
+                    continue
+                jobs.append((t0, t1, exp))
+            return jobs
+
+        def _liquidity_pctl(jobs: List[Tuple[datetime, datetime, float]]) -> Dict[str, Optional[float]]:
+            if not jobs:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+            t_min = min(t0 for t0, _, _ in jobs)
+            t_max = max(t1 for _, t1, _ in jobs)
+            if t_max <= t_min:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+
+            step = max(1, int(LIQUIDITY_GRID_MINUTES))
+            # grid alinhado por minutos (para estabilidade)
+            t = t_min
+            vals: List[float] = []
+            while t <= t_max:
+                s = 0.0
+                for a, b, exp in jobs:
+                    if a <= t < b:
+                        s += float(exp)
+                vals.append(float(s))
+                t = t + timedelta(minutes=step)
+            if not vals:
+                return {"mean": None, "p50": None, "p95": None, "p99": None, "max": None, "n_grid": 0}
+            return {
+                "mean": float(np.mean(vals)),
+                "p50": float(np.quantile(vals, 0.50)),
+                "p95": float(np.quantile(vals, 0.95)),
+                "p99": float(np.quantile(vals, 0.99)),
+                "max": float(max(vals)),
+                "n_grid": int(len(vals)),
+            }
+
+        back_jobs = _exposure_jobs([d for d in back_edge], mode="back")
+        lay_jobs = _exposure_jobs([d for d in lay_edge], mode="lay")
+        total_jobs = back_jobs + lay_jobs
+
+        back_liq = _liquidity_pctl(back_jobs)
+        lay_liq = _liquidity_pctl(lay_jobs)
+        total_liq = _liquidity_pctl(total_jobs)
+
+        def _with_buffer(x: Optional[float]) -> Optional[float]:
+            if x is None:
+                return None
+            return float(x) * (1.0 + max(0.0, LIQUIDITY_BANK_BUFFER_PCT) / 100.0)
+
+        total_bank_liq_p99 = _with_buffer(total_liq.get("p99"))
+        total_bank_eff_conservative = None
+        if total_bank_conservative is not None or total_bank_liq_p99 is not None:
+            total_bank_eff_conservative = max(float(total_bank_conservative or 0.0), float(total_bank_liq_p99 or 0.0))
+
+        def _roi_on_bank(profit_30d: Optional[float], bank: Optional[float]) -> Optional[float]:
+            if profit_30d is None or bank is None or bank <= 0:
+                return None
+            return (float(profit_30d) / float(bank)) * 100.0
+
+        lines.append("| Bloco | Janela(d) | Turnover 30d | Lucro 30d (direto) | Lucro 30d (ROI×turnover) |\n|---|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back | {window_days:.1f} | {_fmt_num(back_turnover_30d, 2)} | {_fmt_num(back_profit_30d_direct, 2)} | {_fmt_num(back_profit_30d_roi, 2)} |\n"
+        )
+        lines.append(
+            f"| Lay (stake) | {window_days:.1f} | {_fmt_num(lay_turnover_30d, 2)} | {_fmt_num(lay_profit_30d_direct, 2)} | {_fmt_num(lay_profit_30d_roi, 2)} |\n"
+        )
+        lines.append(
+            f"| Total (Back+Lay) | {window_days:.1f} | {_fmt_num(total_turnover_30d, 2)} | {_fmt_num(total_profit_30d_direct, 2)} | {_fmt_num(total_profit_30d_roi, 2)} |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Banca por risco (exposição unitária)**\n\n")
+        lines.append("| Bloco | Banca conservadora (p99) | Banca agressiva (ES95) | ROI/banca 30d (direto) | ROI/banca 30d (ROI×turnover) |\n|---|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back (stake) | {_fmt_num(back_bank_conservative, 2)} | {_fmt_num(back_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(back_profit_30d_direct, back_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(back_profit_30d_roi, back_bank_conservative), 2)}% |\n"
+        )
+        lines.append(
+            f"| Lay (liability) | {_fmt_num(lay_bank_conservative, 2)} | {_fmt_num(lay_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(lay_profit_30d_direct, lay_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(lay_profit_30d_roi, lay_bank_conservative), 2)}% |\n"
+        )
+        lines.append(
+            f"| Total (soma) | {_fmt_num(total_bank_conservative, 2)} | {_fmt_num(total_bank_aggressive, 2)} | "
+            f"{_fmt_num(_roi_on_bank(total_profit_30d_direct, total_bank_conservative), 2)}% | "
+            f"{_fmt_num(_roi_on_bank(total_profit_30d_roi, total_bank_conservative), 2)}% |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Banca por liquidez (capital simultaneamente travado)**\n\n")
+        lines.append(
+            f"Definição operacional: cada aposta trava capital de `audited_at` até `kickoff + {LIQUIDITY_MATCH_DURATION_HOURS:.2f}h + {LIQUIDITY_SETTLE_BUFFER_HOURS:.2f}h` "
+            f"(grid={LIQUIDITY_GRID_MINUTES}min). A banca recomendada aplica buffer de +{LIQUIDITY_BANK_BUFFER_PCT:.0f}%.\n\n"
+        )
+        lines.append("| Bloco | Liquidez mean | Liquidez p95 | Liquidez p99 | Liquidez max | Banca liq p99 (+buffer) |\n|---|---:|---:|---:|---:|---:|\n")
+        lines.append(
+            f"| Back (stake) | {_fmt_num(back_liq.get('mean'), 2)} | {_fmt_num(back_liq.get('p95'), 2)} | {_fmt_num(back_liq.get('p99'), 2)} | {_fmt_num(back_liq.get('max'), 2)} | {_fmt_num(_with_buffer(back_liq.get('p99')), 2)} |\n"
+        )
+        lines.append(
+            f"| Lay (liability) | {_fmt_num(lay_liq.get('mean'), 2)} | {_fmt_num(lay_liq.get('p95'), 2)} | {_fmt_num(lay_liq.get('p99'), 2)} | {_fmt_num(lay_liq.get('max'), 2)} | {_fmt_num(_with_buffer(lay_liq.get('p99')), 2)} |\n"
+        )
+        lines.append(
+            f"| Total (Back+Lay) | {_fmt_num(total_liq.get('mean'), 2)} | {_fmt_num(total_liq.get('p95'), 2)} | {_fmt_num(total_liq.get('p99'), 2)} | {_fmt_num(total_liq.get('max'), 2)} | {_fmt_num(total_bank_liq_p99, 2)} |\n"
+        )
+        lines.append("\n")
+
+        lines.append("**Banca recomendada (conservadora)**\n\n")
+        lines.append("| Métrica | Valor |\n|---|---:|\n")
+        lines.append(f"| Banca por risco (p99 unitário, soma) | {_fmt_num(total_bank_conservative, 2)} |\n")
+        lines.append(f"| Banca por liquidez (p99 simultâneo + buffer) | {_fmt_num(total_bank_liq_p99, 2)} |\n")
+        lines.append(f"| Banca efetiva (max das duas) | {_fmt_num(total_bank_eff_conservative, 2)} |\n")
+        lines.append(f"| ROI/banca 30d (direto, banca efetiva) | {_fmt_num(_roi_on_bank(total_profit_30d_direct, total_bank_eff_conservative), 2)}% |\n")
+        lines.append(f"| ROI/banca 30d (ROI×turnover, banca efetiva) | {_fmt_num(_roi_on_bank(total_profit_30d_roi, total_bank_eff_conservative), 2)}% |\n")
+
+        lines.append("**Diagnóstico de cobertura (placar/ROI)**\n\n")
+        lines.append("| Bloco | Turnover total | Turnover com ROI | Cobertura turnover |\n|---|---:|---:|---:|\n")
+        lines.append(
+            f"| Back | {_fmt_num(back_turnover_total, 2)} | {_fmt_num(back_turnover_realized, 2)} | "
+            f"{_fmt_num((back_turnover_realized / back_turnover_total * 100.0) if back_turnover_total > 0 else None, 2)}% |\n"
+        )
+        lines.append(
+            f"| Lay | {_fmt_num(lay_turnover_total, 2)} | {_fmt_num(lay_turnover_realized, 2)} | "
+            f"{_fmt_num((lay_turnover_realized / lay_turnover_total * 100.0) if lay_turnover_total > 0 else None, 2)}% |\n"
+        )
+        lines.append("\n")
+        lines.append(
+            f"Notas (Lay): exposição 30d por liability (não é turnover) = {_fmt_num(lay_liab_30d, 2)}; "
+            f"ROI realizado por liability (ponderado) = {_fmt_num(lay_roi_realized_liab, 2)}%.\n"
+        )
+
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 8) Curva temporal (pico, reversão e melhor timing)
+        # ============================================================
+        EPS_DIFF_STABLE = 0.20   # variação < 0.20pp conta como estável (ruído)
+        EPS_REV = 0.50           # reversão = queda/subida >= 0.50pp vs pico/vale
+
+        def _outcome_mult(line: str, side: str, hs: Any, aws: Any) -> Optional[float]:
+            """Multiplicador do resultado para back (1, 0.5, 0, -0.5, -1)."""
+            if hs is None or aws is None:
+                return None
+            try:
+                goal_diff = int(hs) - int(aws)
+            except Exception:
+                return None
+            try:
+                ah_line = float(str(line).replace(",", "."))
+            except Exception:
+                return None
+            if (side or "").strip() == "home":
+                adjusted = goal_diff + ah_line
+            else:
+                adjusted = -goal_diff - ah_line
+            if adjusted > 0.25:
+                return 1.0
+            if adjusted == 0.25:
+                return 0.5
+            if adjusted == 0:
+                return 0.0
+            if adjusted == -0.25:
+                return -0.5
+            return -1.0
+
+        def _roi_back_pct(odd: float, mult: float) -> float:
+            if mult > 0:
+                return (odd - 1.0) * mult * 100.0
+            if mult < 0:
+                return mult * 100.0
+            return 0.0
+
+        def _roi_lay_pct_per_stake(lay_odd: float, mult_back: float) -> float:
+            # stake=1 (ganho máx = +1), perda = -(odd-1) quando o back vence
+            if mult_back > 0:
+                return -mult_back * max(0.0, lay_odd - 1.0) * 100.0
+            if mult_back < 0:
+                return (-mult_back) * 100.0
+            return 0.0
+
+        def _roi_lay_pct_per_liability(lay_odd: float, mult_back: float) -> Optional[float]:
+            liab = max(0.0, lay_odd - 1.0)
+            if liab <= 0:
+                return None
+            if mult_back > 0:
+                return -mult_back * 100.0
+            if mult_back < 0:
+                # lucro por stake = -mult_back (ex.: 1 ou 0.5), divide pela liability
+                return ((-mult_back) / liab) * 100.0
+            return 0.0
+
+        def _build_back_series(d: dict) -> List[dict]:
+            h = d.get("hypothesis_details") or {}
+            series = []
+            # T0 (auditoria)
+            t0_diff = _safe_float(d.get("diff_pct"))
+            t0_odd = _safe_float(d.get("bs_odd"))
+            if t0_diff is not None and t0_odd is not None:
+                series.append({"t": 0.0, "diff_pct": t0_diff, "odd": t0_odd})
+            arr = h.get("temporal")
+            if isinstance(arr, list):
+                for e in arr:
+                    if not isinstance(e, dict):
+                        continue
+                    t = _safe_float(e.get("t"))
+                    diff = _safe_float(e.get("diff_pct"))
+                    odd = _safe_float(e.get("bs_odd"))
+                    if t is None or diff is None or odd is None:
+                        continue
+                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+            series.sort(key=lambda x: x["t"])
+            return series
+
+        def _build_lay_series(d: dict) -> List[dict]:
+            h = d.get("hypothesis_details") or {}
+            series = []
+            ws_odd = _safe_float(d.get("ws_odd"))
+            lay0 = _safe_float(_get_path(h, ["lay", "odd"]))
+            if ws_odd and lay0:
+                series.append(
+                    {"t": 0.0, "diff_pct": ((lay0 - ws_odd) / ws_odd) * 100.0, "odd": lay0}
+                )
+            arr = h.get("lay_temporal")
+            if isinstance(arr, list):
+                for e in arr:
+                    if not isinstance(e, dict):
+                        continue
+                    t = _safe_float(e.get("t"))
+                    diff = _safe_float(e.get("diff_pct"))
+                    odd = _safe_float(e.get("lay_odd"))
+                    if t is None or diff is None or odd is None:
+                        continue
+                    series.append({"t": float(t), "diff_pct": float(diff), "odd": float(odd)})
+            series.sort(key=lambda x: x["t"])
+            return series
+
+        def _analyze_peak(series: List[dict], mode: str) -> dict:
+            """
+            mode='back': pico = max(diff_pct)
+            mode='lay' : vale = min(diff_pct) (mais negativo)
+            """
+            if not series:
+                return {"n": 0}
+            diffs = [p["diff_pct"] for p in series]
+            if mode == "back":
+                idx_ext = int(np.argmax(diffs))
+            else:
+                idx_ext = int(np.argmin(diffs))
+            ext = series[idx_ext]
+            last = series[-1]
+            # monotonicidade (para "indefinidamente")
+            mono = True
+            for a, b in zip(diffs, diffs[1:]):
+                if mode == "back" and (b < a - EPS_DIFF_STABLE):
+                    mono = False
+                    break
+                if mode == "lay" and (b > a + EPS_DIFF_STABLE):
+                    mono = False
+                    break
+            # reversão: qualquer ponto após o extremo que "volta" >= EPS_REV
+            after = diffs[idx_ext + 1 :] if idx_ext + 1 < len(diffs) else []
+            had_rev = False
+            t_rev = None
+            odd_rev = None
+            diff_rev = None
+            if after:
+                if mode == "back":
+                    threshold = ext["diff_pct"] - EPS_REV
+                    for p in series[idx_ext + 1 :]:
+                        if p["diff_pct"] <= threshold:
+                            had_rev = True
+                            t_rev = p["t"]
+                            odd_rev = p.get("odd")
+                            diff_rev = p.get("diff_pct")
+                            break
+                else:
+                    threshold = ext["diff_pct"] + EPS_REV
+                    for p in series[idx_ext + 1 :]:
+                        if p["diff_pct"] >= threshold:
+                            had_rev = True
+                            t_rev = p["t"]
+                            odd_rev = p.get("odd")
+                            diff_rev = p.get("diff_pct")
+                            break
+            ext_at_end = abs(last["diff_pct"] - ext["diff_pct"]) <= EPS_DIFF_STABLE
+            return {
+                "n": len(series),
+                "t_ext": float(ext["t"]),
+                "diff_ext": float(ext["diff_pct"]),
+                "odd_ext": float(ext["odd"]),
+                "t_last": float(last["t"]),
+                "diff_last": float(last["diff_pct"]),
+                "odd_last": float(last["odd"]),
+                "monotonic": bool(mono),
+                "ext_at_end": bool(ext_at_end),
+                "had_reversal": bool(had_rev),
+                "t_reversal": float(t_rev) if t_rev is not None else None,
+                "odd_reversal": float(odd_rev) if odd_rev is not None else None,
+                "diff_reversal": float(diff_rev) if diff_rev is not None else None,
+            }
+
+        def _clv_pct_from_odd(odd: Optional[float], closing_odd: Any) -> Optional[float]:
+            odd = _safe_float(odd)
+            clo = _safe_float(closing_odd)
+            if odd is None or clo is None or clo <= 0:
+                return None
+            return (odd - clo) / clo * 100.0
+
+        def _clv_pct_lay_from_odd(lay_odd: Optional[float], closing_odd: Any) -> Optional[float]:
+            """
+            Para Lay, o sinal é invertido: é "bom" quando você LAYA barato e o closing sobe.
+            Definição: (closing - entry) / closing * 100
+            """
+            lay_odd = _safe_float(lay_odd)
+            clo = _safe_float(closing_odd)
+            if lay_odd is None or clo is None or clo <= 0:
+                return None
+            return (clo - lay_odd) / clo * 100.0
+
+        def _summarize_timing(rows_in: List[dict], mode: str) -> Dict[str, Any]:
+            stats = []
+            for d in rows_in:
+                if mode == "back":
+                    s = _build_back_series(d)
+                else:
+                    s = _build_lay_series(d)
+                a = _analyze_peak(s, mode=mode)
+                if a.get("n", 0) == 0:
+                    continue
+                a["is_live"] = d.get("is_live")
+                a["match_id"] = d.get("match_id")
+                a["closing_odd"] = d.get("closing_odd")
+                a["line"] = d.get("line")
+                a["side"] = d.get("side")
+                a["hs"] = d.get("home_score")
+                a["as"] = d.get("away_score")
+                stats.append(a)
+            return {"rows": stats}
+
+        def _agg_by_regime(stats_rows: List[dict]) -> Dict[str, dict]:
+            out: Dict[str, dict] = {}
+            for regime, is_live_val in [("PRE_MATCH", False), ("IN_MATCH", True)]:
+                sub = [r for r in stats_rows if r.get("is_live") is is_live_val]
+                if not sub:
+                    out[regime] = {"n": 0}
+                    continue
+                t_ext = [r["t_ext"] for r in sub if r.get("t_ext") is not None]
+                t_rev = [r["t_reversal"] for r in sub if r.get("t_reversal") is not None]
+                t_rev_delay = [
+                    float(r["t_reversal"]) - float(r["t_ext"])
+                    for r in sub
+                    if r.get("t_reversal") is not None and r.get("t_ext") is not None
+                ]
+                # Partição 100% (categorias exclusivas)
+                end_no_rev = sum(1 for r in sub if r.get("ext_at_end") and not r.get("had_reversal"))
+                end_with_rev = sum(1 for r in sub if r.get("ext_at_end") and r.get("had_reversal"))
+                not_end_with_rev = sum(1 for r in sub if (not r.get("ext_at_end")) and r.get("had_reversal"))
+                not_end_no_rev = sum(1 for r in sub if (not r.get("ext_at_end")) and not r.get("had_reversal"))
+                out[regime] = {
+                    "n": len(sub),
+                    "t_ext_avg": float(np.mean(t_ext)) if t_ext else None,
+                    "t_ext_p50": float(np.median(t_ext)) if t_ext else None,
+                    "pct_monotonic": 100.0 * sum(1 for r in sub if r.get("monotonic")) / len(sub),
+                    # "melhora até o fim" = monotônico + extremo no fim (proxy do "sobe/desce indef.")
+                    "pct_improve_to_end": 100.0 * sum(1 for r in sub if r.get("monotonic") and r.get("ext_at_end")) / len(sub),
+                    "pct_reversal": 100.0 * sum(1 for r in sub if r.get("had_reversal")) / len(sub),
+                    "t_rev_avg": float(np.mean(t_rev)) if t_rev else None,
+                    "t_rev_p50": float(np.median(t_rev)) if t_rev else None,
+                    "dt_rev_avg": float(np.mean(t_rev_delay)) if t_rev_delay else None,
+                    "dt_rev_p50": float(np.median(t_rev_delay)) if t_rev_delay else None,
+                    # partição 100% (exclusiva)
+                    "pct_end_no_rev": 100.0 * end_no_rev / len(sub),
+                    "pct_end_with_rev": 100.0 * end_with_rev / len(sub),
+                    "pct_not_end_with_rev": 100.0 * not_end_with_rev / len(sub),
+                    "pct_not_end_no_rev": 100.0 * not_end_no_rev / len(sub),
+                }
+            return out
+
+        def _curve_table(rows_in: List[dict], mode: str) -> List[Tuple[str, int, float, float, Optional[float], Optional[float]]]:
+            """
+            Retorna linhas por tempo: (t_label, n, mean_diff, mean_odd, mean_clv, mean_roi)
+            """
+            times = [0, 3, 6, 10, 15, 20]
+            buckets: Dict[int, List[Tuple[float, float, Optional[float], Optional[float]]]] = {t: [] for t in times}
+            for d in rows_in:
+                series = _build_back_series(d) if mode == "back" else _build_lay_series(d)
+                if not series:
+                    continue
+                # outcome
+                mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                for p in series:
+                    # bin pelo target mais próximo
+                    t = float(p["t"])
+                    tgt = min(times, key=lambda x: abs(x - t))
+                    diff = float(p["diff_pct"])
+                    odd = float(p["odd"])
+                    # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+                    if d.get("is_live") is True:
+                        clv = None
+                    else:
+                        if mode == "back":
+                            clv = _clv_pct_from_odd(odd, d.get("closing_odd"))
+                        else:
+                            clv = _clv_pct_lay_from_odd(odd, d.get("closing_odd"))
+                    roi = None
+                    if mult is not None:
+                        if mode == "back":
+                            roi = _roi_back_pct(odd, mult)
+                        else:
+                            roi = _roi_lay_pct_per_liability(odd, mult)
+                    buckets[tgt].append((diff, odd, clv, roi))
+            out = []
+            for t in times:
+                pts = buckets[t]
+                if not pts:
+                    continue
+                diffs = [x[0] for x in pts]
+                odds = [x[1] for x in pts]
+                clvs = [x[2] for x in pts if x[2] is not None]
+                rois = [x[3] for x in pts if x[3] is not None]
+                out.append((f"t+{t}s", len(pts), float(np.mean(diffs)), float(np.mean(odds)), float(np.mean(clvs)) if clvs else None, float(np.mean(rois)) if rois else None))
+            return out
+
+        lines.append("## 8) Curva temporal (pico, reversão e melhor timing)\n")
+        lines.append("Esta seção usa `hypothesis_details.temporal` (Back) e `hypothesis_details.lay_temporal` (Lay), coletados em pontos discretos (t≈0,3,6,10,15,20s).\n\n")
+        lines.append(
+            "O objetivo é responder: **tempo até o pico/vale**, **% que segue melhorando até t_max**, **% com reversão** e **impacto esperado por timing**. "
+            "**CLV é reportado somente pre-match** (closing pré-jogo).\n\n"
+        )
+
+        # BACK
+        back_stats = _summarize_timing(ok_bs, mode="back")["rows"]
+        back_agg = _agg_by_regime(back_stats)
+        lines.append("### 8.1 Back (pico em diff_pct)\n")
+        lines.append(
+            f"Definições: **pico** = `max(diff_pct)`. **reversão** = após o pico, `diff_pct` cair pelo menos {EPS_REV:.2f} p.p. "
+            f"(para Lay, subir {EPS_REV:.2f} p.p. após o vale). `t_reversão` é o 1º tempo que cruza esse limiar (logo, não é o pico).\n\n"
+        )
+        lines.append("| Regime | N | t_pico médio (s) | t_pico p50 (s) | % melhora até fim | % com reversão | t_reversão médio (s) | Δt (rev - pico) médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = back_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_improve_to_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} | {_fmt_num(s.get('dt_rev_avg'),1)} |\n"
+            )
+
+        lines.append("\n**Partição 100% (Back)**: categorias exclusivas (somam 100% por regime).\n\n")
+        lines.append("| Regime | % pico no fim, sem reversão | % pico no fim, com reversão (recuperou) | % pico antes, com reversão | % pico antes, sem reversão relevante |\n|---|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = back_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {_fmt_num(s.get('pct_end_no_rev'),1)}% | {_fmt_num(s.get('pct_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_no_rev'),1)}% |\n"
+            )
+
+        lines.append("\n**Curva média (Back)**: média de `diff_pct` e `odd` por tempo. `CLV` é reportado **somente pre-match** (closing pré-jogo). `ROI` (quando aparece) é o **ROI realizado** se a aposta fosse feita naquele ponto.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | odd média | CLV médio (pre-match) | ROI médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="back"):
+            lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
+
+        def _entry_metrics_back(d: dict) -> Optional[dict]:
+            series = _build_back_series(d)
+            if not series:
+                return None
+            a = _analyze_peak(series, mode="back")
+            if a.get("n", 0) <= 0:
+                return None
+            closing = d.get("closing_odd")
+            # define pontos
+            p0 = series[0]  # t=0 incluído quando houver
+            plast = series[-1]
+            # ROI por ponto (se houver placar)
+            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
+            roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
+            roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
+            # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+            clv0 = _clv_pct_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
+            clve = _clv_pct_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
+            clvl = _clv_pct_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
+            return {
+                "audit_id": int(d.get("id")) if d.get("id") is not None else None,
+                "match_id": int(d.get("match_id")),
+                "is_live": d.get("is_live"),
+                "audited_at": d.get("audited_at"),
+                "had_reversal": bool(a.get("had_reversal")),
+                "ext_at_end": bool(a.get("ext_at_end")),
+                "monotonic": bool(a.get("monotonic")),
+                "t_ext": a.get("t_ext"),
+                "odd_t0": float(p0["odd"]),
+                "odd_ext": float(a["odd_ext"]),
+                "odd_last": float(plast["odd"]),
+                "closing_odd": _safe_float(closing),
+                "clv_t0": clv0,
+                "clv_ext": clve,
+                "clv_last": clvl,
+                "roi_t0": roi0,
+                "roi_ext": roipeak,
+                "roi_last": roilast,
+            }
+
+        def _entry_metrics_lay(d: dict) -> Optional[dict]:
+            series = _build_lay_series(d)
+            if not series:
+                return None
+            a = _analyze_peak(series, mode="lay")
+            if a.get("n", 0) <= 0:
+                return None
+            closing = d.get("closing_odd")
+            p0 = series[0]
+            plast = series[-1]
+            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
+            roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
+            roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
+            odd_rev = _safe_float(a.get("odd_reversal"))
+            roirev = _roi_lay_pct_per_liability(odd_rev, mult) if (mult is not None and odd_rev is not None) else None
+            # CLV só faz sentido pre-match (closing_odd é pré-jogo).
+            clv0 = _clv_pct_lay_from_odd(p0["odd"], closing) if d.get("is_live") is False else None
+            clve = _clv_pct_lay_from_odd(a["odd_ext"], closing) if d.get("is_live") is False else None
+            clvl = _clv_pct_lay_from_odd(plast["odd"], closing) if d.get("is_live") is False else None
+            # Convenção "única" de CLV para tabela de estratégias (8.3):
+            # usamos (entry - closing) / closing, então Lay "bom" tende a ser NEGATIVO.
+            clv0_conv = (-float(clv0)) if clv0 is not None else None
+            clve_conv = (-float(clve)) if clve is not None else None
+            clvl_conv = (-float(clvl)) if clvl is not None else None
+
+            # Política de entrada Lay (para 8.3 e OOS):
+            # - se há reversão: entrar **logo após a reversão** (odd_reversal)
+            # - se não há reversão: entrar no **último ponto** (t_last, ~t+20s)
+            has_rev = bool(a.get("had_reversal")) and (odd_rev is not None)
+            odd_entry = float(odd_rev) if has_rev else float(plast["odd"])
+            roi_entry = roirev if has_rev else roilast
+            clv_entry = _clv_pct_lay_from_odd(odd_entry, closing) if d.get("is_live") is False else None
+            clv_entry_conv = (-float(clv_entry)) if clv_entry is not None else None
+            return {
+                "audit_id": int(d.get("id")) if d.get("id") is not None else None,
+                "match_id": int(d.get("match_id")),
+                "is_live": d.get("is_live"),
+                "audited_at": d.get("audited_at"),
+                "had_reversal": bool(a.get("had_reversal")),
+                "ext_at_end": bool(a.get("ext_at_end")),
+                "monotonic": bool(a.get("monotonic")),
+                "t_ext": a.get("t_ext"),
+                "clv_t0": clv0,
+                "clv_ext": clve,
+                "clv_last": clvl,
+                "clv_conv_t0": clv0_conv,
+                "clv_conv_ext": clve_conv,
+                "clv_conv_last": clvl_conv,
+                "roi_t0": roi0,
+                "roi_ext": roival,
+                "roi_last": roilast,
+                "odd_reversal": odd_rev,
+                "roi_rev": roirev,
+                "odd_entry": odd_entry,
+                "roi_entry": roi_entry,
+                "clv_entry": clv_entry,
+                "clv_conv_entry": clv_entry_conv,
+            }
+
+        def _summarize_entry(rows: List[dict], key: str, *, clip_low: Optional[float] = None, clip_high: Optional[float] = None) -> MetricSummary:
+            vals = [r.get(key) for r in rows]
+            mids = [r.get("match_id") for r in rows]
+            return summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
+
+        # 8.1b) impacto: t0 vs pico vs último, com/sem reversão
+        back_entries = [em for d in ok_bs for em in [_entry_metrics_back(d)] if em is not None]
+        lines.append("\n### 8.1b Back — impacto por timing (t0 vs pico vs último) e reversão\n")
+        lines.append(
+            "Leitura: se a estratégia é **entrar no pico**, compare CLV/ROI no pico vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
+            "Aqui reportamos **média robusta por jogo + IC90**. Observação: **CLV só é calculado pre-match**.\n\n"
+        )
+
+        # CLV (pre-match) com IC
+        lines.append("**CLV (somente pre-match) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 (mean; IC90) | CLV pico (mean; IC90) | CLV último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]])]:
+            pm = [r for r in filt if r.get("is_live") is False]
+            s0 = _summarize_entry(pm, "clv_t0", clip_low=-50, clip_high=50)
+            se = _summarize_entry(pm, "clv_ext", clip_low=-50, clip_high=50)
+            sl = _summarize_entry(pm, "clv_last", clip_low=-50, clip_high=50)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        # ROI (back) com IC
+        lines.append("\n**ROI (stake=1) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N ROI | ROI t0 (mean; IC90) | ROI pico (mean; IC90) | ROI último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in back_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in back_entries if r["had_reversal"]])]:
+            s0 = _summarize_entry(filt, "roi_t0", clip_low=-100, clip_high=500)
+            se = _summarize_entry(filt, "roi_ext", clip_low=-100, clip_high=500)
+            sl = _summarize_entry(filt, "roi_last", clip_low=-100, clip_high=500)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        lines.append(
+            "\nNota interpretativa: a subcoorte **COM_REVERSAO** pode ter CLV maior no **pico** porque, por definição, ela inclui casos em que o edge atingiu um extremo mais alto antes de reverter. "
+            "Para entender a hipótese 'sem reversão deveria ser maior', compare também a categoria '**pico no fim, sem reversão**' na partição 100% (tabela 8.1).\n"
+        )
+        lines.append("\n**Decomposição (pre-match): entry_odd vs closing_odd (IC90)**\n\n")
+        lines.append("| Subcoorte | N CLV (PM) | entry_odd t0 (mean; IC90) | entry_odd pico (mean; IC90) | closing_odd (mean; IC90) |\n|---|---:|---:|---:|---:|\n")
+        for label, filt in [
+            ("SEM_REVERSAO", [r for r in back_entries if (not r.get("had_reversal")) and r.get("is_live") is False]),
+            ("COM_REVERSAO", [r for r in back_entries if r.get("had_reversal") and r.get("is_live") is False]),
+        ]:
+            s_t0 = summarize_metric([r.get("odd_t0") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            s_ext = summarize_metric([r.get("odd_ext") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            s_clo = summarize_metric([r.get("closing_odd") for r in filt], [r.get("match_id") for r in filt], clip_low=1.01, clip_high=200)
+            lines.append(
+                f"| {label} | {s_clo.n_events} | {_fmt_num(s_t0.mean_cluster,3)} {_fmt_ci(s_t0.ci90_cluster,3,suffix='')} | {_fmt_num(s_ext.mean_cluster,3)} {_fmt_ci(s_ext.ci90_cluster,3,suffix='')} | {_fmt_num(s_clo.mean_cluster,3)} {_fmt_ci(s_clo.ci90_cluster,3,suffix='')} |\n"
+            )
+
+        # LAY
+        lay_stats = _summarize_timing(ok_bs, mode="lay")["rows"]
+        lay_agg = _agg_by_regime(lay_stats)
+        lines.append("\n### 8.2 Lay (vale em diff_pct)\n")
+        lines.append("| Regime | N | t_vale médio (s) | t_vale p50 (s) | % melhora até fim | % com reversão | t_reversão médio (s) | Δt (rev - vale) médio (s) |\n|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = lay_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | 0 | — | — | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {s['n']} | {_fmt_num(s.get('t_ext_avg'),1)} | {_fmt_num(s.get('t_ext_p50'),1)} | {_fmt_num(s.get('pct_improve_to_end'),1)}% | {_fmt_num(s.get('pct_reversal'),1)}% | {_fmt_num(s.get('t_rev_avg'),1)} | {_fmt_num(s.get('dt_rev_avg'),1)} |\n"
+            )
+
+        lines.append("\n**Partição 100% (Lay)**: categorias exclusivas (somam 100% por regime).\n\n")
+        lines.append("| Regime | % vale no fim, sem reversão | % vale no fim, com reversão (recuperou) | % vale antes, com reversão | % vale antes, sem reversão relevante |\n|---|---:|---:|---:|---:|\n")
+        for regime in ["PRE_MATCH", "IN_MATCH"]:
+            s = lay_agg.get(regime, {"n": 0})
+            if s.get("n", 0) == 0:
+                lines.append(f"| {regime} | — | — | — | — |\n")
+                continue
+            lines.append(
+                f"| {regime} | {_fmt_num(s.get('pct_end_no_rev'),1)}% | {_fmt_num(s.get('pct_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_with_rev'),1)}% | {_fmt_num(s.get('pct_not_end_no_rev'),1)}% |\n"
+            )
+
+        lines.append("\n**Curva média (Lay)**: usa `odd=lay_odd`. `CLV` é reportado **somente pre-match** (closing pré-jogo). O ROI mostrado aqui é **ROI por liability** (não por stake), porque Lay é governado por risco.\n\n")
+        lines.append("| Tempo | N pts | diff_pct médio | lay_odd média | CLV médio (pre-match) | ROI/liability médio (se houver) |\n|---|---:|---:|---:|---:|---:|\n")
+        for t_label, n, md, mo, mclv, mroi in _curve_table(ok_bs, mode="lay"):
+            lines.append(f"| {t_label} | {n} | {_fmt_pct(md,2)} | {_fmt_num(mo,3)} | {_fmt_pct(mclv,2)} | {_fmt_num(mroi,2)} |\n")
+
+        lay_entries = [em for d in ok_bs for em in [_entry_metrics_lay(d)] if em is not None]
+        lines.append("\n### 8.2b Lay — impacto por timing (t0 vs vale vs último) e reversão\n")
+        lines.append(
+            "Leitura: se a estratégia é **entrar no vale (odd mais baixa)**, compare CLV/ROI no vale vs t0 e veja diferença entre **casos com reversão** vs **sem reversão**. "
+            "Aqui reportamos **média robusta por jogo + IC90**. Observação: **CLV só é calculado pre-match**.\n\n"
+        )
+
+        lines.append("**CLV (somente pre-match) — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N CLV (PM) | CLV t0 (mean; IC90) | CLV vale (mean; IC90) | CLV último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]])]:
+            pm = [r for r in filt if r.get("is_live") is False]
+            s0 = _summarize_entry(pm, "clv_t0", clip_low=-50, clip_high=50)
+            se = _summarize_entry(pm, "clv_ext", clip_low=-50, clip_high=50)
+            sl = _summarize_entry(pm, "clv_last", clip_low=-50, clip_high=50)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        lines.append("\n**ROI/liability — média robusta por jogo (IC90)**\n\n")
+        lines.append("| Subcoorte | N total | N ROI | ROI/liab t0 (mean; IC90) | ROI/liab vale (mean; IC90) | ROI/liab último (mean; IC90) |\n|---|---:|---:|---:|---:|---:|\n")
+        for label, filt in [("SEM_REVERSAO", [r for r in lay_entries if not r["had_reversal"]]), ("COM_REVERSAO", [r for r in lay_entries if r["had_reversal"]])]:
+            s0 = _summarize_entry(filt, "roi_t0", clip_low=-200, clip_high=5000)
+            se = _summarize_entry(filt, "roi_ext", clip_low=-200, clip_high=5000)
+            sl = _summarize_entry(filt, "roi_last", clip_low=-200, clip_high=5000)
+            lines.append(
+                f"| {label} | {len(filt)} | {s0.n_events} | {_fmt_pct(s0.mean_cluster,2)} {_fmt_ci(s0.ci90_cluster,2)} | {_fmt_pct(se.mean_cluster,2)} {_fmt_ci(se.ci90_cluster,2)} | {_fmt_pct(sl.mean_cluster,2)} {_fmt_ci(sl.ci90_cluster,2)} |\n"
+            )
+
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 8.3) Resumo das 8 combinações (Side × Pre/In × Reversal)
+        # ============================================================
+        lines.append("### 8.3 Resumo de estratégias — combinações (Side × Pre/In × Reversal)\n")
+        lines.append(
+            "Esta tabela resume as combinações possíveis. Observação importante:\n\n"
+            "- **Back**: a estratégia é **entrar rápido em `t0`**, então **não faz sentido separar por Reversal(Sim/Não)** (agregamos como `Any`).\n"
+            "- **Lay**: entrada **após reversão** quando ela existe (`odd_reversal`), senão no **último ponto** (~t+20s).\n"
+            "- **CLV** aqui é **somente pre‑match** (closing pré‑jogo). Para **Lay**, usamos a convenção unificada `clv_conv = -(entry - closing)/closing`, logo **Lay “bom” tende a CLV_CONV > 0**.\n"
+            "- **ROI** é calculado no **ponto de entrada da estratégia** (se houver placar). Para Lay, ROI é **por liability**.\n"
+            "- **IC90** é bootstrap por jogo (cluster em `match_id`). Para critério “p30” usamos o quantil bootstrap **p30** do estimador.\n\n"
+        )
+
+        by_audit_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+
+        def _combo_rows(entries: List[dict], *, is_live: bool, had_rev: bool) -> List[dict]:
+            return [r for r in entries if r.get("is_live") is is_live and bool(r.get("had_reversal")) is bool(had_rev)]
+
+        def _summ_ci(rows: List[dict], key: str, clip_low: float, clip_high: float) -> Tuple[Optional[float], Optional[Tuple[float, float]], Optional[float], Optional[float], int, int]:
+            vals = [r.get(key) for r in rows]
+            mids = [r.get("match_id") for r in rows]
+            s = summarize_metric(vals, mids, clip_low=clip_low, clip_high=clip_high)
+            bym: Dict[int, List[float]] = {}
+            for v, mid in zip(vals, mids):
+                vf = _safe_float(v)
+                if vf is None:
+                    continue
+                if clip_low is not None and vf < clip_low:
+                    continue
+                if clip_high is not None and vf > clip_high:
+                    continue
+                bym.setdefault(int(mid), []).append(float(vf))
+            q10 = cluster_bootstrap_quantile(bym, 0.10, n_boot=2000, seed=int(args.seed))
+            q30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+            return s.mean_cluster, s.ci90_cluster, q10, q30, s.n_events, s.n_matches
+
+        lines.append("| Side | Pre/In | Reversal | N | Jogos | CLV t0 (mean; IC90) | ROI (mean; IC90) | ROI p30 | Ativa? (critério) |\n")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|\n")
+        for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                rev_iters = [(None, "Any")] if side == "Back" else [(True, "Yes"), (False, "No")]
+                for had_rev_val, rev_label in rev_iters:
+                    if had_rev_val is None:
+                        filt = [r for r in entries if r.get("is_live") is is_live_val]
+                    else:
+                        filt = _combo_rows(entries, is_live=is_live_val, had_rev=had_rev_val)
+                    # CLV só pre-match
+                    clv_mean = clv_ci = clv_q10 = clv_q30 = None
+                    n_clv = m_clv = 0
+                    if is_live_val is False:
+                        clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+                        clv_mean, clv_ci, clv_q10, clv_q30, n_clv, m_clv = _summ_ci(
+                            filt,
+                            clv_key,
+                            clip_low=-50,
+                            clip_high=50,
+                        )
+                    # ROI (t0). Back: ROI/stake. Lay: ROI/liability (já calculado assim no entry_metrics)
+                    roi_clip_hi = 500.0 if side == "Back" else 5000.0
+                    roi_key = "roi_t0" if side == "Back" else "roi_entry"
+                    roi_mean, roi_ci, roi_q10, roi_q30, n_roi, m_roi = _summ_ci(
+                        filt,
+                        roi_key,
+                        clip_low=-200.0,
+                        clip_high=roi_clip_hi,
+                    )
+                    n_total = len(filt)
+                    m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
+
+                    # Critérios do usuário (direcionamento):
+                    # Back Pre: CLV>0 significativo p90 (IC90 lb>0) e ROI>0 (não precisa ser sig)
+                    # Back In: apenas ROI com p30>0
+                    # Lay Pre: CLV_CONV>0 significativo p90 (IC90 lb>0) e ROI significativo p30 (p30>0)
+                    # Lay In: apenas ROI p30>0
+                    active = None
+                    crit = ""
+                    if side == "Back" and regime_label == "Pre":
+                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
+                        roi_pos = bool(roi_mean is not None and float(roi_mean) > 0)
+                        active = clv_sig and roi_pos
+                        crit = "CLV p90>0 AND ROI>0"
+                    elif side == "Back" and regime_label == "In":
+                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        crit = "ROI p30>0"
+                    elif side == "Lay" and regime_label == "Pre":
+                        clv_sig = bool(clv_ci and float(clv_ci[0]) > 0)
+                        roi_sig = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        active = clv_sig and roi_sig
+                        crit = "CLV_CONV p90>0 AND ROI p30>0"
+                    else:
+                        active = bool(roi_q30 is not None and float(roi_q30) > 0)
+                        crit = "ROI p30>0"
+                    active_lbl = ("sim" if active else "não") if active is not None else "—"
+
+                    clv_str = f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)}" if (is_live_val is False) else "—"
+                    roi_str = f"{_fmt_pct(roi_mean,2)} {_fmt_ci(roi_ci,2)}"
+                    lines.append(
+                        f"| {side} | {regime_label} | {rev_label} | {n_total} | {m_total} | {clv_str} | {roi_str} | {_fmt_pct(roi_q30,2)} | {active_lbl} ({crit}) |\n"
+                    )
+
+        lines.append(
+            "\nNotas:\n"
+            "- Se você quiser operar **cada combinação como uma estratégia separada**, o sizing (Kelly/caps) deve ser estimado e governado separadamente por estratégia.\n"
+            "- Esta tabela é **in-sample** na janela (`--lookback-days`). A seção OOS (walk-forward) pode ser habilitada com `--walkforward`.\n\n"
+        )
+
+        # ============================================================
+        # 9) Combinações de valor (regime x linha x lag)
+        # ============================================================
+        lines.append("## 9) Combinações de valor (regime × linha AH × lag)\n")
+        lines.append("Tabela rankeada por volume (N). Métrica: diff_pct (OK, betslip confiável).\n\n")
+
+        def top_combos(rows_in: List[dict], max_rows: int = 12) -> List[Tuple[Tuple[str, str, str], MetricSummary]]:
+            groups: Dict[Tuple[str, str, str], Tuple[List[float], List[int]]] = {}
+            for d in rows_in:
+                regime = "IN_MATCH" if d.get("is_live") is True else "PRE_MATCH"
+                key = (regime, str(d.get("line_bucket")), str(d.get("lag_bucket")))
+                groups.setdefault(key, ([], []))
+                groups[key][0].append(float(d["diff_pct"]))
+                groups[key][1].append(int(d["match_id"]))
+            summaries = []
+            for k, (vals, mids) in groups.items():
+                s = summarize_metric(vals, mids, clip_low=-50, clip_high=50)
+                summaries.append((k, s))
+            summaries.sort(key=lambda x: x[1].n_events, reverse=True)
+            return summaries[:max_rows]
+
+        lines.append("### 9.1 Back combos (diff_pct >= corte)\n")
+        back_combo_rows = [d for d in back_edge if d.get("diff_pct") is not None]
+        lines.append("| Regime | Linha | Lag | N | Jogos | Mean diff % | IC90 cluster |\n|---|---|---|---:|---:|---:|---|\n")
+        for (reg, lb, lag), s in top_combos(back_combo_rows, 12):
+            lines.append(f"| {reg} | {lb} | {lag} | {s.n_events} | {s.n_matches} | {_fmt_pct(s.mean_event,2)} | {_fmt_ci(s.ci90_cluster,2)} |\n")
+
+        lines.append("\n### 9.2 Lay combos (diff_pct <= corte) + risco\n")
+        lay_combo_rows = [d for d in lay_edge if d.get("diff_pct") is not None]
+        lines.append("| Regime | Linha | Lag | N | Jogos | Mean diff % | IC90 cluster | Liability p95 |\n|---|---|---|---:|---:|---:|---|---:|\n")
+        # liability por grupo (usando finance_for_row)
+        lay_liab_by_group: Dict[Tuple[str, str, str], List[float]] = {}
+        for d in lay_combo_rows:
+            reg = "IN_MATCH" if d.get("is_live") is True else "PRE_MATCH"
+            key = (reg, str(d.get("line_bucket")), str(d.get("lag_bucket")))
+            _, _, _, ll = finance_for_row(d)
+            lay_liab_by_group.setdefault(key, []).append(float(ll))
+        for (reg, lb, lag), s in top_combos(lay_combo_rows, 12):
+            p95 = _pctl(lay_liab_by_group.get((reg, lb, lag), []), 95)
+            lines.append(f"| {reg} | {lb} | {lag} | {s.n_events} | {s.n_matches} | {_fmt_pct(s.mean_event,2)} | {_fmt_ci(s.ci90_cluster,2)} | {_fmt_num(p95,2)} |\n")
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 9.3) Stake sizing (teoria + calibração empírica)
+        # ============================================================
+        lines.append("### 9.3 Stake sizing — teoria mínima + calibração empírica\n")
+        lines.append(
+            "Objetivo: explicar por que **ROI por aposta** pode divergir de **ROI ponderado por stake/liability**, "
+            "e propor uma política de staking que seja (i) coerente com edge/CLV e (ii) controlada por risco (p99/ES).\n\n"
+        )
+
+        lines.append("**Teoria (resumo prático)**\n\n")
+        lines.append("- **Flat stake**: cada aposta pesa igual. Boa baseline para checar se o sizing atual está piorando resultado.\n")
+        lines.append("- **Proporcional ao limite**: útil operacionalmente (capacidade), mas **não é** sizing por edge.\n")
+        lines.append("- **Kelly fracionado**: sizing por edge. Para Back, \\(f^* \\propto \\frac{EV}{odds-1}\\). Para Lay, o sizing natural é por **liability**.\n")
+        lines.append("- **Governança de risco**: impor **cap por aposta** (ex.: 1–2% da banca) e olhar p95/p99/ES95 de exposição.\n\n")
+
+        lines.append("**Como o Kelly está sendo calculado aqui (detalhado, com premissas)**\n\n")
+        lines.append(
+            "Como ainda não temos um modelo explícito de probabilidade \\(p\\) por aposta, usamos um proxy padrão: "
+            "**o closing pré‑jogo como melhor estimativa de preço justo**. A partir disso inferimos \\(p\\) e aplicamos Kelly como aproximação.\n\n"
+        )
+        lines.append("Premissas e entradas:\n\n")
+        lines.append("- **Entrada (Back)**: `entry_odd = bs_odd` (odd do betslip no momento de execução).\n")
+        lines.append("- **Entrada (Lay)**: `entry_lay_odd = hypothesis_details.lay.odd` (fallback: `bs_odd`).\n")
+        lines.append("- **Preço justo (pre‑match)**: `closing_odd` (closing line). Inferimos \\(p \\approx 1/closing\\_odd\\).\n")
+        lines.append("- **Aplicabilidade**: para `is_live=True` (in‑match), **não usamos** `closing_odd` como benchmark de CLV/Kelly.\n\n")
+        lines.append("Fórmulas (Back):\n\n")
+        lines.append("- Odds decimais \\(O\\); retorno líquido \\(b = O-1\\).\n")
+        lines.append("- \\(p \\approx 1/closing\\_odd\\).\n")
+        lines.append("- Valor esperado por unidade de stake: \\(EV = O\\cdot p - 1\\).\n")
+        lines.append("- Kelly cheio (fração de banca em **stake**): \\(f^* = \\frac{EV}{b} = \\frac{O\\cdot p - 1}{O-1}\\).\n")
+        lines.append("- No relatório: \\(f = \\max(0,f^*)\\cdot \\text{frac}\\) com `frac` em {0.10, 0.25, 0.50, 1.00}.\n\n")
+        lines.append("Fórmulas (Lay):\n\n")
+        lines.append("- Para Lay, o “capital em risco” natural é a **liability** \\(L\\) (perda máxima), não o stake.\n")
+        lines.append("- Usamos \\(p \\approx 1/closing\\_odd\\) e \\(o = entry\\_lay\\_odd\\).\n")
+        lines.append("- Kelly em termos de **liability** (proxy): \\(f^*_{liab} = 1 - p\\cdot o\\).\n")
+        lines.append("- No relatório: \\(f_{liab} = \\max(0,f^*_{liab})\\cdot \\text{frac}\\).\n")
+        lines.append("- Conversão para stake (apenas para turnover): \\(stake = L/(o-1)\\).\n\n")
+        lines.append("Derivação rápida (por que \\(f^*_{liab}=1-p\\cdot o\\)):\n\n")
+        lines.append(
+            "- Defina \\(W\\) como banca e escolha alocar \\(L=f\\cdot W\\) como **liability**.\n"
+            "- Se o evento acontece (prob. \\(p\\)), você perde \\(L\\): \\(W' = W-L = W(1-f)\\).\n"
+            "- Se o evento não acontece (prob. \\(1-p\\)), você ganha o **stake** do Lay, que é \\(S=L/(o-1)\\): "
+            "\\(W' = W+S = W\\left(1+\\frac{f}{o-1}\\right)\\).\n"
+            "- Kelly maximiza \\(p\\log(1-f) + (1-p)\\log\\left(1+\\frac{f}{o-1}\\right)\\). "
+            "Derivando e igualando a zero, obtém-se \\(f^* = 1 - p\\cdot o\\).\n\n"
+        )
+        lines.append("Parâmetros de escala (proxy de banca) e caps:\n\n")
+        lines.append("- Por padrão: `back_bank_ref = p99(stake)` e `lay_bank_ref = p99(liability)` observados no sizing **PROXY** da janela.\n")
+        lines.append("- Opcional: com `--kelly-bankroll`, usamos `bank_ref = bankroll` para simular capacidade com banca explícita.\n")
+        lines.append("- `stake_back = min(f * back_bank_ref, cap_back, cap_evento_limit)`.\n")
+        lines.append("- `liab_lay = min(f_liab * lay_bank_ref, cap_lay, cap_evento_limit)`.\n")
+        _bk = max(0.0, float(getattr(args, "kelly_back_cap_frac", 0.02)))
+        _lk = max(0.0, float(getattr(args, "kelly_lay_cap_frac", 0.01)))
+        _ms = max(0.0, float(getattr(args, "max_stake_pct_of_limit", 1.0)))
+        _msc = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
+        lines.append(
+            f"- Caps atuais (guardrail): `cap_back = {_bk:.1%} * ref`, `cap_lay = {_lk:.1%} * ref`. "
+            f"Cap por evento: `max_stake = {_ms:.0%} * limit`"
+            + (f" e `max_stake_cap={_msc:.2f}`" if _msc > 0 else "")
+            + ".\n"
+        )
+        lines.append(
+            "- **Implicação importante**: se o cap estiver frequentemente ativo, aumentar `frac` (ex.: >0,25×Kelly) "
+            "**não aumenta** tamanho real — a curva satura.\n\n"
+        )
+        lines.append(
+            "Limitações: comissão/vigorish não modelados; correlação entre apostas ignorada; closing como preço justo é aproximação; "
+            "e o `bank_ref` é uma escala interna (proxy) baseada em limits observados.\n\n"
+        )
+
+        # --- calibração: stake vs ROI/CLV ---
+        def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+            if len(xs) < 3 or len(ys) < 3:
+                return None
+            try:
+                x = np.array(xs, dtype=float)
+                y = np.array(ys, dtype=float)
+                if float(np.std(x)) <= 1e-12 or float(np.std(y)) <= 1e-12:
+                    return None
+                return float(np.corrcoef(x, y)[0, 1])
+            except Exception:
+                return None
+
+        back_pairs = []
+        lay_pairs = []
+        for d in ok_bs:
+            roi = _safe_float(d.get("roi_bs"))
+            if roi is None:
+                continue
+            bs, _, _, ll = finance_for_row(d)
+            clv = _safe_float(d.get("clv_bs"))
+            if int(d["id"]) in back_edge_ids:
+                back_pairs.append((float(bs), float(roi), float(clv) if clv is not None else None))
+            if int(d["id"]) in lay_edge_ids:
+                lay_pairs.append((float(ll), float(roi), float(clv) if clv is not None else None))
+
+        def _corr_block(pairs: List[Tuple[float, float, Optional[float]]], label: str):
+            xs_roi = [p[0] for p in pairs]
+            ys_roi = [p[1] for p in pairs]
+            xs_clv = [p[0] for p in pairs if p[2] is not None]
+            ys_clv = [p[2] for p in pairs if p[2] is not None]
+            c_roi = _pearson(xs_roi, ys_roi)
+            c_clv = _pearson(xs_clv, ys_clv)
+            lines.append(f"- **{label}**: corr(exposição, ROI)={_fmt_num(c_roi,3)}; corr(exposição, CLV)={_fmt_num(c_clv,3)} (onde CLV existe).\n")
+
+        lines.append("**Diagnóstico: exposição vs performance (correlação de Pearson; indicativo, não causal)**\n\n")
+        _corr_block(back_pairs, "Back (stake)")
+        _corr_block(lay_pairs, "Lay (liability)")
+        lines.append("\n")
+
+        # --- sizing rules / backtest ---
+        def _kelly_back_frac(entry_odd: Any, closing_odd: Any) -> Optional[float]:
+            o = _safe_float(entry_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            b = o - 1.0
+            ev = (o * p) - 1.0  # esperado por stake=1
+            f = ev / b
+            return float(f)
+
+        def _kelly_lay_liab_frac(entry_lay_odd: Any, closing_odd: Any) -> Optional[float]:
+            """
+            Fração ótima de banca em termos de **liability** para Lay:
+            f* = 1 - p*o, com p≈1/closing_odd e o=entry_lay_odd.
+            """
+            o = _safe_float(entry_lay_odd)
+            c = _safe_float(closing_odd)
+            if o is None or c is None or o <= 1.0 or c <= 1.0:
+                return None
+            p = 1.0 / c
+            f = 1.0 - (p * o)
+            return float(f)
+
+        def _pnl_back(roi_pct: Optional[float], stake: float) -> Optional[float]:
+            if roi_pct is None:
+                return None
+            return float(stake) * float(roi_pct) / 100.0
+
+        def _pnl_lay_from_liab(liab: float, lay_odd: float, mult_back: Optional[float]) -> Optional[float]:
+            if mult_back is None:
+                return None
+            roi_liab = _roi_lay_pct_per_liability(float(lay_odd), float(mult_back))
+            if roi_liab is None:
+                return None
+            return float(liab) * float(roi_liab) / 100.0
+
+        def _max_drawdown(series: List[float]) -> float:
+            eq = 0.0
+            peak = 0.0
+            max_dd = 0.0
+            for x in series:
+                eq += float(x)
+                peak = max(peak, eq)
+                max_dd = min(max_dd, eq - peak)
+            return float(-max_dd)
+
+        def _bootstrap_dd(daily_pnls: List[float], horizon_days: int = 30, n_boot: int = 2000) -> Tuple[Optional[float], Optional[float]]:
+            if not daily_pnls:
+                return (None, None)
+            dd = []
+            for _ in range(int(n_boot)):
+                samp = [float(random.choice(daily_pnls)) for _ in range(int(horizon_days))]
+                dd.append(_max_drawdown(samp))
+            return (float(np.mean(dd)), float(np.quantile(dd, 0.95)))
+
+        # Window days para projeções (mesma lógica do 7.3, mas com fallback seguro)
+        window_days = None
+        try:
+            window_days = float(args.lookback_days) if args.lookback_days else None
+        except Exception:
+            window_days = None
+        if audited_span_days is not None:
+            window_days = max(float(audited_span_days), float(window_days or 0.0))
+        window_days = float(window_days or 1.0)
+        horizon_days = 30.0
+
+        def _proj_30(x: Optional[float]) -> Optional[float]:
+            if x is None:
+                return None
+            return float(x) * (horizon_days / window_days)
+
+        # Bancas de referência (proxy): p99 exposição observada no sizing proxy atual
+        back_bank_ref_proxy = float(_pctl(back_stakes, 99) or 0.0)
+        lay_bank_ref_proxy = float(_pctl(lay_liability, 99) or 0.0)
+        # Escala do Kelly: por padrão usa p99 proxy; opcionalmente usa bankroll explícito.
+        kelly_bankroll = _safe_float(getattr(args, "kelly_bankroll", None))
+        use_bankroll = (kelly_bankroll is not None) and (float(kelly_bankroll) > 0)
+        back_bank_ref = float(kelly_bankroll) if use_bankroll else float(back_bank_ref_proxy)
+        lay_bank_ref = float(kelly_bankroll) if use_bankroll else float(lay_bank_ref_proxy)
+
+        # caps fracionários (guardrail) — configuráveis
+        BACK_CAP_FRAC = max(0.0, float(getattr(args, "kelly_back_cap_frac", 0.02)))
+        LAY_CAP_FRAC = max(0.0, float(getattr(args, "kelly_lay_cap_frac", 0.01)))
+
+        # cap por evento via limit (capacidade operacional)
+        MAX_STAKE_PCT_OF_LIMIT = max(0.0, float(getattr(args, "max_stake_pct_of_limit", 1.0)))
+        MAX_STAKE_CAP = max(0.0, float(getattr(args, "max_stake_cap", 0.0)))
+
+        def _max_stake_from_limit(limit_value: float) -> float:
+            s = max(0.0, float(limit_value)) * float(MAX_STAKE_PCT_OF_LIMIT)
+            if MAX_STAKE_CAP > 0:
+                s = min(s, float(MAX_STAKE_CAP))
+            return float(s)
+
+        def _max_back_stake_event(d: dict) -> float:
+            return _max_stake_from_limit(float(d.get("limit") or 0.0))
+
+        def _max_lay_stake_event(d: dict) -> float:
+            h = d.get("hypothesis_details") or {}
+            lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+            if lay_lim is None:
+                lay_lim = _safe_float(d.get("limit"))
+            return _max_stake_from_limit(float(lay_lim or 0.0))
+
+        def _sizing_back(d: dict, scheme: str) -> Optional[float]:
+            """
+            Retorna stake (em unidade monetária proxy).
+            """
+            if scheme == "FLAT":
+                return 1.0
+            if scheme == "PROXY":
+                bs, _, _, _ = finance_for_row(d)
+                return float(bs)
+            if scheme.startswith("KELLY"):
+                # Kelly/closing só é interpretável pre-match
+                if d.get("is_live") is True:
+                    return None
+                # KELLY_xx: xx = fração (0.10, 0.25, 0.50)
+                frac = float(scheme.split("_")[1])
+                f = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f is None:
+                    return None
+                f = max(0.0, f) * frac
+                cap = BACK_CAP_FRAC * max(1e-9, back_bank_ref)
+                st = min(f * back_bank_ref, cap)
+                # cap adicional por evento (limit)
+                st = min(float(st), float(_max_back_stake_event(d)))
+                return float(st)
+            return None
+
+        def _sizing_lay_liab(d: dict, scheme: str) -> Optional[Tuple[float, float]]:
+            """
+            Retorna (liability, lay_odd) em unidade monetária proxy.
+            Para Lay, o sizing governado por liability.
+            """
+            h = d.get("hypothesis_details") or {}
+            lay_odd = _safe_float(_get_path(h, ["lay", "odd"]))
+            if lay_odd is None:
+                lay_odd = _safe_float(d.get("bs_odd"))
+            if lay_odd is None or lay_odd <= 1.0:
+                return None
+            if scheme == "FLAT":
+                return (1.0, float(lay_odd))
+            if scheme == "PROXY":
+                _, _, _, ll = finance_for_row(d)
+                return (float(ll), float(lay_odd))
+            if scheme.startswith("KELLY"):
+                # Kelly/closing só é interpretável pre-match
+                if d.get("is_live") is True:
+                    return None
+                frac = float(scheme.split("_")[1])
+                f = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f is None:
+                    return None
+                f = max(0.0, f) * frac
+                cap = LAY_CAP_FRAC * max(1e-9, lay_bank_ref)
+                liab = min(f * lay_bank_ref, cap)
+                # cap adicional por evento (limit): converte stake max -> liab max
+                max_st = _max_lay_stake_event(d)
+                liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                return (float(liab), float(lay_odd))
+            return None
+
+        # Frações a reportar (configurável por CLI)
+        try:
+            frac_list = [float(x.strip()) for x in str(getattr(args, "kelly_fractions", "")).split(",") if x.strip()]
+        except Exception:
+            frac_list = []
+        frac_list = [f for f in frac_list if f > 0]
+        if not frac_list:
+            frac_list = [0.10, 0.25, 0.50, 1.00]
+
+        schemes = ["FLAT", "PROXY"] + [f"KELLY_{f:.2f}" for f in frac_list]
+
+        def _eval_back(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+            pnls = []
+            stakes = []
+            mids = []
+            by_day = {}
+            for d in rows_in:
+                roi = _safe_float(d.get("roi_bs"))
+                if roi is None:
+                    continue
+                st = _sizing_back(d, scheme)
+                if st is None or st <= 0:
+                    continue
+                pnl = _pnl_back(roi, st)
+                if pnl is None:
+                    continue
+                pnls.append(float(pnl))
+                stakes.append(float(st))
+                mids.append(int(d.get("match_id")))
+                ko = d.get("kickoff") or d.get("audited_at")
+                if ko:
+                    day = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    by_day[day] = by_day.get(day, 0.0) + float(pnl)
+            turnover = float(sum(stakes)) if stakes else 0.0
+            profit = float(sum(pnls)) if pnls else 0.0
+            roi_turn = (profit / turnover * 100.0) if turnover > 0 else None
+            dd_mean, dd_p95 = _bootstrap_dd(list(by_day.values()), horizon_days=30, n_boot=1200)
+            return {
+                "n": len(pnls),
+                "turnover": turnover,
+                "profit": profit,
+                "roi_turn": roi_turn,
+                "p99_stake": _pctl(stakes, 99),
+                "es95_stake": _es_tail(stakes, 95),
+                "dd_mean": dd_mean,
+                "dd_p95": dd_p95,
+            }
+
+        def _eval_lay(rows_in: List[dict], scheme: str) -> Dict[str, Any]:
+            pnls = []
+            liabs = []
+            stakes = []
+            by_day = {}
+            for d in rows_in:
+                mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if mult is None:
+                    continue
+                sized = _sizing_lay_liab(d, scheme)
+                if not sized:
+                    continue
+                liab, lay_odd = sized
+                if liab is None or liab <= 0:
+                    continue
+                pnl = _pnl_lay_from_liab(float(liab), float(lay_odd), mult)
+                if pnl is None:
+                    continue
+                pnls.append(float(pnl))
+                liabs.append(float(liab))
+                st = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                stakes.append(st)
+                ko = d.get("kickoff") or d.get("audited_at")
+                if ko:
+                    day = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    by_day[day] = by_day.get(day, 0.0) + float(pnl)
+            turnover = float(sum(stakes)) if stakes else 0.0
+            profit = float(sum(pnls)) if pnls else 0.0
+            roi_turn = (profit / turnover * 100.0) if turnover > 0 else None
+            roi_liab = (profit / float(sum(liabs)) * 100.0) if sum(liabs) > 0 else None
+            dd_mean, dd_p95 = _bootstrap_dd(list(by_day.values()), horizon_days=30, n_boot=1200)
+            return {
+                "n": len(pnls),
+                "turnover_stake": turnover,
+                "exposure_liab": float(sum(liabs)) if liabs else 0.0,
+                "profit": profit,
+                "roi_turn": roi_turn,
+                "roi_liab": roi_liab,
+                "p99_liab": _pctl(liabs, 99),
+                "es95_liab": _es_tail(liabs, 95),
+                "dd_mean": dd_mean,
+                "dd_p95": dd_p95,
+            }
+
+        # Baselines: coortes (com placar)
+        back_finished = [d for d in back_edge if d.get("roi_bs") is not None]
+        lay_finished = [d for d in lay_edge if d.get("home_score") is not None and d.get("away_score") is not None]
+
+        lines.append("**Backtest de sizing (apenas eventos com placar; valores em unidade monetária *proxy*)**\n\n")
+        lines.append("| Lado | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover | p99 exposição | ES95 exposição | DD 30d (média) | DD 30d (p95) |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for sc in schemes:
+            eb = _eval_back(back_finished, sc)
+            el = _eval_lay(lay_finished, sc)
+            lines.append(
+                f"| Back | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | "
+                f"{_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['es95_stake'],2)} | {_fmt_num(eb['dd_mean'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
+            )
+            lines.append(
+                f"| Lay | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | "
+                f"{_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['es95_liab'],2)} | {_fmt_num(el['dd_mean'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nLeitura:\n"
+            "- Se `PROXY` piora ROI/turnover vs `FLAT`, isso indica que a política de stake atual está concentrando exposição em pontos com pior performance.\n"
+            "- `KELLY_0.25` tende a ser um bom compromisso quando o edge é estimado por CLV, mas requer **caps** e só é aplicável quando há `closing_odd` (pre‑match).\n"
+            "- Em Lay, é comum observar ROI alto por **liability**, mas sizing menor em **stake**: isso é uma decisão deliberada de governança de risco (liability tem cauda pior).\n"
+            "- DD é estimado por bootstrap i.i.d de dias (aproximação). Para uma curva mais fiel, use bootstrap por dia com blocos maiores.\n\n"
+        )
+
+        # 9.3b) Sizing separado por estratégia (8 combinações)
+        lines.append("### 9.3b Stake sizing por estratégia (8 combinações)\n")
+        lines.append(
+            "Abaixo repetimos o backtest de sizing **separado** por cada combinação `Side × Pre/In × Reversal`. "
+            "Isso responde diretamente sua necessidade: **se várias combinações tiverem valor, o Kelly/caps deve ser calibrado por estratégia**.\n\n"
+            "Observações:\n"
+            "- Kelly é calculado **somente pre-match** (depende de `closing_odd`). Em combinações `In`, reportamos apenas `FLAT` e `PROXY`.\n"
+            "- ROI do Lay é por **liability**; turnover é mostrado em stake equivalente.\n\n"
+        )
+        lines.append("| Side | Pre/In | Reversal | Scheme | N (placar) | Turnover | Lucro | ROI/turnover | p99 exp | DD30 p95 |\n|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
+
+        def _rows_for_combo(side: str, is_live_val: bool, had_rev_val: bool) -> List[dict]:
+            # usa entries para filtrar e volta para o d original (necessário para sizing)
+            ent = back_entries if side == "Back" else lay_entries
+            flt = [r for r in ent if r.get("is_live") is is_live_val and bool(r.get("had_reversal")) is bool(had_rev_val)]
+            out = []
+            for r in flt:
+                aid = r.get("audit_id")
+                if aid is None:
+                    continue
+                d0 = by_audit_id.get(int(aid))
+                if d0:
+                    # filtra por coorte de edge (Back/Lay) para evitar misturar lados
+                    if side == "Back" and int(aid) not in back_edge_ids:
+                        continue
+                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                        continue
+                    out.append(d0)
+            return out
+
+        for side in ["Back", "Lay"]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
+                    rows_combo = _rows_for_combo(side, is_live_val, had_rev_val)
+                    # apenas eventos com placar, como no backtest geral
+                    if side == "Back":
+                        rows_fin = [d for d in rows_combo if d.get("roi_bs") is not None]
+                        for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
+                            eb = _eval_back(rows_fin, sc)
+                            lines.append(
+                                f"| {side} | {regime_label} | {rev_label} | {sc} | {eb['n']} | {_fmt_num(eb['turnover'],2)} | {_fmt_num(eb['profit'],2)} | {_fmt_num(eb['roi_turn'],2)}% | {_fmt_num(eb['p99_stake'],2)} | {_fmt_num(eb['dd_p95'],2)} |\n"
+                            )
+                    else:
+                        rows_fin = [d for d in rows_combo if d.get("home_score") is not None and d.get("away_score") is not None]
+                        for sc in (["FLAT", "PROXY"] + ([f"KELLY_{f:.2f}" for f in frac_list] if (is_live_val is False) else [])):
+                            el = _eval_lay(rows_fin, sc)
+                            lines.append(
+                                f"| {side} | {regime_label} | {rev_label} | {sc} | {el['n']} | {_fmt_num(el['turnover_stake'],2)} | {_fmt_num(el['profit'],2)} | {_fmt_num(el['roi_turn'],2)}% | {_fmt_num(el['p99_liab'],2)} | {_fmt_num(el['dd_p95'],2)} |\n"
+                            )
+
+        # ============================================================
+        # 9.4) Estratégias candidatas (com sizing recomendado)
+        # ============================================================
+        lines.append("### 9.4 Estratégias candidatas (combinações 8.3 + sizing recomendado)\n")
+        lines.append(
+            "Esta seção foi atualizada para refletir as **combinações** que você está analisando (Back/Lay × Pre/In × Reversal). "
+            "Ela não assume mais apenas `BackFast` e `LayReversal`.\n\n"
+            "**Política de entrada**:\n"
+            "- Back: `t0`.\n"
+            "- Lay: **após reversão** quando existir; senão no **último ponto** (~t+20s).\n\n"
+            "**Política de sizing sugerida** (padrão):\n"
+            "- Pre‑match: `KELLY_0.25` (com caps e cap por evento).\n"
+            "- In‑match: `FLAT` ou `PROXY` capado, até existir um benchmark live (Kelly live não é confiável sem referência).\n\n"
+        )
+
+        # Estratégias candidatas = 8 combinações; aqui apenas listamos métricas de entrada (CLV/ROI) e N
+        lines.append("| Side | Pre/In | Reversal | N (janela) | Jogos | CLV (entry; IC90) | ROI (entry; IC90) | ROI p30 | Observação |\n")
+        lines.append("|---|---|---|---:|---:|---:|---:|---:|---|\n")
+        for side, entries in [("Back", back_entries), ("Lay", lay_entries)]:
+            for is_live_val, regime_label in [(False, "Pre"), (True, "In")]:
+                for had_rev_val, rev_label in [(True, "Yes"), (False, "No")]:
+                    filt = [r for r in entries if r.get("is_live") is is_live_val and bool(r.get("had_reversal")) is bool(had_rev_val)]
+                    m_total = len(set(int(r.get("match_id")) for r in filt if r.get("match_id") is not None))
+                    # CLV: pre-match only
+                    clv_mean = clv_ci = None
+                    if is_live_val is False:
+                        clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+                        s_clv = summarize_metric([r.get(clv_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-50, clip_high=50)
+                        clv_mean, clv_ci = s_clv.mean_cluster, s_clv.ci90_cluster
+                    # ROI: entry policy
+                    roi_key = "roi_t0" if side == "Back" else "roi_entry"
+                    s_roi = summarize_metric([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-200, clip_high=(500.0 if side == "Back" else 5000.0))
+                    bym = {}
+                    for v, mid in zip([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt]):
+                        vf = _safe_float(v)
+                        if vf is None:
+                            continue
+                        bym.setdefault(int(mid), []).append(float(vf))
+                    roi_p30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+                    obs = "pre: Kelly OK" if regime_label == "Pre" else "in: use FLAT/PROXY"
+                    lines.append(
+                        f"| {side} | {regime_label} | {rev_label} | {len(filt)} | {m_total} | "
+                        f"{_fmt_pct(clv_mean,2)} {_fmt_ci(clv_ci,2)} | {_fmt_pct(s_roi.mean_cluster,2)} {_fmt_ci(s_roi.ci90_cluster,2)} | {_fmt_pct(roi_p30,2)} | {obs} |\n"
+                    )
+
+        FX = float(args.fx_usdbrl or 5.20)
+
+        def _liq_bank_from_sized(rows_b_all: List[dict], rows_l_all: List[dict], scheme: str) -> Optional[float]:
+            """Banca por liquidez: p99 do capital simultaneamente travado (com buffer)."""
+            # Reusa premissas de liquidez do 7.3 (defaults/env)
+            settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+            dur_h = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
+            grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+            buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
+
+            jobs: List[Tuple[datetime, datetime, float]] = []
+
+            for d in rows_b_all:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
+                if t1 <= t0:
+                    t1 = t0 + timedelta(hours=(dur_h + settle_h))
+                st = _sizing_back(d, scheme)
+                if st is None or float(st) <= 0:
+                    continue
+                jobs.append((t0, t1, float(st)))
+
+            for d in rows_l_all:
+                t0 = d.get("audited_at") or d.get("hypothesis_detected_at")
+                if not isinstance(t0, datetime):
+                    continue
+                ko = d.get("kickoff") or d.get("kickoff_time")
+                t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
+                if t1 <= t0:
+                    t1 = t0 + timedelta(hours=(dur_h + settle_h))
+                sized = _sizing_lay_liab(d, scheme)
+                if not sized:
+                    continue
+                liab, _ = sized
+                if liab is None or float(liab) <= 0:
+                    continue
+                jobs.append((t0, t1, float(liab)))
+
+            if not jobs:
+                return None
+            t_min = min(a for a, _, _ in jobs)
+            t_max = max(b for _, b, _ in jobs)
+            if t_max <= t_min:
+                return None
+            step = max(1, int(grid_min))
+            vals: List[float] = []
+            t = t_min
+            while t <= t_max:
+                s = 0.0
+                for a, b, exp in jobs:
+                    if a <= t < b:
+                        s += float(exp)
+                vals.append(float(s))
+                t = t + timedelta(minutes=step)
+            if not vals:
+                return None
+            p99 = float(np.quantile(vals, 0.99))
+            return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
+
+        def _summ_strategy(name: str, rows_b: List[dict], rows_l: List[dict], scheme: str):
+            eb = _eval_back([d for d in rows_b if d.get("roi_bs") is not None], scheme)
+            el = _eval_lay([d for d in rows_l if d.get("home_score") is not None and d.get("away_score") is not None], scheme)
+
+            back_n = int(eb["n"] or 0)
+            lay_n = int(el["n"] or 0)
+            back_n_30d = int(round((back_n / window_days) * horizon_days)) if window_days > 0 else None
+            lay_n_30d = int(round((lay_n / window_days) * horizon_days)) if window_days > 0 else None
+
+            turn_win = float(eb["turnover"] + el["turnover_stake"])
+            prof_win = float(eb["profit"] + el["profit"])
+            roi_turn_win = (prof_win / turn_win * 100.0) if turn_win > 0 else None
+            lay_roi_liab_win = el.get("roi_liab")
+            lay_roi_turn_win = el.get("roi_turn")
+
+            turn_30d = _proj_30(turn_win)
+            profit_30d = _proj_30(prof_win)
+
+            # stake/liability médios na janela (proxy)
+            stake_avg_back = (float(eb["turnover"]) / back_n) if back_n > 0 else None
+            stake_avg_lay = (float(el["turnover_stake"]) / lay_n) if lay_n > 0 else None
+            liab_avg_lay = (float(el["exposure_liab"]) / lay_n) if lay_n > 0 else None
+
+            # Banca por risco (unitária) deve vir do sizing (não só do subconjunto com ROI).
+            risk_back = []
+            for d in rows_b:
+                st = _sizing_back(d, scheme)
+                if st is not None and float(st) > 0:
+                    risk_back.append(float(st))
+            risk_lay = []
+            for d in rows_l:
+                sized = _sizing_lay_liab(d, scheme)
+                if sized and sized[0] is not None and float(sized[0]) > 0:
+                    risk_lay.append(float(sized[0]))
+            bank_back_p99 = _pctl(risk_back, 99) if risk_back else None
+            bank_lay_p99 = _pctl(risk_lay, 99) if risk_lay else None
+            bank_risk_total = None
+            if bank_back_p99 is not None or bank_lay_p99 is not None:
+                bank_risk_total = float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)
+
+            bank_liq_total = _liq_bank_from_sized(rows_b, rows_l, scheme)
+            bank_eff = None
+            if bank_risk_total is not None or bank_liq_total is not None:
+                bank_eff = max(float(bank_risk_total or 0.0), float(bank_liq_total or 0.0))
+
+            roi_bank_30d = (float(profit_30d) / float(bank_eff) * 100.0) if (profit_30d is not None and bank_eff and bank_eff > 0) else None
+
+            return {
+                "name": name,
+                "scheme": scheme,
+                # N: sempre na janela; também reportamos projeção simples 30d
+                "back_n": back_n,
+                "lay_n": lay_n,
+                "back_n_30d": back_n_30d,
+                "lay_n_30d": lay_n_30d,
+                # stake sizing médio (janela)
+                "stake_avg_back": stake_avg_back,
+                "stake_avg_lay": stake_avg_lay,
+                "liab_avg_lay": liab_avg_lay,
+                # janela
+                "turn_win": turn_win,
+                "prof_win": prof_win,
+                "roi_turn_win": roi_turn_win,
+                "lay_roi_liab_win": lay_roi_liab_win,
+                "lay_roi_turn_win": lay_roi_turn_win,
+                # 30d
+                "turn_30d": turn_30d,
+                "profit_30d": profit_30d,
+                "bank_risk_p99": bank_risk_total,
+                "bank_liq_p99": bank_liq_total,
+                "bank_eff": bank_eff,
+                "roi_bank_30d": roi_bank_30d,
+                # risco
+                "back_bank_p99": bank_back_p99,
+                "lay_bank_p99": bank_lay_p99,
+                "dd_p95": max([x for x in [eb["dd_p95"], el["dd_p95"]] if x is not None], default=None),
+                # BRL
+                "turn_30d_brl": (float(turn_30d) * FX) if turn_30d is not None else None,
+                "profit_30d_brl": (float(profit_30d) * FX) if profit_30d is not None else None,
+                "bank_eff_brl": (float(bank_eff) * FX) if bank_eff is not None else None,
+            }
+
+        lines.append(
+            "| Estratégia | Scheme | N Back (janela) | N Lay (janela) | N Back 30d (proj.) | N Lay 30d (proj.) | "
+            "Stake médio Back | Stake médio Lay | Liability média Lay | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/turnover (janela) | ROI Lay/liability (janela) | ROI Lay/turnover (janela) | "
+            "Banca p99 (Back) | Banca p99 (Lay) | Banca risco p99 (soma) | Banca liquidez p99 (+buf) | Banca recomendada (max) | ROI/banca 30d | "
+            "Turnover 30d (R$) | Lucro 30d (R$) | Banca rec. (R$) | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        )
+        # Consolida estratégia pre-match como união das combinações ativas (8.3) — somente PRE (Kelly depende de closing).
+        by_audit_id_94: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+
+        def _combo_active_83(side: str, had_rev: bool) -> bool:
+            # Aplica os mesmos critérios da tabela 8.3 (PRE apenas)
+            ent = back_entries if side == "Back" else lay_entries
+            filt = [r for r in ent if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev)]
+            if not filt:
+                return False
+            # CLV
+            clv_key = "clv_t0" if side == "Back" else "clv_conv_entry"
+            s_clv = summarize_metric([r.get(clv_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-50, clip_high=50)
+            # ROI (entry)
+            roi_key = "roi_t0" if side == "Back" else "roi_entry"
+            s_roi = summarize_metric([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt], clip_low=-200, clip_high=(500.0 if side == "Back" else 5000.0))
+            if side == "Back":
+                clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[0]) > 0)
+                roi_ok = bool(s_roi.mean_cluster is not None and float(s_roi.mean_cluster) > 0)
+                return bool(clv_ok and roi_ok)
+            # Lay: CLV bom tende a ser negativo nesta convenção
+            clv_ok = bool(s_clv.ci90_cluster and float(s_clv.ci90_cluster[1]) < 0)
+            # “sig a p30” ≈ p30 > 0
+            bym = {}
+            for v, mid in zip([r.get(roi_key) for r in filt], [r.get("match_id") for r in filt]):
+                vf = _safe_float(v)
+                if vf is None:
+                    continue
+                bym.setdefault(int(mid), []).append(float(vf))
+            roi_p30 = cluster_bootstrap_quantile(bym, 0.30, n_boot=2000, seed=int(args.seed))
+            roi_ok = bool(roi_p30 is not None and float(roi_p30) > 0)
+            return bool(clv_ok and roi_ok)
+
+        active_back_aids = set()
+        for had_rev in (True, False):
+            if _combo_active_83("Back", had_rev):
+                active_back_aids.update(int(r.get("audit_id")) for r in back_entries if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev) and r.get("audit_id") is not None)
+        active_lay_aids = set()
+        for had_rev in (True, False):
+            if _combo_active_83("Lay", had_rev):
+                active_lay_aids.update(int(r.get("audit_id")) for r in lay_entries if r.get("is_live") is False and bool(r.get("had_reversal")) is bool(had_rev) and r.get("audit_id") is not None)
+
+        rows_back_active = [by_audit_id_94[aid] for aid in active_back_aids if aid in by_audit_id_94 and aid in back_edge_ids]
+        rows_lay_active = [by_audit_id_94[aid] for aid in active_lay_aids if aid in by_audit_id_94 and aid in lay_edge_ids]
+
+        base_schemes_94 = ["FLAT"] + [f"KELLY_{f:.2f}" for f in frac_list if abs(f - 0.25) < 1e-9]
+        if len(base_schemes_94) == 1:
+            base_schemes_94.append("KELLY_0.25")
+        for sc in base_schemes_94:
+            s1 = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
+            lines.append(
+                f"| {s1['name']} | {sc} | {s1['back_n']} | {s1['lay_n']} | {s1['back_n_30d']} | {s1['lay_n_30d']} | "
+                f"{_fmt_num(s1['stake_avg_back'],2)} | {_fmt_num(s1['stake_avg_lay'],2)} | {_fmt_num(s1['liab_avg_lay'],2)} | "
+                f"{_fmt_num(s1['turn_30d'],2)} | {_fmt_num(s1['profit_30d'],2)} | {_fmt_num(s1['roi_turn_win'],2)}% | {_fmt_num(s1['lay_roi_liab_win'],2)}% | {_fmt_num(s1['lay_roi_turn_win'],2)}% | "
+                f"{_fmt_num(s1['back_bank_p99'],2)} | {_fmt_num(s1['lay_bank_p99'],2)} | {_fmt_num(s1['bank_risk_p99'],2)} | {_fmt_num(s1['bank_liq_p99'],2)} | {_fmt_num(s1['bank_eff'],2)} | {_fmt_num(s1['roi_bank_30d'],2)}% | "
+                f"{_fmt_num(s1['turn_30d_brl'],2)} | {_fmt_num(s1['profit_30d_brl'],2)} | {_fmt_num(s1['bank_eff_brl'],2)} | {_fmt_num(s1['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nNotas:\n"
+            "- **N Back/Lay** na tabela é **na janela observada**. As colunas `N 30d (proj.)` são uma **escala linear** por dias observados.\n"
+            "- Esta linha usa a união das **combinações pre‑match ativas** sob os critérios da 8.3 (é um resumo, não substitui a tabela 8.3).\n"
+            "- `Stake médio` e `Liability média` são **proxies** na unidade monetária do seu limit/finance; valores em **R$** usam fx `--fx-usdbrl`.\n"
+            "- `Banca recomendada` = max( banca por risco p99 (unitária, soma) ; banca por liquidez p99 (+buffer) ).\n"
+            "- **Por que Lay pode ter stake médio menor mesmo com ROI maior**: (i) Lay é governado por **liability** (risco) e usamos cap mais conservador; "
+            "(ii) stake em Lay é derivado de `liability/(odd-1)` e depende do nível médio de odds; (iii) Kelly depende do **edge vs closing** (gap entry→closing), "
+            "não do ROI observado isoladamente.\n"
+            "- **Por que não incluímos Back in‑match aqui**: Kelly/CLV usam `closing_odd` pré‑jogo; in‑match requer benchmark diferente (ex.: referência por minuto/VWAP) e "
+            "governança operacional específica. A seção 2.2 já compara PRE_MATCH vs IN_MATCH.\n"
+        )
+
+        # ------------------------------------------------------------
+        # 9.4b) Curva de capacidade (fração de Kelly) — tamanho potencial
+        # ------------------------------------------------------------
+        lines.append("\n### 9.4b Curva de capacidade — frações de Kelly e tamanho potencial\n")
+        lines.append(
+            "Esta tabela é um exercício para estimar **capacidade** (turnover/lucro/risco) ao variar a fração de Kelly. "
+            "Ela deixa explícito quando o sizing satura por **cap por aposta**.\n\n"
+        )
+
+        def _cap_rate_back(rows_b_all: List[dict], scheme: str) -> Optional[float]:
+            if not str(scheme).startswith("KELLY"):
+                return None
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return None
+            cap = BACK_CAP_FRAC * max(1e-9, float(back_bank_ref))
+            hits = 0
+            n = 0
+            for d in rows_b_all:
+                f0 = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(back_bank_ref)
+                if raw > cap + 1e-12:
+                    hits += 1
+                n += 1
+            return (100.0 * hits / n) if n > 0 else None
+
+        def _cap_rate_lay(rows_l_all: List[dict], scheme: str) -> Optional[float]:
+            if not str(scheme).startswith("KELLY"):
+                return None
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return None
+            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+            hits = 0
+            n = 0
+            for d in rows_l_all:
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d.get("bs_odd"))
+                if lay_odd is None:
+                    continue
+                f0 = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(lay_bank_ref)
+                if raw > cap + 1e-12:
+                    hits += 1
+                n += 1
+            return (100.0 * hits / n) if n > 0 else None
+
+        def _hit_rates_back(rows_b_all: List[dict], scheme: str) -> Tuple[Optional[float], Optional[float]]:
+            """Retorna (cap_hit_pct, limit_hit_pct) para Back em Kelly."""
+            if not str(scheme).startswith("KELLY"):
+                return (None, None)
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return (None, None)
+            cap = BACK_CAP_FRAC * max(1e-9, float(back_bank_ref))
+            cap_hits = 0
+            lim_hits = 0
+            n = 0
+            for d in rows_b_all:
+                f0 = _kelly_back_frac(d.get("bs_odd"), d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(back_bank_ref)
+                st1 = min(raw, cap)
+                lim = float(_max_back_stake_event(d))
+                st2 = min(st1, lim)
+                if raw > cap + 1e-12:
+                    cap_hits += 1
+                if st1 > lim + 1e-12:
+                    lim_hits += 1
+                n += 1
+            return ((100.0 * cap_hits / n) if n > 0 else None, (100.0 * lim_hits / n) if n > 0 else None)
+
+        def _hit_rates_lay(rows_l_all: List[dict], scheme: str) -> Tuple[Optional[float], Optional[float]]:
+            """Retorna (cap_hit_pct, limit_hit_pct) para Lay em Kelly (liability)."""
+            if not str(scheme).startswith("KELLY"):
+                return (None, None)
+            try:
+                frac = float(str(scheme).split("_")[1])
+            except Exception:
+                return (None, None)
+            cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+            cap_hits = 0
+            lim_hits = 0
+            n = 0
+            for d in rows_l_all:
+                h = d.get("hypothesis_details") or {}
+                lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d.get("bs_odd"))
+                if lay_odd is None:
+                    continue
+                f0 = _kelly_lay_liab_frac(lay_odd, d.get("closing_odd"))
+                if f0 is None:
+                    continue
+                f = max(0.0, float(f0)) * float(frac)
+                raw = f * float(lay_bank_ref)
+                liab1 = min(raw, cap)
+                max_st = float(_max_lay_stake_event(d))
+                lim = float(max_st) * max(0.0, float(lay_odd) - 1.0)
+                liab2 = min(liab1, lim)
+                if raw > cap + 1e-12:
+                    cap_hits += 1
+                if liab1 > lim + 1e-12:
+                    lim_hits += 1
+                n += 1
+            return ((100.0 * cap_hits / n) if n > 0 else None, (100.0 * lim_hits / n) if n > 0 else None)
+
+        lines.append(
+            f"**Escala Kelly usada nesta curva**: {'BANKROLL' if use_bankroll else 'P99_PROXY'} | "
+            f"ref_back={_fmt_num(back_bank_ref,2)} ref_lay={_fmt_num(lay_bank_ref,2)} | "
+            f"cap_back={BACK_CAP_FRAC:.1%} cap_lay={LAY_CAP_FRAC:.1%} | max_stake_event={MAX_STAKE_PCT_OF_LIMIT:.0%}*limit\n\n"
+        )
+        lines.append(
+            "| Strategy | Scheme | cap_hit Back (%) | limit_hit Back (%) | cap_hit Lay (%) | limit_hit Lay (%) | "
+            "Turnover 30d (proj.) | Lucro 30d (proj.) | ROI/banca 30d | DD 30d p95 |\n"
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        )
+        for sc in [f"KELLY_{f:.2f}" for f in frac_list]:
+            s = _summ_strategy("Ativas (PRE, critérios 8.3)", rows_back_active, rows_lay_active, sc)
+            crb, lrb = _hit_rates_back(rows_back_active, sc)
+            crl, lrl = _hit_rates_lay(rows_lay_active, sc)
+            lines.append(
+                f"| {s['name']} | {sc} | {_fmt_num(crb,1)}% | {_fmt_num(lrb,1)}% | {_fmt_num(crl,1)}% | {_fmt_num(lrl,1)}% | "
+                f"{_fmt_num(s['turn_30d'],2)} | {_fmt_num(s['profit_30d'],2)} | {_fmt_num(s['roi_bank_30d'],2)}% | {_fmt_num(s['dd_p95'],2)} |\n"
+            )
+        lines.append(
+            "\nLeitura rápida:\n"
+            "- Se `cap_hit` estiver alto, a alavancagem adicional (ex.: 0,50× ou 1,00×) não vira turnover — o cap está “travando” o tamanho.\n"
+            "- Se `limit_hit` estiver alto, você está batendo no **limit operacional** (capacidade da conta/mercado) — aumentar banca ou frac não aumenta turnover.\n"
+            "- Se `cap_hit` estiver baixo, a curva deve escalar quase linearmente com `frac` (até bater em limites reais/operacionais).\n"
+            "- Lay normalmente satura antes por ter cap mais conservador (liability) e por ter risco de cauda mais assimétrico.\n\n"
+        )
+
+        # ------------------------------------------------------------
+        # 9.4c) Diagnóstico in-match (Back): por que não entra na estratégia
+        # ------------------------------------------------------------
+        lines.append("### 9.4c Diagnóstico: Back in‑match (por que não está na estratégia candidata)\n")
+        lines.append(
+            "Aqui reportamos Back in‑match **apenas como diagnóstico**. "
+            "Não incluímos in‑match na estratégia candidata porque (i) `closing_odd` pré‑jogo não é benchmark in‑match e "
+            "(ii) o sizing Kelly acima depende desse benchmark.\n\n"
+        )
+        strat_back_im = [d for d in back_edge if str(d.get("exec_bucket")) == "< 5s" and d.get("is_live") is True]
+        eb_flat_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "FLAT")
+        eb_proxy_im = _eval_back([d for d in strat_back_im if d.get("roi_bs") is not None], "PROXY")
+        lines.append("| Regime | Scheme | N | Turnover (janela) | Lucro (janela) | ROI/turnover |\n|---|---|---:|---:|---:|---:|\n")
+        lines.append(f"| IN_MATCH BackFast (<5s) | FLAT | {eb_flat_im['n']} | {_fmt_num(eb_flat_im['turnover'],2)} | {_fmt_num(eb_flat_im['profit'],2)} | {_fmt_num(eb_flat_im['roi_turn'],2)}% |\n")
+        lines.append(f"| IN_MATCH BackFast (<5s) | PROXY | {eb_proxy_im['n']} | {_fmt_num(eb_proxy_im['turnover'],2)} | {_fmt_num(eb_proxy_im['profit'],2)} | {_fmt_num(eb_proxy_im['roi_turn'],2)}% |\n")
+        lines.append(
+            "\nPróximo passo (se quiser operar in‑match): definir um benchmark de preço justo in‑match (ex.: referência por minuto, VWAP, ou odds externas) "
+            "e calibrar sizing/risco específico do live.\n\n"
+        )
+
+        # ============================================================
+        # 12) OOS rolling-forward (walk-forward)
+        # ============================================================
+        wf_train_mode_hdr = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
+        if wf_train_mode_hdr not in ("rolling", "expanding"):
+            wf_train_mode_hdr = "rolling"
+        wf_mode_label = "expanding window" if wf_train_mode_hdr == "expanding" else "rolling window"
+        lines.append(f"## 12) OOS walk-forward ({wf_mode_label}): seleção e validação\n")
+        lines.append(
+            "Até aqui o relatório é **in-sample** (na janela `--lookback-days`). "
+            "Este bloco (opcional) faz um walk-forward por dia:\n\n"
+            f"- **Train mode**: `{wf_train_mode_hdr}`.\n"
+            "- Em cada passo, usamos uma janela de treino para **selecionar** combinações (Side×Pre/In×Reversal) com evidência de valor.\n"
+            "  - `rolling`: usa os **últimos** `wf_train_days`.\n"
+            "  - `expanding`: usa **todos os dias anteriores** (com `wf_train_days` só definindo quando o teste começa).\n"
+            "- No(s) dia(s) seguinte(s) (`wf_test_days`), medimos o resultado OOS nas combinações ativas.\n\n"
+            "**Evidência de valor (por combinação, no treino)** segue seus critérios (com elegibilidade por volume):\n"
+            "- Elegibilidade: `N_ROI >= wf_min_matches` (jogos com ROI na janela de treino).\n"
+            "- Back/Pre: CLV p90>0 (IC90 lb>0) e ROI>0 (não precisa ser sig.)\n"
+            "- Back/In: ROI p30>0\n"
+            "- Lay/Pre: CLV_CONV p90>0 (IC90 lb>0) e ROI p30>0\n"
+            "- Lay/In: ROI p30>0\n\n"
+            "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
+        )
+
+        if not bool(getattr(args, "walkforward", False)):
+            lines.append(
+                "Walk-forward **desligado**. Para habilitar: rode com `--walkforward` "
+                "(e ajuste `--wf-train-days/--wf-test-days/--wf-min-matches` se quiser).\n\n"
+            )
+        else:
+            wf_train = int(max(1, getattr(args, "wf_train_days", 3)))
+            wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
+            wf_min_m = int(max(5, getattr(args, "wf_min_matches", 30)))
+            wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
+            if wf_train_mode not in ("rolling", "expanding"):
+                wf_train_mode = "rolling"
+            wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
+            wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
+            wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
+            bud_back_frac = max(0.0, float(getattr(args, "wf_budget_back_frac", 0.01)))
+            bud_lay_frac = max(0.0, float(getattr(args, "wf_budget_lay_frac", 0.005)))
+            bud_cap_sig_frac = max(0.0, float(getattr(args, "wf_budget_cap_signal_frac", 0.33)))
+
+            # index para recuperar campos de sizing/liquidez
+            audit_by_id: Dict[int, dict] = {int(d.get("id")): d for d in ok_bs if d.get("id") is not None}
+
+            # dataset de entradas com timestamp
+            combo_events: List[dict] = []
+            for side, ent in [("Back", back_entries), ("Lay", lay_entries)]:
+                for r in ent:
+                    aid = r.get("audit_id")
+                    if aid is None:
+                        continue
+                    # mantém apenas eventos de edge do lado correspondente
+                    if side == "Back" and int(aid) not in back_edge_ids:
+                        continue
+                    if side == "Lay" and int(aid) not in lay_edge_ids:
+                        continue
+                    ts = r.get("audited_at")
+                    if not isinstance(ts, datetime):
+                        continue
+                    combo_events.append(
+                        {
+                            "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+                            "audit_id": int(aid),
+                            "side": side,
+                            "regime": "Pre" if r.get("is_live") is False else "In",
+                            "reversal": "Yes" if bool(r.get("had_reversal")) else "No",
+                            "match_id": int(r.get("match_id")),
+                            # métricas (t0)
+                            "clv_back": r.get("clv_t0") if (r.get("is_live") is False and side == "Back") else None,
+                            # Para Lay, faz mais sentido avaliar CLV no **ponto de entrada da estratégia** (pós-reversão ou último ponto),
+                            # e na convenção unificada `clv_conv = -(entry-closing)/closing` (Lay "bom" -> positivo).
+                            "clv_lay_conv": r.get("clv_conv_entry") if (r.get("is_live") is False and side == "Lay") else None,
+                            # ROI no ponto de entrada (Back=t0; Lay=após reversão se existir, senão último ponto)
+                            "roi": r.get("roi_t0") if side == "Back" else r.get("roi_entry"),
+                            # odd de entrada para sizing Lay coerente com o ponto de entrada
+                            "entry_odd": r.get("odd_t0") if side == "Back" else r.get("odd_entry"),
+                        }
+                    )
+
+            # Calendário do walk-forward: usar os dias com dados carregados no recorte (mesmo que não haja eventos OK/edge),
+            # para não “sumir” dias recentes (ex.: 17/18) na tabela OOS.
+            def _day_utc_from_ts(ts: Any) -> Optional[str]:
+                if isinstance(ts, datetime):
+                    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                return None
+
+            days_loaded = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in all_data) if d})
+            days_ok = sorted({d for d in (_day_utc_from_ts(r.get("audited_at")) for r in ok_bs) if d})
+            days_combo = sorted({e["day"] for e in combo_events})
+            days = days_loaded if days_loaded else days_combo
+            # Diagnóstico de cobertura (explica por que OOS tem N bem menor)
+            uniq_matches_total = len({int(e["match_id"]) for e in combo_events})
+            uniq_matches_roi = len({int(e["match_id"]) for e in combo_events if e.get("roi") is not None})
+            uniq_matches_clv = len(
+                {int(e["match_id"]) for e in combo_events if (e.get("clv_back") is not None or e.get("clv_lay_conv") is not None)}
+            )
+            lines.append("### 12.0 Diagnóstico de cobertura OOS (por que N cai)\n")
+            lines.append("| Filtro | Jogos únicos |\n|---|---:|\n")
+            lines.append(f"| Combinações elegíveis (edge + timing + t0) | {uniq_matches_total} |\n")
+            lines.append(f"| Com ROI disponível (precisa de placar) | {uniq_matches_roi} |\n")
+            lines.append(f"| Com CLV disponível (pre-match + closing) | {uniq_matches_clv} |\n")
+            lines.append("\n**Calendário do walk-forward (dias únicos)**\n\n")
+            lines.append("| Tipo | Dias |\n|---|---:|\n")
+            lines.append(f"| Dias com dados carregados (audited_at) | {len(days_loaded)} |\n")
+            lines.append(f"| Dias com eventos OK/betslip conf. | {len(days_ok)} |\n")
+            lines.append(f"| Dias com eventos elegíveis p/ WF (edge) | {len(days_combo)} |\n")
+            lines.append(f"| Dias usados no walk-forward | {len(days)} |\n")
+
+            # Diagnóstico por dia: ajuda a distinguir "dia vazio por falta de oportunidade" vs "dia vazio por falha de qualidade/execução"
+            day_all_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in all_data if _day_utc_from_ts(d.get("audited_at")))
+            day_bs_raw_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs_raw if _day_utc_from_ts(d.get("audited_at")))
+            day_bs_conf_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in with_bs if _day_utc_from_ts(d.get("audited_at")))
+            day_ok_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in ok_bs if _day_utc_from_ts(d.get("audited_at")))
+            day_back_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in back_edge if _day_utc_from_ts(d.get("audited_at")))
+            day_lay_edge_cnt = Counter(_day_utc_from_ts(d.get("audited_at")) for d in lay_edge if _day_utc_from_ts(d.get("audited_at")))
+
+            day_non_ok_top: Dict[str, str] = {}
+            tmp: Dict[str, Counter] = {}
+            for d in with_bs:
+                day = _day_utc_from_ts(d.get("audited_at"))
+                if not day:
+                    continue
+                st = str(d.get("status", "") or "").upper()
+                if st == "OK":
+                    continue
+                tmp.setdefault(day, Counter())
+                tmp[day][st or "NA"] += 1
+            for day, c in tmp.items():
+                day_non_ok_top[day] = str(c.most_common(1)[0][0]) if c else "—"
+
+            lines.append("\n**Diagnóstico por dia (audited_at): betslip vs qualidade vs edge**\n\n")
+            lines.append(
+                "| Dia | Auditorias carregadas | Betslip bruto | Betslip conf. | OK (conf.) | Edge Back/Lay | %OK/conf. | Status não-OK dominante |\n"
+                "|---|---:|---:|---:|---:|---:|---:|---|\n"
+            )
+            for day in days_loaded:
+                a = int(day_all_cnt.get(day, 0))
+                br = int(day_bs_raw_cnt.get(day, 0))
+                conf = int(day_bs_conf_cnt.get(day, 0))
+                ok = int(day_ok_cnt.get(day, 0))
+                eb = int(day_back_edge_cnt.get(day, 0))
+                el = int(day_lay_edge_cnt.get(day, 0))
+                ok_rate = (100.0 * ok / conf) if conf > 0 else None
+                lines.append(
+                    f"| {day} | {a} | {br} | {conf} | {ok} | {eb}/{el} | {_fmt_num(ok_rate,1)}% | {day_non_ok_top.get(day,'—')} |\n"
+                )
+            lines.append(
+                "\nLeitura:\n"
+                "- Se `Auditorias carregadas > 0` mas `Betslip conf.` ≈ 0, geralmente houve **mismatch/parse** (diff fora de [-10,+10]) ou ausência de betslip.\n"
+                "- Se `Betslip conf. > 0` mas `OK (conf.) = 0`, o robô coletou betslip, mas os eventos falharam por **status != OK** (ver coluna de status).\n"
+                "- Dias com `OK (conf.) = 0` **não devem ser tratados como “0 oportunidade”** sem investigar o operacional.\n\n"
+            )
+            lines.append(
+                "\nLeitura: o walk-forward mede OOS principalmente por **ROI**, então ele encolhe quando a cobertura de placar é baixa. "
+                "Além disso, a métrica é agregada por **jogo único** (cluster), então você verá números menores que o N de eventos.\n\n"
+            )
+            if len(days) < (wf_train + wf_test):
+                lines.append(
+                    f"[WARN] Janela curta para walk-forward: dias únicos={len(days)}; precisa >= {wf_train + wf_test}.\n\n"
+                )
+            else:
+                def _key(e: dict) -> str:
+                    """
+                    Chave de combinação para OOS.
+                    - Back: não depende de reversão (estratégia é "entrar rápido"), então agregamos Yes/No como 'Any'.
+                    - Lay: mantém Yes/No porque a política de entrada depende de reversão (reversal -> entra após; senão entra no último ponto).
+                    """
+                    side = str(e.get("side"))
+                    regime = str(e.get("regime"))
+                    rev = str(e.get("reversal"))
+                    if side == "Back":
+                        rev = "Any"
+                    return f"{side}_{regime}_{rev}"
+
+                def _bym(sub: List[dict], key: str) -> Dict[int, List[float]]:
+                    bym: Dict[int, List[float]] = {}
+                    for e in sub:
+                        v = _safe_float(e.get(key))
+                        if v is None:
+                            continue
+                        bym.setdefault(int(e["match_id"]), []).append(float(v))
+                    return bym
+
+                def _q(bym: Dict[int, List[float]], q: float) -> Optional[float]:
+                    return cluster_bootstrap_quantile(bym, q, n_boot=2000, seed=int(args.seed))
+
+                def _mean_ci90(bym: Dict[int, List[float]]) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+                    return cluster_bootstrap_ci(bym, n_boot=2000, alpha=0.10, seed=int(args.seed))
+
+                steps = []
+                active_counts: Dict[str, int] = {}
+                # séries para estimativa 30d (OOS)
+                daily_turn = {}  # day -> turnover stake eq (todas elegíveis)
+                daily_turn_pre = {}
+                daily_turn_in = {}
+                daily_pnl_obs = {}  # day -> pnl observado (somente ROI disponível)
+                daily_pnl_obs_pre = {}
+                daily_pnl_obs_in = {}
+                daily_pnl_exp = {}  # day -> pnl expandido (se wf_expand)
+                daily_pnl_exp_pre = {}
+                daily_pnl_exp_in = {}
+                # exposições para banca/liquidez (todas elegíveis)
+                oos_back_stakes_all: List[float] = []
+                oos_lay_liab_all: List[float] = []
+                oos_jobs: List[Tuple[datetime, datetime, float]] = []  # (t0, t1, exposure)
+
+                def _scheme_for_event(ev: dict) -> str:
+                    return wf_scheme_pre if ev.get("regime") == "Pre" else wf_scheme_in
+
+                def _sizing_for_event(ev: dict) -> Tuple[Optional[float], Optional[float]]:
+                    """
+                    Retorna (stake_turnover_equivalente, exposure_risk).
+                    - Back: stake=exposure=stake
+                    - Lay: stake_turnover = liab/(odd-1), exposure_risk=liab
+                    """
+                    aid = int(ev.get("audit_id"))
+                    d0 = audit_by_id.get(aid)
+                    if not d0:
+                        return (None, None)
+                    sc = _scheme_for_event(ev)
+                    if ev.get("side") == "Back":
+                        st = _sizing_back(d0, sc)
+                        if st is None or float(st) <= 0:
+                            return (None, None)
+                        return (float(st), float(st))
+                    # Lay
+                    # Usa odd de entrada (reversão/último) para sizing coerente com a estratégia
+                    lay_odd = _safe_float(ev.get("entry_odd"))
+                    if lay_odd is None:
+                        h = d0.get("hypothesis_details") or {}
+                        lay_odd = _safe_float(_get_path(h, ["lay", "odd"])) or _safe_float(d0.get("bs_odd"))
+                    if lay_odd is None or float(lay_odd) <= 1.0:
+                        return (None, None)
+                    if sc == "FLAT":
+                        liab = 1.0
+                    elif sc == "PROXY":
+                        # replica finance_for_row, mas com odd de entrada
+                        h = d0.get("hypothesis_details") or {}
+                        lay_lim = _safe_float(_get_path(h, ["lay", "available_limit"]))
+                        if lay_lim is None:
+                            lay_lim = _safe_float(d0.get("limit"))
+                        st = stake_from_limit(float(lay_lim or 0.0))
+                        liab = float(st) * max(0.0, float(lay_odd) - 1.0)
+                    elif sc.startswith("KELLY"):
+                        frac = float(sc.split("_")[1])
+                        f0 = _kelly_lay_liab_frac(lay_odd, d0.get("closing_odd"))
+                        if f0 is None:
+                            return (None, None)
+                        f = max(0.0, float(f0)) * float(frac)
+                        cap = LAY_CAP_FRAC * max(1e-9, float(lay_bank_ref))
+                        liab = min(f * float(lay_bank_ref), cap)
+                    else:
+                        return (None, None)
+                    # cap por evento (limit): converte stake max -> liab max
+                    max_st = _max_lay_stake_event(d0)
+                    liab = min(float(liab), float(max_st) * max(0.0, float(lay_odd) - 1.0))
+                    if liab is None or float(liab) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
+                        return (None, None)
+                    stake_eq = float(liab) / max(1e-9, (float(lay_odd) - 1.0))
+                    return (float(stake_eq), float(liab))
+
+                def _append_job(ev: dict, exposure: float):
+                    """Para banca de liquidez: capital simultaneamente travado."""
+                    aid = int(ev.get("audit_id"))
+                    d0 = audit_by_id.get(aid)
+                    if not d0:
+                        return
+                    t0 = d0.get("audited_at") or d0.get("hypothesis_detected_at")
+                    if not isinstance(t0, datetime):
+                        return
+                    settle_h = float(os.getenv("LIQUIDITY_SETTLE_BUFFER_HOURS", "2.25"))
+                    dur_h = float(os.getenv("LIQUIDITY_MATCH_DURATION_HOURS", "2.0"))
+                    ko = d0.get("kickoff") or d0.get("kickoff_time")
+                    t1 = (ko + timedelta(hours=(dur_h + settle_h))) if isinstance(ko, datetime) else (t0 + timedelta(hours=(dur_h + settle_h)))
+                    if t1 <= t0:
+                        t1 = t0 + timedelta(hours=(dur_h + settle_h))
+                    oos_jobs.append((t0, t1, float(exposure)))
+
+                def _liq_p99_from_jobs(jobs: List[Tuple[datetime, datetime, float]]) -> Optional[float]:
+                    if not jobs:
+                        return None
+                    grid_min = int(os.getenv("LIQUIDITY_GRID_MINUTES", "5"))
+                    buf_pct = float(os.getenv("LIQUIDITY_BANK_BUFFER_PCT", "10"))
+                    step = max(1, grid_min)
+                    t_min = min(j[0] for j in jobs)
+                    t_max = max(j[1] for j in jobs)
+                    t = t_min
+                    vals = []
+                    while t <= t_max:
+                        s = 0.0
+                        for a, b, exp in jobs:
+                            if a <= t <= b:
+                                s += float(exp)
+                        vals.append(float(s))
+                        t = t + timedelta(minutes=step)
+                    if not vals:
+                        return None
+                    p99 = float(np.quantile(vals, 0.99))
+                    return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
+                # Inclui o último dia possível como teste (ex.: com wf_test_days=1, testa também o último dia do recorte).
+                for i in range(wf_train, len(days) - wf_test + 1):
+                    train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
+                    test_days = set(days[i : i + wf_test])
+
+                    # Garante que dias de teste apareçam no acumulado, mesmo com turnover/lucro zero
+                    # (importante para refletir “dias sem operação” no OOS e não encurtar artificialmente o horizonte).
+                    for dday in test_days:
+                        daily_turn.setdefault(dday, 0.0)
+                        daily_turn_pre.setdefault(dday, 0.0)
+                        daily_turn_in.setdefault(dday, 0.0)
+                        daily_pnl_obs.setdefault(dday, 0.0)
+                        daily_pnl_exp.setdefault(dday, 0.0)
+                        daily_pnl_obs_pre.setdefault(dday, 0.0)
+                        daily_pnl_obs_in.setdefault(dday, 0.0)
+                        daily_pnl_exp_pre.setdefault(dday, 0.0)
+                        daily_pnl_exp_in.setdefault(dday, 0.0)
+
+                    train = [e for e in combo_events if e["day"] in train_days]
+                    test = [e for e in combo_events if e["day"] in test_days and e.get("roi") is not None]
+
+                    # seleção por combinação
+                    active: List[str] = []
+                    diag = {}
+                    for k in sorted({_key(e) for e in train}):
+                        sub = [e for e in train if _key(e) == k]
+                        # aplica critérios do usuário (mesmos da 8.3), com thresholds p90/p30
+                        # parse key
+                        parts = k.split("_")
+                        side = parts[0]
+                        regime = parts[1]
+                    # Back Pre: CLV p90>0 (q10>0) AND ROI mean>0 (se existir)
+                        # Back In: ROI p30>0
+                    # Lay Pre: CLV_CONV p90>0 (q10>0) AND ROI p30>0
+                        # Lay In: ROI p30>0
+                        ok_sel = False
+                        reason = ""
+                        if side == "Back" and regime == "Pre":
+                            bym_clv = _bym(sub, "clv_back")
+                            if len(bym_clv) >= wf_min_m:
+                                q10 = _q(bym_clv, 0.10)
+                                clv_ok = bool(q10 is not None and float(q10) > 0)
+                            else:
+                                clv_ok = False
+                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                            roi_mean, _ = _mean_ci90(bym_roi) if bym_roi else (None, None)
+                            roi_ok = bool(roi_mean is not None and float(roi_mean) > 0) if len(bym_roi) >= max(5, int(wf_min_m // 3)) else True
+                            ok_sel = bool(clv_ok and roi_ok)
+                            reason = f"BackPre: clv_q10>0={clv_ok}, roi_mean>0={roi_ok}"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_clv": len(bym_clv),
+                                "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
+                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_mean": roi_mean,
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
+                        elif side == "Back" and regime == "In":
+                            bym_roi = _bym(sub, "roi")
+                            q30 = _q(bym_roi, 0.30) if bym_roi else None
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
+                            reason = f"BackIn: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": q30,
+                            }
+                        elif side == "Lay" and regime == "Pre":
+                            bym_clv = _bym(sub, "clv_lay_conv")
+                            # `clv_lay_conv` é a convenção com sinal "unificado":
+                            # clv_conv = -(entry - closing) / closing  => Lay "bom" tende a ser POSITIVO.
+                            clv_ok = bool(len(bym_clv) >= wf_min_m and (_q(bym_clv, 0.10) or -1e9) > 0)
+                            bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                            roi_ok = bool(len(bym_roi) >= wf_min_m and (_q(bym_roi, 0.30) or -1e9) > 0)
+                            ok_sel = bool(clv_ok and roi_ok)
+                            reason = f"LayPre: clv_conv_q10>0={clv_ok}, roi_q30>0={roi_ok}"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_clv": len(bym_clv),
+                                "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
+                                "clv_ci90_lb": (cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1][0] if (len(bym_clv) >= 2 and cluster_bootstrap_ci(bym_clv, n_boot=2000, alpha=0.10, seed=int(args.seed))[1]) else None),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else None,
+                            }
+                        else:
+                            bym_roi = _bym(sub, "roi")
+                            q30 = _q(bym_roi, 0.30) if bym_roi else None
+                            ok_sel = bool(len(bym_roi) >= wf_min_m and (q30 or -1e9) > 0)
+                            reason = f"In: roi_q30>0 AND N_ROI>=min (N={len(bym_roi)}/{wf_min_m})"
+                            diag[k] = {
+                                "ok": ok_sel,
+                                "reason": reason,
+                                "train_matches_total": len({e['match_id'] for e in sub}),
+                                "train_matches_roi": len(bym_roi),
+                                "roi_q30": q30,
+                            }
+                        if ok_sel:
+                            active.append(k)
+                            active_counts[k] = active_counts.get(k, 0) + 1
+
+                    # avaliação OOS: ROI agregado nas combinações ativas
+                    test_active = [e for e in test if _key(e) in set(active)]
+                    bym_roi: Dict[int, List[float]] = {}
+                    for e in test_active:
+                        bym_roi.setdefault(int(e["match_id"]), []).append(float(e["roi"]))
+                    oos_mean, oos_ci = cluster_bootstrap_ci(bym_roi, n_boot=2000, alpha=0.10, seed=int(args.seed))
+
+                    # sizing + P&L no período de teste
+                    # Conjunto elegível no teste (inclui sem ROI para turnover)
+                    test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in set(active)]
+                    back_st_all = back_st_roi = 0.0
+                    lay_liab_all = lay_liab_roi = 0.0
+                    turn_all = turn_roi = 0.0
+                    pnl_obs = 0.0
+                    # budget por jogo (padrão)
+                    bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
+                    if bank_ref_budget is None or float(bank_ref_budget) <= 0:
+                        bank_ref_budget = max(float(back_bank_ref or 0.0), float(lay_bank_ref or 0.0), 1.0)
+                    bud_back = float(bud_back_frac) * float(bank_ref_budget)
+                    bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                    cap_sig_back = float(bud_cap_sig_frac) * float(bud_back)
+                    cap_sig_lay = float(bud_cap_sig_frac) * float(bud_lay)
+                    spent_back: Dict[int, float] = {}
+                    spent_lay: Dict[int, float] = {}
+
+                    # ordena por tempo para consumir budget de forma realista
+                    def _ts_ev(ev: dict) -> float:
+                        d0 = audit_by_id.get(int(ev.get("audit_id")))
+                        ts = d0.get("audited_at") if d0 else None
+                        if isinstance(ts, datetime):
+                            return ts.timestamp()
+                        return 0.0
+                    test_elig.sort(key=_ts_ev)
+                    for ev in test_elig:
+                        st_eq, exp = _sizing_for_event(ev)
+                        if st_eq is None or exp is None:
+                            continue
+                        # aplica budget por jogo como padrão
+                        mid = int(ev.get("match_id"))
+                        if ev.get("side") == "Back":
+                            rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_back))
+                            if exp_use <= 0:
+                                continue
+                            # proporcionalmente reduz stake_eq
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(exp_use)
+                        else:
+                            rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                            if rem <= 0:
+                                continue
+                            exp_use = min(float(exp), float(rem), float(cap_sig_lay))
+                            if exp_use <= 0:
+                                continue
+                            ratio = exp_use / max(1e-9, float(exp))
+                            exp = exp_use
+                            st_eq = float(st_eq) * float(ratio)
+                            spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(exp_use)
+                        turn_all += float(st_eq)
+                        if ev.get("side") == "Back":
+                            back_st_all += float(exp)
+                        else:
+                            lay_liab_all += float(exp)
+                        _append_job(ev, float(exp))
+                        # lucro observado se ROI existe
+                        if ev.get("roi") is None:
+                            continue
+                        turn_roi += float(st_eq)
+                        roi_pct = float(ev.get("roi"))
+                        if ev.get("side") == "Back":
+                            back_st_roi += float(exp)
+                            pnl_obs += float(exp) * roi_pct / 100.0
+                        else:
+                            lay_liab_roi += float(exp)
+                            pnl_obs += float(exp) * roi_pct / 100.0
+
+                    pnl_exp = pnl_obs
+                    if wf_expand:
+                        # expande separadamente por tipo de exposição (stake Back, liability Lay)
+                        scale_back = (back_st_all / back_st_roi) if back_st_roi > 0 else 1.0
+                        scale_lay = (lay_liab_all / lay_liab_roi) if lay_liab_roi > 0 else 1.0
+                        # aproxima: separa pnl por lado no loop acima? como não guardamos, re-estima com base em shares
+                        # fallback: escala global por turnover quando não há como separar
+                        if back_st_roi > 0 and lay_liab_roi > 0:
+                            # estima split por peso de exposição observada
+                            w_back = back_st_roi / (back_st_roi + lay_liab_roi)
+                            w_lay = 1.0 - w_back
+                            pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                        elif back_st_roi > 0:
+                            pnl_exp = float(pnl_obs) * float(scale_back)
+                        elif lay_liab_roi > 0:
+                            pnl_exp = float(pnl_obs) * float(scale_lay)
+                        else:
+                            pnl_exp = float(pnl_obs)
+
+                    # acumula séries diárias (test pode ter vários dias)
+                    for dday in test_days:
+                        daily_turn[dday] = daily_turn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                        daily_pnl_obs[dday] = daily_pnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
+                        daily_pnl_exp[dday] = daily_pnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+                        # breakdown Pre/In
+                        if any(ev.get("regime") == "Pre" for ev in test_elig):
+                            pass
+                    # breakdown por regime (usando o mesmo loop, mas recontando por ev)
+                    turn_pre = turn_in = 0.0
+                    pnl_obs_pre = pnl_obs_in = 0.0
+                    pnl_exp_pre = pnl_exp_in = 0.0  # preenchido depois
+                    back_pre_all = back_pre_roi = 0.0
+                    lay_pre_all = lay_pre_roi = 0.0
+                    back_in_all = back_in_roi = 0.0
+                    lay_in_all = lay_in_roi = 0.0
+                    for ev in test_elig:
+                        st_eq, exp = _sizing_for_event(ev)
+                        if st_eq is None or exp is None:
+                            continue
+                        if ev.get("regime") == "Pre":
+                            turn_pre += float(st_eq)
+                            if ev.get("side") == "Back":
+                                back_pre_all += float(exp)
+                            else:
+                                lay_pre_all += float(exp)
+                        else:
+                            turn_in += float(st_eq)
+                            if ev.get("side") == "Back":
+                                back_in_all += float(exp)
+                            else:
+                                lay_in_all += float(exp)
+                        if ev.get("roi") is None:
+                            continue
+                        roi_pct = float(ev.get("roi"))
+                        if ev.get("regime") == "Pre":
+                            if ev.get("side") == "Back":
+                                back_pre_roi += float(exp)
+                            else:
+                                lay_pre_roi += float(exp)
+                            pnl_obs_pre += float(exp) * roi_pct / 100.0
+                        else:
+                            if ev.get("side") == "Back":
+                                back_in_roi += float(exp)
+                            else:
+                                lay_in_roi += float(exp)
+                            pnl_obs_in += float(exp) * roi_pct / 100.0
+                    # expande por regime
+                    pnl_exp_pre = pnl_obs_pre
+                    pnl_exp_in = pnl_obs_in
+                    if wf_expand:
+                        scale_pre = ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0) * 0.5 + ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0) * 0.5
+                        scale_in = ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0) * 0.5 + ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0) * 0.5
+                        if (back_pre_roi + lay_pre_roi) > 0:
+                            wbp = back_pre_roi / max(1e-9, (back_pre_roi + lay_pre_roi))
+                            wlp = 1.0 - wbp
+                            pnl_exp_pre = float(pnl_obs_pre) * (wbp * ((back_pre_all / back_pre_roi) if back_pre_roi > 0 else 1.0) + wlp * ((lay_pre_all / lay_pre_roi) if lay_pre_roi > 0 else 1.0))
+                        if (back_in_roi + lay_in_roi) > 0:
+                            wbi = back_in_roi / max(1e-9, (back_in_roi + lay_in_roi))
+                            wli = 1.0 - wbi
+                            pnl_exp_in = float(pnl_obs_in) * (wbi * ((back_in_all / back_in_roi) if back_in_roi > 0 else 1.0) + wli * ((lay_in_all / lay_in_roi) if lay_in_roi > 0 else 1.0))
+                    for dday in test_days:
+                        daily_turn_pre[dday] = daily_turn_pre.get(dday, 0.0) + float(turn_pre) / max(1, len(test_days))
+                        daily_turn_in[dday] = daily_turn_in.get(dday, 0.0) + float(turn_in) / max(1, len(test_days))
+                        daily_pnl_obs_pre[dday] = daily_pnl_obs_pre.get(dday, 0.0) + float(pnl_obs_pre) / max(1, len(test_days))
+                        daily_pnl_obs_in[dday] = daily_pnl_obs_in.get(dday, 0.0) + float(pnl_obs_in) / max(1, len(test_days))
+                        daily_pnl_exp_pre[dday] = daily_pnl_exp_pre.get(dday, 0.0) + float(pnl_exp_pre) / max(1, len(test_days))
+                        daily_pnl_exp_in[dday] = daily_pnl_exp_in.get(dday, 0.0) + float(pnl_exp_in) / max(1, len(test_days))
+
+                    if back_st_all > 0:
+                        oos_back_stakes_all.append(float(back_st_all))
+                    if lay_liab_all > 0:
+                        oos_lay_liab_all.append(float(lay_liab_all))
+
+                    steps.append(
+                        {
+                            "train": f"{min(train_days)}→{max(train_days)}",
+                            "test": f"{min(test_days)}→{max(test_days)}",
+                            "test_days": sorted(test_days),
+                            "active_keys": list(active),
+                            "active_n": len(active),
+                            "oos_matches": len(bym_roi),
+                            "oos_mean": oos_mean,
+                            "oos_ci": oos_ci,
+                            "turn_all": turn_all,
+                            "pnl_obs": pnl_obs,
+                            "pnl_exp": pnl_exp,
+                            "diag": diag,
+                        }
+                    )
+
+                lines.append("| Train window | Test window | #ativas | Jogos OOS | ROI OOS (mean; IC90) | Turnover (teste) | Lucro (estratégia, budget) |\n|---|---|---:|---:|---:|---:|---:|\n")
+                for s in steps[:20]:
+                    lines.append(
+                        f"| {s['train']} | {s['test']} | {s['active_n']} | {s['oos_matches']} | {_fmt_pct(s['oos_mean'],2)} {_fmt_ci(s['oos_ci'],2)} | "
+                        f"{_fmt_num(s.get('turn_all'),2)} | {_fmt_num(s.get('pnl_exp'),2)} |\n"
+                    )
+                if len(steps) > 20:
+                    lines.append(f"\n*(mostrando apenas 20 passos; total passos={len(steps)})*\n\n")
+
+                lines.append("\n**Frequência de ativação por combinação (quantas janelas ela entrou como ativa)**\n\n")
+                lines.append("| Combinação | #steps ativa |\n|---|---:|\n")
+                for k, c in sorted(active_counts.items(), key=lambda x: x[1], reverse=True):
+                    lines.append(f"| {k} | {c} |\n")
+
+                # Transparência: métricas por combinação no treino (por janela)
+                lines.append("\n### 12.A Transparência da seleção: métricas por combinação no treino\n")
+                lines.append(
+                    "Para cada janela de treino, mostramos as métricas usadas para decidir se cada combinação ficou **ativa** ou não. "
+                    "Isso ajuda a entender, por exemplo, por que nenhuma Lay entrou em algumas janelas (geralmente N insuficiente ou ROI p30 <= 0).\n\n"
+                )
+                lines.append(f"**Regra de elegibilidade (todas as combinações):** exige `N_ROI >= wf_min_matches` (aqui: {wf_min_m}).\n\n")
+                combos_all = [
+                    "Back_Pre_Any", "Back_In_Any",
+                    "Lay_Pre_Yes", "Lay_Pre_No", "Lay_In_Yes", "Lay_In_No",
+                ]
+                for st in steps[:10]:
+                    lines.append(f"**Train {st['train']} → Test {st['test']}**\n\n")
+                    lines.append("| Combinação | Ativa? | Jogos treino (tot/CLV/ROI) | CLV q10/q90 ou CI | ROI q30 | Motivo |\n|---|---|---:|---:|---:|---|\n")
+                    diag = st.get("diag") or {}
+                    for k in combos_all:
+                        d = diag.get(k) or {}
+                        ok = bool(d.get("ok"))
+                        tm = int(d.get("train_matches_total") or 0)
+                        tclv = d.get("train_matches_clv")
+                        troi = d.get("train_matches_roi")
+                        tclv_s = str(int(tclv)) if tclv is not None else "—"
+                        troi_s = str(int(troi)) if troi is not None else "—"
+                        clv_val = "—"
+                        if k.startswith("Back_Pre"):
+                            clv_val = _fmt_num(_safe_float(d.get("clv_q10")), 2)
+                            lb = _safe_float(d.get("clv_ci90_lb"))
+                            if lb is not None:
+                                clv_val = f"q10={_fmt_num(_safe_float(d.get('clv_q10')),2)} | CI90_lb={_fmt_num(lb,2)}"
+                        if k.startswith("Lay_Pre"):
+                            q10 = _safe_float(d.get("clv_q10"))
+                            lb = _safe_float(d.get("clv_ci90_lb"))
+                            if q10 is not None or lb is not None:
+                                clv_val = f"q10={_fmt_num(q10,2)} | CI90_lb={_fmt_num(lb,2)}"
+                        roi_q30 = _safe_float(d.get("roi_q30"))
+                        lines.append(
+                            f"| {k} | {'SIM' if ok else 'NÃO'} | {tm} / {tclv_s} / {troi_s} | {clv_val} | {_fmt_pct(roi_q30,2)} | {str(d.get('reason') or '')} |\n"
+                        )
+                    lines.append("\n")
+
+                lines.append(
+                    "\nNotas importantes:\n"
+                    "- Se `Jogos OOS` for baixo em muitos passos, você ainda não tem volume suficiente para decisões por combinação. "
+                    "Nesse cenário faz sentido **Bayes hierárquico (partial pooling)** para estabilizar estimativas.\n"
+                    "- **Lucro (estratégia, budget)** acima já incorpora a política de risco por jogo (match budget) e é a métrica principal.\n"
+                    "- O walk-forward usa ROI no **ponto de entrada**: Back em `t0`; Lay em `t_reversal` quando existir, senão `t_last` (~t+20s).\n"
+                    "- Para Lay pre-match, o CLV usado na seleção é `clv_conv = -(entry-closing)/closing`, ou seja **Lay “bom” tende a ser positivo**.\n"
+                    "- Para pre-match, também é útil monitorar CLV OOS (menos dependente de resultados), mas CLV mede qualidade de entrada, não P&L.\n\n"
+                )
+                lines.append(
+                    "**O que significa 'Bayes hierárquico / partial pooling' aqui?**\n\n"
+                    "Quando você tem poucas partidas por combinação na janela de treino/teste, o estimador (ex.: ROI p30) fica muito ruidoso e pode alternar sinal por acaso. "
+                    "O Bayes hierárquico modela cada combinação como um desvio de um **efeito global** (ex.: ROI médio global do live) e aplica **shrinkage**: "
+                    "combinações com pouco N são puxadas para o global; combinações com muito N “ganham identidade própria”.\n\n"
+                    "Na prática isso reduz falsos positivos/negativos no rolling e torna a seleção mais estável quando o volume ainda é baixo.\n\n"
+                )
+
+                # ------------------------------------------------------------
+                # 12.1 Estimativa do tamanho da oportunidade (30 dias) — OOS
+                # ------------------------------------------------------------
+                lines.append("### 12.1 Estimativa 30 dias (OOS): turnover, lucro, banca, ROI/banca e drawdown\n")
+                lines.append(
+                    "Esta estimativa usa o walk-forward acima como **simulador OOS**. "
+                    "O lucro pode ser reportado em duas versões:\n\n"
+                    "- **obs.**: apenas jogos com ROI (placar) disponível.\n"
+                    "- **exp.**: expande o lucro para a população elegível usando scaling por exposição/turnover (assume missing-at-random condicional à estratégia).\n\n"
+                )
+                lines.append(
+                    f"**Padrão de risco**: P&L aqui já é calculado com **budget por jogo (match_id)** consumido ao longo do tempo "
+                    f"(Back={bud_back_frac:.2%} da banca ref; Lay={bud_lay_frac:.2%} em liability; cap por sinal={bud_cap_sig_frac:.0%} do budget).\n\n"
+                )
+
+                oos_days = sorted(daily_turn.keys())
+                n_oos_days = len(oos_days) if oos_days else 0
+                # Dias "operacionais": houve ao menos 1 evento OK+conf naquele dia (evita tratar downtime como 0 oportunidade)
+                try:
+                    oos_days_ok = [d for d in oos_days if int(day_ok_cnt.get(d, 0)) > 0]
+                except Exception:
+                    oos_days_ok = []
+                n_oos_days_ok = len(oos_days_ok)
+                turn_sum = float(sum(daily_turn.values())) if daily_turn else 0.0
+                pnl_obs_sum = float(sum(daily_pnl_obs.values())) if daily_pnl_obs else 0.0
+                pnl_exp_sum = float(sum(daily_pnl_exp.values())) if daily_pnl_exp else 0.0
+                pnl_obs_pre_sum = float(sum(daily_pnl_obs_pre.values())) if daily_pnl_obs_pre else 0.0
+                pnl_obs_in_sum = float(sum(daily_pnl_obs_in.values())) if daily_pnl_obs_in else 0.0
+                pnl_exp_pre_sum = float(sum(daily_pnl_exp_pre.values())) if daily_pnl_exp_pre else 0.0
+                pnl_exp_in_sum = float(sum(daily_pnl_exp_in.values())) if daily_pnl_exp_in else 0.0
+                turn_pre_sum = float(sum(daily_turn_pre.values())) if daily_turn_pre else 0.0
+                turn_in_sum = float(sum(daily_turn_in.values())) if daily_turn_in else 0.0
+                horizon = 30.0
+                scale = (horizon / float(n_oos_days)) if n_oos_days > 0 else None
+                scale_ok = (horizon / float(n_oos_days_ok)) if n_oos_days_ok > 0 else None
+
+                # Projeção "calendário": inclui dias sem OK como 0 (boa para refletir downtime).
+                turn_30d = float(turn_sum) * float(scale) if scale is not None else None
+                profit_obs_30d = float(pnl_obs_sum) * float(scale) if scale is not None else None
+                profit_exp_30d = float(pnl_exp_sum) * float(scale) if scale is not None else None
+
+                # Projeção "condicional a dia OK": exclui dias sem OK do denominador (boa para não deturpar edge quando operacional falhou).
+                turn_30d_ok = float(turn_sum) * float(scale_ok) if scale_ok is not None else None
+                profit_obs_30d_ok = float(pnl_obs_sum) * float(scale_ok) if scale_ok is not None else None
+                profit_exp_30d_ok = float(pnl_exp_sum) * float(scale_ok) if scale_ok is not None else None
+                profit_obs_pre_30d = float(pnl_obs_pre_sum) * float(scale) if scale is not None else None
+                profit_obs_in_30d = float(pnl_obs_in_sum) * float(scale) if scale is not None else None
+                profit_exp_pre_30d = float(pnl_exp_pre_sum) * float(scale) if scale is not None else None
+                profit_exp_in_30d = float(pnl_exp_in_sum) * float(scale) if scale is not None else None
+                turn_pre_30d = float(turn_pre_sum) * float(scale) if scale is not None else None
+                turn_in_30d = float(turn_in_sum) * float(scale) if scale is not None else None
+
+                # banca por risco (unitária) e por liquidez (simultânea)
+                bank_back_p99 = _pctl(oos_back_stakes_all, 99) if oos_back_stakes_all else None
+                bank_lay_p99 = _pctl(oos_lay_liab_all, 99) if oos_lay_liab_all else None
+                bank_risk = (float(bank_back_p99 or 0.0) + float(bank_lay_p99 or 0.0)) if (bank_back_p99 is not None or bank_lay_p99 is not None) else None
+                bank_liq = _liq_p99_from_jobs(oos_jobs)
+                bank_eff = None
+                if bank_risk is not None or bank_liq is not None:
+                    bank_eff = max(float(bank_risk or 0.0), float(bank_liq or 0.0))
+
+                # drawdown p95 via bootstrap de dias OOS (obs/exp)
+                dd_obs_mean, dd_obs_p95 = _bootstrap_dd(list(daily_pnl_obs.values()), horizon_days=30, n_boot=2000)
+                dd_exp_mean, dd_exp_p95 = _bootstrap_dd(list(daily_pnl_exp.values()), horizon_days=30, n_boot=2000)
+                dd_obs_mean_ok, dd_obs_p95_ok = _bootstrap_dd([daily_pnl_obs.get(d, 0.0) for d in oos_days_ok], horizon_days=30, n_boot=2000)
+                dd_exp_mean_ok, dd_exp_p95_ok = _bootstrap_dd([daily_pnl_exp.get(d, 0.0) for d in oos_days_ok], horizon_days=30, n_boot=2000)
+
+                roi_bank_obs = (float(profit_obs_30d) / float(bank_eff) * 100.0) if (profit_obs_30d is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_exp = (float(profit_exp_30d) / float(bank_eff) * 100.0) if (profit_exp_30d is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_obs_ok = (float(profit_obs_30d_ok) / float(bank_eff) * 100.0) if (profit_obs_30d_ok is not None and bank_eff and bank_eff > 0) else None
+                roi_bank_exp_ok = (float(profit_exp_30d_ok) / float(bank_eff) * 100.0) if (profit_exp_30d_ok is not None and bank_eff and bank_eff > 0) else None
+
+                lines.append("| Premissa | Valor |\n|---|---:|\n")
+                lines.append(f"| Train mode (OOS) | `{wf_train_mode}` |\n")
+                lines.append(f"| Scheme pre-match (OOS) | `{wf_scheme_pre}` |\n")
+                lines.append(f"| Scheme in-match (OOS) | `{wf_scheme_in}` |\n")
+                lines.append(f"| Expansão missing ROI | {'ON' if wf_expand else 'OFF'} |\n")
+                lines.append(f"| Dias OOS (calendário de teste) | {n_oos_days} |\n")
+                lines.append(f"| Dias OOS com OK (>=1 evento OK/conf) | {n_oos_days_ok} |\n")
+                lines.append(f"| Turnover 30d (proj., calendário) | {_fmt_num(turn_30d,2)} |\n")
+                lines.append(f"| Turnover 30d (proj., cond OK) | {_fmt_num(turn_30d_ok,2)} |\n")
+                lines.append(f"| Turnover 30d (Pre/In) | {_fmt_num(turn_pre_30d,2)} / {_fmt_num(turn_in_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs., calendário) | {_fmt_num(profit_obs_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (obs., cond OK) | {_fmt_num(profit_obs_30d_ok,2)} |\n")
+                lines.append(f"| Lucro 30d (obs.) Pre/In | {_fmt_num(profit_obs_pre_30d,2)} / {_fmt_num(profit_obs_in_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp., calendário) | {_fmt_num(profit_exp_30d,2)} |\n")
+                lines.append(f"| Lucro 30d (exp., cond OK) | {_fmt_num(profit_exp_30d_ok,2)} |\n")
+                lines.append(f"| Lucro 30d (exp.) Pre/In | {_fmt_num(profit_exp_pre_30d,2)} / {_fmt_num(profit_exp_in_30d,2)} |\n")
+                lines.append(f"| Banca risco p99 (Back+Lay) | {_fmt_num(bank_risk,2)} |\n")
+                lines.append(f"| Banca liquidez p99 (+buf) | {_fmt_num(bank_liq,2)} |\n")
+                lines.append(f"| Banca recomendada (max) | {_fmt_num(bank_eff,2)} |\n")
+                lines.append(f"| ROI/banca 30d (obs., calendário) | {_fmt_num(roi_bank_obs,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (obs., cond OK) | {_fmt_num(roi_bank_obs_ok,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (exp., calendário) | {_fmt_num(roi_bank_exp,2)}% |\n")
+                lines.append(f"| ROI/banca 30d (exp., cond OK) | {_fmt_num(roi_bank_exp_ok,2)}% |\n")
+                lines.append(f"| DD 30d p95 (obs., calendário) | {_fmt_num(dd_obs_p95,2)} |\n")
+                lines.append(f"| DD 30d p95 (obs., cond OK) | {_fmt_num(dd_obs_p95_ok,2)} |\n")
+                lines.append(f"| DD 30d p95 (exp., calendário) | {_fmt_num(dd_exp_p95,2)} |\n")
+                lines.append(f"| DD 30d p95 (exp., cond OK) | {_fmt_num(dd_exp_p95_ok,2)} |\n")
+                lines.append("\n")
+
+                # ------------------------------------------------------------
+                # 12.2 Governança por jogo (budget por match_id) — sensibilidade
+                # ------------------------------------------------------------
+                if bool(getattr(args, "wf_match_budget", True)):
+                    lines.append("### 12.2 Governança de exposição por jogo (budget por `match_id`) — sensibilidade\n")
+                    lines.append(
+                        "Objetivo: evitar concentração quando um mesmo jogo gera muitos sinais. "
+                        "Simulamos um orçamento de exposição por jogo, consumido ao longo do tempo.\n\n"
+                        "- **Back** consome budget em **stake**.\n"
+                        "- **Lay** consome budget em **liability**.\n"
+                        "- Também aplicamos um cap por sinal como fração do budget do jogo (para não gastar tudo no 1º sinal).\n\n"
+                        "Importante: o budget é parametrizado como fração de uma referência de banca. Aqui usamos:\n"
+                        "- se `--kelly-bankroll` estiver setado: essa banca explícita;\n"
+                        "- senão: a `Banca recomendada (max)` estimada na 12.1 (baseline).\n\n"
+                    )
+
+                    bank_ref_budget = _safe_float(getattr(args, "kelly_bankroll", None))
+                    if bank_ref_budget is None or bank_ref_budget <= 0:
+                        bank_ref_budget = bank_eff
+                    bank_ref_budget = float(bank_ref_budget or 1.0)
+
+                    def _simulate_with_budget(
+                        *,
+                        bud_back_frac: float,
+                        bud_lay_frac: float,
+                        cap_signal_frac: float,
+                    ) -> Dict[str, Any]:
+                        bud_back = float(bud_back_frac) * float(bank_ref_budget)
+                        bud_lay = float(bud_lay_frac) * float(bank_ref_budget)
+                        cap_sig_back = float(cap_signal_frac) * float(bud_back)
+                        cap_sig_lay = float(cap_signal_frac) * float(bud_lay)
+
+                        dturn: Dict[str, float] = {}
+                        dpnl_obs: Dict[str, float] = {}
+                        dpnl_exp: Dict[str, float] = {}
+                        back_exps: List[float] = []
+                        lay_exps: List[float] = []
+                        jobs: List[Tuple[datetime, datetime, float]] = []
+
+                        for st in steps:
+                            test_days = set(st.get("test_days") or [])
+                            active_keys = set(st.get("active_keys") or [])
+                            if not test_days or not active_keys:
+                                continue
+
+                            # elegíveis no teste (inclui sem ROI para turnover)
+                            test_elig = [e for e in combo_events if e["day"] in test_days and _key(e) in active_keys]
+                            # ordena por tempo para consumir budget de forma realista
+                            def _ts_ev(ev: dict) -> float:
+                                d0 = audit_by_id.get(int(ev.get("audit_id")))
+                                ts = d0.get("audited_at") if d0 else None
+                                if isinstance(ts, datetime):
+                                    return ts.timestamp()
+                                return 0.0
+                            test_elig.sort(key=_ts_ev)
+
+                            spent_back: Dict[int, float] = {}
+                            spent_lay: Dict[int, float] = {}
+
+                            back_all = back_roi = 0.0
+                            lay_all = lay_roi = 0.0
+                            pnl_obs = 0.0
+                            turn_all = 0.0
+
+                            for ev in test_elig:
+                                aid = int(ev.get("audit_id"))
+                                d0 = audit_by_id.get(aid)
+                                if not d0:
+                                    continue
+                                sc = _scheme_for_event(ev)
+                                mid = int(ev.get("match_id"))
+                                if ev.get("side") == "Back":
+                                    raw = _sizing_back(d0, sc)
+                                    if raw is None or float(raw) <= 0:
+                                        continue
+                                    rem = max(0.0, float(bud_back) - float(spent_back.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    use = min(float(raw), float(rem), float(cap_sig_back))
+                                    if use <= 0:
+                                        continue
+                                    spent_back[mid] = float(spent_back.get(mid, 0.0)) + float(use)
+                                    exp = float(use)
+                                    st_eq = float(use)
+                                    turn_all += st_eq
+                                    back_all += exp
+                                    _append_job(ev, exp)
+                                    if ev.get("roi") is not None:
+                                        pnl_obs += exp * float(ev.get("roi")) / 100.0
+                                        back_roi += exp
+                                else:
+                                    sized = _sizing_lay_liab(d0, sc)
+                                    if not sized:
+                                        continue
+                                    liab_raw, lay_odd = sized
+                                    if liab_raw is None or float(liab_raw) <= 0 or lay_odd is None or float(lay_odd) <= 1.0:
+                                        continue
+                                    rem = max(0.0, float(bud_lay) - float(spent_lay.get(mid, 0.0)))
+                                    if rem <= 0:
+                                        continue
+                                    liab_use = min(float(liab_raw), float(rem), float(cap_sig_lay))
+                                    if liab_use <= 0:
+                                        continue
+                                    spent_lay[mid] = float(spent_lay.get(mid, 0.0)) + float(liab_use)
+                                    exp = float(liab_use)  # liability
+                                    st_eq = float(liab_use) / max(1e-9, (float(lay_odd) - 1.0))
+                                    turn_all += st_eq
+                                    lay_all += exp
+                                    _append_job(ev, exp)
+                                    if ev.get("roi") is not None:
+                                        pnl_obs += exp * float(ev.get("roi")) / 100.0
+                                        lay_roi += exp
+
+                            pnl_exp = pnl_obs
+                            if wf_expand:
+                                scale_back = (back_all / back_roi) if back_roi > 0 else 1.0
+                                scale_lay = (lay_all / lay_roi) if lay_roi > 0 else 1.0
+                                if back_roi > 0 and lay_roi > 0:
+                                    w_back = back_roi / (back_roi + lay_roi)
+                                    w_lay = 1.0 - w_back
+                                    pnl_exp = float(pnl_obs) * (w_back * scale_back + w_lay * scale_lay)
+                                elif back_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_back)
+                                elif lay_roi > 0:
+                                    pnl_exp = float(pnl_obs) * float(scale_lay)
+
+                            for dday in test_days:
+                                dturn[dday] = dturn.get(dday, 0.0) + float(turn_all) / max(1, len(test_days))
+                                dpnl_obs[dday] = dpnl_obs.get(dday, 0.0) + float(pnl_obs) / max(1, len(test_days))
+                                dpnl_exp[dday] = dpnl_exp.get(dday, 0.0) + float(pnl_exp) / max(1, len(test_days))
+
+                            if back_all > 0:
+                                back_exps.append(float(back_all))
+                            if lay_all > 0:
+                                lay_exps.append(float(lay_all))
+                        # projeção 30d
+                        oos_days2 = sorted(dturn.keys())
+                        n_days2 = len(oos_days2) if oos_days2 else 0
+                        scale2 = (30.0 / float(n_days2)) if n_days2 > 0 else None
+                        turn_30 = float(sum(dturn.values())) * float(scale2) if scale2 is not None else None
+                        prof_obs_30 = float(sum(dpnl_obs.values())) * float(scale2) if scale2 is not None else None
+                        prof_exp_30 = float(sum(dpnl_exp.values())) * float(scale2) if scale2 is not None else None
+                        # banca
+                        bank_back = _pctl(back_exps, 99) if back_exps else None
+                        bank_lay = _pctl(lay_exps, 99) if lay_exps else None
+                        bank_risk2 = (float(bank_back or 0.0) + float(bank_lay or 0.0)) if (bank_back is not None or bank_lay is not None) else None
+                        bank_liq2 = _liq_p99_from_jobs(jobs)
+                        bank_eff2 = None
+                        if bank_risk2 is not None or bank_liq2 is not None:
+                            bank_eff2 = max(float(bank_risk2 or 0.0), float(bank_liq2 or 0.0))
+                        roi_bank2 = (float(prof_exp_30) / float(bank_eff2) * 100.0) if (prof_exp_30 is not None and bank_eff2 and bank_eff2 > 0) else None
+                        dd_mean2, dd_p952 = _bootstrap_dd(list(dpnl_exp.values()), horizon_days=30, n_boot=2000)
+                        return {
+                            "turn_30d": turn_30,
+                            "profit_30d_exp": prof_exp_30,
+                            "bank_eff": bank_eff2,
+                            "roi_bank_30d": roi_bank2,
+                            "dd_p95": dd_p952,
+                            "days": n_days2,
+                        }
+
+                    scenarios = [
+                        ("BUDGET_0.50%/0.25% cap25%", 0.005, 0.0025, 0.25),
+                        ("BUDGET_1.00%/0.50% cap33%", 0.010, 0.0050, 0.33),
+                        ("BUDGET_2.00%/1.00% cap50%", 0.020, 0.0100, 0.50),
+                        ("BUDGET_3.00%/1.50% cap33%", 0.030, 0.0150, 0.33),
+                        ("BUDGET_4.00%/2.00% cap33%", 0.040, 0.0200, 0.33),
+                        ("BUDGET_3.00%/1.50% cap50%", 0.030, 0.0150, 0.50),
+                        ("BUDGET_4.00%/2.00% cap50%", 0.040, 0.0200, 0.50),
+                    ]
+                    lines.append(
+                        f"Referência de banca p/ budget: {_fmt_num(bank_ref_budget,2)} | "
+                        f"budgets por jogo aplicados em stake (Back) e liability (Lay).\n\n"
+                    )
+                    lines.append("| Cenário | Turnover 30d | Lucro 30d (exp.) | Banca rec. (max) | ROI/banca 30d (exp.) | DD 30d p95 (exp.) |\n")
+                    lines.append("|---|---:|---:|---:|---:|---:|\n")
+                    # baseline = sem budget por jogo (12.1)
+                    lines.append(
+                        f"| BASELINE (sem budget) | {_fmt_num(turn_30d,2)} | {_fmt_num(profit_exp_30d,2)} | {_fmt_num(bank_eff,2)} | {_fmt_num(roi_bank_exp,2)}% | {_fmt_num(dd_exp_p95,2)} |\n"
+                    )
+                    for name, bbf, blf, csf in scenarios:
+                        r = _simulate_with_budget(bud_back_frac=bbf, bud_lay_frac=blf, cap_signal_frac=csf)
+                        lines.append(
+                            f"| {name} | {_fmt_num(r.get('turn_30d'),2)} | {_fmt_num(r.get('profit_30d_exp'),2)} | {_fmt_num(r.get('bank_eff'),2)} | {_fmt_num(r.get('roi_bank_30d'),2)}% | {_fmt_num(r.get('dd_p95'),2)} |\n"
+                        )
+                    lines.append(
+                        "\nLeitura:\n"
+                        "- Se a curva com budget melhora muito (menos negativo ou mais positivo) com pouca perda de turnover, o problema era **concentração por jogo**.\n"
+                        "- Se tudo continuar negativo, o problema é **edge OOS** (principalmente in‑match) e budget só reduz a escala da perda.\n\n"
+                    )
+
+                    # Breakdown de volume por combinação (para explicar queda de turnover/lucro)
+                    lines.append("**Volume e stake médio por combinação (janela OOS, com budget padrão)**\n\n")
+                    lines.append(
+                        "| Combinação | #steps ativa | Jogos OOS (uniques) | N eventos OOS | Stake eq. médio | Observação |\n"
+                        "|---|---:|---:|---:|---:|---|\n"
+                    )
+                    # coleta universo OOS usado nos steps
+                    oos_keys = set(active_counts.keys())
+                    # estimativa rápida em cima dos próprios steps: soma por test_days
+                    combo_stats: Dict[str, Dict[str, float]] = {}
+                    for st in steps:
+                        tdays = set(st.get("test_days") or [])
+                        akeys = set(st.get("active_keys") or [])
+                        for k in akeys:
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                        # percorre eventos elegíveis do teste
+                        test_elig = [e for e in combo_events if e["day"] in tdays and _key(e) in akeys]
+                        # sem aplicar budget de novo; usamos sizing base para estimar stake médio (ordem correta é budget, mas aqui é diagnóstico)
+                        seen_matches: Dict[str, set] = {}
+                        for ev in test_elig:
+                            k = _key(ev)
+                            st_eq, exp = _sizing_for_event(ev)
+                            if st_eq is None or exp is None:
+                                continue
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                            combo_stats[k]["events"] += 1.0
+                            combo_stats[k]["turn"] += float(st_eq)
+                            seen_matches.setdefault(k, set()).add(int(ev.get("match_id")))
+                        for k, ms in seen_matches.items():
+                            combo_stats.setdefault(k, {"events": 0.0, "turn": 0.0, "matches": 0.0})
+                            combo_stats[k]["matches"] += float(len(ms))
+
+                    for k, c in sorted(active_counts.items(), key=lambda x: x[1], reverse=True):
+                        st = combo_stats.get(k, {})
+                        events = int(st.get("events") or 0)
+                        matches = int(st.get("matches") or 0)
+                        turn = float(st.get("turn") or 0.0)
+                        stake_avg = (turn / events) if events > 0 else None
+                        note = "budget reduz concentração por jogo" if True else ""
+                        lines.append(f"| {k} | {c} | {matches} | {events} | {_fmt_num(stake_avg,2)} | {note} |\n")
+
+        # ============================================================
+        # 10) Diagnóstico de ROI / atualização de resultados
+        # ============================================================
+        lines.append("## 10) Diagnóstico: por que o ROI pode estar zerado\n")
+        lines.append("ROI aqui é calculado por placar do jogo (`matches.home_score/away_score`). Se os placares não estiverem preenchidos no banco, a cobertura de ROI será 0.\n\n")
+        lines.append("| Indicador | Valor |\n|---|---:|\n")
+        lines.append(f"| Jogos únicos no recorte | {unique_matches_all} |\n")
+        lines.append(f"| Jogos com placar disponível (home_score/away_score não nulos) | {matches_with_scores} |\n")
+        lines.append(f"| Jogos com status='finished' no banco | {matches_finished_flag} |\n")
+        # distribuição por data de kickoff (para explicar janela da API free)
+        match_meta: Dict[int, Dict[str, Any]] = {}
+        for d in all_data:
+            mid = int(d.get("match_id"))
+            # No dataset usamos a chave "kickoff" (datetime do match).
+            kickoff = d.get("kickoff") or d.get("kickoff_time")
+            has_score = d.get("home_score") is not None and d.get("away_score") is not None
+            if mid not in match_meta:
+                match_meta[mid] = {"kickoff": kickoff, "has_score": bool(has_score)}
+            else:
+                if has_score:
+                    match_meta[mid]["has_score"] = True
+        kickoff_dates = [m.get("kickoff") for m in match_meta.values() if m.get("kickoff") is not None]
+        kickoff_min = min(kickoff_dates) if kickoff_dates else None
+        kickoff_max = max(kickoff_dates) if kickoff_dates else None
+        by_date: Dict[str, Dict[str, int]] = {}
+        for m in match_meta.values():
+            ko = m.get("kickoff")
+            if not ko:
+                continue
+            ds = ko.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            by_date.setdefault(ds, {"matches": 0, "with_score": 0})
+            by_date[ds]["matches"] += 1
+            by_date[ds]["with_score"] += 1 if m.get("has_score") else 0
+
+        lines.append("\n### 10.1 Distribuição por data de kickoff (explica janela da API)\n")
+        def _fmt_ko(dt: Any) -> str:
+            try:
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                return str(dt)
+
+        lines.append(f"- Kickoff (UTC) no recorte: **{_fmt_ko(kickoff_min) if kickoff_min else '—'}** até **{_fmt_ko(kickoff_max) if kickoff_max else '—'}**.\n\n")
+        lines.append("| Kickoff date (UTC) | Jogos | Com placar | Cobertura |\n|---|---:|---:|---:|\n")
+        for ds in sorted(by_date.keys(), reverse=True)[:14]:
+            m = by_date[ds]
+            cov = 100.0 * m["with_score"] / m["matches"] if m["matches"] else 0.0
+            lines.append(f"| {ds} | {m['matches']} | {m['with_score']} | {_fmt_num(cov,1)}% |\n")
+
+        lines.append(
+            "\n**Leitura**: se seu recorte inclui muitos jogos com kickoff antigo, a API-Football **free** pode não retornar fixtures dessa data "
+            "(limitação por janela recente). Nesse cenário, mesmo com o job rodando, `placar disponível` ficará baixo para jogos fora da janela.\n\n"
+        )
+        lines.append("Se `placar disponível` estiver 0 (mesmo para datas recentes), isso geralmente indica que o job de resultados não rodou ou está sem chave válida.  \n")
+        lines.append("Sugestão (rodar no servidor): `cd betinasia_bot && python3 -m results.auto_update_results --once` (ou configure o serviço para rodar em loop).\n")
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 11) Conclusões, riscos e pontos em aberto
+        # ============================================================
+        lines.append("## 11) Conclusões (visão de investidor), riscos e próximos passos\n")
+        lines.append(
+            "Esta seção é escrita como se um investidor externo estivesse avaliando a tese: **há edge replicável? o sistema executa? "
+            "o risco é governável? a mensuração é confiável?**\n\n"
+        )
+
+        lines.append("### 11.1 O que já está forte (e por quê)\n")
+        lines.append(
+            "- **Evidência de execução (CLV pre‑match)**: CLV robusto por jogo positivo é um dos melhores sinais de edge/execução em janela curta. "
+            "Diferente de ROI, CLV não depende de amostra grande de jogos liquidados; ele mede **qualidade de entrada**.\n"
+        )
+        lines.append(
+            "- **Controle de latência por regime**: o relatório já separa regimes de execução por tempo total (2.3/2.3b). "
+            "Isso permite uma regra objetiva de operação (ex.: só operar `exec_bucket < 5s`).\n"
+        )
+        lines.append(
+            "- **Separação Back vs Lay**: Back e Lay têm perfis de risco diferentes. Lay deve ser governado por **liability** (p95/p99/ES), "
+            "e isso já aparece como métrica de banca e risco.\n\n"
+        )
+
+        lines.append("### 11.2 O que ainda está frágil (e impede captação hoje)\n")
+        lines.append(
+            "- **ROI ainda não é prova**: mesmo quando ROI aparece, a incerteza por jogo pode ser grande e a cobertura de placar pode ser incompleta. "
+            "Para captação, um investidor vai pedir **histórico maior**, **pipeline de resultados estável** e **métrica de drawdown** bem definida.\n"
+        )
+        lines.append(
+            "- **Risco de viés por falhas de coleta**: quando o collector fica “active” mas não coleta odds, você perde janelas do mercado de forma não aleatória. "
+            "Isso impacta a extrapolação para execução.\n"
+        )
+        lines.append(
+            "- **Stake sizing ainda é proxy**: parte do sizing usa limit/finance como aproximação. Para captação, é necessário um sizing governado por risco "
+            "e consistente com edge (ex.: Kelly fracionado + caps), com auditoria clara.\n\n"
+        )
+
+        lines.append("### 11.3 Avaliação das 2 estratégias candidatas (como um investidor leria)\n")
+        lines.append(
+            "Você propôs duas teses operacionais coerentes com o mecanismo observado:\n"
+            "1) **BackFast**: operar Back edge apenas quando a execução foi rápida (`< 5s`) e pre‑match.\n"
+            "2) **LayReversal**: operar Lay edge apenas quando há reversão e entrar próximo do vale (t_ext curto).\n\n"
+        )
+        lines.append(
+            "O relatório quantifica isso na **Seção 9.4** com (i) N na janela, (ii) projeção 30d, "
+            "(iii) stake/liability médio, (iv) banca p99 e ROI/banca mensal, e (v) drawdown p95.\n\n"
+        )
+        lines.append(
+            "**Como um investidor decide**: ele vai priorizar uma estratégia com\n"
+            "- sinal de edge (CLV) consistente,\n"
+            "- execução estável (latência controlada),\n"
+            "- sizing governado por risco (caps + banca p99/ES),\n"
+            "- e um perfil de drawdown aceitável no horizonte de caixa.\n\n"
+        )
+
+        lines.append("### 11.4 Stake sizing: recomendação inicial para produção (sem overfitting)\n")
+        lines.append(
+            "- Use **baseline FLAT** como controle (para detectar se o sizing está degradando performance).\n"
+            "- Para Back, use **Kelly fracionado** (ex.: `KELLY_0.25`) apenas quando houver `closing_odd` (pre‑match), com **cap** por aposta (ex.: 2% da banca p99).\n"
+            "- Para Lay, faça sizing por **liability**, com cap mais conservador (ex.: 1% da banca p99) e monitoramento de cauda (p95/p99/ES95).\n\n"
+        )
+        lines.append(
+            "A Seção 9.3 compara `FLAT` vs `PROXY` vs `KELLY` (fracionado) no subconjunto com placar, "
+            "e reporta risco (p99/ES) e drawdown 30d via bootstrap.\n\n"
+        )
+
+        lines.append("### 11.5 Status para captação (checkpoint objetivo)\n")
+        lines.append(
+            "Se você estivesse captando hoje, um investidor institucional provavelmente pediria:\n"
+            "- **(A)** 30–90 dias de execução estável com SLO de coleta (collector), auditoria e resultados.\n"
+            "- **(B)** KPIs: CLV pre‑match por jogo estável; latência por bucket; taxa de falhas; cobertura de placar.\n"
+            "- **(C)** Política de risco: banca por p99/ES, caps por aposta, limites por janela e mecanismos de stop.\n"
+            "- **(D)** Demonstração de P&L com sizing definido (não só proxy) e drawdown observado/estimado.\n\n"
+        )
+        lines.append(
+            "Minha leitura: **a tese de edge/execução parece promissora pelo CLV**, mas o projeto ainda está em fase de "
+            "**consolidação operacional/medição** para uma captação “grande”. Um caminho pragmático é:\n"
+            "- validar BackFast com sizing conservador e risco baixo,\n"
+            "- validar LayReversal com governança de liability,\n"
+            "- e só então ampliar banca.\n"
+        )
+
+        lines.append("\n---\n")
+
+        # ============================================================
+        # 12) Como reproduzir
+        # ============================================================
+        lines.append("## 12) Como reproduzir\n")
+        lines.append("1. Configure `betinasia_bot/.env` com `DATABASE_URL`.  \n")
+        lines.append("2. (Opcional) Atualize resultados para ter ROI: `cd betinasia_bot && python3 -m results.auto_update_results --once`.  \n")
+        lines.append("3. Execute:\n\n")
+        lines.append("```bash\n")
+        lines.append("python3 betinasia_bot/analyze_contexto_operacao_b808_robust_report.py \\\n")
+        lines.append("  --direction up \\\n")
+        lines.append("  --versions v4.0-api,v1.0,v1.0-recovered \\\n")
+        lines.append("  --lookback-days 14 \\\n")
+        lines.append("  --out betinasia_bot/docs/analise_contexto_operacao_b808_robusta.md \\\n")
+        lines.append("  --pdf betinasia_bot/docs/analise_contexto_operacao_b808_robusta.pdf\n")
+        lines.append("```\n")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("".join(lines), encoding="utf-8")
+
+        print(f"Relatório gerado em: {out_path}")
+
+        pdf_path = None
+        if args.pdf:
+            pdf_path = Path(str(args.pdf))
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            renderer = Path(__file__).resolve().parent / "docs" / "render_markdown_to_pdf.py"
+            cmd = [sys.executable, str(renderer), str(out_path), str(pdf_path)]
+            try:
+                subprocess.run(cmd, check=True)
+                print(f"PDF gerado em: {pdf_path}")
+            except FileNotFoundError:
+                print(f"[WARN] Não achei o renderizador de PDF em: {renderer}")
+            except subprocess.CalledProcessError as e:
+                print(f"[WARN] Falha ao gerar PDF (instale 'reportlab'): {e}")
+
+        if args.git_commit:
+            # Tenta versionar os artefatos gerados para facilitar download via GitHub.
+            try:
+                # Descobre root do repo
+                repo_root_str = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+                repo_root = Path(repo_root_str).resolve()
+                msg = (
+                    args.git_message
+                    or f"Adiciona relatório b808 ({args.direction}, {','.join(versions)}, lookback={args.lookback_days})"
+                )
+
+                def _as_git_path(p: Path) -> str:
+                    """
+                    Converte um Path (possivelmente relativo ao CWD atual) em path válido para `git add`
+                    rodando em `repo_root`. Isso evita erro de pathspec quando o script é executado a partir
+                    de um subdiretório e `--out/--pdf` foram passados como paths relativos.
+                    """
+                    abs_p = p.expanduser().resolve()
+                    try:
+                        return str(abs_p.relative_to(repo_root))
+                    except Exception:
+                        # fallback: path absoluto (git aceita se estiver dentro do worktree)
+                        return str(abs_p)
+
+                paths: List[str] = [_as_git_path(out_path)]
+                if pdf_path and pdf_path.exists():
+                    paths.append(_as_git_path(pdf_path))
+
+                subprocess.run(["git", "add", "--"] + paths, check=True, cwd=str(repo_root))
+                subprocess.run(["git", "commit", "-m", msg], check=True, cwd=str(repo_root))
+                print(f"[INFO] Artefatos commitados no git: {', '.join(paths)}")
+                if args.git_push:
+                    subprocess.run(["git", "push"], check=True, cwd=str(repo_root))
+                    print("[INFO] Push concluído.")
+            except subprocess.CalledProcessError as e:
+                print(f"[WARN] Falha ao commitar/pushar artefatos: {e}")
+            except Exception as e:
+                print(f"[WARN] Git não disponível ou não é repositório: {e}")
+        return 0
+
+    finally:
+        await db.close()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    raise SystemExit(asyncio.run(main()))
+

@@ -1,0 +1,14 @@
+  regime   |   bucket   | n_total | n_lay | lay_clv_mean 
+-----------+------------+---------+-------+--------------
+ IN_MATCH  | A <= -10%  |      49 |     1 |             
+ IN_MATCH  | B (-10,-5] |      37 |     4 |             
+ IN_MATCH  | C (-5,-2]  |      48 |    11 |             
+ IN_MATCH  | D (-2,+2)  |     204 |    24 |             
+ IN_MATCH  | E >= +2%   |     242 |    86 |             
+ PRE_MATCH | A <= -10%  |      16 |     1 |       18.069
+ PRE_MATCH | B (-10,-5] |      27 |     1 |             
+ PRE_MATCH | C (-5,-2]  |      58 |     4 |        5.079
+ PRE_MATCH | D (-2,+2)  |     700 |    63 |        2.789
+ PRE_MATCH | E >= +2%   |     200 |    92 |       -5.918
+(10 rows)
+
