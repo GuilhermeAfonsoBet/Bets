@@ -1,0 +1,2 @@
+mode,weeks,weeks_with_stake,stake_total,stake_covered,stake_covered_pct,delta_profit_cap2_total,delta_profit_uncapped_total,delta_roi_on_stake_cap2,delta_roi_on_stake_uncapped,stake_per_week_when_active,exp_delta_profit_cap2_per_week
+global_bayes_roll12_robust_p10_p70,19,15,27346.738440454006,5817.112029910088,0.2127168489425722,50.843288479566574,50.843288479566574,0.0018592084972134792,0.0018592084972134792,1823.115896030267,3.3895525653044385

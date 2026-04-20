@@ -1,0 +1,2 @@
+test_month,train_end_month,caps,bank_min,oos_bets,oos_stake,oos_profit,oos_roi_turn,oos_roi_bank
+2025-12,2025-11,"{'Seg': 500.0, 'Ter': 100.0, 'Qua': 700.0, 'Sáb': 700.0}",14000.0,178,35919.0,2189.5995000000003,0.060959366908878314,0.15639996428571432

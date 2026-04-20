@@ -1,0 +1,397 @@
+' === Macro principal ===
+Public
+Sub
+PreencherIDs_E_ColunasH_I_J_
+K
+(
+)
+Const
+SH_NAME As
+String
+= "Folha1"
+Const
+FIRST_DATA_ROW As
+Long
+= 2 ' cabeçalho na linha 1
+Const
+CHECK_START_COL As
+Long
+= 2 ' B
+Const
+CHECK_END_COL As
+Long
+= 11 ' K (inclusive)
+Dim
+ws As Worksheet
+Dim
+lastRow
+As
+Long
+Dim
+cols
+As Variant
+Dim
+i As
+Long
+On
+Error
+GoTo
+SafeExit
+Set ws =
+ThisWorkbook.Worksheets
+(SH_NAME)
+' Descobre a última linha com algum valor VISÍVEL entre B:K
+lastRow
+=
+LastVisibleDataRow
+(
+ws, CHECK_START_COL, CHECK_END_COL)
+If
+lastRow
+< FIRST_DATA_ROW
+Then
+GoTo
+SafeExit
+' nada a fazer
+Application.ScreenUpdating
+= False
+Application.EnableEvents
+= False
+Application.Calculation
+=
+xlCalculationManual
+' Colunas a preencher: A, H, I, J, K
+cols
+=
+Array
+(
+1, 8, 9, 10, 11)
+For i =
+LBound
+(
+cols
+)
+To
+UBound
+(
+cols
+)
+FillDownGaps
+ws,
+cols
+(i), FIRST_DATA_ROW,
+lastRow
+Next i
+SafeExit
+:
+On
+Error
+Resume Next
+Application.Calculation
+=
+xlCalculationAutomatic
+Application.EnableEvents
+=
+True
+Application.ScreenUpdating
+=
+True
+End
+Sub
+' === Preenche “lacunas” de uma coluna copiando o último valor acima ===
+' Apenas preenche em linhas que tenham ALGUM outro valor em A:K (exceto a própria coluna).
+Private Sub
+FillDownGaps
+(
+ByVal
+ws As Worksheet,
+ByVal
+colIndex
+As
+Long
+, _
+ByVal
+firstRow
+As
+Long
+,
+ByVal
+lastRow
+As
+Long
+)
+Dim
+r As
+Long
+Dim
+lastValue
+As Variant
+lastValue
+=
+Empty
+For r =
+firstRow
+To
+lastRow
+' Só consideramos linhas com outros dados (para não propagar em linhas totalmente vazias)
+If
+RowHasOtherData
+(
+ws, r,
+colIndex
+, 1, 11)
+Then
+' verifica A:K exceto a coluna atual
+If
+IsCellEmpty
+(
+ws.Cells
+(r,
+colIndex
+))
+Then
+If
+Not
+IsEmpty
+(
+lastValue
+)
+Then
+ws.Cells
+(r,
+colIndex
+).
+Value
+=
+lastValue
+End
+If
+Else
+lastValue
+=
+ws.Cells
+(r,
+colIndex
+).
+Value
+End
+If
+Else
+' Se a linha não tem outros dados, apenas atualiza o
+lastValue
+se a própria célula tiver algo
+If
+Not
+IsCellEmpty
+(
+ws.Cells
+(r,
+colIndex
+))
+Then
+lastValue
+=
+ws.Cells
+(r,
+colIndex
+).
+Value
+End
+If
+End
+If
+Next r
+End
+Sub
+' === Determina a última linha com valor “visível” em um intervalo de colunas ===
+' Usa
+LookIn
+:=
+xlValues
+para ignorar fórmulas que retornam "" (vazio visual).
+Private
+Function
+LastVisibleDataRow
+(
+ByVal
+ws As Worksheet, _
+ByVal
+startCol
+As
+Long
+,
+ByVal
+endCol
+As
+Long
+) As
+Long
+Dim
+rng
+As Range,
+lastCell
+As Range
+Set
+rng
+=
+ws.Range
+(
+ws.Cells
+(1,
+startCol
+),
+ws.Cells
+(
+ws.Rows.Count
+,
+endCol
+))
+Set
+lastCell
+=
+rng.Find
+(
+What
+:="*",
+After
+:=
+rng.Cells
+(1, 1),
+LookIn
+:=
+xlValues
+, _
+LookAt
+:=
+xlPart
+,
+SearchOrder
+:=
+xlByRows
+, _
+SearchDirection
+:=
+xlPrevious
+,
+MatchCase
+:=False)
+If
+lastCell
+Is
+Nothing
+Then
+LastVisibleDataRow
+= 1
+Else
+LastVisibleDataRow
+=
+lastCell.Row
+End
+If
+End
+Function
+' === Verifica se uma linha possui algum valor em [
+startCol
+..
+endCol
+], exceto
+currentCol
+===
+Private
+Function
+RowHasOtherData
+(
+ByVal
+ws As Worksheet,
+ByVal
+r As
+Long
+, _
+ByVal
+currentCol
+As
+Long
+, _
+ByVal
+startCol
+As
+Long
+,
+ByVal
+endCol
+As
+Long
+) As
+Boolean
+Dim
+c As
+Long
+For c =
+startCol
+To
+endCol
+If
+c <>
+currentCol
+Then
+If
+Not
+IsCellEmpty
+(
+ws.Cells
+(r, c))
+Then
+RowHasOtherData
+=
+True
+Exit
+Function
+End
+If
+End
+If
+Next c
+End
+Function
+' === Considera vazia se não há valor visível (inclui "" e espaços) ===
+Private
+Function
+IsCellEmpty
+(
+ByVal
+c As Range) As
+Boolean
+' Trata como vazia quando é realmente vazio,
+Null
+, ou
+string
+vazia/
+espac¸os
+If
+IsError
+(
+c.Value
+)
+Then
+IsCellEmpty
+= False
+ElseIf
+LenB
+(
+Trim
+$(
+CStr
+(
+c.Value
+))) = 0
+Then
+IsCellEmpty
+=
+True
+Else
+IsCellEmpty
+= False
+End
+If
+End
+Function

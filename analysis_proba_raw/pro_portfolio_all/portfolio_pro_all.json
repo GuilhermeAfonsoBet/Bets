@@ -1,0 +1,458 @@
+{
+  "bankroll": 2300.0,
+  "max_frac_per_bet": 0.07,
+  "train_period": {
+    "start": "2025-10-01",
+    "end": "2025-12-31"
+  },
+  "daily_risk_constraints": {
+    "daily_exposure_quantile": 0.8,
+    "max_daily_stake_sum_frac": 0.7,
+    "max_daily_drawdown_frac": 0.25,
+    "daily_var_quantile": 0.1,
+    "max_p_daily_dd": 0.1,
+    "min_weekly_sharpe_cap2": 0.1
+  },
+  "grid": {
+    "stake_fracs": [
+      0.01,
+      0.02,
+      0.03,
+      0.04,
+      0.05,
+      0.06,
+      0.07
+    ],
+    "cutoffs": [
+      0.05,
+      0.07,
+      0.09,
+      0.11,
+      0.13,
+      0.15,
+      0.17,
+      0.19,
+      0.21,
+      0.23,
+      0.25,
+      0.27,
+      0.29,
+      0.31,
+      0.33,
+      0.35,
+      0.37,
+      0.39,
+      0.41,
+      0.43,
+      0.45,
+      0.47,
+      0.49,
+      0.51,
+      0.53,
+      0.55,
+      0.57,
+      0.59,
+      0.61,
+      0.63,
+      0.65,
+      0.67,
+      0.69,
+      0.71,
+      0.73,
+      0.75,
+      0.77,
+      0.79,
+      0.81,
+      0.83,
+      0.85,
+      0.87,
+      0.89,
+      0.91,
+      0.93,
+      0.95
+    ],
+    "top_k": 20
+  },
+  "bootstrap": {
+    "n_boot": 8000,
+    "n_boot_dd": 3000
+  },
+  "portfolio": {
+    "FT": {
+      "segunda-feira": {
+        "type": "FT",
+        "score_col": "proba_raw_segunda",
+        "cutoff": 0.21,
+        "stake_frac": 0.03
+      },
+      "terça-feira": {
+        "type": "FT",
+        "score_col": "proba_raw_terca",
+        "cutoff": 0.25,
+        "stake_frac": 0.03
+      },
+      "quarta-feira": {
+        "type": "FT",
+        "score_col": "proba_raw_quarta",
+        "cutoff": 0.31,
+        "stake_frac": 0.03
+      },
+      "quinta-feira": {
+        "type": "FT",
+        "score_col": "proba_raw_segqui",
+        "cutoff": 1.0,
+        "stake_frac": 0.0
+      },
+      "sexta-feira": {
+        "type": "FT",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.31,
+        "stake_frac": 0.02
+      },
+      "sábado": {
+        "type": "FT",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.57,
+        "stake_frac": 0.07
+      },
+      "domingo": {
+        "type": "FT",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.49,
+        "stake_frac": 0.04
+      }
+    },
+    "FH": {
+      "segunda-feira": {
+        "type": "FH",
+        "score_col": "proba_raw_segunda",
+        "cutoff": 1.0,
+        "stake_frac": 0.0
+      },
+      "terça-feira": {
+        "type": "FH",
+        "score_col": "proba_raw_terca",
+        "cutoff": 0.67,
+        "stake_frac": 0.07
+      },
+      "quarta-feira": {
+        "type": "FH",
+        "score_col": "proba_raw_quarta",
+        "cutoff": 1.0,
+        "stake_frac": 0.0
+      },
+      "quinta-feira": {
+        "type": "FH",
+        "score_col": "proba_raw_segqui",
+        "cutoff": 1.0,
+        "stake_frac": 0.0
+      },
+      "sexta-feira": {
+        "type": "FH",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.09,
+        "stake_frac": 0.01
+      },
+      "sábado": {
+        "type": "FH",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.23,
+        "stake_frac": 0.01
+      },
+      "domingo": {
+        "type": "FH",
+        "score_col": "proba_raw_sexdom",
+        "cutoff": 0.41,
+        "stake_frac": 0.05
+      }
+    }
+  },
+  "stability": {
+    "FT": {
+      "segunda-feira": {
+        "status": "ok",
+        "cap2_mean_week": 191.3181818181818,
+        "cap2_std_week": 246.2132482957886,
+        "cap2_pneg_week": 0.09090909090909091,
+        "cap2_var05_52w": 7196.825,
+        "cap2_cvar05_52w": 6442.30125,
+        "cap2_dd_p95_52w": 798.7499999999959,
+        "cap1_mean_week": 135.77272727272728,
+        "cap1_pneg_week": 0.18181818181818182,
+        "cap1_dd_p95_52w": 1050.0,
+        "p95_daily_bets": 29.0,
+        "p95_daily_exposure": 1868.5,
+        "p80_daily_bets": 24.0,
+        "p80_daily_exposure": 1604.0,
+        "daily_var_q": 0.0,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7770425967831815,
+        "wf_mean": 242.5,
+        "wf_pneg": 0.0,
+        "wf_p05": 59.9,
+        "score_bins_cap2": {
+          "pos": 3,
+          "n": 3
+        },
+        "obj": 119.9088697442347
+      },
+      "terça-feira": {
+        "status": "ok",
+        "cap2_mean_week": 212.84615384615384,
+        "cap2_std_week": 278.4013428349578,
+        "cap2_pneg_week": 0.23076923076923078,
+        "cap2_var05_52w": 8001.8,
+        "cap2_cvar05_52w": 7415.11,
+        "cap2_dd_p95_52w": 155.5,
+        "cap1_mean_week": 166.6153846153846,
+        "cap1_pneg_week": 0.23076923076923078,
+        "cap1_dd_p95_52w": 155.5749999999996,
+        "p95_daily_bets": 33.599999999999994,
+        "p95_daily_exposure": 2168.9999999999995,
+        "p80_daily_bets": 23.800000000000004,
+        "p80_daily_exposure": 1532.0000000000002,
+        "daily_var_q": -16.099999999999998,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7645299109506578,
+        "wf_mean": 226.11111111111111,
+        "wf_pneg": 0.3333333333333333,
+        "wf_p05": -89.4,
+        "score_bins_cap2": {
+          "pos": 5,
+          "n": 5
+        },
+        "obj": 139.52181813741439
+      },
+      "quarta-feira": {
+        "status": "ok",
+        "cap2_mean_week": 148.3846153846154,
+        "cap2_std_week": 194.56063256370686,
+        "cap2_pneg_week": 0.07692307692307693,
+        "cap2_var05_52w": 5506.375,
+        "cap2_cvar05_52w": 4978.3025,
+        "cap2_dd_p95_52w": 551.5,
+        "cap1_mean_week": 74.0,
+        "cap1_pneg_week": 0.23076923076923078,
+        "cap1_dd_p95_52w": 1035.5,
+        "p95_daily_bets": 25.999999999999993,
+        "p95_daily_exposure": 1724.7999999999997,
+        "p80_daily_bets": 19.6,
+        "p80_daily_exposure": 1318.2,
+        "daily_var_q": 0.7000000000000006,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7626651570225975,
+        "wf_mean": 116.55555555555556,
+        "wf_pneg": 0.2222222222222222,
+        "wf_p05": -260.0,
+        "score_bins_cap2": {
+          "pos": 5,
+          "n": 5
+        },
+        "obj": 92.50465724368867
+      },
+      "quinta-feira": {
+        "status": "no_candidate_stage2"
+      },
+      "sexta-feira": {
+        "status": "ok",
+        "cap2_mean_week": 84.6923076923077,
+        "cap2_std_week": 177.02419072704188,
+        "cap2_pneg_week": 0.23076923076923078,
+        "cap2_var05_52w": 2407.9,
+        "cap2_cvar05_52w": 1871.64,
+        "cap2_dd_p95_52w": 874.0499999999997,
+        "cap1_mean_week": 21.0,
+        "cap1_pneg_week": 0.5384615384615384,
+        "cap1_dd_p95_52w": 1961.1499999999992,
+        "p95_daily_bets": 42.199999999999996,
+        "p95_daily_exposure": 1941.1999999999998,
+        "p80_daily_bets": 33.00000000000001,
+        "p80_daily_exposure": 1518.0000000000002,
+        "daily_var_q": -133.79999999999998,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.4784222277445512,
+        "wf_mean": 231.94444444444446,
+        "wf_pneg": 0.2222222222222222,
+        "wf_p05": -164.8,
+        "score_bins_cap2": {
+          "pos": 4,
+          "n": 5
+        },
+        "obj": 29.754560010547227
+      },
+      "sábado": {
+        "status": "ok",
+        "cap2_mean_week": 163.34615384615387,
+        "cap2_std_week": 276.47358106271395,
+        "cap2_pneg_week": 0.23076923076923078,
+        "cap2_var05_52w": 5278.700000000003,
+        "cap2_cvar05_52w": 4561.226250000001,
+        "cap2_dd_p95_52w": 817.0,
+        "cap1_mean_week": 113.80769230769235,
+        "cap1_pneg_week": 0.3076923076923077,
+        "cap1_dd_p95_52w": 1053.0,
+        "p95_daily_bets": 9.899999999999999,
+        "p95_daily_exposure": 1560.35,
+        "p80_daily_bets": 6.800000000000001,
+        "p80_daily_exposure": 1070.0000000000005,
+        "daily_var_q": -120.20000000000003,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.5908201182126737,
+        "wf_mean": 295.7222222222223,
+        "wf_pneg": 0.1111111111111111,
+        "wf_p05": -286.5000000000001,
+        "score_bins_cap2": {
+          "pos": 4,
+          "n": 5
+        },
+        "obj": 84.49740858047538
+      },
+      "domingo": {
+        "status": "ok",
+        "cap2_mean_week": 7.666666666666667,
+        "cap2_std_week": 26.558112382722783,
+        "cap2_pneg_week": 0.0,
+        "cap2_var05_52w": 92.0,
+        "cap2_cvar05_52w": 76.60408163265306,
+        "cap2_dd_p95_52w": 0.0,
+        "cap1_mean_week": 7.666666666666667,
+        "cap1_pneg_week": 0.0,
+        "cap1_dd_p95_52w": 0.0,
+        "p95_daily_bets": 1.0,
+        "p95_daily_exposure": 92.0,
+        "p80_daily_bets": 1.0,
+        "p80_daily_exposure": 92.0,
+        "daily_var_q": 92.0,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.2886751345948129,
+        "wf_mean": 34.125,
+        "wf_pneg": 0.25,
+        "wf_p05": -105.0,
+        "score_bins_cap2": {
+          "pos": 1,
+          "n": 1
+        },
+        "obj": 0.9351385709859713
+      }
+    },
+    "FH": {
+      "segunda-feira": {
+        "status": "no_candidate_stage2"
+      },
+      "terça-feira": {
+        "status": "ok",
+        "cap2_mean_week": 170.5,
+        "cap2_std_week": 239.70872476251827,
+        "cap2_pneg_week": 0.08333333333333333,
+        "cap2_var05_52w": 6117.0,
+        "cap2_cvar05_52w": 5389.049875311721,
+        "cap2_dd_p95_52w": 888.0,
+        "cap1_mean_week": 118.41666666666667,
+        "cap1_pneg_week": 0.16666666666666666,
+        "cap1_dd_p95_52w": 966.0,
+        "p95_daily_bets": 7.099999999999998,
+        "p95_daily_exposure": 635.6999999999999,
+        "p80_daily_bets": 6.0,
+        "p80_daily_exposure": 466.6,
+        "daily_var_q": 6.500000000000028,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7112799092687009,
+        "wf_mean": 109.125,
+        "wf_pneg": 0.125,
+        "wf_p05": -209.3,
+        "score_bins_cap2": {
+          "pos": 4,
+          "n": 5
+        },
+        "obj": 101.05711880937044
+      },
+      "quarta-feira": {
+        "status": "no_candidate_stage2"
+      },
+      "quinta-feira": {
+        "status": "no_candidate_stage2"
+      },
+      "sexta-feira": {
+        "status": "ok",
+        "cap2_mean_week": 60.15384615384615,
+        "cap2_std_week": 145.70352097887348,
+        "cap2_pneg_week": 0.23076923076923078,
+        "cap2_var05_52w": 1449.0,
+        "cap2_cvar05_52w": 1011.8304668304668,
+        "cap2_dd_p95_52w": 897.0,
+        "cap1_mean_week": 17.692307692307693,
+        "cap1_pneg_week": 0.3076923076923077,
+        "cap1_dd_p95_52w": 1472.0,
+        "p95_daily_bets": 75.0,
+        "p95_daily_exposure": 1724.9999999999998,
+        "p80_daily_bets": 53.40000000000002,
+        "p80_daily_exposure": 1228.2000000000005,
+        "daily_var_q": -154.1,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.4128510124512932,
+        "wf_mean": 51.111111111111114,
+        "wf_pneg": 0.3333333333333333,
+        "wf_p05": -213.9,
+        "score_bins_cap2": {
+          "pos": 4,
+          "n": 5
+        },
+        "obj": 13.032965909127782
+      },
+      "sábado": {
+        "status": "ok",
+        "cap2_mean_week": 118.0,
+        "cap2_std_week": 157.94751237884904,
+        "cap2_pneg_week": 0.3076923076923077,
+        "cap2_var05_52w": 4349.0,
+        "cap2_cvar05_52w": 3900.2655086848636,
+        "cap2_dd_p95_52w": 207.0,
+        "cap1_mean_week": 70.23076923076923,
+        "cap1_pneg_week": 0.38461538461538464,
+        "cap1_dd_p95_52w": 471.5,
+        "p95_daily_bets": 69.6,
+        "p95_daily_exposure": 1600.7999999999997,
+        "p80_daily_bets": 63.20000000000001,
+        "p80_daily_exposure": 1453.6000000000001,
+        "daily_var_q": -11.5,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7470836243179828,
+        "wf_mean": 151.27777777777777,
+        "wf_pneg": 0.3333333333333333,
+        "wf_p05": -48.3,
+        "score_bins_cap2": {
+          "pos": 5,
+          "n": 5
+        },
+        "obj": 74.84232190528773
+      },
+      "domingo": {
+        "status": "ok",
+        "cap2_mean_week": 62.291666666666664,
+        "cap2_std_week": 82.99410119600871,
+        "cap2_pneg_week": 0.0,
+        "cap2_var05_52w": 2300.0,
+        "cap2_cvar05_52w": 2101.206697459584,
+        "cap2_dd_p95_52w": 0.0,
+        "cap1_mean_week": 52.708333333333336,
+        "cap1_pneg_week": 0.0,
+        "cap1_dd_p95_52w": 0.0,
+        "p95_daily_bets": 4.75,
+        "p95_daily_exposure": 546.25,
+        "p80_daily_bets": 4.0,
+        "p80_daily_exposure": 460.0,
+        "daily_var_q": 57.5,
+        "p_daily_dd": 0.0,
+        "sharpe_week_cap2": 0.7505553499465134,
+        "wf_mean": 6.4375,
+        "wf_pneg": 0.125,
+        "wf_p05": -153.39999999999998,
+        "score_bins_cap2": {
+          "pos": 4,
+          "n": 5
+        },
+        "obj": 40.99689136766449
+      }
+    }
+  }
+}

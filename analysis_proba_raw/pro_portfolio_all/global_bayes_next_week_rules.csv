@@ -1,0 +1,15 @@
+test_week,bet_type,dow_pt,score_col,cutoff,stake_frac,alpha_global,status,rule_key,as_of_date
+2026-02-02/2026-02-08,FT,segunda-feira,proba_raw_segunda,0.23,0.04,1.0,ok,FT|segunda-feira,2026-02-02
+2026-02-02/2026-02-08,FT,terça-feira,proba_raw_terca,0.15,0.02,1.0,ok,FT|terça-feira,2026-02-02
+2026-02-02/2026-02-08,FT,quarta-feira,proba_raw_quarta,0.55,0.01,1.0,ok,FT|quarta-feira,2026-02-02
+2026-02-02/2026-02-08,FT,quinta-feira,proba_cal_segqui,0.53,0.01,1.0,ok,FT|quinta-feira,2026-02-02
+2026-02-02/2026-02-08,FT,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sexta-feira,2026-02-02
+2026-02-02/2026-02-08,FT,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|sábado,2026-02-02
+2026-02-02/2026-02-08,FT,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FT|domingo,2026-02-02
+2026-02-02/2026-02-08,FH,segunda-feira,proba_raw_segunda,1.0,0.0,1.0,no_candidate,FH|segunda-feira,2026-02-02
+2026-02-02/2026-02-08,FH,terça-feira,proba_raw_terca,0.61,0.01,1.0,ok,FH|terça-feira,2026-02-02
+2026-02-02/2026-02-08,FH,quarta-feira,proba_raw_quarta,0.27,0.02,1.0,ok,FH|quarta-feira,2026-02-02
+2026-02-02/2026-02-08,FH,quinta-feira,proba_cal_segqui,0.47,0.01,1.0,ok,FH|quinta-feira,2026-02-02
+2026-02-02/2026-02-08,FH,sexta-feira,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|sexta-feira,2026-02-02
+2026-02-02/2026-02-08,FH,sábado,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|sábado,2026-02-02
+2026-02-02/2026-02-08,FH,domingo,proba_cal_sexdom,1.0,0.0,1.0,no_candidate,FH|domingo,2026-02-02
