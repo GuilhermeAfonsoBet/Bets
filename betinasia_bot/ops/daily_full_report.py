@@ -7,11 +7,12 @@ import os
 import subprocess
 import sys
 import statistics
+import random
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from loguru import logger
@@ -505,6 +506,93 @@ def _slip_raw_pct(*, odd_dec: Optional[float], odd_fin: Optional[float]) -> Opti
         return None
 
 
+def _safe_int_or_none(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+
+def _safe_float_or_none(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
+
+
+def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
+    try:
+        if a is None:
+            return False
+        return abs(float(a) - float(b)) <= float(eps)
+    except Exception:
+        return False
+
+
+def _stake_bucket(stake: Any) -> str:
+    """
+    Bucket simples para acompanhamento operacional do sizing:
+    - "12" para stake≈12
+    - "1.5" para stake≈1.5
+    - "other" para valores diferentes/ausentes
+    """
+    if _approx_eq(stake, 12.0, eps=0.02):
+        return "12"
+    if _approx_eq(stake, 1.5, eps=0.02):
+        return "1.5"
+    if stake is None:
+        return "NA"
+    return "other"
+
+
+def _slip_bucket_3(slip_pct: Any) -> str:
+    s = _safe_float_or_none(slip_pct)
+    if s is None:
+        return "NA"
+    if s <= -2.0:
+        return "<= -2%"
+    if s <= 2.0:
+        return "(-2, 2]"
+    return "> 2%"
+
+
+def _bootstrap_ci_mean(xs: List[float], *, ci: float = 0.90, n_boot: int = 2000, seed: int = 0) -> Optional[Tuple[float, float]]:
+    """
+    IC bootstrap para a média (percentil). Retorna (lb, ub).
+    xs: amostras (ex.: ROI por ordem).
+    """
+    try:
+        xs2 = [float(x) for x in (xs or [])]
+    except Exception:
+        xs2 = []
+    if len(xs2) < 5:
+        return None
+    n = len(xs2)
+    nb = int(max(100, int(n_boot)))
+    rnd = random.Random(int(seed))
+    means: List[float] = []
+    for _ in range(nb):
+        s = 0.0
+        for _j in range(n):
+            s += xs2[rnd.randrange(0, n)]
+        means.append(s / float(n))
+    means.sort()
+    alpha = float(max(0.0, min(1.0, 1.0 - float(ci))))
+    lo = int(round((alpha / 2.0) * (len(means) - 1)))
+    hi = int(round((1.0 - alpha / 2.0) * (len(means) - 1)))
+    lo = max(0, min(len(means) - 1, lo))
+    hi = max(0, min(len(means) - 1, hi))
+    return float(means[lo]), float(means[hi])
+
+
 def _agg_pnl_exposure(rows: list[dict]) -> Dict[str, Any]:
     """
     Agrega {pnl, exposure} e retorna ROIw=(∑pnl)/(∑exposure)*100.
@@ -601,7 +689,7 @@ def _counterfactual_filters_back(
 def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, Any]]:
     """
     Lê executor_jsonl e retorna order_id -> métricas para Back LIVE_OK:
-      {created_at, slip_raw_pct, lat_ms, exposure, audit_id, is_live_mode}
+      {created_at, slip_raw_pct, lat_ms, exposure, audit_id, is_live_mode, pre_submit_ms, slippage_pre_pct, market_regime}
     """
     out: Dict[str, Dict[str, Any]] = {}
     if not path.exists():
@@ -645,6 +733,10 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
         odd_dec = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
         odd_fin = _safe_float(res.get("odd_final"))
         slip = _slip_raw_pct(odd_dec=odd_dec, odd_fin=odd_fin)
+        vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
+        pre_submit_ms = _safe_int_or_none(vs.get("pre_submit_ms"))
+        slip_pre = _safe_float_or_none(vs.get("slippage_pre_pct"))
+        mreg = str(vs.get("market_regime") or "").strip() or None
         # IMPORTANTE: no executor, `is_live` significa "modo LIVE (apostar de verdade)", não "in-play".
         is_live_mode = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
         rec = {
@@ -655,11 +747,193 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
             "exposure": (float(stake) if stake is not None else None),
             "audit_id": (int(audit_id) if audit_id is not None else None),
             "is_live_mode": bool(is_live_mode) if is_live_mode is not None else False,
+            "pre_submit_ms": (int(pre_submit_ms) if pre_submit_ms is not None else None),
+            "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+            "market_regime": mreg,
         }
         prev = out.get(str(oid))
         if prev is None or rec["created_at"] >= prev.get("created_at"):
             out[str(oid)] = rec
     return out
+
+
+def _append_backpre_fast_slow_sections(
+    out_lines: list[str],
+    *,
+    exec_by_oid_back: Dict[str, Dict[str, Any]],
+    acct_pnl_by_oid_total: Dict[str, float],
+    audit_by_id: Optional[Dict[int, Dict[str, Any]]],
+) -> None:
+    """
+    Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake 12 vs 1.5):
+    - contagem por grupo e por stake_bucket
+    - P&L/ROIw (accounting ledger por order_id)
+    - slippage_pre_pct por grupo
+    - robustez: IC90/IC95 (bootstrap) para média do ROI por ordem
+    """
+    if not exec_by_oid_back:
+        return
+    try:
+        thr_ms = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
+    except Exception:
+        thr_ms = 5000
+    try:
+        n_boot = int(float(os.getenv("DAILY_BACKPRE_FAST_BOOTSTRAP_N", "2000") or 2000))
+    except Exception:
+        n_boot = 2000
+    try:
+        min_n = int(float(os.getenv("DAILY_BACKPRE_FAST_MIN_ORDERS", "25") or 25))
+    except Exception:
+        min_n = 25
+
+    # rows com accounting (pnl) + stake (exposure)
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for oid, em in (exec_by_oid_back or {}).items():
+        if not isinstance(em, dict):
+            continue
+        created = em.get("created_at")
+        if not isinstance(created, datetime):
+            continue
+        exp = _safe_float_or_none(em.get("exposure"))
+        if exp is None or exp <= 0:
+            continue
+        pnl = acct_pnl_by_oid_total.get(str(oid))
+        if pnl is None:
+            continue
+
+        # Pre/In: preferir audit (kickoff/is_live); fallback: market_regime quando existir
+        is_in = None
+        try:
+            aid = em.get("audit_id")
+            arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+            if isinstance(arow, dict):
+                is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=created))
+        except Exception:
+            is_in = None
+        if is_in is None:
+            try:
+                mreg = str(em.get("market_regime") or "").strip().lower()
+                if mreg in ("pre", "in"):
+                    is_in = bool(mreg == "in")
+            except Exception:
+                is_in = None
+
+        pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
+        slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
+        stake_b = _stake_bucket(exp)
+        roi_i = float(pnl) / float(exp) * 100.0
+        row = {
+            "order_id": str(oid),
+            "pnl": float(pnl),
+            "exposure": float(exp),
+            "roi": float(roi_i),
+            "stake_bucket": stake_b,
+            "pre_submit_ms": pre_submit_ms,
+            "slippage_pre_pct": slip_pre,
+        }
+
+        if bool(is_in):
+            groups["Back In"].append(row)
+        else:
+            # Pre
+            if pre_submit_ms is None:
+                groups["Back Pre (pre_submit_ms NA)"].append(row)
+            elif int(pre_submit_ms) <= int(thr_ms):
+                groups[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
+            else:
+                groups[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
+
+    if not groups:
+        return
+
+    out_lines.append("**Tese: Back Pre fast (pre_submit_ms) — sizing (stake 12 vs 1.5), P&L e robustez (accounting; order_id)**\n\n")
+    out_lines.append(
+        "| Grupo | n_ordens | Exposição (∑stake) | P&L (∑acct) | ROIw | ROI mean (por ordem) | IC90 ROI mean | IC95 ROI mean | stake=12 | stake=1.5 | stake=other/NA |\n"
+    )
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+
+    def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+        c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
+        for r in rows or []:
+            sb = str(r.get("stake_bucket") or "")
+            if sb == "12":
+                c["12"] += 1
+            elif sb == "1.5":
+                c["1.5"] += 1
+            else:
+                c["other"] += 1
+        return c
+
+    order = [
+        f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)",
+        f"Back Pre slow (pre_submit_ms> {thr_ms}ms)",
+        "Back Pre (pre_submit_ms NA)",
+        "Back In",
+    ]
+    for g in order:
+        rows = groups.get(g) or []
+        if not rows:
+            continue
+        summ = _summarize_rows_pnl_exp(rows)
+        rois = [float(r.get("roi")) for r in rows if r.get("roi") is not None]
+        roi_mean = float(statistics.fmean(rois)) if rois else None
+        ci90 = _bootstrap_ci_mean(rois, ci=0.90, n_boot=n_boot, seed=hash(g) & 0xFFFF) if (len(rois) >= min_n) else None
+        ci95 = _bootstrap_ci_mean(rois, ci=0.95, n_boot=n_boot, seed=(hash(g) + 1) & 0xFFFF) if (len(rois) >= min_n) else None
+        stc = _cnt_stake(rows)
+        out_lines.append(
+            f"| {g} | {int(summ.get('n_orders') or 0)} | {_fmt_num(summ.get('exposure_sum'),2)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_pct(summ.get('roi_weighted'))} | "
+            f"{_fmt_pct(roi_mean)} | "
+            f"{(_fmt_pct(ci90[0]) + ' .. ' + _fmt_pct(ci90[1])) if ci90 else '—'} | "
+            f"{(_fmt_pct(ci95[0]) + ' .. ' + _fmt_pct(ci95[1])) if ci95 else '—'} | "
+            f"{int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n"
+        )
+    out_lines.append("\n")
+
+    # Slippage_pre_pct por grupo (3 buckets)
+    out_lines.append("**Tese: Back Pre fast — slippage_pre_pct (bucket 3-way; accounting por order_id)**\n\n")
+    out_lines.append("| Grupo | n_ordens | slippage_pre_pct mean | slippage_pre_pct mediana | <= -2% | (-2,2] | > 2% | NA |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+    for g in order:
+        rows = groups.get(g) or []
+        if not rows:
+            continue
+        slips = [float(r.get("slippage_pre_pct")) for r in rows if r.get("slippage_pre_pct") is not None]
+        mean_s = float(statistics.fmean(slips)) if slips else None
+        med_s = float(statistics.median(slips)) if slips else None
+        bc = {"<= -2%": 0, "(-2, 2]": 0, "> 2%": 0, "NA": 0}
+        for r in rows:
+            b = _slip_bucket_3(r.get("slippage_pre_pct"))
+            bc[b] = int(bc.get(b) or 0) + 1
+        out_lines.append(
+            f"| {g} | {len(rows)} | {_fmt_pct(mean_s)} | {_fmt_pct(med_s)} | {bc.get('<= -2%')} | {bc.get('(-2, 2]')} | {bc.get('> 2%')} | {bc.get('NA')} |\n"
+        )
+    out_lines.append("\n")
+
+    # Robustez: delta fast-slow
+    try:
+        fast = groups.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
+        slow = groups.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
+        if len(fast) >= min_n and len(slow) >= min_n:
+            # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
+            rnd = random.Random(123)
+            deltas: List[float] = []
+            nf = len(fast)
+            ns = len(slow)
+            for _ in range(int(max(300, n_boot))):
+                mf = 0.0
+                ms = 0.0
+                for _j in range(nf):
+                    mf += float(fast[rnd.randrange(0, nf)].get("roi"))
+                for _j in range(ns):
+                    ms += float(slow[rnd.randrange(0, ns)].get("roi"))
+                deltas.append((mf / float(nf)) - (ms / float(ns)))
+            deltas.sort()
+            lo = deltas[int(round(0.05 * (len(deltas) - 1)))]
+            hi = deltas[int(round(0.95 * (len(deltas) - 1)))]
+            out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
+            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo)} .. {_fmt_pct(hi)}` (min_n={min_n}).\n\n")
+    except Exception:
+        pass
 
 
 def _acct_amount_by_order_day_from_balance_csv(
@@ -4048,6 +4322,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Tese Back Pre fast (pre_submit_ms) — P&L/ROI por order_id e robustez (bootstrap)
+        # Usa: exec_by_oid_back (executor_jsonl) + acct_pnl_by_oid_total (ledger) + audit_by_id (classificar Pre/In)
+        try:
+            if acct_pnl_by_oid_total and exec_by_oid_back:
+                _append_backpre_fast_slow_sections(
+                    s1,
+                    exec_by_oid_back=exec_by_oid_back,
+                    acct_pnl_by_oid_total=acct_pnl_by_oid_total,
+                    audit_by_id=(audit_by_id or None),
+                )
+        except Exception:
+            pass
+
         # Diagnóstico explícito de void/refund/cancel por dia (UTC), quando há ledger.
         try:
             if isinstance(acct_day_typ, dict) and acct_day_typ:
@@ -4964,7 +5251,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append("**Regras de execução atuais (stake sizing)**\n\n")
         extra.append(
             "- No operacional (shadow/live), o tamanho enviado pelo bridge é **FLAT** via `BRIDGE_STAKE`.\n"
-            "- Em **Back**: stake = `BRIDGE_STAKE`.\n"
+            "- Em **Back**: stake padrão = `BRIDGE_STAKE`.\n"
+            "  - **Exceção (sizing no executor)**: se `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1`, o executor pode sobrescrever stake em Back:\n"
+            "    - Back **Pre** com `pre_submit_ms <= EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS` ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_HI` (ex.: 12)\n"
+            "    - demais Back ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_LO` (ex.: 1.50)\n"
             "- Em **Lay**: o executor recebe stake, mas o risco relevante é a **liability**, aproximadamente `liability ≈ stake × (odd - 1)`.\n"
             "- Importante: o Kelly/caps que aparece no relatório OOS é **simulação/diagnóstico** do walk-forward; ele não está sendo aplicado no executor/bridge neste momento.\n\n"
         )
