@@ -593,6 +593,44 @@ def _bootstrap_ci_mean(xs: List[float], *, ci: float = 0.90, n_boot: int = 2000,
     return float(means[lo]), float(means[hi])
 
 
+def _latest_open_stakes_csv(out_dir: Path) -> Optional[Path]:
+    try:
+        cands = sorted(out_dir.glob("*__open_stakes.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return cands[0] if cands else None
+    except Exception:
+        return None
+
+
+def _open_order_ids_from_open_stakes_csv(path: Path) -> Optional[set[str]]:
+    """
+    Retorna set(order_id) em aberto (ainda não liquidadas) a partir do CSV open_stakes.
+    Best-effort: se não conseguir achar coluna de order_id, retorna None.
+    """
+    if not path or not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            r = csv.DictReader(f)
+            cols = list(r.fieldnames or [])
+            if not cols:
+                return None
+            oid_col = _pick_col(cols, ("order_id", "order id", "order", "bet id", "bet_id", "id"))
+            if not oid_col:
+                return None
+            out: set[str] = set()
+            for row in r:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get(oid_col) or "").strip()
+                if not oid:
+                    continue
+                # geralmente é numérico; se não for, ainda assim guardamos o string (para joins futuros)
+                out.add(oid)
+            return out
+    except Exception:
+        return None
+
+
 def _agg_pnl_exposure(rows: list[dict]) -> Dict[str, Any]:
     """
     Agrega {pnl, exposure} e retorna ROIw=(∑pnl)/(∑exposure)*100.
@@ -763,6 +801,7 @@ def _append_backpre_fast_slow_sections(
     exec_by_oid_back: Dict[str, Dict[str, Any]],
     acct_pnl_by_oid_total: Dict[str, float],
     audit_by_id: Optional[Dict[int, Dict[str, Any]]],
+    open_order_ids: Optional[set[str]] = None,
 ) -> None:
     """
     Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake 12 vs 1.5):
@@ -786,14 +825,28 @@ def _append_backpre_fast_slow_sections(
     except Exception:
         min_n = 25
 
+    # “início operacional” da tese (quando stake=HI foi habilitado em produção).
+    # Se vazio, usa tudo (comportamento antigo).
+    thesis_start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
+    stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0) or 12.0
+
     # rows com accounting (pnl) + stake (exposure)
-    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
+    groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake=HI)
     for oid, em in (exec_by_oid_back or {}).items():
         if not isinstance(em, dict):
             continue
         created = em.get("created_at")
         if not isinstance(created, datetime):
             continue
+        # filtro de janela (>= start_day)
+        if thesis_start_day:
+            try:
+                if str(created.date().isoformat()) < thesis_start_day:
+                    continue
+            except Exception:
+                pass
+
         exp = _safe_float_or_none(em.get("exposure"))
         if exp is None or exp <= 0:
             continue
@@ -830,27 +883,61 @@ def _append_backpre_fast_slow_sections(
             "stake_bucket": stake_b,
             "pre_submit_ms": pre_submit_ms,
             "slippage_pre_pct": slip_pre,
+            "created_day": str(created.date().isoformat()),
         }
 
         if bool(is_in):
-            groups["Back In"].append(row)
+            groups_all["Back In"].append(row)
         else:
             # Pre
             if pre_submit_ms is None:
-                groups["Back Pre (pre_submit_ms NA)"].append(row)
+                groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
-                groups[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
+                groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
+                # tese = fast + stake=HI (pós-início)
+                if _approx_eq(exp, float(stake_hi), eps=0.02):
+                    groups_thesis[f"Back Pre fast (stake≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"].append(row)
             else:
-                groups[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
+                groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 
-    if not groups:
+    if not groups_all and not groups_thesis:
         return
 
-    out_lines.append("**Tese: Back Pre fast (pre_submit_ms) — sizing (stake 12 vs 1.5), P&L e robustez (accounting; order_id)**\n\n")
-    out_lines.append(
-        "| Grupo | n_ordens | Exposição (∑stake) | P&L (∑acct) | ROIw | ROI mean (por ordem) | IC90 ROI mean | IC95 ROI mean | stake=12 | stake=1.5 | stake=other/NA |\n"
-    )
-    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    # -------------------------
+    # A) Performance da tese (stake=HI) com métricas “liquidadas”
+    # -------------------------
+    out_lines.append("**Tese: Back Pre fast (pós-início; stake=HI) — performance (accounting; order_id)**\n\n")
+    if thesis_start_day:
+        out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+
+    def _split_settled(rows: List[Dict[str, Any]]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
+        # Sem open_stakes.csv não sabemos o que está liquidado vs aberto.
+        if open_order_ids is None:
+            return None, None
+        settled = []
+        open_rows = []
+        for r in rows or []:
+            oid0 = str(r.get("order_id") or "").strip()
+            if oid0 and oid0 in open_order_ids:
+                open_rows.append(r)
+            else:
+                settled.append(r)
+        return settled, open_rows
+
+    for g, rows in sorted((groups_thesis or {}).items(), key=lambda kv: kv[0]):
+        settled_rows, open_rows = _split_settled(rows)
+        if settled_rows is None or open_rows is None:
+            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
+        else:
+            summ_set = _summarize_rows_pnl_exp(settled_rows)
+            out_lines.append(
+                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+            )
+    out_lines.append("\n")
+    if open_order_ids is None:
+        out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
@@ -864,37 +951,34 @@ def _append_backpre_fast_slow_sections(
                 c["other"] += 1
         return c
 
-    order = [
+    # -------------------------
+    # B) Compliance: fast/slow/NA (todos stakes) + contagem por stake bucket
+    # -------------------------
+    out_lines.append("**Tese Back Pre fast — compliance (pós-início; distribuição de stake e pre_submit_ms)**\n\n")
+    out_lines.append(
+        "| Grupo | n_ordens | stake=12 | stake=1.5 | stake=other/NA |\n"
+    )
+    out_lines.append("|---|---:|---:|---:|---:|\n")
+    order_diag = [
         f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)",
         f"Back Pre slow (pre_submit_ms> {thr_ms}ms)",
         "Back Pre (pre_submit_ms NA)",
         "Back In",
     ]
-    for g in order:
-        rows = groups.get(g) or []
+    for g in order_diag:
+        rows = groups_all.get(g) or []
         if not rows:
             continue
-        summ = _summarize_rows_pnl_exp(rows)
-        rois = [float(r.get("roi")) for r in rows if r.get("roi") is not None]
-        roi_mean = float(statistics.fmean(rois)) if rois else None
-        ci90 = _bootstrap_ci_mean(rois, ci=0.90, n_boot=n_boot, seed=hash(g) & 0xFFFF) if (len(rois) >= min_n) else None
-        ci95 = _bootstrap_ci_mean(rois, ci=0.95, n_boot=n_boot, seed=(hash(g) + 1) & 0xFFFF) if (len(rois) >= min_n) else None
         stc = _cnt_stake(rows)
-        out_lines.append(
-            f"| {g} | {int(summ.get('n_orders') or 0)} | {_fmt_num(summ.get('exposure_sum'),2)} | {_fmt_num(summ.get('pnl_sum'),2)} | {_fmt_pct(summ.get('roi_weighted'))} | "
-            f"{_fmt_pct(roi_mean)} | "
-            f"{(_fmt_pct(ci90[0]) + ' .. ' + _fmt_pct(ci90[1])) if ci90 else '—'} | "
-            f"{(_fmt_pct(ci95[0]) + ' .. ' + _fmt_pct(ci95[1])) if ci95 else '—'} | "
-            f"{int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n"
-        )
+        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n")
     out_lines.append("\n")
 
     # Slippage_pre_pct por grupo (3 buckets)
     out_lines.append("**Tese: Back Pre fast — slippage_pre_pct (bucket 3-way; accounting por order_id)**\n\n")
     out_lines.append("| Grupo | n_ordens | slippage_pre_pct mean | slippage_pre_pct mediana | <= -2% | (-2,2] | > 2% | NA |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|\n")
-    for g in order:
-        rows = groups.get(g) or []
+    for g in order_diag:
+        rows = groups_all.get(g) or []
         if not rows:
             continue
         slips = [float(r.get("slippage_pre_pct")) for r in rows if r.get("slippage_pre_pct") is not None]
@@ -911,8 +995,8 @@ def _append_backpre_fast_slow_sections(
 
     # Robustez: delta fast-slow
     try:
-        fast = groups.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
-        slow = groups.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
+        fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
+        slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
         if len(fast) >= min_n and len(slow) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
             rnd = random.Random(123)
@@ -4326,11 +4410,22 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         # Usa: exec_by_oid_back (executor_jsonl) + acct_pnl_by_oid_total (ledger) + audit_by_id (classificar Pre/In)
         try:
             if acct_pnl_by_oid_total and exec_by_oid_back:
+                # Para n_liquidadas / ROIw_liquidado precisamos do open_stakes.csv (quando disponível)
+                open_csv = None
+                open_oids = None
+                try:
+                    out_dir = Path(os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting"))
+                    open_csv = _latest_open_stakes_csv(out_dir)
+                    if open_csv is not None:
+                        open_oids = _open_order_ids_from_open_stakes_csv(open_csv)
+                except Exception:
+                    open_oids = None
                 _append_backpre_fast_slow_sections(
                     s1,
                     exec_by_oid_back=exec_by_oid_back,
                     acct_pnl_by_oid_total=acct_pnl_by_oid_total,
                     audit_by_id=(audit_by_id or None),
+                    open_order_ids=open_oids,
                 )
         except Exception:
             pass
@@ -4566,6 +4661,94 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                                     is_in = False
                                 if not bool(is_in):
                                     continue
+                                pnl_amt = None
+                                if isinstance(acct_by_oid_day_typ, dict) and str(oid) in acct_by_oid_day_typ:
+                                    dmap = acct_by_oid_day_typ.get(str(oid)) if isinstance(acct_by_oid_day_typ.get(str(oid)), dict) else None
+                                    tmap = dmap.get(dayk) if isinstance(dmap, dict) and isinstance(dmap.get(dayk), dict) else None
+                                    if isinstance(tmap, dict) and tmap:
+                                        try:
+                                            pnl_amt = float(sum(float(v or 0.0) for k, v in tmap.items() if not _acct_type_excl(str(k))))
+                                        except Exception:
+                                            pnl_amt = None
+                                if pnl_amt is None and isinstance(acct_by_oid_day, dict) and str(oid) in acct_by_oid_day:
+                                    amt_by_day = acct_by_oid_day.get(str(oid)) if isinstance(acct_by_oid_day.get(str(oid)), dict) else None
+                                    if isinstance(amt_by_day, dict) and dayk in amt_by_day:
+                                        try:
+                                            pnl_amt = float(amt_by_day.get(dayk) or 0.0)
+                                        except Exception:
+                                            pnl_amt = None
+                                if pnl_amt is None:
+                                    continue
+                                n_with_acct += 1
+                                rows0.append(
+                                    {
+                                        "pnl": float(pnl_amt),
+                                        "exposure": em.get("exposure"),
+                                        "slip_raw_pct": em.get("slip_raw_pct"),
+                                        "lat_ms": em.get("lat_ms"),
+                                    }
+                                )
+                            if not rows0:
+                                continue
+                            cf_acct = _counterfactual_filters_back(
+                                rows0,
+                                slip_raw_pct_max=float(os.getenv("CF_SLIP_RAW_PCT_MAX", "2.0") or 2.0),
+                                lat_ms_max=int(float(os.getenv("CF_LAT_CALL_TO_DONE_MS_MAX", "6000") or 6000)),
+                                slip_missing_pass=True,
+                                lat_missing_fail_closed=True,
+                            )
+                            base = cf_acct.get("base") if isinstance(cf_acct.get("base"), dict) else {}
+                            a_slip = cf_acct.get("after_slip") if isinstance(cf_acct.get("after_slip"), dict) else {}
+                            a_lat = cf_acct.get("after_lat") if isinstance(cf_acct.get("after_lat"), dict) else {}
+                            a_both = cf_acct.get("after_both") if isinstance(cf_acct.get("after_both"), dict) else {}
+                            s1.append(
+                                f"| {dayk} | {_fmt_num(base.get('pnl_sum'),2)} | {_fmt_pct(base.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_slip.get('pnl_sum'),2)} | {_fmt_pct(a_slip.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_lat.get('pnl_sum'),2)} | {_fmt_pct(a_lat.get('roi_weighted'))} | "
+                                f"{_fmt_num(a_both.get('pnl_sum'),2)} | {_fmt_pct(a_both.get('roi_weighted'))} | "
+                                f"{int(n_with_acct)} |\n"
+                            )
+                        s1.append("\n")
+                    except Exception:
+                        pass
+
+                    # Versão 1c: somente Back Pre (exclui Back In)
+                    try:
+                        s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back Pre somente)**\n\n")
+                        s1.append(
+                            "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders Back Pre com acct no dia) |\n"
+                        )
+                        s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                        for it in adh_day.get("per_day") or []:
+                            if not isinstance(it, dict):
+                                continue
+                            dayk = str(it.get("day") or "")
+                            if not dayk:
+                                continue
+                            rows0 = []
+                            n_with_acct = 0
+                            for oid, em in (exec_by_oid or {}).items():
+                                if not isinstance(em, dict):
+                                    continue
+                                # filtro Back Pre: usa kickoff_time/is_live do audit (DB) quando possível; fallback market_regime
+                                is_in = None
+                                try:
+                                    aid = em.get("audit_id")
+                                    arow = (audit_by_id or {}).get(int(aid)) if (aid is not None and audit_by_id is not None) else None
+                                    if isinstance(arow, dict):
+                                        is_in = bool(_is_inplay_from_audit_row(arow, exec_created_at_utc=em.get("created_at")))
+                                except Exception:
+                                    is_in = None
+                                if is_in is None:
+                                    try:
+                                        mreg = str(em.get("market_regime") or "").strip().lower()
+                                        if mreg in ("pre", "in"):
+                                            is_in = bool(mreg == "in")
+                                    except Exception:
+                                        is_in = None
+                                if bool(is_in):
+                                    continue
+
                                 pnl_amt = None
                                 if isinstance(acct_by_oid_day_typ, dict) and str(oid) in acct_by_oid_day_typ:
                                     dmap = acct_by_oid_day_typ.get(str(oid)) if isinstance(acct_by_oid_day_typ.get(str(oid)), dict) else None
