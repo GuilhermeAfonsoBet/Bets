@@ -262,6 +262,16 @@ def main() -> int:
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--accounting-out-dir", default=os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting"))
     ap.add_argument("--perm-n", type=int, default=int(float(os.getenv("BACKPRE_FAST_PERM_N", "20000") or 20000)))
+    ap.add_argument(
+        "--manual-text",
+        default=None,
+        help="Caminho de um .txt com outputs (ex.: colados do terminal) para anexar no PDF.",
+    )
+    ap.add_argument(
+        "--manual-stdin",
+        action="store_true",
+        help="Lê texto do stdin e anexa no PDF (para colar outputs via pipe).",
+    )
     args = ap.parse_args()
 
     _load_env_file(Path(str(args.env_file)))
@@ -347,12 +357,31 @@ def main() -> int:
     if start_day in ("", "—", None):
         alerts.append("DAILY_BACKPRE_FAST_THESIS_START_DAY não está setado; o recorte pós-início pode estar misturando períodos.")
 
+    manual_blob = ""
+    try:
+        if args.manual_text:
+            p = Path(str(args.manual_text)).expanduser()
+            if p.exists():
+                manual_blob = p.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        manual_blob = manual_blob or ""
+    if args.manual_stdin:
+        try:
+            stdin_txt = (sys.stdin.read() or "").strip()
+            if stdin_txt:
+                manual_blob = (manual_blob + "\n\n" + stdin_txt).strip() if manual_blob else stdin_txt
+        except Exception:
+            pass
+
     md = f"""# Estatísticas — Tese Back Pre fast (pre_submit_ms)
 
 Gerado em: **{ts}**
 
 ## ALERTAS (se aparecerem, o PDF pode ficar “sem análise”)
-{(''.join(f'- **{a}**\\n' for a in alerts) if alerts else '- (ok) dataset encontrado e join executado.\\n')}
+{(''.join(f'- **{a}**\n' for a in alerts) if alerts else '- (ok) dataset encontrado e join executado.\n')}
+
+## Outputs anexados (manual; opcional)
+{('```\n'+manual_blob+'\n```\n' if manual_blob else '_—_\n')}
 
 ## Definição da tese (operacional)
 - Universo: **Back Pre** (pre-match), apostas efetivas (`LIVE_OK`).
@@ -369,7 +398,7 @@ Gerado em: **{ts}**
 - n com join no ledger por order_id: `{len(joined)}`
 
 ## Resultado principal (ROI por ordem; stake=HI)
-| Grupo | n_ordens | ROI mean | ROIw | IC90 ROI mean (bootstrap) |
+| Grupo | n ordens | ROI mean | ROIw | IC90 ROI mean (bootstrap) |
 |---|---:|---:|---:|---:|
 | Fast (pre_submit_ms<= {thr_ms}ms) | {len(fast)} | {_fmt_pct(statistics.fmean([x['roi'] for x in fast]) if fast else None)} | {_fmt_pct(_roiw(fast))} | {(_fmt_pct(ci_fast90[0])+' .. '+_fmt_pct(ci_fast90[1])) if ci_fast90 else '—'} |
 | Slow (pre_submit_ms> {thr_ms}ms) | {len(slow)} | {_fmt_pct(statistics.fmean([x['roi'] for x in slow]) if slow else None)} | {_fmt_pct(_roiw(slow))} | {(_fmt_pct(ci_slow90[0])+' .. '+_fmt_pct(ci_slow90[1])) if ci_slow90 else '—'} |
