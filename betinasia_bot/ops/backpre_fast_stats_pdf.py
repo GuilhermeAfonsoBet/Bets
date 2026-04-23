@@ -333,9 +333,26 @@ def main() -> int:
     ci_fast90 = _bootstrap_ci_mean([x["roi"] for x in fast], ci=0.90, n_boot=n_boot, seed=1) if len(fast) >= min_n else None
     ci_slow90 = _bootstrap_ci_mean([x["roi"] for x in slow], ci=0.90, n_boot=n_boot, seed=2) if len(slow) >= min_n else None
 
+    alerts: List[str] = []
+    if not exec_path.exists():
+        alerts.append(f"executor_jsonl não encontrado em `{exec_path}` (ajuste EXECUTOR_JSONL ou rode no VPS).")
+    if not acct_dir.exists():
+        alerts.append(f"ACCOUNTING_OUT_DIR `{acct_dir}` não existe (ajuste ACCOUNTING_OUT_DIR).")
+    if bal_csv is None:
+        alerts.append("Nenhum `*__balance.csv` encontrado em ACCOUNTING_OUT_DIR (sem join P&L por order_id).")
+    if open_csv is None:
+        alerts.append("Nenhum `*__open_stakes.csv` encontrado em ACCOUNTING_OUT_DIR (sem n_liquidadas/ROIw_liquidado).")
+    if exec_rows and not joined:
+        alerts.append("Há ordens elegíveis no executor_jsonl, mas 0 fizeram join no ledger (order_id ausente no balance.csv ou formatos divergentes).")
+    if start_day in ("", "—", None):
+        alerts.append("DAILY_BACKPRE_FAST_THESIS_START_DAY não está setado; o recorte pós-início pode estar misturando períodos.")
+
     md = f"""# Estatísticas — Tese Back Pre fast (pre_submit_ms)
 
 Gerado em: **{ts}**
+
+## ALERTAS (se aparecerem, o PDF pode ficar “sem análise”)
+{(''.join(f'- **{a}**\\n' for a in alerts) if alerts else '- (ok) dataset encontrado e join executado.\\n')}
 
 ## Definição da tese (operacional)
 - Universo: **Back Pre** (pre-match), apostas efetivas (`LIVE_OK`).

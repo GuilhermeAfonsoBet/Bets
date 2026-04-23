@@ -167,6 +167,15 @@ def parse_table_block(lines: List[str], start_idx: int):
 
 
 def table_to_flowable(table_lines: List[str], available_width: float, body_style: ParagraphStyle):
+    # Importante: o `wordWrap="CJK"` do estilo "body" permite quebrar palavras em qualquer
+    # caractere, o que é bom para paths longos em parágrafos, mas péssimo para tabelas
+    # (ex.: "n_ordens" vira "n_orden" + "s"). Para tabelas, forçamos `LTR`.
+    table_body_style = ParagraphStyle(
+        "table_body",
+        parent=body_style,
+        wordWrap="LTR",
+    )
+
     rows = []
     for ln in table_lines:
         cells = [normalize_cell(c) for c in ln.strip().strip("|").split("|")]
@@ -221,17 +230,17 @@ def table_to_flowable(table_lines: List[str], available_width: float, body_style
     # a cor já definida dentro do ParagraphStyle.
     header_style = ParagraphStyle(
         "table_header",
-        parent=body_style,
+        parent=table_body_style,
         fontName="Helvetica-Bold",
         fontSize=9,
         leading=11,
         textColor=colors.white,
-        wordWrap="CJK",
+        wordWrap="LTR",
     )
 
     table_data = []
     for i, r in enumerate(padded_rows):
-        style = header_style if i == 0 else body_style
+        style = header_style if i == 0 else table_body_style
         row_cells = [Paragraph(c if c else "&nbsp;", style) for c in r]
         table_data.append(row_cells)
 
