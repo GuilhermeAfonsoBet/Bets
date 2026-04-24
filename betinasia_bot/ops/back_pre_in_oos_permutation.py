@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 @dataclass
 class ExecRecord:
+    order_id: Optional[str]
     created_at: datetime
     audit_id: int
     event_id: Optional[str]
@@ -79,6 +82,49 @@ def _sanitize_decimal_odd(odd: Optional[float]) -> Optional[float]:
     if o > 30.0:
         return None
     return float(o)
+
+
+def _repo_roots() -> List[Path]:
+    roots: List[Path] = []
+    try:
+        roots.append(Path(__file__).resolve().parents[2])  # .../Bets
+    except Exception:
+        pass
+    try:
+        roots.append(Path(__file__).resolve().parents[1])  # .../Bets/betinasia_bot
+    except Exception:
+        pass
+    try:
+        roots.append(Path.cwd())
+    except Exception:
+        pass
+    out: List[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            rr = r.resolve()
+            if str(rr) not in seen:
+                out.append(rr)
+                seen.add(str(rr))
+        except Exception:
+            continue
+    return out
+
+
+def _resolve_rel_path(p: Path) -> Path:
+    try:
+        if p.is_absolute():
+            return p
+    except Exception:
+        return p
+    for root in _repo_roots():
+        cand = (root / p).resolve()
+        if cand.exists():
+            return cand
+    try:
+        return (_repo_roots()[0] / p).resolve()
+    except Exception:
+        return p
 
 
 def _weighted_roi_pct(rows: Sequence[BackObservation]) -> Optional[float]:
@@ -442,6 +488,108 @@ def _infer_regime(created_at: datetime, audit_row: Dict[str, Any]) -> str:
     return "pre"
 
 
+def _pick_col(cols: Sequence[str], keys: Sequence[str]) -> Optional[str]:
+    for k in keys:
+        kl = str(k).lower().strip()
+        for c in cols:
+            cl = str(c).lower().strip()
+            if cl == kl or cl.startswith(kl) or kl in cl:
+                return c
+    return None
+
+
+def _extract_order_id_from_raw(raw: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(raw, dict):
+        return None
+    for k in ("order_id", "orderId", "bet_id", "betId", "id"):
+        v = raw.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s.isdigit():
+            return s
+    try:
+        payload = json.dumps(raw, ensure_ascii=False)
+        m = re.search(r"\"order[_ ]?id\"\\s*:\\s*\"?(\\d+)\"?", payload, flags=re.IGNORECASE)
+        if m:
+            return str(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_balance_csv(args: argparse.Namespace) -> Path:
+    if str(args.balance_csv or "").strip():
+        p = _resolve_rel_path(Path(str(args.balance_csv)).expanduser())
+        if not p.exists():
+            raise SystemExit(f"--balance-csv não encontrado: {p}")
+        return p
+
+    acct_report = _resolve_rel_path(Path(str(args.accounting_report_json)).expanduser())
+    if not acct_report.exists():
+        raise SystemExit(
+            f"Arquivo de accounting não encontrado: {acct_report}. "
+            "Passe --balance-csv explicitamente ou ajuste --accounting-report-json."
+        )
+    try:
+        obj = json.loads(acct_report.read_text(encoding="utf-8", errors="ignore") or "{}")
+    except Exception as e:
+        raise SystemExit(f"Falha lendo accounting report ({acct_report}): {e}")
+    bal_raw = str((obj or {}).get("balance_csv") or "").strip()
+    if not bal_raw:
+        raise SystemExit(
+            f"`balance_csv` ausente em {acct_report}. "
+            "Passe --balance-csv explicitamente."
+        )
+    bal = _resolve_rel_path(Path(bal_raw).expanduser())
+    if not bal.exists():
+        raise SystemExit(f"balance_csv não encontrado: {bal} (origem: {acct_report})")
+    return bal
+
+
+def _read_accounting_pnl_by_order(balance_csv: Path) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    by_oid: Dict[str, float] = {}
+    n_rows = 0
+    n_rows_used = 0
+    n_ignored_type = 0
+    with balance_csv.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        reader = csv.DictReader(f)
+        cols = list(reader.fieldnames or [])
+        if not cols:
+            return {}, {"rows_total": 0, "rows_used": 0, "orders": 0}
+        pnl_col = _pick_col(cols, ("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl"))
+        oid_col = _pick_col(cols, ("order_id", "order id", "order", "bet id", "bet_id", "id"))
+        typ_col = _pick_col(cols, ("type",))
+        if not pnl_col or not oid_col:
+            raise SystemExit(
+                f"balance_csv sem colunas necessárias (order_id/pnl). arquivo={balance_csv}"
+            )
+        for row in reader:
+            n_rows += 1
+            if not isinstance(row, dict):
+                continue
+            oid = str(row.get(oid_col) or "").strip()
+            if not oid or not oid.isdigit():
+                continue
+            pnl = _safe_float(row.get(pnl_col))
+            if pnl is None:
+                continue
+            typ = str(row.get(typ_col) or "").strip().lower() if typ_col else ""
+            # Quando existe tipo, restringimos a movimentos de aposta.
+            if typ and ("bet" not in typ):
+                n_ignored_type += 1
+                continue
+            by_oid[oid] = float(by_oid.get(oid) or 0.0) + float(pnl)
+            n_rows_used += 1
+    meta = {
+        "rows_total": int(n_rows),
+        "rows_used": int(n_rows_used),
+        "rows_ignored_non_bet_type": int(n_ignored_type),
+        "orders": int(len(by_oid)),
+    }
+    return by_oid, meta
+
+
 def _load_executor_rows(jsonl_path: Path, allowed_statuses: Iterable[str]) -> List[ExecRecord]:
     st_allowed = {str(x).strip().upper() for x in allowed_statuses if str(x).strip()}
     out: List[ExecRecord] = []
@@ -474,6 +622,7 @@ def _load_executor_rows(jsonl_path: Path, allowed_statuses: Iterable[str]) -> Li
             continue
 
         raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+        oid = _extract_order_id_from_raw(raw)
         sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
         stake = _safe_float(sent.get("stake"))
         if stake is None:
@@ -489,6 +638,7 @@ def _load_executor_rows(jsonl_path: Path, allowed_statuses: Iterable[str]) -> Li
 
         out.append(
             ExecRecord(
+                order_id=(str(oid) if oid else None),
                 created_at=created_at,
                 audit_id=audit_id,
                 event_id=(str(res.get("event_id") or req.get("event_id") or "").strip() or None),
@@ -578,6 +728,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         tz = timezone.utc
 
     database_url = _pick_database_url(str(args.database_url or ""))
+    balance_csv = _resolve_balance_csv(args)
+    pnl_by_order, accounting_meta = _read_accounting_pnl_by_order(balance_csv)
     allowed_statuses = [x.strip().upper() for x in str(args.statuses).split(",") if x.strip()]
     exec_rows = _load_executor_rows(Path(str(args.executor_jsonl)), allowed_statuses=allowed_statuses)
 
@@ -589,27 +741,25 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
 
     obs: List[BackObservation] = []
     dropped = {
+        "missing_order_id": 0,
+        "missing_accounting_pnl": 0,
         "missing_audit": 0,
-        "missing_scores_or_line": 0,
-        "invalid_odd_final": 0,
         "missing_event_id": 0,
+        "missing_exposure": 0,
         "outside_day_range": 0,
     }
 
     for ex in exec_rows:
+        if not ex.order_id:
+            dropped["missing_order_id"] += 1
+            continue
+        pnl = pnl_by_order.get(str(ex.order_id))
+        if pnl is None:
+            dropped["missing_accounting_pnl"] += 1
+            continue
         ar = audit_map.get(int(ex.audit_id))
         if not ar:
             dropped["missing_audit"] += 1
-            continue
-        odd_fin = _sanitize_decimal_odd(ex.odd_final)
-        if odd_fin is None:
-            dropped["invalid_odd_final"] += 1
-            continue
-        line = ar.get("line") or ex.line
-        side = ar.get("side") or ex.side
-        mult = _mult_back_from_scores(line, str(side or ""), ar.get("home_score"), ar.get("away_score"))
-        if mult is None:
-            dropped["missing_scores_or_line"] += 1
             continue
         event_id = str(ar.get("event_id") or ex.event_id or "").strip()
         if not event_id:
@@ -623,10 +773,14 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             dropped["outside_day_range"] += 1
             continue
 
+        exposure = _safe_float(ex.stake)
+        if exposure is None or float(exposure) <= 0:
+            dropped["missing_exposure"] += 1
+            continue
+
         regime = _infer_regime(ex.created_at, ar)
-        roi = _roi_back_pct(float(odd_fin), float(mult))
-        pnl = float(ex.stake) * float(roi) / 100.0
-        slip = _slip_raw_pct(ex.odd_decision, ex.odd_final)
+        roi = float(float(pnl) / float(exposure) * 100.0)
+        slip = _slip_raw_pct(_sanitize_decimal_odd(ex.odd_decision), _sanitize_decimal_odd(ex.odd_final))
         lat_bucket = _bucket_latency(ex.latency_ms)
         slip_bucket = _bucket_slippage(slip)
         obs.append(
@@ -637,7 +791,7 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 regime=regime,
                 roi_pct=float(roi),
                 pnl=float(pnl),
-                exposure=float(ex.stake),
+                exposure=float(exposure),
                 latency_ms=(float(ex.latency_ms) if ex.latency_ms is not None else None),
                 slip_raw_pct=(float(slip) if slip is not None else None),
                 lat_bucket=lat_bucket,
@@ -699,6 +853,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         "meta": {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "executor_jsonl": str(args.executor_jsonl),
+            "balance_csv": str(balance_csv),
+            "pnl_source": "accounting_real_by_order_id",
             "tz": str(args.tz),
             "statuses": allowed_statuses,
             "start_day": start_day,
@@ -713,6 +869,9 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         },
         "coverage": {
             "jsonl_rows_back_status": int(len(exec_rows)),
+            "jsonl_rows_with_order_id": int(sum(1 for x in exec_rows if x.order_id)),
+            "orders_with_accounting_pnl": int(len(pnl_by_order)),
+            "accounting_meta": accounting_meta,
             "audit_rows_found": int(len(audit_map)),
             "final_observations": int(len(obs)),
             "dropped": dropped,
@@ -722,8 +881,10 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         "permutation_tests": perm_results,
         "oos_expanding_combo": oos_results,
         "notes": [
-            "ROI é calculado por placar (AH) com odd executada (odd_final) e exposição stake.",
-            "regime Pre/In é inferido por kickoff_time vs created_at (fallback: is_live).",
+            "P&L/ROI usa modo accounting-real por order_id (balance_csv).",
+            "slippage usa odd executada vs odd de decisão do sinal no executor_jsonl.",
+            "latência usa timing.call_to_done_ms do executor_jsonl (tempo de execução da aposta).",
+            "regime Pre/In é inferido por kickoff_time vs created_at (fallback: is_live no audit).",
             "permutação mantém exposição e buckets fixos e embaralha PnL para testar dependência bucket->resultado.",
             "OOS usa seleção de melhor combo lat_bucket x slip_bucket no treino (expanding) e avalia no dia seguinte.",
         ],
@@ -737,6 +898,12 @@ def main() -> int:
     )
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--database-url", default="")
+    ap.add_argument("--balance-csv", default="", help="CSV do ledger/accounting para P&L real por order_id.")
+    ap.add_argument(
+        "--accounting-report-json",
+        default=os.getenv("ACCOUNTING_DAILY_REPORT_OUT", "logs/accounting_daily_report.json"),
+        help="JSON do accounting diário com campo balance_csv (usado quando --balance-csv não for passado).",
+    )
     ap.add_argument("--tz", default=os.getenv("REPORT_TZ", "America/Sao_Paulo"))
     ap.add_argument("--statuses", default="LIVE_OK")
     ap.add_argument("--start-day", default="", help="YYYY-MM-DD (dia local em --tz)")
