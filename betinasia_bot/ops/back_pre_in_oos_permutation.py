@@ -518,6 +518,28 @@ def _extract_order_id_from_raw(raw: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _normalize_order_id(value: Any) -> Optional[str]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return s
+    s2 = s.replace(".0", "").strip()
+    if s2.isdigit():
+        return s2
+    m = re.search(r"\d{4,}", s)
+    if m:
+        return str(m.group(0))
+    return None
+
+
+def _is_excluded_accounting_type(type_value: str) -> bool:
+    t = str(type_value or "").strip().lower()
+    if not t:
+        return False
+    return any(k in t for k in ("deposit", "withdraw", "transfer", "top", "payment", "adjust", "bonus"))
+
+
 def _resolve_balance_csv(args: argparse.Namespace) -> Path:
     if str(args.balance_csv or "").strip():
         p = _resolve_rel_path(Path(str(args.balance_csv)).expanduser())
@@ -568,15 +590,15 @@ def _read_accounting_pnl_by_order(balance_csv: Path) -> Tuple[Dict[str, float], 
             n_rows += 1
             if not isinstance(row, dict):
                 continue
-            oid = str(row.get(oid_col) or "").strip()
-            if not oid or not oid.isdigit():
+            oid = _normalize_order_id(row.get(oid_col))
+            if not oid:
                 continue
             pnl = _safe_float(row.get(pnl_col))
             if pnl is None:
                 continue
             typ = str(row.get(typ_col) or "").strip().lower() if typ_col else ""
-            # Quando existe tipo, restringimos a movimentos de aposta.
-            if typ and ("bet" not in typ):
+            # Mantém movimentos P&L-like e exclui movimentações de caixa.
+            if _is_excluded_accounting_type(typ):
                 n_ignored_type += 1
                 continue
             by_oid[oid] = float(by_oid.get(oid) or 0.0) + float(pnl)
@@ -584,7 +606,8 @@ def _read_accounting_pnl_by_order(balance_csv: Path) -> Tuple[Dict[str, float], 
     meta = {
         "rows_total": int(n_rows),
         "rows_used": int(n_rows_used),
-        "rows_ignored_non_bet_type": int(n_ignored_type),
+        "rows_ignored_non_bet_type": int(n_ignored_type),  # compat retro (agora: tipos excluídos)
+        "rows_ignored_excluded_type": int(n_ignored_type),
         "orders": int(len(by_oid)),
     }
     return by_oid, meta
@@ -732,6 +755,11 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     pnl_by_order, accounting_meta = _read_accounting_pnl_by_order(balance_csv)
     allowed_statuses = [x.strip().upper() for x in str(args.statuses).split(",") if x.strip()]
     exec_rows = _load_executor_rows(Path(str(args.executor_jsonl)), allowed_statuses=allowed_statuses)
+    matched_order_ids = {
+        str(ex.order_id)
+        for ex in exec_rows
+        if ex.order_id and (str(ex.order_id) in pnl_by_order)
+    }
 
     audit_ids = sorted({int(r.audit_id) for r in exec_rows})
     audit_map = await _fetch_audit_rows(database_url, audit_ids)
@@ -870,7 +898,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         "coverage": {
             "jsonl_rows_back_status": int(len(exec_rows)),
             "jsonl_rows_with_order_id": int(sum(1 for x in exec_rows if x.order_id)),
-            "orders_with_accounting_pnl": int(len(pnl_by_order)),
+            "orders_with_accounting_pnl": int(len(matched_order_ids)),
+            "accounting_orders_total": int(len(pnl_by_order)),
             "accounting_meta": accounting_meta,
             "audit_rows_found": int(len(audit_map)),
             "final_observations": int(len(obs)),
