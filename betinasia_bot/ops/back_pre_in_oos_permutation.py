@@ -135,16 +135,104 @@ def _weighted_roi_pct(rows: Sequence[BackObservation]) -> Optional[float]:
     return float(pnl / exp * 100.0)
 
 
-def _summarize(rows: Sequence[BackObservation]) -> Dict[str, Any]:
+def _weighted_roi_pct_from_arrays(pnl: Sequence[float], exposure: Sequence[float]) -> Optional[float]:
+    exp = float(sum(float(x) for x in exposure))
+    if exp <= 0:
+        return None
+    p = float(sum(float(x) for x in pnl))
+    return float(p / exp * 100.0)
+
+
+def _quantile(sorted_vals: Sequence[float], q: float) -> Optional[float]:
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    qq = min(1.0, max(0.0, float(q)))
+    pos = qq * (len(sorted_vals) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(sorted_vals[lo])
+    frac = float(pos - lo)
+    return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac)
+
+
+def _bootstrap_weighted_roi_ci(
+    rows: Sequence[BackObservation],
+    *,
+    n_boot: int,
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    if int(n_boot) <= 1 or len(rows) <= 1:
+        return None
+    pnl = [float(r.pnl) for r in rows]
+    exp = [float(r.exposure) for r in rows]
+    n = len(rows)
+    rng = random.Random(int(seed))
+    boots: List[float] = []
+    for _ in range(int(n_boot)):
+        idx = [rng.randrange(0, n) for _ in range(n)]
+        p = [pnl[i] for i in idx]
+        e = [exp[i] for i in idx]
+        roi = _weighted_roi_pct_from_arrays(p, e)
+        if roi is not None:
+            boots.append(float(roi))
+    if not boots:
+        return None
+    boots.sort()
+    return {
+        "lb": _quantile(boots, 0.025),
+        "ub": _quantile(boots, 0.975),
+        "n_boot": int(n_boot),
+    }
+
+
+def _bootstrap_mean_ci(values: Sequence[float], *, n_boot: int, seed: int) -> Optional[Dict[str, Any]]:
+    vv = [float(x) for x in values if x is not None]
+    if int(n_boot) <= 1 or not vv:
+        return None
+    if len(vv) == 1:
+        x = float(vv[0])
+        return {"lb": x, "ub": x, "n_boot": int(n_boot)}
+    n = len(vv)
+    rng = random.Random(int(seed))
+    boots: List[float] = []
+    for _ in range(int(n_boot)):
+        idx = [rng.randrange(0, n) for _ in range(n)]
+        m = float(sum(vv[i] for i in idx) / n)
+        boots.append(m)
+    if not boots:
+        return None
+    boots.sort()
+    return {
+        "lb": _quantile(boots, 0.025),
+        "ub": _quantile(boots, 0.975),
+        "n_boot": int(n_boot),
+    }
+
+
+def _summarize(
+    rows: Sequence[BackObservation],
+    *,
+    bootstrap_n: int = 0,
+    bootstrap_seed: int = 1337,
+) -> Dict[str, Any]:
     events = {r.event_id for r in rows if r.event_id}
     exp = float(sum(float(r.exposure) for r in rows))
     pnl = float(sum(float(r.pnl) for r in rows))
+    roi = _weighted_roi_pct(rows)
     return {
         "n_orders": int(len(rows)),
         "n_games": int(len(events)),
         "exposure_sum": exp,
         "pnl_sum": pnl,
-        "roi_weighted_pct": (_weighted_roi_pct(rows)),
+        "roi_weighted_pct": roi,
+        "roi_ci95_bootstrap": _bootstrap_weighted_roi_ci(
+            rows,
+            n_boot=int(bootstrap_n),
+            seed=int(bootstrap_seed),
+        ),
     }
 
 
@@ -176,29 +264,48 @@ def _bucket_slippage(slip_raw_pct: Optional[float]) -> str:
     return ">2%"
 
 
-def _breakdown_by_key(rows: Sequence[BackObservation], key: str) -> List[Dict[str, Any]]:
+def _breakdown_by_key(
+    rows: Sequence[BackObservation],
+    key: str,
+    *,
+    bootstrap_n: int = 0,
+    bootstrap_seed: int = 1337,
+) -> List[Dict[str, Any]]:
     groups: Dict[str, List[BackObservation]] = {}
     for r in rows:
         k = str(getattr(r, key))
         groups.setdefault(k, []).append(r)
     out: List[Dict[str, Any]] = []
-    for k in sorted(groups.keys()):
+    for idx, k in enumerate(sorted(groups.keys())):
         g = groups[k]
-        s = _summarize(g)
+        s = _summarize(
+            g,
+            bootstrap_n=int(bootstrap_n),
+            bootstrap_seed=int(bootstrap_seed) + int(idx),
+        )
         s["bucket"] = k
         out.append(s)
     return out
 
 
-def _breakdown_by_combo(rows: Sequence[BackObservation]) -> List[Dict[str, Any]]:
+def _breakdown_by_combo(
+    rows: Sequence[BackObservation],
+    *,
+    bootstrap_n: int = 0,
+    bootstrap_seed: int = 1337,
+) -> List[Dict[str, Any]]:
     groups: Dict[Tuple[str, str], List[BackObservation]] = {}
     for r in rows:
         k = (str(r.lat_bucket), str(r.slip_bucket))
         groups.setdefault(k, []).append(r)
     out: List[Dict[str, Any]] = []
-    for (lb, sb) in sorted(groups.keys(), key=lambda x: (x[0], x[1])):
+    for idx, (lb, sb) in enumerate(sorted(groups.keys(), key=lambda x: (x[0], x[1]))):
         g = groups[(lb, sb)]
-        s = _summarize(g)
+        s = _summarize(
+            g,
+            bootstrap_n=int(bootstrap_n),
+            bootstrap_seed=int(bootstrap_seed) + int(idx),
+        )
         s["lat_bucket"] = lb
         s["slip_bucket"] = sb
         out.append(s)
@@ -311,6 +418,189 @@ def _permutation_test_gap(
     }
 
 
+def _benjamini_hochberg_qvalues(pvals: Sequence[Optional[float]]) -> List[Optional[float]]:
+    m = 0
+    pairs: List[Tuple[int, float]] = []
+    for i, p in enumerate(pvals):
+        if p is None:
+            continue
+        try:
+            pv = float(p)
+        except Exception:
+            continue
+        if not (0.0 <= pv <= 1.0):
+            continue
+        pairs.append((i, pv))
+    m = len(pairs)
+    out: List[Optional[float]] = [None for _ in pvals]
+    if m == 0:
+        return out
+    pairs_sorted = sorted(pairs, key=lambda x: x[1])
+    q_tmp = [1.0 for _ in range(m)]
+    for rank, (_, pv) in enumerate(pairs_sorted, start=1):
+        q_tmp[rank - 1] = float(pv * m / rank)
+    # monotonicidade BH (passo reverso)
+    for i in range(m - 2, -1, -1):
+        q_tmp[i] = float(min(q_tmp[i], q_tmp[i + 1]))
+    for i, (orig_idx, _) in enumerate(pairs_sorted):
+        out[orig_idx] = float(min(1.0, max(0.0, q_tmp[i])))
+    return out
+
+
+def _permutation_combo_vs_rest(
+    rows: Sequence[BackObservation],
+    *,
+    min_combo_obs: int,
+    max_tests: int,
+    n_perm: int,
+    seed: int,
+    include_unknown: bool,
+    bootstrap_n: int,
+    bootstrap_seed: int,
+    fdr_alpha: float,
+) -> Dict[str, Any]:
+    valid_rows: List[BackObservation] = []
+    for r in rows:
+        if (not include_unknown) and (r.lat_bucket == "unknown" or r.slip_bucket == "unknown"):
+            continue
+        valid_rows.append(r)
+    if not valid_rows:
+        return {"tests": [], "n_rows": 0, "n_combos_candidate": 0, "n_combos_tested": 0}
+
+    combos: Dict[Tuple[str, str], List[int]] = {}
+    for i, r in enumerate(valid_rows):
+        combos.setdefault((r.lat_bucket, r.slip_bucket), []).append(i)
+
+    candidates = [
+        (k, idxs)
+        for k, idxs in combos.items()
+        if len(idxs) >= int(min_combo_obs) and (len(valid_rows) - len(idxs)) > 0
+    ]
+    # Testa primeiro combos com maior n (mais estáveis).
+    candidates.sort(key=lambda x: len(x[1]), reverse=True)
+    if int(max_tests) > 0:
+        candidates = candidates[: int(max_tests)]
+    if not candidates:
+        return {
+            "tests": [],
+            "n_rows": int(len(valid_rows)),
+            "n_combos_candidate": int(len(combos)),
+            "n_combos_tested": 0,
+        }
+
+    pnl = [float(r.pnl) for r in valid_rows]
+    exposure = [float(r.exposure) for r in valid_rows]
+    total_pnl = float(sum(pnl))
+    total_exp = float(sum(exposure))
+    if total_exp <= 0:
+        return {
+            "tests": [],
+            "n_rows": int(len(valid_rows)),
+            "n_combos_candidate": int(len(combos)),
+            "n_combos_tested": 0,
+            "note": "exposição total <= 0",
+        }
+
+    tests: List[Dict[str, Any]] = []
+    for t_idx, (combo, idxs) in enumerate(candidates):
+        exp_combo = float(sum(exposure[i] for i in idxs))
+        exp_rest = float(total_exp - exp_combo)
+        if exp_combo <= 0 or exp_rest <= 0:
+            continue
+        pnl_combo = float(sum(pnl[i] for i in idxs))
+        pnl_rest = float(total_pnl - pnl_combo)
+        roi_combo = float(pnl_combo / exp_combo * 100.0)
+        roi_rest = float(pnl_rest / exp_rest * 100.0)
+        delta_obs = float(roi_combo - roi_rest)
+
+        # IC95 bootstrap para delta(combo - resto)
+        delta_boot: List[float] = []
+        if int(bootstrap_n) > 1 and len(valid_rows) > 1:
+            rng_b = random.Random(int(bootstrap_seed) + int(t_idx) * 97)
+            n_rows = len(valid_rows)
+            for _ in range(int(bootstrap_n)):
+                bidx = [rng_b.randrange(0, n_rows) for _ in range(n_rows)]
+                exp_c = pnl_c = exp_r = pnl_r = 0.0
+                idx_set = set(idxs)
+                for bi in bidx:
+                    e = exposure[bi]
+                    p = pnl[bi]
+                    if bi in idx_set:
+                        exp_c += e
+                        pnl_c += p
+                    else:
+                        exp_r += e
+                        pnl_r += p
+                if exp_c > 0 and exp_r > 0:
+                    delta_boot.append(float((pnl_c / exp_c * 100.0) - (pnl_r / exp_r * 100.0)))
+        delta_ci = None
+        if delta_boot:
+            delta_boot.sort()
+            delta_ci = {
+                "lb": _quantile(delta_boot, 0.025),
+                "ub": _quantile(delta_boot, 0.975),
+                "n_boot": int(bootstrap_n),
+            }
+
+        rng = random.Random(int(seed) + int(t_idx) * 1009)
+        shuffled = list(pnl)
+        ge = 0
+        valid_perm = 0
+        idx_set = set(idxs)
+        for _ in range(int(max(1, n_perm))):
+            rng.shuffle(shuffled)
+            pnl_c = float(sum(shuffled[i] for i in idx_set))
+            pnl_r = float(total_pnl - pnl_c)
+            delta_perm = float((pnl_c / exp_combo * 100.0) - (pnl_r / exp_rest * 100.0))
+            valid_perm += 1
+            if abs(delta_perm) >= abs(delta_obs):
+                ge += 1
+        p_value = float((ge + 1) / (valid_perm + 1)) if valid_perm > 0 else None
+
+        tests.append(
+            {
+                "lat_bucket": str(combo[0]),
+                "slip_bucket": str(combo[1]),
+                "n_combo": int(len(idxs)),
+                "n_rest": int(len(valid_rows) - len(idxs)),
+                "roi_combo_pct": roi_combo,
+                "roi_rest_pct": roi_rest,
+                "delta_roi_pct": delta_obs,
+                "delta_roi_ci95_bootstrap": delta_ci,
+                "p_value": p_value,
+                "n_perm": int(n_perm),
+                "valid_permutations": int(valid_perm),
+            }
+        )
+
+    # BH/FDR nos p-values dos testes realizados
+    pvals = [t.get("p_value") for t in tests]
+    qvals = _benjamini_hochberg_qvalues(pvals)
+    sig = 0
+    for i, t in enumerate(tests):
+        q = qvals[i]
+        t["q_value_bh"] = q
+        t["significant_fdr"] = bool((q is not None) and (q <= float(fdr_alpha)))
+        if t["significant_fdr"]:
+            sig += 1
+
+    tests.sort(
+        key=lambda x: (
+            1.0 if x.get("q_value_bh") is None else float(x.get("q_value_bh")),
+            1.0 if x.get("p_value") is None else float(x.get("p_value")),
+            -abs(float(x.get("delta_roi_pct") or 0.0)),
+        )
+    )
+    return {
+        "tests": tests,
+        "fdr_alpha": float(fdr_alpha),
+        "n_rows": int(len(valid_rows)),
+        "n_combos_candidate": int(len(combos)),
+        "n_combos_tested": int(len(tests)),
+        "n_significant_fdr": int(sig),
+    }
+
+
 def _expanding_oos_combo(
     rows: Sequence[BackObservation],
     *,
@@ -318,6 +608,8 @@ def _expanding_oos_combo(
     min_train_obs_per_combo: int,
     min_test_obs: int,
     include_unknown: bool,
+    bootstrap_n: int,
+    bootstrap_seed: int,
 ) -> Dict[str, Any]:
     by_day: Dict[str, List[BackObservation]] = {}
     for r in rows:
@@ -410,6 +702,11 @@ def _expanding_oos_combo(
         "days_evaluated": n_eval,
         "days_delta_positive": n_pos,
         "mean_delta_roi_pct": mean_delta,
+        "mean_delta_roi_ci95_bootstrap": _bootstrap_mean_ci(
+            eval_deltas,
+            n_boot=int(bootstrap_n),
+            seed=int(bootstrap_seed),
+        ),
         "median_delta_roi_pct": median_delta,
         "sign_test_p_value": _sign_test_two_sided_p(n_pos, n_eval),
         "folds": folds,
@@ -838,10 +1135,28 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     oos_results: Dict[str, Any] = {}
     for regime_key, rows in by_regime.items():
         summaries[regime_key] = {
-            "base": _summarize(rows),
-            "lat_buckets": _breakdown_by_key(rows, "lat_bucket"),
-            "slip_buckets": _breakdown_by_key(rows, "slip_bucket"),
-            "combo_buckets": _breakdown_by_combo(rows),
+            "base": _summarize(
+                rows,
+                bootstrap_n=int(args.bootstrap_n),
+                bootstrap_seed=int(args.bootstrap_seed),
+            ),
+            "lat_buckets": _breakdown_by_key(
+                rows,
+                "lat_bucket",
+                bootstrap_n=int(args.bootstrap_n),
+                bootstrap_seed=int(args.bootstrap_seed) + 11,
+            ),
+            "slip_buckets": _breakdown_by_key(
+                rows,
+                "slip_bucket",
+                bootstrap_n=int(args.bootstrap_n),
+                bootstrap_seed=int(args.bootstrap_seed) + 22,
+            ),
+            "combo_buckets": _breakdown_by_combo(
+                rows,
+                bootstrap_n=int(args.bootstrap_n),
+                bootstrap_seed=int(args.bootstrap_seed) + 33,
+            ),
         }
         perm_results[regime_key] = {
             "lat_bucket": _permutation_test_gap(
@@ -868,6 +1183,17 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 seed=int(args.perm_seed) + 202,
                 include_unknown=bool(args.include_unknown_buckets),
             ),
+            "combo_vs_rest_tests": _permutation_combo_vs_rest(
+                rows,
+                min_combo_obs=int(args.combo_perm_min_obs),
+                max_tests=int(args.combo_perm_max_tests),
+                n_perm=int(args.perm_n),
+                seed=int(args.perm_seed) + 303,
+                include_unknown=bool(args.include_unknown_buckets),
+                bootstrap_n=int(args.bootstrap_n),
+                bootstrap_seed=int(args.bootstrap_seed) + 404,
+                fdr_alpha=float(args.fdr_alpha),
+            ),
         }
         oos_results[regime_key] = _expanding_oos_combo(
             rows,
@@ -875,6 +1201,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             min_train_obs_per_combo=int(args.oos_min_train_obs),
             min_test_obs=int(args.oos_min_test_obs),
             include_unknown=bool(args.include_unknown_buckets),
+            bootstrap_n=int(args.bootstrap_n),
+            bootstrap_seed=int(args.bootstrap_seed) + 505,
         )
 
     out: Dict[str, Any] = {
@@ -889,7 +1217,12 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             "end_day": end_day,
             "perm_n": int(args.perm_n),
             "perm_seed": int(args.perm_seed),
+            "bootstrap_n": int(args.bootstrap_n),
+            "bootstrap_seed": int(args.bootstrap_seed),
             "min_bucket_obs": int(args.min_bucket_obs),
+            "combo_perm_min_obs": int(args.combo_perm_min_obs),
+            "combo_perm_max_tests": int(args.combo_perm_max_tests),
+            "fdr_alpha": float(args.fdr_alpha),
             "oos_min_train_days": int(args.oos_min_train_days),
             "oos_min_train_obs": int(args.oos_min_train_obs),
             "oos_min_test_obs": int(args.oos_min_test_obs),
@@ -915,6 +1248,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             "latência usa timing.call_to_done_ms do executor_jsonl (tempo de execução da aposta).",
             "regime Pre/In é inferido por kickoff_time vs created_at (fallback: is_live no audit).",
             "permutação mantém exposição e buckets fixos e embaralha PnL para testar dependência bucket->resultado.",
+            "combo_vs_rest: testa cada combo (n>=combo_perm_min_obs) contra o resto via permutação bicaudal; aplica BH/FDR em q_value_bh.",
+            "IC95 bootstrap é calculado para ROI base/buckets/combos e para mean_delta do OOS.",
             "OOS usa seleção de melhor combo lat_bucket x slip_bucket no treino (expanding) e avalia no dia seguinte.",
         ],
     }
@@ -939,7 +1274,12 @@ def main() -> int:
     ap.add_argument("--end-day", default="", help="YYYY-MM-DD (dia local em --tz)")
     ap.add_argument("--perm-n", type=int, default=3000)
     ap.add_argument("--perm-seed", type=int, default=1337)
+    ap.add_argument("--bootstrap-n", type=int, default=2000, help="N bootstrap para IC95 de ROI e mean_delta OOS.")
+    ap.add_argument("--bootstrap-seed", type=int, default=7331)
     ap.add_argument("--min-bucket-obs", type=int, default=25)
+    ap.add_argument("--combo-perm-min-obs", type=int, default=40, help="Mínimo de observações por combo em combo_vs_rest.")
+    ap.add_argument("--combo-perm-max-tests", type=int, default=40, help="Máximo de combos testados em combo_vs_rest (ordem por n).")
+    ap.add_argument("--fdr-alpha", type=float, default=0.10, help="Alpha para significância após correção BH/FDR.")
     ap.add_argument("--include-unknown-buckets", action="store_true")
     ap.add_argument("--oos-min-train-days", type=int, default=20)
     ap.add_argument("--oos-min-train-obs", type=int, default=80)
