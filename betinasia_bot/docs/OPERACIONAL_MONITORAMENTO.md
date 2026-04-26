@@ -197,6 +197,24 @@ PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --tele
 Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
+- `OPS_TELEMETRY_WARN_ON_MISSING` (default 1) e `OPS_TELEMETRY_WARN_ON_STALE` (default 1): em operação, reduzem falso FAIL de telemetria por divergência de path/aging, mantendo sinal em WARN.
+- `OPS_EXECUTOR_NONHEARTBEAT_MIN_EVENTS_WARN` (default = `OPS_EXECUTOR_IDLE_MIN_AUDITS`): evita WARN espúrio de "sem non-heartbeat" quando o volume real está baixo.
+- `OPS_TELEGRAM_NOTIFY_ON_UNCHANGED_NON_OK=0` + `OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC=600`: anti-flood para não repetir no Telegram o mesmo WARN/FAIL a cada ciclo.
+- `OPS_TELEGRAM_FORCE_ON_ESCALATION=1`: mantém envio imediato quando houver escalada (ex.: WARN -> FAIL).
+- `OPS_TELEGRAM_AUTOPILOT_ONLY_ALERTS=0` (default): evita mensagens “apenas autopilot” sem WARN/FAIL/recovery, reduzindo ruído.
+
+### Diagnóstico do overload no Telegram (caso dos prints)
+Nos alertas enviados em sequência, o conteúdo essencial era o mesmo:
+- `audit-api: telemetria inválida (MISSING) ...`
+- `executor: sem eventos não-heartbeat no tail ...`
+
+Sem deduplicação, o timer do monitor/autopilot reenviava praticamente o mesmo evento a cada execução, mudando apenas campos voláteis (`consecutive_fail`, cooldown em segundos), causando flood.
+
+Correções aplicadas no monitor:
+- deduplicação por **assinatura do alerta** (normaliza partes voláteis);
+- rate limit por intervalo mínimo para alertas idênticos;
+- fallback de telemetria do audit-api (`logs/audit_api_telemetry.jsonl` <-> `logs/audit_api_back_telemetry.jsonl`) para evitar falso negativo por arquivo divergente;
+- check de non-heartbeat mais robusto em baixa atividade (PASS informativo ao invés de WARN quando `audits_n` está abaixo do mínimo).
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.

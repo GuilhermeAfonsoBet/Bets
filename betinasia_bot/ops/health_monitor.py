@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -156,7 +158,9 @@ def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg
     Regra:
       - se o argumento explícito veio do usuário, respeita;
       - se está no default "logs/audit_api_telemetry.jsonl", e o service contém "-back",
-        preferimos "logs/audit_api_back_telemetry.jsonl" (se existir).
+        mantemos o arquivo genérico (mais comum no audit_h3b_api.py atual).
+      - se por algum motivo existir um arquivo dedicado `audit_api_back_telemetry.jsonl`
+        e o genérico não existir, usamos o dedicado.
     Observação: o `audit_h3b_api.py` atual escreve em `logs/audit_api_telemetry.jsonl` por default,
     mas alguns deployments podem ter sido customizados via symlink/override.
     """
@@ -170,6 +174,9 @@ def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg
         if str(p) != "logs/audit_api_telemetry.jsonl":
             return p
         if "-back" in svc:
+            # Preferimos o "genérico" por compatibilidade (audit_h3b_api.py default).
+            if p.exists():
+                return p
             alt = Path("logs/audit_api_back_telemetry.jsonl")
             if alt.exists():
                 return alt
@@ -283,6 +290,112 @@ def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
         return False
 
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    try:
+        return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return str(default).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _normalize_alert_line(msg: str) -> str:
+    """
+    Remove partes altamente variáveis para melhorar deduplicação no Telegram.
+    """
+    s = str(msg or "")
+    # Ex.: consecutive_fail=5545 -> consecutive_fail=*
+    s = re.sub(r"consecutive_fail=\d+", "consecutive_fail=*", s)
+    # Ex.: cooldown (853s < 1800s) -> cooldown (*s < *s)
+    s = re.sub(r"cooldown \(\d+s < \d+s\)", "cooldown (*s < *s)", s)
+    # Ex.: rate_limit (3/10 ...) mantém estrutura, mas remove contadores
+    s = re.sub(r"rate_limit \(\d+/\d+", "rate_limit (*/ *", s)
+    return s.strip()
+
+
+def _alert_signature(code: int, results: List[CheckResult]) -> str:
+    core = []
+    for r in results:
+        if r.level in ("WARN", "FAIL"):
+            core.append(f"[{r.level}] {_normalize_alert_line(r.message)}")
+    payload = {"code": int(code), "lines": sorted(core)}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _read_telemetry_with_fallback(
+    *,
+    name: str,
+    path: Path,
+    audit_service: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Path, Optional[str]]:
+    """
+    Lê telemetria com fallback defensivo para evitar falso FAIL por path divergente.
+    Casos comuns:
+    - deployment antigo escreve em logs/audit_api_telemetry.jsonl
+    - monitor foi configurado para logs/audit_api_back_telemetry.jsonl (ou vice-versa)
+    """
+    payload, err = _read_last_jsonl(path)
+    if not err:
+        return payload, None, path, None
+    if str(name) != "audit-api":
+        return payload, err, path, None
+
+    svc = str(audit_service or "").strip().lower()
+    # Preferência: se service é "-back", tentamos primeiro o arquivo "genérico"
+    # porque o audit_h3b_api.py padrão escreve nele.
+    if "-back" in svc:
+        cands = [Path("logs/audit_api_telemetry.jsonl"), Path("logs/audit_api_back_telemetry.jsonl")]
+    else:
+        cands = [Path("logs/audit_api_back_telemetry.jsonl"), Path("logs/audit_api_telemetry.jsonl")]
+
+    for cand in cands:
+        if str(cand) == str(path):
+            continue
+        p2, e2 = _read_last_jsonl(cand)
+        if not e2:
+            note = f"fallback_telemetry: configured={path} err={err} using={cand}"
+            return p2, None, cand, note
+    return payload, err, path, None
+
+
+def _should_send_non_ok_alert(
+    *,
+    state: Dict[str, Any],
+    code: int,
+    results: List[CheckResult],
+    now: datetime,
+) -> Tuple[bool, str, str]:
+    """
+    Dedup/rate-limit para reduzir overload no Telegram.
+    - sempre envia em escalada (WARN->FAIL), se habilitado
+    - pode suprimir alertas idênticos continuamente
+    """
+    sig = _alert_signature(int(code), results)
+    last_sig = str(state.get("last_alert_sig") or "")
+    last_code = _safe_int(state.get("last_alert_code"), 0)
+    last_utc = _parse_iso_ts(state.get("last_alert_utc"))
+    same_sig = bool(last_sig and (sig == last_sig))
+    age = int((now - last_utc).total_seconds()) if last_utc else None
+
+    notify_unchanged = _env_bool("OPS_TELEGRAM_NOTIFY_ON_UNCHANGED_NON_OK", "0")
+    min_interval = _safe_int(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC", "600"), 600)
+    force_on_escalation = _env_bool("OPS_TELEGRAM_FORCE_ON_ESCALATION", "1")
+    escalated = int(code) > int(last_code)
+    if force_on_escalation and escalated:
+        return True, "escalation", sig
+
+    if same_sig and (not notify_unchanged):
+        return False, "suppressed_same_signature", sig
+    if same_sig and notify_unchanged and age is not None and age < int(min_interval):
+        return False, f"suppressed_min_interval ({age}s < {min_interval}s)", sig
+    return True, "send", sig
+
+
+def _mark_last_alert_state(state: Dict[str, Any], *, code: int, sig: str, now: datetime) -> None:
+    state["last_alert_sig"] = str(sig)
+    state["last_alert_code"] = int(code)
+    state["last_alert_utc"] = now.isoformat()
+
+
 async def _db_metrics(db: Database, since: datetime) -> Dict[str, Any]:
     q = text(
         """
@@ -380,24 +493,37 @@ async def run_checks(
                 exit_code = max(exit_code, 1)
 
     # 2) telemetria freshness
+    telemetry_warn_on_missing = _env_bool("OPS_TELEMETRY_WARN_ON_MISSING", "1")
+    telemetry_warn_on_stale = _env_bool("OPS_TELEMETRY_WARN_ON_STALE", "1")
+
     def _check_telemetry(name: str, path: Path):
         nonlocal exit_code
-        payload, err = _read_last_jsonl(path)
+        payload, err, used_path, fallback_note = _read_telemetry_with_fallback(
+            name=str(name),
+            path=Path(path),
+            audit_service=str(audit_service),
+        )
+        if fallback_note:
+            results.append(CheckResult("WARN", f"{name}: {fallback_note}"))
+            exit_code = max(exit_code, 1)
         if err:
-            results.append(CheckResult("FAIL", f"{name}: telemetria inválida ({err}) em {path}"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_missing) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: telemetria inválida ({err}) em {used_path}"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
             return
-        ts = _parse_iso_ts(payload.get("ts_utc") or payload.get("timestamp") or payload.get("ts"))
+        ts = _parse_iso_ts((payload or {}).get("ts_utc") or (payload or {}).get("timestamp") or (payload or {}).get("ts"))
         if not ts:
-            results.append(CheckResult("FAIL", f"{name}: sem timestamp no último JSONL ({path})"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_missing) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: sem timestamp no último JSONL ({used_path})"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
             return
         age = int((now - ts).total_seconds())
         if age <= int(telemetry_max_age_sec):
-            results.append(CheckResult("PASS", f"{name}: telemetria atualizada (age={age}s)"))
+            results.append(CheckResult("PASS", f"{name}: telemetria atualizada (age={age}s, path={used_path})"))
         else:
-            results.append(CheckResult("FAIL", f"{name}: telemetria parada (age={age}s > {telemetry_max_age_sec}s)"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_stale) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: telemetria parada (age={age}s > {telemetry_max_age_sec}s, path={used_path})"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
 
     _check_telemetry("collector", collector_telemetry)
     _check_telemetry("audit-api", audit_telemetry)
@@ -518,6 +644,10 @@ async def run_checks(
         warn_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_WARN", "0.20"))
         fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
         min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
+        min_audits_for_idle_warn = _safe_int(
+            os.getenv("OPS_EXECUTOR_NONHEARTBEAT_MIN_EVENTS_WARN", str(min_audits_for_idle_fail)),
+            min_audits_for_idle_fail,
+        )
         lat_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_MIN_EVENTS", "30"), 30)
         lat_call_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_WARN_MS", "12000"), 12000)
         lat_call_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_FAIL_MS", "20000"), 20000)
@@ -597,10 +727,24 @@ async def run_checks(
                 if ("execution context was destroyed" in e) or ("target closed" in e) or ("no_root_session_cookie" in e) or ("auth_error" in e) or ("http_401" in e):
                     fatal_n += 1
 
-            # idle: sem non-heartbeat por tempo alto *e* audit gerando oportunidades
+            # idle: sem non-heartbeat por tempo alto.
+            # Só alerta quando há volume mínimo de audits; evita WARN espúrio em baixa atividade real.
             if age_nonhb is None:
-                results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
-                exit_code = max(exit_code, 1)
+                if int(audits_n) >= int(min_audits_for_idle_warn):
+                    results.append(
+                        CheckResult(
+                            "WARN",
+                            f"executor: sem eventos não-heartbeat no tail (hb={len(hb)} audits_n={audits_n} >= {min_audits_for_idle_warn}).",
+                        )
+                    )
+                    exit_code = max(exit_code, 1)
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"executor: idle esperado sem non-heartbeat (hb={len(hb)} audits_n={audits_n} < {min_audits_for_idle_warn}).",
+                        )
+                    )
             else:
                 if age_nonhb > int(max_nonhb_age) and int(audits_n) >= int(min_audits_for_idle_fail):
                     results.append(
@@ -1184,7 +1328,24 @@ def main() -> int:
     print(f"Exit code: {code}")
 
     should_send_recovery = bool(args.telegram_recovery) and recovered
-    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
+    should_send_non_ok = False
+    non_ok_send_reason = ""
+    non_ok_sig = ""
+    if int(code) > 0:
+        should_send_non_ok, non_ok_send_reason, non_ok_sig = _should_send_non_ok_alert(
+            state=state,
+            code=int(code),
+            results=results,
+            now=now,
+        )
+        if not should_send_non_ok:
+            print(f"[INFO] Telegram non-ok suprimido: {non_ok_send_reason}")
+
+    send_autopilot_only = _env_bool("OPS_TELEGRAM_AUTOPILOT_ONLY_ALERTS", "0")
+    should_send_autopilot_only = bool(
+        send_autopilot_only and args.autopilot and autopilot_actions and (not should_send_non_ok) and (not should_send_recovery)
+    )
+    if args.telegram and (should_send_non_ok or should_send_recovery or should_send_autopilot_only):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
         if token and chat_id:
@@ -1201,7 +1362,7 @@ def main() -> int:
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
                 _telegram_send(token, chat_id, "\n".join(lines))
-            else:
+            elif should_send_non_ok:
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
                 pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
                 # Alerta chamativo sempre que latência estiver alta (WARN/FAIL), mesmo sem pausar bridges.
@@ -1245,6 +1406,15 @@ def main() -> int:
                     lines.append("- Auto-pilot:")
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
+                sent = _telegram_send(token, chat_id, "\n".join(lines))
+                if sent:
+                    _mark_last_alert_state(state, code=int(code), sig=str(non_ok_sig), now=now)
+                    _save_state(state_path, state)
+            elif should_send_autopilot_only:
+                lines = [f"OPS HEALTH (AUTO-PILOT) @ {meta.get('now_utc')}"]
+                lines.append("- Auto-pilot:")
+                for a in autopilot_actions:
+                    lines.append(f"  - {a}")
                 _telegram_send(token, chat_id, "\n".join(lines))
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")

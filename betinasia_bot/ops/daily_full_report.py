@@ -57,6 +57,79 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _safe_int_default(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _parse_iso_ts(x: Any) -> Optional[datetime]:
+    if not x:
+        return None
+    if isinstance(x, datetime):
+        dt = x
+    else:
+        s = str(x).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _load_health_monitor_state(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _recent_ops_incidents_from_health_state(state: Optional[Dict[str, Any]], *, now_utc: datetime) -> List[Dict[str, Any]]:
+    """
+    Extrai "incidentes abertos" do estado do health monitor para o daily:
+    - serviços com consecutive_fail > 0
+    - bridges pausadas pelo auto-pilot (paused=true)
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(state, dict):
+        return out
+    try:
+        services = state.get("services") if isinstance(state.get("services"), dict) else {}
+        for svc, raw in services.items():
+            row = raw if isinstance(raw, dict) else {}
+            nfail = _safe_int_default(row.get("consecutive_fail"), 0)
+            paused = bool(row.get("paused"))
+            paused_reason = str(row.get("paused_reason") or "")
+            paused_utc = _parse_iso_ts(row.get("paused_utc"))
+            if nfail <= 0 and not paused:
+                continue
+            item: Dict[str, Any] = {
+                "service": str(svc),
+                "consecutive_fail": int(nfail),
+                "paused": bool(paused),
+                "paused_reason": paused_reason,
+                "paused_utc": paused_utc.isoformat() if paused_utc else None,
+            }
+            if paused_utc is not None:
+                item["paused_age_min"] = max(0, int((now_utc - paused_utc).total_seconds() // 60))
+            out.append(item)
+    except Exception:
+        return out
+    return out
+
+
 def _pick_col(cols: list[str], needles: tuple[str, ...] | list[str]) -> Optional[str]:
     """
     Seleciona uma coluna por heurística, preferindo:
@@ -3405,6 +3478,43 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if int(exec_activity.get("live_ok_6h") or 0) == 0:
             s0.append("- Se isso persistir com auditoria OK no DB, suspeite de sessão/PMM/timeout ou bridge travado (ver checklist abaixo).\n")
         s0.append("\n")
+    except Exception:
+        pass
+
+    # Pendências operacionais abertas (para reporte diário das 19h), a partir do state do health monitor.
+    try:
+        hm_state_path = Path(str(os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))).expanduser()
+        if not hm_state_path.is_absolute():
+            hm_state_path = (Path.cwd() / hm_state_path).resolve()
+        hm_state = _load_health_monitor_state(hm_state_path)
+        hm_incidents = _recent_ops_incidents_from_health_state(hm_state, now_utc=_utcnow())
+        last_non_ok_code = _safe_int_default((hm_state or {}).get("last_non_ok_code"), 0)
+        last_non_ok_utc = str((hm_state or {}).get("last_non_ok_utc") or "")
+        last_non_ok_lines = list((hm_state or {}).get("last_non_ok_lines") or [])
+
+        if hm_incidents or last_non_ok_code > 0:
+            s0.append("\n**Pendências operacionais p/ reporte 19h (health monitor)**\n\n")
+            s0.append(f"- Fonte: `{hm_state_path}`\n")
+            if last_non_ok_code > 0:
+                lvl = "FAIL" if int(last_non_ok_code) >= 2 else "WARN"
+                s0.append(f"- Último não-OK registrado: **{lvl}** @ `{last_non_ok_utc or '—'}`\n")
+                if last_non_ok_lines:
+                    for ln in last_non_ok_lines[:5]:
+                        s0.append(f"  - {str(ln)}\n")
+            if hm_incidents:
+                s0.append("\n| Serviço | consecutive_fail | paused | paused_reason | paused_age_min |\n")
+                s0.append("|---|---:|---|---|---:|\n")
+                for it in hm_incidents[:20]:
+                    svc = str(it.get("service") or "—")
+                    nfail = int(it.get("consecutive_fail") or 0)
+                    paused = "yes" if bool(it.get("paused")) else "no"
+                    reason = str(it.get("paused_reason") or "—").replace("|", "/")
+                    age_m = it.get("paused_age_min")
+                    age_txt = str(int(age_m)) if age_m is not None else "—"
+                    s0.append(f"| `{svc}` | {nfail} | {paused} | {reason} | {age_txt} |\n")
+            else:
+                s0.append("- Sem incidentes abertos por serviço.\n")
+            s0.append("\n")
     except Exception:
         pass
 
