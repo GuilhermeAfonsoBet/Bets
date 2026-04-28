@@ -613,11 +613,12 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
 def _stake_bucket(stake: Any) -> str:
     """
     Bucket simples para acompanhamento operacional do sizing:
-    - "12" para stake≈12
+    - "12" para stake no intervalo [8,14]
     - "1.5" para stake≈1.5
     - "other" para valores diferentes/ausentes
     """
-    if _approx_eq(stake, 12.0, eps=0.02):
+    st = _safe_float_or_none(stake)
+    if st is not None and 8.0 <= float(st) <= 14.0:
         return "12"
     if _approx_eq(stake, 1.5, eps=0.02):
         return "1.5"
@@ -967,9 +968,11 @@ def _append_backpre_fast_slow_sections(
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake=HI (pós-início)
-                if _approx_eq(exp, float(stake_hi), eps=0.02):
-                    groups_thesis[f"Back Pre fast (stake≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"].append(row)
+                # tese = fast + stake no intervalo [8,14] (pós-início)
+                if 8.0 <= float(exp) <= 14.0:
+                    groups_thesis[
+                        f"Back Pre fast (stake em [8,14]; alvo≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"
+                    ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 

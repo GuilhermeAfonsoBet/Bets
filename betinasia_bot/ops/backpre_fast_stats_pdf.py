@@ -78,6 +78,16 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
         return False
 
 
+def _in_range(x: Any, lo: float, hi: float) -> bool:
+    try:
+        if x is None:
+            return False
+        xv = float(x)
+        return float(lo) <= xv <= float(hi)
+    except Exception:
+        return False
+
+
 def _bootstrap_ci_mean(xs: List[float], *, ci: float, n_boot: int, seed: int = 0) -> Optional[Tuple[float, float]]:
     try:
         xs2 = [float(x) for x in (xs or [])]
@@ -175,10 +185,12 @@ def _iter_exec_rows(
     start_day: str,
     thr_ms: int,
     stake_hi: float,
+    stake_hi_min: float,
+    stake_hi_max: float,
 ) -> List[Dict[str, Any]]:
     """
     Retorna rows com {oid, roi, fast(bool), stake, pre_submit_ms, market_regime}
-    Somente Back LIVE_OK, market_regime=pre, stake≈stake_hi e created>=start_day.
+    Somente Back LIVE_OK, market_regime=pre, stake na faixa HI e created>=start_day.
     """
     rows: List[Dict[str, Any]] = []
     if not executor_jsonl.exists():
@@ -212,7 +224,7 @@ def _iter_exec_rows(
             st = _safe_float(res.get("policy", {}).get("stake_requested"))
         if st is None:
             continue
-        if not _approx_eq(st, float(stake_hi), eps=0.02):
+        if not _in_range(st, float(stake_hi_min), float(stake_hi_max)):
             continue
         vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
         if str(vs.get("market_regime") or "") != "pre":
@@ -280,6 +292,16 @@ def main() -> int:
     start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
     thr_ms = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
     stake_hi = float(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0)
+    try:
+        stake_hi_min = float(os.getenv("DAILY_BACKPRE_FAST_STAKE_HI_MIN", "8") or 8.0)
+    except Exception:
+        stake_hi_min = 8.0
+    try:
+        stake_hi_max = float(os.getenv("DAILY_BACKPRE_FAST_STAKE_HI_MAX", "14") or 14.0)
+    except Exception:
+        stake_hi_max = 14.0
+    if stake_hi_min > stake_hi_max:
+        stake_hi_min, stake_hi_max = stake_hi_max, stake_hi_min
     stake_lo = str(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_LO", "1.50") or "1.50").strip()
     n_boot = int(float(os.getenv("DAILY_BACKPRE_FAST_BOOTSTRAP_N", "2000") or 2000))
     min_n = int(float(os.getenv("DAILY_BACKPRE_FAST_MIN_ORDERS", "25") or 25))
@@ -290,7 +312,14 @@ def main() -> int:
     open_csv = _latest_csv(acct_dir, "open_stakes")
     open_oids = _open_order_ids_from_open_stakes_csv(open_csv) if open_csv else None
     ledger = _ledger_pnl_like_by_order(bal_csv) if bal_csv else {}
-    exec_rows = _iter_exec_rows(executor_jsonl=exec_path, start_day=start_day, thr_ms=thr_ms, stake_hi=stake_hi)
+    exec_rows = _iter_exec_rows(
+        executor_jsonl=exec_path,
+        start_day=start_day,
+        thr_ms=thr_ms,
+        stake_hi=stake_hi,
+        stake_hi_min=stake_hi_min,
+        stake_hi_max=stake_hi_max,
+    )
 
     # join com ledger -> ROI por ordem
     joined = []
@@ -386,7 +415,7 @@ Gerado em: **{ts}**
 ## Definição da tese (operacional)
 - Universo: **Back Pre** (pre-match), apostas efetivas (`LIVE_OK`).
 - “Fast”: `pre_submit_ms <= {thr_ms}ms`.
-- Sizing operacional (quando habilitado): fast ⇒ **stake={stake_hi}**, demais Back ⇒ **stake={stake_lo}**.
+- Sizing operacional (quando habilitado): fast ⇒ **stake alvo={stake_hi}** (classificação HI no relatório: faixa `{stake_hi_min}..{stake_hi_max}`), demais Back ⇒ **stake={stake_lo}**.
 - Início operacional (recorte recomendado): `{start_day or '—'}` (UTC).  
   (Use a data em que você ligou `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1` em produção.)
 
