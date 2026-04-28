@@ -3721,6 +3721,92 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- Reduzir `STALE_QUEUE_WAIT` (fila/concurrency) para não operar atrasado.\n\n"
         )
 
+    # Árvore de causas v2 (acionável): Sintoma -> Causa -> Evidência -> Ação -> Resultado esperado -> Status D+1
+    try:
+        s0.append("\n**Árvore de causas v2 (operacional)**\n\n")
+        s0.append("| Sintoma | Causa provável | Evidência do dia | Ação aplicada/recomendada | Resultado esperado | Status D+1 |\n")
+        s0.append("|---|---|---|---|---|---|\n")
+
+        # 1) Latência alta sustentada (p90 call acima do alvo)
+        lat_fail = (p90_call_24h is not None and int(p90_call_24h) > int(thr_p90_ms))
+        if lat_fail:
+            if p50_queue_24h is not None and int(p50_queue_24h) >= 700:
+                lat_cause = "Backlog/fila no executor (workers/concurrency/burst no bridge)"
+                lat_action = (
+                    "Aumentar `EXECUTOR_WORKERS`, reduzir burst (`BRIDGE_MAX_PER_CYCLE`/`BRIDGE_POLL_SEC`) e "
+                    "validar queda de `queue_delay_ms` na janela seguinte."
+                )
+            elif (p50_post_24h is not None) and int(p50_post_24h) >= 2000:
+                lat_cause = "Submit/POST lento (UI/anti-bot/sessão)"
+                lat_action = (
+                    "Reforçar estabilidade de sessão (login/cookie), revisar timeout/retries e "
+                    "monitorar `post_ms` no health monitor."
+                )
+            else:
+                lat_cause = "Causa mista (fila + submit + ambiente)"
+                lat_action = (
+                    "Executar diagnóstico por componente (queue/post/overhead), depois ajustar "
+                    "thresholds e capacidade do executor."
+                )
+            lat_ev = (
+                f"p90_call_24h={_fmt_num(p90_call_24h,0)}ms (alvo≤{int(thr_p90_ms)}), "
+                f"p50_queue_24h={_fmt_num(p50_queue_24h,0)}ms, p50_post_24h={_fmt_num(p50_post_24h,0)}ms"
+            )
+            s0.append(
+                f"| Latência p90 alta | {lat_cause} | {lat_ev} | {lat_action} | "
+                "p50<5s e p90<8s sustentados | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| Latência p90 controlada | — | p90_call_24h={_fmt_num(p90_call_24h,0)}ms | "
+                "Manter tuning atual e monitoramento | Manter p90<=8s | Fechado |\n"
+            )
+
+        # 2) Sistema vivo porém sem operar (audit alto, bridge sem fluxo)
+        bridge_seen = _safe_int_default((hm_state or {}).get("last_bridge_seen_total"), 0)
+        bridge_exec = _safe_int_default((hm_state or {}).get("last_bridge_executed_total"), 0)
+        bridge_aud = _safe_int_default((hm_state or {}).get("last_bridge_audits_n"), 0)
+        bridge_issue = bool(bridge_aud >= 80 and bridge_seen <= 0)
+        if bridge_issue:
+            s0.append(
+                "| Audit com volume e bridge sem fluxo | Gate excessivo (policy/filtros) ou bridge sem varredura efetiva | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Revisar `wf_policy_current`/filtros e validar `executor_bridge_seen_keys`; autopilot pode pausar bridge para forçar ação humana | "
+                "Retomar seen/executed > 0 com mesma janela de auditoria | Aberto |\n"
+            )
+        else:
+            s0.append(
+                "| Fluxo bridge->executor normal | — | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Sem ação corretiva | Manter seen/executed coerente com audits | Fechado |\n"
+            )
+
+        # 3) Saturação de PMM/WS -> queda de conversão
+        if not chk_pmms:
+            s0.append(
+                "| Erro `No PMMs received` elevado | Timeout curto/WS instável/sessão degradada | "
+                f"no_pmms={int(err_pmms)} (24h) | Ajustar timeout/min_wait e estabilizar sessão WS; auditar ws_age nos eventos de erro | "
+                "Reduzir `No PMMs` para 0 (ou próximo de 0) | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| PMM/WS estável | — | no_pmms={int(err_pmms)} (24h) | "
+                "Sem ação corretiva | Manter ocorrência baixa/zero | Fechado |\n"
+            )
+
+        # 4) Excesso de alertas Telegram
+        tele_min_interval = _safe_int_default(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC"), 600)
+        s0.append(
+            "| Excesso de alertas Telegram | Repetição de assinatura sem dedup/rate-limit | "
+            f"anti_flood ativo (min_interval={tele_min_interval}s) | "
+            "Manter dedup por assinatura e envio forçado só em escalada | "
+            "Alertas relevantes, sem flood | Acompanhar |\n"
+        )
+
+        s0.append("\n")
+    except Exception:
+        pass
+
     # leitura executiva (heurística): onde atacar primeiro
     s0.append(
         "\n**Conclusões operacionais (prioridades)**\n\n"

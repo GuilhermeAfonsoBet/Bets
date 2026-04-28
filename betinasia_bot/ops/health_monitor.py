@@ -450,6 +450,30 @@ async def _db_audit_friction(db: Database, since: datetime) -> Dict[str, Any]:
         return dict(row._mapping) if row else {}
 
 
+async def _db_bridge_flow(db: Database, since: datetime) -> Dict[str, Any]:
+    """
+    Sinais de fluxo bridge->executor na janela:
+    - seen_total: linhas no executor_bridge_seen_keys
+    - executed_total: linhas com execution_id preenchido
+    - last_seen_utc: última atividade de bridge
+    """
+    q = text(
+        """
+        SELECT
+          count(*)::bigint AS seen_total,
+          count(*) FILTER (WHERE execution_id IS NOT NULL)::bigint AS executed_total,
+          max(created_at) AS last_seen_utc
+        FROM executor_bridge_seen_keys
+        WHERE created_at >= :since
+          AND action = :action
+        """
+    )
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since, "action": "live:Back"})
+        row = r.fetchone()
+        return dict(row._mapping) if row else {}
+
+
 async def run_checks(
     *,
     since_minutes: int,
@@ -531,6 +555,7 @@ async def run_checks(
     # 3) DB freshness
     db = Database()
     await db.connect()
+    bf: Dict[str, Any] = {}
     try:
         m = await _db_metrics(db, since)
         # Sinais rápidos de fricção/bloqueio (janela menor)
@@ -538,6 +563,10 @@ async def run_checks(
         fric_min = max(1, min(int(since_minutes), int(fric_min)))
         fric_since = now - timedelta(minutes=int(fric_min))
         fr = await _db_audit_friction(db, fric_since)
+        bridge_flow_min = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MINUTES", "10"), 10)
+        bridge_flow_min = max(1, min(int(since_minutes), int(bridge_flow_min)))
+        bf_since = now - timedelta(minutes=int(bridge_flow_min))
+        bf = await _db_bridge_flow(db, bf_since)
     finally:
         await db.close()
 
@@ -632,6 +661,40 @@ async def run_checks(
             )
     except Exception:
         # Nunca deixa o monitor quebrar por esse check
+        pass
+
+    # 4.5) Fluxo bridge->executor (detector de "vivo porém mudo")
+    try:
+        flow_check_enable = _env_bool("OPS_BRIDGE_FLOW_CHECK_ENABLE", "1")
+        flow_fail_on_zero = _env_bool("OPS_BRIDGE_FLOW_FAIL_ON_ZERO", "1")
+        min_audits_for_flow = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MIN_AUDITS", "80"), 80)
+        seen_total = int(bf.get("seen_total") or 0)
+        executed_total = int(bf.get("executed_total") or 0)
+        last_seen = _parse_iso_ts(bf.get("last_seen_utc"))
+        last_seen_age = int((now - last_seen).total_seconds()) if last_seen else None
+        flow_window_min = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MINUTES", "10"), 10)
+
+        if flow_check_enable:
+            if int(audits_n) >= int(min_audits_for_flow) and seen_total <= 0:
+                lvl = "FAIL" if flow_fail_on_zero else "WARN"
+                results.append(
+                    CheckResult(
+                        lvl,
+                        f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n} "
+                        f"(seen={seen_total}, executed={executed_total}, last_seen_age={last_seen_age}s)",
+                    )
+                )
+                exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+            else:
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"bridge_flow: ok janela={flow_window_min}m seen={seen_total} executed={executed_total} "
+                        f"last_seen_age={last_seen_age}s audits_n={audits_n}",
+                    )
+                )
+    except Exception:
+        # Nunca quebra monitor por esse check.
         pass
 
     # 5) Executor activity/health (via JSONL)
@@ -903,6 +966,9 @@ async def run_checks(
             "best_odds_n": best_n,
             "audits_n": audits_n,
             "h3b_n": h3b_n,
+            "bridge_seen_total": int(bf.get("seen_total") or 0),
+            "bridge_executed_total": int(bf.get("executed_total") or 0),
+            "bridge_last_seen_utc": str(bf.get("last_seen_utc") or ""),
         },
     }
 
@@ -1083,6 +1149,16 @@ def _has_executor_latency_fail(results: List[CheckResult], executor_service: str
     return False
 
 
+def _has_bridge_flow_fail(results: List[CheckResult]) -> bool:
+    for r in results:
+        if r.level != "FAIL":
+            continue
+        msg = str(r.message or "").lower()
+        if "bridge_flow:" in msg and "sem seen_keys" in msg:
+            return True
+    return False
+
+
 def _get_executor_latency_fail_message(results: List[CheckResult], executor_service: str) -> Optional[str]:
     key = str(executor_service or "").strip().lower()
     for r in results:
@@ -1220,6 +1296,28 @@ def main() -> int:
         except Exception:
             pause_max_per_hour = 1
         latency_fail = _has_executor_latency_fail(results, str(args.executor_service))
+        bridge_flow_fail = _has_bridge_flow_fail(results)
+        bridge_pause_flag = os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_BRIDGES", "1")
+        bridge_flow_pause_enabled = str(bridge_pause_flag or "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        try:
+            bridge_pause_after_fails = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_BRIDGES_FAILS", "2") or 2))
+        except Exception:
+            bridge_pause_after_fails = 2
+        bridge_pause_after_fails = max(1, int(bridge_pause_after_fails))
+        try:
+            bridge_pause_cooldown = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_COOLDOWN_SEC", "1200") or 1200))
+        except Exception:
+            bridge_pause_cooldown = 1200
+        try:
+            bridge_pause_max_per_hour = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_MAX_PER_HOUR", "2") or 2))
+        except Exception:
+            bridge_pause_max_per_hour = 2
         # streak de FAIL de latência (por executor_service) para evitar pausar por spikes únicos
         try:
             exsvc = str(args.executor_service or "").strip() or "betinasia-executor"
@@ -1231,6 +1329,16 @@ def main() -> int:
             latency_fail_streak = _safe_int(ex_state.get("latency_fail_streak"), 0)
         except Exception:
             latency_fail_streak = 0
+        # streak de FAIL de fluxo do bridge (executor_bridge_seen_keys zerado com audit alto)
+        try:
+            bf_state = state.setdefault("services", {}).setdefault("bridge_flow_detector", {})
+            if bridge_flow_fail:
+                bf_state["bridge_flow_fail_streak"] = _safe_int(bf_state.get("bridge_flow_fail_streak"), 0) + 1
+            else:
+                bf_state["bridge_flow_fail_streak"] = 0
+            bridge_flow_fail_streak = _safe_int(bf_state.get("bridge_flow_fail_streak"), 0)
+        except Exception:
+            bridge_flow_fail_streak = 0
 
         paused_now: List[str] = []
         if latency_pause_enabled and latency_fail and int(latency_fail_streak) >= int(pause_after_fails):
@@ -1260,6 +1368,35 @@ def main() -> int:
         elif latency_pause_enabled and latency_fail:
             autopilot_actions.append(
                 f"pause_on_latency_fail: aguardando streak (latency_fail_streak={int(latency_fail_streak)}/{int(pause_after_fails)})"
+            )
+        if bridge_flow_pause_enabled and bridge_flow_fail and int(bridge_flow_fail_streak) >= int(bridge_pause_after_fails):
+            to_pause = []
+            for svc in [str(args.bridge_back_service), str(args.bridge_lay_service)]:
+                s = str(svc or "").strip()
+                if not s or s.lower() in ("0", "off", "none", "false"):
+                    continue
+                to_pause.append(s)
+            for svc in to_pause:
+                allowed, reason = _rate_limited_action(
+                    state,
+                    svc,
+                    "pause_on_bridge_flow_fail",
+                    now=now,
+                    max_per_hour=int(bridge_pause_max_per_hour),
+                    cooldown_sec=int(bridge_pause_cooldown),
+                )
+                if not allowed:
+                    autopilot_actions.append(f"{svc}: pause bridge-flow bloqueado ({reason})")
+                    continue
+                ok = _systemctl_stop(svc)
+                _append_action(state, svc, "pause_on_bridge_flow_fail", now)
+                _set_paused(state, svc, now=now, reason="bridge_flow_fail")
+                autopilot_actions.append(f"{svc}: paused(stop) por bridge_flow FAIL ok={ok}")
+                paused_now.append(str(svc))
+        elif bridge_flow_pause_enabled and bridge_flow_fail:
+            autopilot_actions.append(
+                "pause_on_bridge_flow_fail: aguardando streak "
+                f"(bridge_flow_fail_streak={int(bridge_flow_fail_streak)}/{int(bridge_pause_after_fails)})"
             )
 
         # marca falhas por serviço
@@ -1305,6 +1442,14 @@ def main() -> int:
     # Atualiza estado de "último status"
     state["last_overall_utc"] = str(meta.get("now_utc") or now.isoformat())
     state["last_overall_code"] = int(code)
+    try:
+        db_meta = (meta or {}).get("db") if isinstance(meta, dict) else {}
+        state["last_bridge_seen_total"] = int((db_meta or {}).get("bridge_seen_total") or 0)
+        state["last_bridge_executed_total"] = int((db_meta or {}).get("bridge_executed_total") or 0)
+        state["last_bridge_audits_n"] = int((db_meta or {}).get("audits_n") or 0)
+        state["last_bridge_last_seen_utc"] = str((db_meta or {}).get("bridge_last_seen_utc") or "")
+    except Exception:
+        pass
     if int(code) > 0:
         state["last_non_ok_utc"] = str(meta.get("now_utc") or now.isoformat())
         state["last_non_ok_code"] = int(code)
