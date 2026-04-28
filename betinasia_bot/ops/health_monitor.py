@@ -502,6 +502,63 @@ async def _db_bridge_flow(db: Database, since: datetime) -> Dict[str, Any]:
         return dict(row._mapping) if row else {}
 
 
+async def _db_bridge_skip_reasons(db: Database, since: datetime, *, action: str) -> Dict[str, Any]:
+    """
+    Diagnóstico do bridge por motivo de skip no executor_bridge_seen.
+    Ajuda a separar:
+    - "sem execução por policy/filtro" (intencional de negócio)
+    - "sem execução por problema operacional"
+    """
+    q_tot = text(
+        """
+        SELECT
+          count(*)::bigint AS seen_rows,
+          count(*) FILTER (
+            WHERE lower(coalesce(meta->>'skipped', 'false')) IN ('1','true','t','yes','y','on')
+          )::bigint AS skipped_rows
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+          AND src_table = 'betslip_audit_results'
+        """
+    )
+    q_reasons = text(
+        """
+        SELECT
+          coalesce(meta->>'reason', '') AS reason,
+          count(*)::bigint AS n
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+          AND src_table = 'betslip_audit_results'
+          AND lower(coalesce(meta->>'skipped', 'false')) IN ('1','true','t','yes','y','on')
+        GROUP BY 1
+        ORDER BY 2 DESC
+        """
+    )
+    async with db.async_session() as session:
+        tot_r = await session.execute(q_tot, {"since": since, "action": str(action)})
+        tot_row = tot_r.fetchone()
+        seen_rows = int((tot_row._mapping.get("seen_rows") if tot_row else 0) or 0)
+        skipped_rows = int((tot_row._mapping.get("skipped_rows") if tot_row else 0) or 0)
+
+        rr = await session.execute(q_reasons, {"since": since, "action": str(action)})
+        reason_counts: Dict[str, int] = {}
+        for row in (rr.fetchall() or []):
+            try:
+                mp = row._mapping
+                k = str(mp.get("reason") or "").strip() or "-"
+                reason_counts[k] = int(mp.get("n") or 0)
+            except Exception:
+                continue
+
+        return {
+            "seen_rows": int(seen_rows),
+            "skipped_rows": int(skipped_rows),
+            "reason_counts": reason_counts,
+        }
+
+
 async def run_checks(
     *,
     since_minutes: int,
@@ -571,6 +628,7 @@ async def run_checks(
     db = Database()
     await db.connect()
     bf: Dict[str, Any] = {}
+    bs: Dict[str, Any] = {}
     try:
         m = await _db_metrics(db, since)
         # Sinais rápidos de fricção/bloqueio (janela menor)
@@ -582,6 +640,7 @@ async def run_checks(
         bridge_flow_min = max(1, min(int(since_minutes), int(bridge_flow_min)))
         bf_since = now - timedelta(minutes=int(bridge_flow_min))
         bf = await _db_bridge_flow(db, bf_since)
+        bs = await _db_bridge_skip_reasons(db, bf_since, action="live:Back")
     finally:
         await db.close()
 
@@ -688,18 +747,68 @@ async def run_checks(
         last_seen = _parse_iso_ts(bf.get("last_seen_utc"))
         last_seen_age = int((now - last_seen).total_seconds()) if last_seen else None
         flow_window_min = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MINUTES", "10"), 10)
+        seen_rows = int(bs.get("seen_rows") or 0)
+        skipped_rows = int(bs.get("skipped_rows") or 0)
+        reason_counts = bs.get("reason_counts") if isinstance(bs.get("reason_counts"), dict) else {}
+        ratio_min = _safe_float(os.getenv("OPS_BRIDGE_FLOW_POLICY_RATIO_MIN", "0.80"))
+        if ratio_min is None:
+            ratio_min = 0.80
+        ratio_min = max(0.0, min(1.0, float(ratio_min)))
+        policy_as_warn = _env_bool("OPS_BRIDGE_FLOW_POLICY_AS_WARN", "1")
+        policy_reason_csv = str(
+            os.getenv(
+                "OPS_BRIDGE_FLOW_POLICY_REASONS",
+                "not_active,wf_ah_max_abs_line,min_limit,disabled_back,disabled_lay",
+            )
+            or ""
+        )
+        policy_reasons = {x.strip() for x in policy_reason_csv.split(",") if str(x).strip()}
+        policy_skip_n = 0
+        for rk, rv in (reason_counts or {}).items():
+            if str(rk) in policy_reasons:
+                try:
+                    policy_skip_n += int(rv or 0)
+                except Exception:
+                    continue
+        policy_ratio = (float(policy_skip_n) / float(skipped_rows)) if int(skipped_rows) > 0 else 0.0
+        policy_like_no_bet = bool(int(skipped_rows) > 0 and int(policy_skip_n) > 0 and float(policy_ratio) >= float(ratio_min))
+        policy_reasons_top = sorted(
+            [
+                (str(k), int(v or 0))
+                for k, v in (reason_counts or {}).items()
+                if str(k) in policy_reasons and int(v or 0) > 0
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        policy_reasons_txt = ", ".join([f"{k}={n}" for k, n in policy_reasons_top[:4]]) if policy_reasons_top else "-"
 
         if flow_check_enable:
             if int(audits_n) >= int(min_audits_for_flow) and seen_total <= 0:
-                lvl = "FAIL" if flow_fail_on_zero else "WARN"
-                results.append(
-                    CheckResult(
-                        lvl,
-                        f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n} "
-                        f"(seen={seen_total}, executed={executed_total}, last_seen_age={last_seen_age}s)",
+                if policy_like_no_bet:
+                    lvl = "WARN" if policy_as_warn else "PASS"
+                    results.append(
+                        CheckResult(
+                            lvl,
+                            f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n}, "
+                            f"mas no-bet por policy detectado "
+                            f"(policy_skip={policy_skip_n}/{skipped_rows}={policy_ratio:.0%}, reasons={policy_reasons_txt}; "
+                            f"seen={seen_total}, executed={executed_total}, seen_rows={seen_rows}, last_seen_age={last_seen_age}s)",
+                        )
                     )
-                )
-                exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+                    if lvl == "WARN":
+                        exit_code = max(exit_code, 1)
+                else:
+                    lvl = "FAIL" if flow_fail_on_zero else "WARN"
+                    results.append(
+                        CheckResult(
+                            lvl,
+                            f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n} "
+                            f"(seen={seen_total}, executed={executed_total}, last_seen_age={last_seen_age}s, "
+                            f"seen_rows={seen_rows}, skipped_rows={skipped_rows})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
             else:
                 results.append(
                     CheckResult(
@@ -966,6 +1075,9 @@ async def run_checks(
             "bridge_seen_total": int(bf.get("seen_total") or 0),
             "bridge_executed_total": int(bf.get("executed_total") or 0),
             "bridge_last_seen_utc": str(bf.get("last_seen_utc") or ""),
+            "bridge_seen_rows": int(bs.get("seen_rows") or 0),
+            "bridge_skipped_rows": int(bs.get("skipped_rows") or 0),
+            "bridge_skip_reasons": dict(bs.get("reason_counts") or {}),
         },
     }
 
@@ -1152,6 +1264,16 @@ def _has_bridge_flow_fail(results: List[CheckResult]) -> bool:
             continue
         msg = str(r.message or "").lower()
         if "bridge_flow:" in msg and "sem seen_keys" in msg:
+            return True
+    return False
+
+
+def _has_bridge_flow_policy_warn(results: List[CheckResult]) -> bool:
+    for r in results:
+        if r.level != "WARN":
+            continue
+        msg = str(r.message or "").lower()
+        if "bridge_flow:" in msg and "no-bet por policy" in msg:
             return True
     return False
 
