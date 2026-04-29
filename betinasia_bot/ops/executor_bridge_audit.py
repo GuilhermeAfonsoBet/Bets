@@ -619,6 +619,147 @@ def _rp_bool(rp: Dict[str, Any], key: str) -> Optional[bool]:
         return None
 
 
+def _rp_float_first(rp: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    try:
+        for k in (keys or []):
+            v = _rp_float(rp, str(k))
+            if v is not None:
+                return float(v)
+    except Exception:
+        return None
+    return None
+
+
+def _rp_multiplier_for_regime(rp: Dict[str, Any], *, exec_side: ExecSide, is_live: bool) -> Optional[float]:
+    """
+    Multiplicador de exposição por lado/regime.
+    Prioriza chave específica de regime; fallback para chave geral do lado.
+    """
+    try:
+        if exec_side == ExecSide.BACK:
+            if is_live:
+                v = _rp_float_first(
+                    rp,
+                    [
+                        "auto_stake_multiplier_back_in",
+                        "stake_multiplier_back_in",
+                        "auto_stake_multiplier_back",
+                        "stake_multiplier_back",
+                    ],
+                )
+            else:
+                v = _rp_float_first(
+                    rp,
+                    [
+                        "auto_stake_multiplier_back_pre",
+                        "stake_multiplier_back_pre",
+                        "auto_stake_multiplier_back",
+                        "stake_multiplier_back",
+                    ],
+                )
+        else:
+            if is_live:
+                v = _rp_float_first(
+                    rp,
+                    [
+                        "auto_liability_multiplier_lay_in",
+                        "liability_multiplier_lay_in",
+                        "auto_liability_multiplier_lay",
+                        "liability_multiplier_lay",
+                    ],
+                )
+            else:
+                v = _rp_float_first(
+                    rp,
+                    [
+                        "auto_liability_multiplier_lay_pre",
+                        "liability_multiplier_lay_pre",
+                        "auto_liability_multiplier_lay",
+                        "liability_multiplier_lay",
+                    ],
+                )
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _rp_cap_for_regime(rp: Dict[str, Any], *, exec_side: ExecSide, is_live: bool) -> Optional[float]:
+    """
+    Cap absoluto de exposição por lado/regime.
+    """
+    try:
+        if exec_side == ExecSide.BACK:
+            v = _rp_float(rp, "cap_back_in_abs" if is_live else "cap_back_pre_abs")
+        else:
+            v = _rp_float(rp, "cap_lay_in_abs" if is_live else "cap_lay_pre_abs")
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _apply_risk_profile_to_request(
+    *,
+    req: ExecutionRequest,
+    row: Dict[str, Any],
+    cfg: BridgeConfig,
+    risk_params: Dict[str, Any],
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Aplica multiplicador/cap absoluto do risk_params mesmo fora do modo WF budget.
+    Retorna (ok, reason_when_blocked, meta).
+    """
+    try:
+        is_live = _row_is_live(row, unknown_as_live=(cfg.exec_side == ExecSide.LAY))
+    except Exception:
+        is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+    regime = "in" if bool(is_live) else "pre"
+
+    target_attr = "stake_requested" if cfg.exec_side == ExecSide.BACK else "liability_requested"
+    cur = _safe_float(getattr(req.policy, target_attr, None))
+    if cur is None:
+        # Sem exposição explícita para ajustar.
+        return True, None, {"applied": False, "reason": "no_explicit_requested_exposure"}
+
+    before = float(cur)
+    out = float(cur)
+    meta: Dict[str, Any] = {
+        "applied": False,
+        "exec_side": cfg.exec_side.value,
+        "regime": regime,
+        "target": target_attr,
+        "before": float(before),
+    }
+
+    mult = _rp_multiplier_for_regime(risk_params, exec_side=cfg.exec_side, is_live=is_live)
+    if mult is not None:
+        meta["multiplier"] = float(mult)
+        if float(mult) <= 0:
+            meta["blocked_by"] = "multiplier<=0"
+            return False, "risk_multiplier_blocked", meta
+        out = float(out) * float(mult)
+        meta["after_multiplier"] = float(out)
+
+    cap_abs = _rp_cap_for_regime(risk_params, exec_side=cfg.exec_side, is_live=is_live)
+    if cap_abs is not None:
+        meta["cap_abs"] = float(cap_abs)
+        if float(cap_abs) <= 0:
+            meta["blocked_by"] = "cap_abs<=0"
+            return False, "abs_cap_blocked", meta
+        out = min(float(out), float(cap_abs))
+        meta["after_cap"] = float(out)
+
+    if float(out) <= 0:
+        meta["blocked_by"] = "final_exposure<=0"
+        return False, "risk_profile_zero_exposure", meta
+
+    setattr(req.policy, target_attr, float(out))
+    meta["applied"] = bool(abs(float(out) - float(before)) > 1e-9)
+    meta["final"] = float(out)
+    return True, None, meta
+
+
 def _event_key(row: Dict[str, Any], cfg: BridgeConfig) -> str:
     event_id = str(row.get("event_id") or "").strip()
     market = str(row.get("market_type") or "AH").strip().upper()
@@ -1810,6 +1951,42 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             req.meta["slippage_gate"]["enabled"] = True
                 except Exception:
                     pass
+
+                # Ajuste operacional de exposição (multiplicador/cap) via risk_params_json.
+                # Importante para auto-healing sem depender do WF budget.
+                try:
+                    prof_ok, prof_reason, prof_meta = _apply_risk_profile_to_request(
+                        req=req,
+                        row=row,
+                        cfg=cfg,
+                        risk_params=risk_params,
+                    )
+                    if not prof_ok:
+                        await _mark_seen(
+                            db,
+                            src_id=src_id,
+                            action=action,
+                            execution_id=None,
+                            meta={
+                                "skipped": True,
+                                "reason": str(prof_reason or "risk_profile_blocked"),
+                                "risk_profile": prof_meta,
+                                "risk_params_json": cfg.risk_params_json,
+                            },
+                        )
+                        await _unreserve_seen_key(db, src_key=skey, action=action)
+                        continue
+                    if isinstance(prof_meta, dict):
+                        req.meta.setdefault("bridge", {})
+                        req.meta["bridge"]["risk_profile"] = prof_meta
+                        if bool(prof_meta.get("applied")):
+                            logger.info(
+                                f"[bridge] risk_profile applied src_id={src_id} "
+                                f"side={cfg.exec_side.value} regime={prof_meta.get('regime')} "
+                                f"{prof_meta.get('target')} {prof_meta.get('before')} -> {prof_meta.get('final')}"
+                            )
+                except Exception as e:
+                    logger.warning(f"[bridge] risk_profile apply failed src_id={src_id}: {str(e)[:160]}")
 
                 res = await submit_execution(req=req, unix_socket=cfg.unix_socket, http_base=cfg.http_url)
                 eid = str(res.get("execution_id") or "")

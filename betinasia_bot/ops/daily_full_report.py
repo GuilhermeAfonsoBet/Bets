@@ -2754,6 +2754,71 @@ def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, captio
         return bool(r.ok)
 
 
+def _load_json_best_effort(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _append_latency_feedback_loop_section(
+    out_lines: List[str],
+    *,
+    state_path: Path,
+) -> None:
+    """
+    Mostra no daily o que o auto-healing de latência aplicou/removou recentemente.
+    """
+    st = _load_json_best_effort(state_path)
+    if not isinstance(st, dict):
+        return
+    ld = st.get("latency_degrade") if isinstance(st.get("latency_degrade"), dict) else None
+    if not isinstance(ld, dict):
+        return
+
+    out_lines.append("\n**Feedback loop de latência (auto-healing → verificação D+1)**\n\n")
+    active = bool(ld.get("active"))
+    cause = str(ld.get("cause") or "—")
+    risk_json = str(ld.get("risk_params_json") or "logs/bridge_risk_params.json")
+    fail_streak = _safe_int(ld.get("fail_streak"))
+    pass_streak = _safe_int(ld.get("pass_streak"))
+    activated_utc = str(ld.get("activated_utc") or "—")
+    recovered_utc = str(ld.get("recovered_utc") or "—")
+    metrics = ld.get("last_latency_metrics") if isinstance(ld.get("last_latency_metrics"), dict) else {}
+
+    out_lines.append("| Item | Valor |\n|---|---|\n")
+    out_lines.append(f"| Estado atual | {'ATIVO' if active else 'INATIVO'} |\n")
+    out_lines.append(f"| Causa predominante (última) | `{cause}` |\n")
+    out_lines.append(f"| fail_streak / pass_streak | `{fail_streak if fail_streak is not None else '—'}` / `{pass_streak if pass_streak is not None else '—'}` |\n")
+    out_lines.append(f"| Ativado em | `{activated_utc}` |\n")
+    out_lines.append(f"| Recuperado em | `{recovered_utc}` |\n")
+    out_lines.append(f"| Arquivo de atuação | `{risk_json}` |\n")
+    out_lines.append(
+        f"| Últimas métricas de latência | "
+        f"p50_call=`{metrics.get('p50_call_ms', '—')}`ms; "
+        f"p90_call=`{metrics.get('p90_call_ms', '—')}`ms; "
+        f"p50_post=`{metrics.get('p50_post_ms', '—')}`ms; "
+        f"p50_queue=`{metrics.get('p50_queue_ms', '—')}`ms |\n"
+    )
+    out_lines.append("\n")
+
+    hist = list(ld.get("history") or [])
+    if hist:
+        out_lines.append("**Ações automáticas recentes (latência)**\n\n")
+        out_lines.append("| Quando (UTC) | Ação | Causa | Streak |\n|---|---|---|---:|\n")
+        for it in hist[-10:]:
+            if not isinstance(it, dict):
+                continue
+            ts = str(it.get("ts_utc") or "—")
+            action = str(it.get("action") or "—")
+            c0 = str(it.get("cause") or "—")
+            stv = it.get("streak") if it.get("streak") is not None else it.get("pass_streak")
+            out_lines.append(f"| `{ts}` | `{action}` | `{c0}` | `{stv if stv is not None else '—'}` |\n")
+        out_lines.append("\n")
+
 @dataclass
 class DailyReportCfg:
     out_dir: Path = Path("logs/daily_reports")
@@ -3618,6 +3683,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
         "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
     )
+    try:
+        hm_state_path = Path(str(os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))).expanduser()
+        _append_latency_feedback_loop_section(s0, state_path=hm_state_path)
+    except Exception:
+        pass
 
     # ------------------------------------------------------------
     # Carteira (active_keys): delta vs policy anterior + marginais OOS por key
