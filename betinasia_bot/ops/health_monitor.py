@@ -68,6 +68,27 @@ def _env_bool(name: str, default: str = "0") -> bool:
         return str(default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _load_env_file(path: Path) -> None:
+    """
+    Carrega um .env simples (KEY=VALUE) sem sobrescrever variáveis já definidas.
+    Importante para execução manual via shell, antes de resolver defaults do argparse.
+    """
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if not k or k in os.environ:
+                continue
+            os.environ[k] = v.strip()
+    except Exception:
+        return
+
+
 def _pctl(xs: List[float], p: float) -> Optional[float]:
     if not xs:
         return None
@@ -1076,6 +1097,9 @@ def _get_executor_latency_fail_message(results: List[CheckResult], executor_serv
 
 
 def main() -> int:
+    # Garante que defaults de argparse respeitem .env quando rodando manualmente.
+    _load_env_file(Path(os.getenv("ENV_FILE", ".env")))
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-minutes", type=int, default=30)
     ap.add_argument("--telemetry-max-age-sec", type=int, default=int(os.getenv("OPS_TELEMETRY_MAX_AGE_SEC", "600")))
