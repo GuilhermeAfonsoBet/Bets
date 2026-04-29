@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -56,6 +57,15 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    try:
+        v = os.getenv(name, default)
+        s = str(v if v is not None else default).strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return str(default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _pctl(xs: List[float], p: float) -> Optional[float]:
@@ -281,6 +291,116 @@ def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
             return 200 <= int(resp.status) < 300
     except Exception:
         return False
+
+
+def _extract_latency_metrics_from_message(msg: str) -> Dict[str, int]:
+    """
+    Extrai métricas numéricas da mensagem de latência do executor.
+    Ex.: p50_call=12000ms p90_call=18000ms p50_post=3000ms p50_queue=900ms
+    """
+    out: Dict[str, int] = {}
+    try:
+        s = str(msg or "")
+        pats = {
+            "p50_call_ms": r"p50_call=(\d+)ms",
+            "p90_call_ms": r"p90_call=(\d+)ms",
+            "p50_post_ms": r"p50_post=(\d+)ms",
+            "p50_queue_ms": r"p50_queue=(\d+)ms",
+            "n_ok": r"n_ok=(\d+)",
+        }
+        for k, p in pats.items():
+            m = re.search(p, s)
+            if m:
+                out[k] = int(m.group(1))
+    except Exception:
+        return {}
+    return out
+
+
+def _pick_latency_root_cause(metrics: Dict[str, int]) -> str:
+    """
+    Heurística simples de causa predominante para orientar auto-healing.
+    """
+    try:
+        q = int(metrics.get("p50_queue_ms") or 0)
+        p = int(metrics.get("p50_post_ms") or 0)
+        c = int(metrics.get("p50_call_ms") or 0)
+        if q >= 1000 and q >= p:
+            return "queue_backlog"
+        if p >= 2000 and p > q:
+            return "post_slow"
+        if c >= 10000:
+            return "end_to_end_slow"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _merge_risk_params_json(path: Path, updates: Dict[str, Any], *, removals: Optional[List[str]] = None) -> bool:
+    """
+    Merge best-effort em risk_params JSON sem apagar chaves não relacionadas.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        obj: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    obj = raw
+            except Exception:
+                obj = {}
+        for k, v in (updates or {}).items():
+            obj[str(k)] = v
+        for k in (removals or []):
+            if str(k) in obj:
+                obj.pop(str(k), None)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _latency_degrade_profile_from_env(*, cause: str) -> Dict[str, Any]:
+    """
+    Perfil de contenção aplicado automaticamente no bridge quando há latência degradada.
+    """
+    def _f(name: str, default: str) -> float:
+        try:
+            return float(os.getenv(name, default))
+        except Exception:
+            return float(default)
+
+    base = {
+        "stake_multiplier_back_pre": _f("OPS_LATENCY_DEGRADE_STAKE_MULT_BACK_PRE", "0.60"),
+        "stake_multiplier_back_in": _f("OPS_LATENCY_DEGRADE_STAKE_MULT_BACK_IN", "0.45"),
+        "liability_multiplier_lay_pre": _f("OPS_LATENCY_DEGRADE_LIAB_MULT_LAY_PRE", "0.70"),
+        "liability_multiplier_lay_in": _f("OPS_LATENCY_DEGRADE_LIAB_MULT_LAY_IN", "0.55"),
+    }
+    # Se o gargalo é fila, reduzimos in-match um pouco mais.
+    if str(cause) == "queue_backlog":
+        try:
+            base["stake_multiplier_back_in"] = min(float(base["stake_multiplier_back_in"]), 0.40)
+            base["liability_multiplier_lay_in"] = min(float(base["liability_multiplier_lay_in"]), 0.50)
+        except Exception:
+            pass
+    return base
+
+
+def _latency_degrade_keys() -> List[str]:
+    return [
+        "auto_stake_multiplier_back_pre",
+        "auto_stake_multiplier_back_in",
+        "auto_liability_multiplier_lay_pre",
+        "auto_liability_multiplier_lay_in",
+        # compat com versões que possam ter gravado chaves sem prefixo "auto_"
+        "stake_multiplier_back_pre",
+        "stake_multiplier_back_in",
+        "liability_multiplier_lay_pre",
+        "liability_multiplier_lay_in",
+    ]
 
 
 async def _db_metrics(db: Database, since: datetime) -> Dict[str, Any]:
@@ -1089,6 +1209,89 @@ def main() -> int:
             latency_fail_streak = 0
 
         paused_now: List[str] = []
+        latency_msg: Optional[str] = _get_executor_latency_fail_message(results, str(args.executor_service))
+        latency_metrics = _extract_latency_metrics_from_message(latency_msg or "")
+        latency_cause = _pick_latency_root_cause(latency_metrics)
+        # Auto-healing de contenção: reduz exposição no bridge via risk_params quando latência degrada.
+        # Não substitui pausas/restarts; complementa para evitar operar grande em ambiente ruim.
+        degrade_flag = str(os.getenv("OPS_LATENCY_DEGRADE_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+        degrade_state = state.setdefault("latency_degrade", {}) if isinstance(state, dict) else {}
+        degrade_streak = int(max(0, _safe_int(degrade_state.get("fail_streak"), 0)))
+        if latency_fail:
+            degrade_streak += 1
+        else:
+            degrade_streak = 0
+        degrade_state["fail_streak"] = int(degrade_streak)
+        try:
+            degrade_after_fails = int(float(os.getenv("OPS_LATENCY_DEGRADE_AFTER_FAILS", "1") or 1))
+        except Exception:
+            degrade_after_fails = 1
+        degrade_after_fails = max(1, int(degrade_after_fails))
+        try:
+            recover_after_pass = int(float(os.getenv("OPS_LATENCY_DEGRADE_RECOVER_PASSES", "3") or 3))
+        except Exception:
+            recover_after_pass = 3
+        recover_after_pass = max(1, int(recover_after_pass))
+        pass_streak = int(max(0, _safe_int(degrade_state.get("pass_streak"), 0)))
+        if latency_fail:
+            pass_streak = 0
+        else:
+            pass_streak += 1
+        degrade_state["pass_streak"] = int(pass_streak)
+        risk_path = Path(str(os.getenv("BRIDGE_RISK_PARAMS_JSON", "logs/bridge_risk_params.json") or "logs/bridge_risk_params.json"))
+        degrade_active = bool(degrade_state.get("active"))
+        if degrade_flag and latency_fail and int(degrade_streak) >= int(degrade_after_fails):
+            updates = _latency_degrade_profile_from_env(cause=str(latency_cause))
+            if (not degrade_active) or (str(degrade_state.get("cause") or "") != str(latency_cause)):
+                ok_merge = _merge_risk_params_json(risk_path, updates)
+                if ok_merge:
+                    degrade_state["active"] = True
+                    degrade_state["activated_utc"] = now.isoformat()
+                    degrade_state["risk_params_json"] = str(risk_path)
+                    degrade_state["cause"] = str(latency_cause)
+                    degrade_state["last_latency_metrics"] = latency_metrics
+                    degrade_state["profile"] = updates
+                    hist = list(degrade_state.get("history") or [])
+                    hist.append(
+                        {
+                            "ts_utc": now.isoformat(),
+                            "action": "apply",
+                            "cause": str(latency_cause),
+                            "streak": int(degrade_streak),
+                        }
+                    )
+                    degrade_state["history"] = hist[-120:]
+                    autopilot_actions.append(
+                        f"latency_degrade: perfil aplicado em {risk_path} (cause={latency_cause}, streak={degrade_streak})"
+                    )
+                else:
+                    autopilot_actions.append(f"latency_degrade: falha ao aplicar perfil em {risk_path}")
+            else:
+                degrade_state["active"] = True
+                degrade_state["risk_params_json"] = str(risk_path)
+                degrade_state["last_latency_metrics"] = latency_metrics
+                degrade_state["profile"] = updates
+        elif (not latency_fail) and degrade_active and int(pass_streak) >= int(recover_after_pass):
+            ok_merge = _merge_risk_params_json(risk_path, {}, removals=_latency_degrade_keys())
+            if ok_merge:
+                degrade_state["active"] = False
+                degrade_state["recovered_utc"] = now.isoformat()
+                hist = list(degrade_state.get("history") or [])
+                hist.append(
+                    {
+                        "ts_utc": now.isoformat(),
+                        "action": "remove",
+                        "cause": str(degrade_state.get("cause") or ""),
+                        "pass_streak": int(pass_streak),
+                    }
+                )
+                degrade_state["history"] = hist[-120:]
+                autopilot_actions.append(
+                    f"latency_degrade: perfil removido de {risk_path} (pass_streak={pass_streak})"
+                )
+            else:
+                autopilot_actions.append(f"latency_degrade: falha ao remover perfil de {risk_path}")
+        state["latency_degrade"] = degrade_state
         if latency_pause_enabled and latency_fail and int(latency_fail_streak) >= int(pause_after_fails):
             to_pause = []
             for svc in [str(args.bridge_back_service), str(args.bridge_lay_service)]:
