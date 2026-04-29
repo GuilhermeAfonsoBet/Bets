@@ -628,6 +628,12 @@ async def main() -> int:
         "Ex.: \"< 5s\" ou \"< 5s,5-10s\".",
     )
     parser.add_argument(
+        "--only-back-in",
+        action="store_true",
+        help="Restringe o recorte para oportunidades in-play (`is_live=true`) do lado Back. "
+        "Útil para estudos dedicados de Back In.",
+    )
+    parser.add_argument(
         "--include-inplay-minute-start",
         action="store_true",
         help="Inclui no relatório uma seção nativa de Back In por minuto desde kickoff (audited_at - kickoff).",
@@ -1466,6 +1472,9 @@ async def main() -> int:
         if args.exec_bucket:
             wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
             all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
+        # Filtro opcional de estudo dedicado: somente Back In.
+        if bool(getattr(args, "only_back_in", False)):
+            all_data = [d for d in all_data if (d.get("is_live") is True)]
 
         # Diagnóstico de cobertura do closing e distribuição de mercado (após filtros de recorte)
         mt_counts = Counter(str(d.get("market_type") or "NA") for d in all_data)
