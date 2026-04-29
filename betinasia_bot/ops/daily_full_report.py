@@ -2745,6 +2745,106 @@ def _fmt_status(ok: Optional[bool]) -> str:
     return "OK" if ok else "FAIL"
 
 
+def _append_operational_action_plan_section(
+    out_lines: List[str],
+    *,
+    p50_call_24h: Optional[int],
+    p90_call_24h: Optional[int],
+    p50_post_24h: Optional[int],
+    p50_queue_24h: Optional[int],
+    gaps15: Optional[int],
+    err_pmms: int,
+    err_open: int,
+    api_failed_pct: Optional[float],
+    stale_pct: Optional[float],
+) -> None:
+    """
+    Gera plano de ação automático (com comandos) a partir dos sinais do daily.
+    """
+    try:
+        out_lines.append("\n**Plano automático de atuação (daily → execução)**\n\n")
+        out_lines.append("| Trigger observado | Ação sugerida | Comando rápido |\n|---|---|---|\n")
+
+        # 1) fila/backlog
+        if p50_queue_24h is not None and int(p50_queue_24h) >= 1000:
+            cmd = (
+                "`upsert_env EXECUTOR_WORKERS 2 ; "
+                "upsert_env BRIDGE_POLL_SEC 1.5 ; "
+                "sudo systemctl restart betinasia-executor.service betinasia-executor-bridge-back.service betinasia-executor-bridge-lay.service`"
+            )
+            out_lines.append(
+                f"| `queue_delay_ms p50={int(p50_queue_24h)}ms` (alto) | reduzir backlog (mais workers + menos burst de bridge) | {cmd} |\n"
+            )
+
+        # 2) post lento (UI/sessão/anti-bot)
+        if p50_post_24h is not None and int(p50_post_24h) >= 2000:
+            cmd = (
+                "`upsert_env OPS_LATENCY_DEGRADE_ENABLE 1 ; "
+                "upsert_env OPS_LATENCY_DEGRADE_AFTER_FAILS 1 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `post_ms p50={int(p50_post_24h)}ms` (alto) | conter exposição automaticamente enquanto sessão/POST degrada | {cmd} |\n"
+            )
+
+        # 3) end-to-end latency
+        if p90_call_24h is not None and int(p90_call_24h) >= 8000:
+            cmd = (
+                "`upsert_env OPS_EXECUTOR_LAT_CALL_P90_WARN_MS 8000 ; "
+                "upsert_env OPS_EXECUTOR_LAT_CALL_P90_FAIL_MS 12000 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `call_to_done p90={int(p90_call_24h)}ms` (alto) | endurecer gatilho de latência p90 para atuar mais cedo | {cmd} |\n"
+            )
+
+        # 4) PMM/WS falhando
+        if int(err_pmms or 0) > 0:
+            cmd = (
+                "`sudo systemctl restart betinasia-audit-api-back.service ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `No PMMs received` ({int(err_pmms)}) | reciclar audit-api-back e manter monitor/autopilot ativos | {cmd} |\n"
+            )
+
+        # 5) too many open betslips
+        if int(err_open or 0) > 0:
+            cmd = (
+                "`upsert_env EXECUTOR_BETSLIP_CACHE_MAX_KEYS 0 ; "
+                "upsert_env EXECUTOR_TOO_MANY_OPEN_CLEANUP_MAX 16 ; "
+                "sudo systemctl restart betinasia-executor.service`"
+            )
+            out_lines.append(
+                f"| `too_many_open_betslips` ({int(err_open)}) | reduzir acúmulo de tickets e aumentar cleanup | {cmd} |\n"
+            )
+
+        # 6) stale queue / API failed
+        if (stale_pct is not None and float(stale_pct) > 10.0) or (api_failed_pct is not None and float(api_failed_pct) > 20.0):
+            cmd = (
+                "`upsert_env OPS_EXECUTOR_NONHEARTBEAT_MAX_AGE_SEC 900 ; "
+                "upsert_env OPS_EXECUTOR_FAIL_RATE_FAIL 0.35 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                "| `STALE_QUEUE_WAIT`/`API_FAILED` acima do alvo | aumentar sensibilidade de proteção no monitor | "
+                f"{cmd} |\n"
+            )
+
+        # 7) gaps longos
+        if gaps15 is not None and int(gaps15) > 8:
+            cmd = (
+                "`./venv/bin/python -m ops.health_monitor --since-minutes 60 --autopilot --telegram || true`"
+            )
+            out_lines.append(
+                f"| gaps>15min no JSONL ({int(gaps15)}) | executar check forçado e registrar ação imediata | {cmd} |\n"
+            )
+
+        out_lines.append("\n")
+    except Exception:
+        return
+
+
 def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     with file_path.open("rb") as f:
@@ -3682,6 +3782,18 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Objetivo 1 (conversão)**: reduzir `API_FAILED` (especialmente `No PMMs received`) e `STALE_QUEUE_WAIT` para aumentar taxa de execução sem inflar risco.\n"
         "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
         "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
+    )
+    _append_operational_action_plan_section(
+        s0,
+        p50_call_24h=p50_call_24h,
+        p90_call_24h=p90_call_24h,
+        p50_post_24h=p50_post_24h if "p50_post_24h" in locals() else None,
+        p50_queue_24h=p50_queue_24h,
+        gaps15=gaps15,
+        err_pmms=int(err_pmms),
+        err_open=int(err_open),
+        api_failed_pct=api_failed_pct,
+        stale_pct=stale_pct,
     )
     try:
         hm_state_path = Path(str(os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))).expanduser()
