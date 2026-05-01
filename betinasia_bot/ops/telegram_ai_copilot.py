@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from sqlalchemy import text
 
@@ -171,12 +172,35 @@ def _telegram_call(token: str, method: str, params: Dict[str, Any], *, timeout: 
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urlencode({k: v for k, v in params.items() if v is not None}).encode("utf-8")
     req = Request(url, data=data, method="POST")
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
     try:
-        return json.loads(raw)
-    except Exception:
-        return {"ok": False, "raw": raw}
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"ok": False, "raw": raw}
+    except HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict):
+                parsed.setdefault("ok", False)
+                parsed.setdefault("http_status", int(getattr(e, "code", 0) or 0))
+                return parsed
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": "http_error",
+            "http_status": int(getattr(e, "code", 0) or 0),
+            "description": str(e)[:240],
+            "raw": raw[:500],
+        }
+    except URLError as e:
+        return {"ok": False, "error": "url_error", "description": str(e)[:240]}
+    except Exception as e:
+        return {"ok": False, "error": "request_error", "description": str(e)[:240]}
 
 
 def _send_message(token: str, chat_id: str, text_msg: str) -> bool:
