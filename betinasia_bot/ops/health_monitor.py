@@ -900,6 +900,14 @@ async def run_checks(
             ok_n = sum(1 for o in nonhb if _get_status(o) == "LIVE_OK")
             denom = max(1, len(nonhb))
             fr = float(fail_n) / float(denom)
+            try:
+                zero_ok_fail_hours = float(os.getenv("OPS_EXECUTOR_ZERO_LIVE_OK_FAIL_HOURS", "8") or 8.0)
+            except Exception:
+                zero_ok_fail_hours = 8.0
+            try:
+                zero_ok_min_nonhb = _safe_int(os.getenv("OPS_EXECUTOR_ZERO_LIVE_OK_MIN_NONHB", "20"), 20)
+            except Exception:
+                zero_ok_min_nonhb = 20
 
             # padrões fatais
             fatal_n = 0
@@ -960,6 +968,32 @@ async def run_checks(
                         f"executor: amostra baixa p/ taxa de falhas (nonhb_n={len(nonhb)} < min_events={min_events}) live_ok_age={age_liveok}s",
                     )
                 )
+
+            # FAIL explícito: executor ativo, mas sem sucessos por janela longa com atividade suficiente.
+            # Evita falso "PASS" quando operação degrada para 0 n_sucessos por horas.
+            try:
+                age_nonhb_eff = int(age_nonhb) if age_nonhb is not None else None
+                nonhb_has_activity = bool(len(nonhb) >= int(zero_ok_min_nonhb))
+                no_recent_ok = bool(age_liveok is None) or (
+                    age_liveok is not None and float(age_liveok) >= float(zero_ok_fail_hours) * 3600.0
+                )
+                if (
+                    nonhb_has_activity
+                    and no_recent_ok
+                    and age_nonhb_eff is not None
+                    and age_nonhb_eff <= int(max_nonhb_age)
+                    and int(audits_n) >= int(min_audits_for_idle_fail)
+                ):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{executor_service or 'betinasia-executor'}: 0 LIVE_OK recente "
+                            f"(live_ok_age={age_liveok}s >= {int(float(zero_ok_fail_hours)*3600)}s, nonhb_n={len(nonhb)}, audits_n={audits_n})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+            except Exception:
+                pass
 
             # Latência (p50/p90) em execuções bem-sucedidas
             try:

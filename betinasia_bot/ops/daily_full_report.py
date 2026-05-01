@@ -528,6 +528,24 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_bool_or_none(x: Any) -> Optional[bool]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return bool(x)
+        s = str(x).strip().lower()
+        if not s:
+            return None
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    except Exception:
+        return None
+    return None
+
+
 def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
     try:
         if a is None:
@@ -776,6 +794,8 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
         pre_submit_ms = _safe_int_or_none(vs.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(vs.get("slippage_pre_pct"))
         mreg = str(vs.get("market_regime") or "").strip() or None
+        vs_eligible = _safe_bool_or_none(vs.get("eligible"))
+        vs_stake_chosen = _safe_float_or_none(vs.get("stake_chosen"))
         # IMPORTANTE: no executor, `is_live` significa "modo LIVE (apostar de verdade)", não "in-play".
         is_live_mode = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
         rec = {
@@ -789,6 +809,8 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
             "pre_submit_ms": (int(pre_submit_ms) if pre_submit_ms is not None else None),
             "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
             "market_regime": mreg,
+            "vs_eligible": (bool(vs_eligible) if vs_eligible is not None else None),
+            "vs_stake_chosen": (float(vs_stake_chosen) if vs_stake_chosen is not None else None),
         }
         prev = out.get(str(oid))
         if prev is None or rec["created_at"] >= prev.get("created_at"):
@@ -874,8 +896,19 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
+        vs_eligible = _safe_bool_or_none(em.get("vs_eligible"))
+        vs_stake_chosen = _safe_float_or_none(em.get("vs_stake_chosen"))
         stake_b = _stake_bucket(exp)
         roi_i = float(pnl) / float(exp) * 100.0
+        # Classificação da tese em camadas:
+        # 1) preferir flag nativa de elegibilidade (value_sizing.eligible), pois permanece correta
+        #    mesmo quando multiplicadores dinâmicos alteram stake final executado;
+        # 2) fallback para stake executado na faixa HI [8,14] para manter compatibilidade histórica.
+        thesis_hi = False
+        if vs_eligible is True:
+            thesis_hi = True
+        elif 8.0 <= float(exp) <= 14.0:
+            thesis_hi = True
         row = {
             "order_id": str(oid),
             "pnl": float(pnl),
@@ -885,6 +918,9 @@ def _append_backpre_fast_slow_sections(
             "pre_submit_ms": pre_submit_ms,
             "slippage_pre_pct": slip_pre,
             "created_day": str(created.date().isoformat()),
+            "vs_eligible": (bool(vs_eligible) if vs_eligible is not None else None),
+            "vs_stake_chosen": (float(vs_stake_chosen) if vs_stake_chosen is not None else None),
+            "thesis_hi": bool(thesis_hi),
         }
 
         if bool(is_in):
@@ -895,10 +931,10 @@ def _append_backpre_fast_slow_sections(
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake no intervalo [8,14] (pós-início)
-                if 8.0 <= float(exp) <= 14.0:
+                # tese = fast + elegível HI (ou fallback stake HI na faixa [8,14]) (pós-início)
+                if bool(row.get("thesis_hi")):
                     groups_thesis[
-                        f"Back Pre fast (stake em [8,14]; alvo≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"
+                        f"Back Pre fast (elegível HI/flag; fallback stake em [8,14]; alvo≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"
                     ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
@@ -909,9 +945,13 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     # A) Performance da tese (stake=HI) com métricas “liquidadas”
     # -------------------------
-    out_lines.append("**Tese: Back Pre fast (pós-início; stake=HI) — performance (accounting; order_id)**\n\n")
+    out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
+    out_lines.append(
+        "- Regra de classificação: `value_sizing.eligible=True` (preferencial) "
+        "ou fallback `stake executado em [8,14]`.\n\n"
+    )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
 

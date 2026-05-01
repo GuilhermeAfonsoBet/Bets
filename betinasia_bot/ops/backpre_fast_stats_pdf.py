@@ -69,6 +69,24 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_bool_or_none(x: Any) -> Optional[bool]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return bool(x)
+        s = str(x).strip().lower()
+        if not s:
+            return None
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    except Exception:
+        return None
+    return None
+
+
 def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
     try:
         if a is None:
@@ -190,7 +208,10 @@ def _iter_exec_rows(
 ) -> List[Dict[str, Any]]:
     """
     Retorna rows com {oid, roi, fast(bool), stake, pre_submit_ms, market_regime}
-    Somente Back LIVE_OK, market_regime=pre, stake na faixa HI e created>=start_day.
+    Somente Back LIVE_OK, market_regime=pre e created>=start_day.
+    Classificação HI:
+    - preferencial: value_sizing.eligible=True (robusta a multiplicadores dinâmicos);
+    - fallback: stake final dentro da faixa HI.
     """
     rows: List[Dict[str, Any]] = []
     if not executor_jsonl.exists():
@@ -222,12 +243,14 @@ def _iter_exec_rows(
         st = _safe_float(sent.get("stake"))
         if st is None and isinstance(res.get("policy"), dict):
             st = _safe_float(res.get("policy", {}).get("stake_requested"))
-        if st is None:
-            continue
-        if not _in_range(st, float(stake_hi_min), float(stake_hi_max)):
-            continue
         vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
         if str(vs.get("market_regime") or "") != "pre":
+            continue
+        if st is None:
+            continue
+        vs_eligible = _safe_bool_or_none(vs.get("eligible"))
+        is_hi = bool(vs_eligible is True or _in_range(st, float(stake_hi_min), float(stake_hi_max)))
+        if not is_hi:
             continue
         pre_ms = None
         try:
