@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -41,6 +42,13 @@ from storage.database import Database
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log(msg: str) -> None:
+    try:
+        print(f"{_utcnow().isoformat()} [ops_ai_copilot] {msg}", flush=True)
+    except Exception:
+        pass
 
 
 def _safe_int(x: Any, default: int) -> int:
@@ -182,11 +190,27 @@ def _send_message(token: str, chat_id: str, text_msg: str) -> bool:
         chunks = [""]
     ok_all = True
     for c in chunks:
-        try:
-            r = _telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=15)
-            ok_all = ok_all and bool(r.get("ok"))
-        except Exception:
+        sent = False
+        last_err = ""
+        for attempt in range(4):
+            try:
+                r = _telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=20)
+                if bool(r.get("ok")):
+                    sent = True
+                    break
+                last_err = str(r.get("description") or r.get("raw") or "unknown_send_error")[:240]
+                params = r.get("parameters") if isinstance(r.get("parameters"), dict) else {}
+                retry_after = _safe_int(params.get("retry_after"), 0) if isinstance(params, dict) else 0
+                if retry_after > 0:
+                    time.sleep(min(30, int(retry_after) + 1))
+                else:
+                    time.sleep(1.0 + attempt)
+            except Exception as e:
+                last_err = str(e)[:240]
+                time.sleep(1.0 + attempt)
+        if not sent:
             ok_all = False
+            _log(f"sendMessage failed chat_id={chat_id} err={last_err}")
     return ok_all
 
 
@@ -588,6 +612,28 @@ async def _build_diag_snapshot(since_minutes: int) -> Dict[str, Any]:
     return diag
 
 
+def _parse_diag_minutes(text_msg: str, *, default: int = 30) -> int:
+    """
+    Aceita formatos:
+    - /diag
+    - /diag 30
+    - /diag [30]
+    - /diag (30min)
+    """
+    try:
+        txt = str(text_msg or "").strip()
+        parts = txt.split(maxsplit=1)
+        if len(parts) < 2:
+            return max(5, int(default))
+        raw = str(parts[1]).strip()
+        m = re.search(r"(\d{1,4})", raw)
+        if not m:
+            return max(5, int(default))
+        return max(5, int(m.group(1)))
+    except Exception:
+        return max(5, int(default))
+
+
 def _fmt_diag(diag: Dict[str, Any]) -> str:
     code = int(diag.get("overall_code") or 0)
     lvl = "PASS" if code == 0 else "WARN" if code == 1 else "FAIL"
@@ -740,10 +786,7 @@ async def _process_command(text_msg: str, *, chat_id: str, state: Dict[str, Any]
         return report + f"\n\n[AI Copilot] pendentes={pending}"
 
     if low.startswith("/diag"):
-        parts = t.split()
-        mins = 30
-        if len(parts) >= 2:
-            mins = max(5, _safe_int(parts[1], 30))
+        mins = _parse_diag_minutes(t, default=30)
         diag, created = await _run_diag_and_queue(state, since_minutes=mins, source="manual_diag")
         msg = _fmt_diag(diag)
         if created:
@@ -827,7 +870,9 @@ async def main_loop() -> int:
                         cid = _primary_chat_id()
                         if cid:
                             txt = _fmt_diag(diag) + "\n\n" + _fmt_pending(state)
-                            _send_message(token, cid, txt)
+                            ok_send = _send_message(token, cid, txt)
+                            if not ok_send:
+                                _log("falha ao enviar notificação automática de novas propostas")
                     _save_state(state_file, state)
 
             resp = _telegram_call(
@@ -860,12 +905,17 @@ async def main_loop() -> int:
                 if not _is_authorized(chat_id):
                     continue
                 try:
+                    if str(text_msg).strip().lower().startswith("/diag"):
+                        _send_message(token, str(int(chat_id)), "Recebido. Processando diagnóstico...")
                     reply = await _process_command(text_msg, chat_id=str(int(chat_id)), state=state)
                 except Exception as e:
                     reply = f"Falha no comando: {str(e)[:200]}"
                 _save_state(state_file, state)
-                _send_message(token, str(int(chat_id)), reply)
+                ok_send = _send_message(token, str(int(chat_id)), reply)
+                if not ok_send:
+                    _log(f"falha ao enviar resposta do comando chat_id={int(chat_id)} cmd={text_msg[:60]}")
         except Exception:
+            _log("falha no loop principal; retry em 2s")
             time.sleep(2)
 
 
