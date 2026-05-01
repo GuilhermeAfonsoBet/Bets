@@ -906,6 +906,9 @@ async def main_loop() -> int:
                 timeout=poll_timeout + 10,
             )
             if not resp.get("ok"):
+                desc = str(resp.get("description") or resp.get("error") or resp.get("raw") or "telegram_getupdates_not_ok")
+                code = _safe_int(resp.get("error_code"), 0)
+                _log(f"getUpdates not ok code={code} desc={desc[:240]}")
                 time.sleep(2)
                 continue
             updates = resp.get("result") or []
@@ -938,8 +941,8 @@ async def main_loop() -> int:
                 ok_send = _send_message(token, str(int(chat_id)), reply)
                 if not ok_send:
                     _log(f"falha ao enviar resposta do comando chat_id={int(chat_id)} cmd={text_msg[:60]}")
-        except Exception:
-            _log("falha no loop principal; retry em 2s")
+        except Exception as e:
+            _log(f"falha no loop principal: {type(e).__name__}: {str(e)[:240]} ; retry em 2s")
             time.sleep(2)
 
 
