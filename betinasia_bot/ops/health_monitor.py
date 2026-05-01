@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -312,6 +313,72 @@ def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
             return 200 <= int(resp.status) < 300
     except Exception:
         return False
+
+
+def _normalize_alert_line(msg: str) -> str:
+    """
+    Remove trechos muito variáveis para assinatura de deduplicação.
+    """
+    s = str(msg or "")
+    # Ex.: consecutive_fail=12 -> consecutive_fail=*
+    s = re.sub(r"consecutive_fail=\d+", "consecutive_fail=*", s)
+    # Ex.: age=123s, n=456 etc.
+    s = re.sub(r"\bage=\d+s\b", "age=*s", s)
+    s = re.sub(r"\bn=\d+\b", "n=*", s)
+    s = re.sub(r"\baudits_n=\d+\b", "audits_n=*", s)
+    return s.strip()
+
+
+def _alert_signature(code: int, results: List[CheckResult], autopilot_actions: List[str]) -> str:
+    lines: List[str] = []
+    for r in (results or []):
+        if r.level in ("WARN", "FAIL"):
+            lines.append(f"[{r.level}] {_normalize_alert_line(r.message)}")
+    for a in (autopilot_actions or []):
+        lines.append(f"[AUTO] {_normalize_alert_line(str(a))}")
+    payload = {"code": int(code), "lines": sorted(lines)}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _should_send_non_ok_alert(
+    *,
+    state: Dict[str, Any],
+    code: int,
+    results: List[CheckResult],
+    autopilot_actions: List[str],
+    now: datetime,
+) -> Tuple[bool, str, str]:
+    """
+    Rate limit/dedup para reduzir flood de Telegram.
+    """
+    sig = _alert_signature(int(code), results, autopilot_actions)
+    last_sig = str(state.get("last_alert_sig") or "")
+    last_code = _safe_int(state.get("last_alert_code"), 0)
+    last_utc = _parse_iso_ts(state.get("last_alert_utc"))
+    same_sig = bool(last_sig and sig == last_sig)
+    age_sec = int((now - last_utc).total_seconds()) if last_utc else None
+
+    notify_unchanged = _env_bool("OPS_TELEGRAM_NOTIFY_ON_UNCHANGED_NON_OK", "0")
+    min_interval = _safe_int(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC", "900"), 900)
+    force_on_escalation = _env_bool("OPS_TELEGRAM_FORCE_ON_ESCALATION", "1")
+    escalated = int(code) > int(last_code)
+    if force_on_escalation and escalated:
+        return True, "escalation", sig
+
+    if same_sig and (not notify_unchanged):
+        return False, "suppressed_same_signature", sig
+    if same_sig and notify_unchanged and age_sec is not None and age_sec < int(min_interval):
+        return False, f"suppressed_min_interval({age_sec}s<{min_interval}s)", sig
+    if (not same_sig) and age_sec is not None and age_sec < int(min_interval):
+        return False, f"suppressed_global_min_interval({age_sec}s<{min_interval}s)", sig
+    return True, "send", sig
+
+
+def _mark_last_alert_state(state: Dict[str, Any], *, code: int, sig: str, now: datetime) -> None:
+    state["last_alert_sig"] = str(sig)
+    state["last_alert_code"] = int(code)
+    state["last_alert_utc"] = now.isoformat()
 
 
 def _extract_latency_metrics_from_message(msg: str) -> Dict[str, int]:
@@ -1730,6 +1797,18 @@ def main() -> int:
                         lines.append(f"  - {a}")
                 _telegram_send(token, chat_id, "\n".join(lines))
             else:
+                send_autopilot_only = _env_bool("OPS_TELEGRAM_AUTOPILOT_ONLY_ALERTS", "0")
+                if send_autopilot_only and int(code) == 0 and not bool(autopilot_actions):
+                    return int(code)
+                should_send_non_ok, _reason, non_ok_sig = _should_send_non_ok_alert(
+                    state=state,
+                    code=int(code),
+                    results=results,
+                    autopilot_actions=autopilot_actions,
+                    now=now,
+                )
+                if not should_send_non_ok:
+                    return int(code)
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
                 pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
                 # Alerta chamativo sempre que latência estiver alta (WARN/FAIL), mesmo sem pausar bridges.
@@ -1773,7 +1852,10 @@ def main() -> int:
                     lines.append("- Auto-pilot:")
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
-                _telegram_send(token, chat_id, "\n".join(lines))
+                sent = _telegram_send(token, chat_id, "\n".join(lines))
+                if sent:
+                    _mark_last_alert_state(state, code=int(code), sig=str(non_ok_sig), now=now)
+                    _save_state(state_path, state)
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")
 
