@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -156,7 +158,9 @@ def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg
     Regra:
       - se o argumento explícito veio do usuário, respeita;
       - se está no default "logs/audit_api_telemetry.jsonl", e o service contém "-back",
-        preferimos "logs/audit_api_back_telemetry.jsonl" (se existir).
+        mantemos o arquivo genérico (mais comum no audit_h3b_api.py atual).
+      - se por algum motivo existir um arquivo dedicado `audit_api_back_telemetry.jsonl`
+        e o genérico não existir, usamos o dedicado.
     Observação: o `audit_h3b_api.py` atual escreve em `logs/audit_api_telemetry.jsonl` por default,
     mas alguns deployments podem ter sido customizados via symlink/override.
     """
@@ -170,6 +174,9 @@ def _audit_telemetry_default_for_service(audit_service: str, audit_telemetry_arg
         if str(p) != "logs/audit_api_telemetry.jsonl":
             return p
         if "-back" in svc:
+            # Preferimos o "genérico" por compatibilidade (audit_h3b_api.py default).
+            if p.exists():
+                return p
             alt = Path("logs/audit_api_back_telemetry.jsonl")
             if alt.exists():
                 return alt
@@ -283,6 +290,112 @@ def _telegram_send(token: str, chat_id: str, text_msg: str) -> bool:
         return False
 
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    try:
+        return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return str(default).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _normalize_alert_line(msg: str) -> str:
+    """
+    Remove partes altamente variáveis para melhorar deduplicação no Telegram.
+    """
+    s = str(msg or "")
+    # Ex.: consecutive_fail=5545 -> consecutive_fail=*
+    s = re.sub(r"consecutive_fail=\d+", "consecutive_fail=*", s)
+    # Ex.: cooldown (853s < 1800s) -> cooldown (*s < *s)
+    s = re.sub(r"cooldown \(\d+s < \d+s\)", "cooldown (*s < *s)", s)
+    # Ex.: rate_limit (3/10 ...) mantém estrutura, mas remove contadores
+    s = re.sub(r"rate_limit \(\d+/\d+", "rate_limit (*/ *", s)
+    return s.strip()
+
+
+def _alert_signature(code: int, results: List[CheckResult]) -> str:
+    core = []
+    for r in results:
+        if r.level in ("WARN", "FAIL"):
+            core.append(f"[{r.level}] {_normalize_alert_line(r.message)}")
+    payload = {"code": int(code), "lines": sorted(core)}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _read_telemetry_with_fallback(
+    *,
+    name: str,
+    path: Path,
+    audit_service: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Path, Optional[str]]:
+    """
+    Lê telemetria com fallback defensivo para evitar falso FAIL por path divergente.
+    Casos comuns:
+    - deployment antigo escreve em logs/audit_api_telemetry.jsonl
+    - monitor foi configurado para logs/audit_api_back_telemetry.jsonl (ou vice-versa)
+    """
+    payload, err = _read_last_jsonl(path)
+    if not err:
+        return payload, None, path, None
+    if str(name) != "audit-api":
+        return payload, err, path, None
+
+    svc = str(audit_service or "").strip().lower()
+    # Preferência: se service é "-back", tentamos primeiro o arquivo "genérico"
+    # porque o audit_h3b_api.py padrão escreve nele.
+    if "-back" in svc:
+        cands = [Path("logs/audit_api_telemetry.jsonl"), Path("logs/audit_api_back_telemetry.jsonl")]
+    else:
+        cands = [Path("logs/audit_api_back_telemetry.jsonl"), Path("logs/audit_api_telemetry.jsonl")]
+
+    for cand in cands:
+        if str(cand) == str(path):
+            continue
+        p2, e2 = _read_last_jsonl(cand)
+        if not e2:
+            note = f"fallback_telemetry: configured={path} err={err} using={cand}"
+            return p2, None, cand, note
+    return payload, err, path, None
+
+
+def _should_send_non_ok_alert(
+    *,
+    state: Dict[str, Any],
+    code: int,
+    results: List[CheckResult],
+    now: datetime,
+) -> Tuple[bool, str, str]:
+    """
+    Dedup/rate-limit para reduzir overload no Telegram.
+    - sempre envia em escalada (WARN->FAIL), se habilitado
+    - pode suprimir alertas idênticos continuamente
+    """
+    sig = _alert_signature(int(code), results)
+    last_sig = str(state.get("last_alert_sig") or "")
+    last_code = _safe_int(state.get("last_alert_code"), 0)
+    last_utc = _parse_iso_ts(state.get("last_alert_utc"))
+    same_sig = bool(last_sig and (sig == last_sig))
+    age = int((now - last_utc).total_seconds()) if last_utc else None
+
+    notify_unchanged = _env_bool("OPS_TELEGRAM_NOTIFY_ON_UNCHANGED_NON_OK", "0")
+    min_interval = _safe_int(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC", "600"), 600)
+    force_on_escalation = _env_bool("OPS_TELEGRAM_FORCE_ON_ESCALATION", "1")
+    escalated = int(code) > int(last_code)
+    if force_on_escalation and escalated:
+        return True, "escalation", sig
+
+    if same_sig and (not notify_unchanged):
+        return False, "suppressed_same_signature", sig
+    if same_sig and notify_unchanged and age is not None and age < int(min_interval):
+        return False, f"suppressed_min_interval ({age}s < {min_interval}s)", sig
+    return True, "send", sig
+
+
+def _mark_last_alert_state(state: Dict[str, Any], *, code: int, sig: str, now: datetime) -> None:
+    state["last_alert_sig"] = str(sig)
+    state["last_alert_code"] = int(code)
+    state["last_alert_utc"] = now.isoformat()
+
+
 async def _db_metrics(db: Database, since: datetime) -> Dict[str, Any]:
     q = text(
         """
@@ -337,6 +450,87 @@ async def _db_audit_friction(db: Database, since: datetime) -> Dict[str, Any]:
         return dict(row._mapping) if row else {}
 
 
+async def _db_bridge_flow(db: Database, since: datetime) -> Dict[str, Any]:
+    """
+    Sinais de fluxo bridge->executor na janela:
+    - seen_total: linhas no executor_bridge_seen_keys
+    - executed_total: linhas com execution_id preenchido
+    - last_seen_utc: última atividade de bridge
+    """
+    q = text(
+        """
+        SELECT
+          count(*)::bigint AS seen_total,
+          count(*) FILTER (WHERE execution_id IS NOT NULL)::bigint AS executed_total,
+          max(created_at) AS last_seen_utc
+        FROM executor_bridge_seen_keys
+        WHERE created_at >= :since
+          AND action = :action
+        """
+    )
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since, "action": "live:Back"})
+        row = r.fetchone()
+        return dict(row._mapping) if row else {}
+
+
+async def _db_bridge_skip_reasons(db: Database, since: datetime, *, action: str) -> Dict[str, Any]:
+    """
+    Diagnóstico do bridge por motivo de skip no executor_bridge_seen.
+    Ajuda a separar:
+    - "sem execução por policy/filtro" (intencional de negócio)
+    - "sem execução por problema operacional"
+    """
+    q_tot = text(
+        """
+        SELECT
+          count(*)::bigint AS seen_rows,
+          count(*) FILTER (
+            WHERE lower(coalesce(meta->>'skipped', 'false')) IN ('1','true','t','yes','y','on')
+          )::bigint AS skipped_rows
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+          AND src_table = 'betslip_audit_results'
+        """
+    )
+    q_reasons = text(
+        """
+        SELECT
+          coalesce(meta->>'reason', '') AS reason,
+          count(*)::bigint AS n
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+          AND src_table = 'betslip_audit_results'
+          AND lower(coalesce(meta->>'skipped', 'false')) IN ('1','true','t','yes','y','on')
+        GROUP BY 1
+        ORDER BY 2 DESC
+        """
+    )
+    async with db.async_session() as session:
+        tot_r = await session.execute(q_tot, {"since": since, "action": str(action)})
+        tot_row = tot_r.fetchone()
+        seen_rows = int((tot_row._mapping.get("seen_rows") if tot_row else 0) or 0)
+        skipped_rows = int((tot_row._mapping.get("skipped_rows") if tot_row else 0) or 0)
+
+        rr = await session.execute(q_reasons, {"since": since, "action": str(action)})
+        reason_counts: Dict[str, int] = {}
+        for row in (rr.fetchall() or []):
+            try:
+                mp = row._mapping
+                k = str(mp.get("reason") or "").strip() or "-"
+                reason_counts[k] = int(mp.get("n") or 0)
+            except Exception:
+                continue
+
+        return {
+            "seen_rows": int(seen_rows),
+            "skipped_rows": int(skipped_rows),
+            "reason_counts": reason_counts,
+        }
+
+
 async def run_checks(
     *,
     since_minutes: int,
@@ -380,24 +574,37 @@ async def run_checks(
                 exit_code = max(exit_code, 1)
 
     # 2) telemetria freshness
+    telemetry_warn_on_missing = _env_bool("OPS_TELEMETRY_WARN_ON_MISSING", "1")
+    telemetry_warn_on_stale = _env_bool("OPS_TELEMETRY_WARN_ON_STALE", "1")
+
     def _check_telemetry(name: str, path: Path):
         nonlocal exit_code
-        payload, err = _read_last_jsonl(path)
+        payload, err, used_path, fallback_note = _read_telemetry_with_fallback(
+            name=str(name),
+            path=Path(path),
+            audit_service=str(audit_service),
+        )
+        if fallback_note:
+            results.append(CheckResult("WARN", f"{name}: {fallback_note}"))
+            exit_code = max(exit_code, 1)
         if err:
-            results.append(CheckResult("FAIL", f"{name}: telemetria inválida ({err}) em {path}"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_missing) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: telemetria inválida ({err}) em {used_path}"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
             return
-        ts = _parse_iso_ts(payload.get("ts_utc") or payload.get("timestamp") or payload.get("ts"))
+        ts = _parse_iso_ts((payload or {}).get("ts_utc") or (payload or {}).get("timestamp") or (payload or {}).get("ts"))
         if not ts:
-            results.append(CheckResult("FAIL", f"{name}: sem timestamp no último JSONL ({path})"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_missing) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: sem timestamp no último JSONL ({used_path})"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
             return
         age = int((now - ts).total_seconds())
         if age <= int(telemetry_max_age_sec):
-            results.append(CheckResult("PASS", f"{name}: telemetria atualizada (age={age}s)"))
+            results.append(CheckResult("PASS", f"{name}: telemetria atualizada (age={age}s, path={used_path})"))
         else:
-            results.append(CheckResult("FAIL", f"{name}: telemetria parada (age={age}s > {telemetry_max_age_sec}s)"))
-            exit_code = max(exit_code, 2)
+            lv = "WARN" if bool(telemetry_warn_on_stale) else "FAIL"
+            results.append(CheckResult(lv, f"{name}: telemetria parada (age={age}s > {telemetry_max_age_sec}s, path={used_path})"))
+            exit_code = max(exit_code, 1 if lv == "WARN" else 2)
 
     _check_telemetry("collector", collector_telemetry)
     _check_telemetry("audit-api", audit_telemetry)
@@ -405,6 +612,8 @@ async def run_checks(
     # 3) DB freshness
     db = Database()
     await db.connect()
+    bf: Dict[str, Any] = {}
+    bs: Dict[str, Any] = {}
     try:
         m = await _db_metrics(db, since)
         # Sinais rápidos de fricção/bloqueio (janela menor)
@@ -412,6 +621,11 @@ async def run_checks(
         fric_min = max(1, min(int(since_minutes), int(fric_min)))
         fric_since = now - timedelta(minutes=int(fric_min))
         fr = await _db_audit_friction(db, fric_since)
+        bridge_flow_min = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MINUTES", "10"), 10)
+        bridge_flow_min = max(1, min(int(since_minutes), int(bridge_flow_min)))
+        bf_since = now - timedelta(minutes=int(bridge_flow_min))
+        bf = await _db_bridge_flow(db, bf_since)
+        bs = await _db_bridge_skip_reasons(db, bf_since, action="live:Back")
     finally:
         await db.close()
 
@@ -508,6 +722,90 @@ async def run_checks(
         # Nunca deixa o monitor quebrar por esse check
         pass
 
+    # 4.5) Fluxo bridge->executor (detector de "vivo porém mudo")
+    try:
+        flow_check_enable = _env_bool("OPS_BRIDGE_FLOW_CHECK_ENABLE", "1")
+        flow_fail_on_zero = _env_bool("OPS_BRIDGE_FLOW_FAIL_ON_ZERO", "1")
+        min_audits_for_flow = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MIN_AUDITS", "80"), 80)
+        seen_total = int(bf.get("seen_total") or 0)
+        executed_total = int(bf.get("executed_total") or 0)
+        last_seen = _parse_iso_ts(bf.get("last_seen_utc"))
+        last_seen_age = int((now - last_seen).total_seconds()) if last_seen else None
+        flow_window_min = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MINUTES", "10"), 10)
+        seen_rows = int(bs.get("seen_rows") or 0)
+        skipped_rows = int(bs.get("skipped_rows") or 0)
+        reason_counts = bs.get("reason_counts") if isinstance(bs.get("reason_counts"), dict) else {}
+        ratio_min = _safe_float(os.getenv("OPS_BRIDGE_FLOW_POLICY_RATIO_MIN", "0.80"))
+        if ratio_min is None:
+            ratio_min = 0.80
+        ratio_min = max(0.0, min(1.0, float(ratio_min)))
+        policy_as_warn = _env_bool("OPS_BRIDGE_FLOW_POLICY_AS_WARN", "1")
+        policy_reason_csv = str(
+            os.getenv(
+                "OPS_BRIDGE_FLOW_POLICY_REASONS",
+                "not_active,wf_ah_max_abs_line,min_limit,disabled_back,disabled_lay",
+            )
+            or ""
+        )
+        policy_reasons = {x.strip() for x in policy_reason_csv.split(",") if str(x).strip()}
+        policy_skip_n = 0
+        for rk, rv in (reason_counts or {}).items():
+            if str(rk) in policy_reasons:
+                try:
+                    policy_skip_n += int(rv or 0)
+                except Exception:
+                    continue
+        policy_ratio = (float(policy_skip_n) / float(skipped_rows)) if int(skipped_rows) > 0 else 0.0
+        policy_like_no_bet = bool(int(skipped_rows) > 0 and int(policy_skip_n) > 0 and float(policy_ratio) >= float(ratio_min))
+        policy_reasons_top = sorted(
+            [
+                (str(k), int(v or 0))
+                for k, v in (reason_counts or {}).items()
+                if str(k) in policy_reasons and int(v or 0) > 0
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        policy_reasons_txt = ", ".join([f"{k}={n}" for k, n in policy_reasons_top[:4]]) if policy_reasons_top else "-"
+
+        if flow_check_enable:
+            if int(audits_n) >= int(min_audits_for_flow) and seen_total <= 0:
+                if policy_like_no_bet:
+                    lvl = "WARN" if policy_as_warn else "PASS"
+                    results.append(
+                        CheckResult(
+                            lvl,
+                            f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n}, "
+                            f"mas no-bet por policy detectado "
+                            f"(policy_skip={policy_skip_n}/{skipped_rows}={policy_ratio:.0%}, reasons={policy_reasons_txt}; "
+                            f"seen={seen_total}, executed={executed_total}, seen_rows={seen_rows}, last_seen_age={last_seen_age}s)",
+                        )
+                    )
+                    if lvl == "WARN":
+                        exit_code = max(exit_code, 1)
+                else:
+                    lvl = "FAIL" if flow_fail_on_zero else "WARN"
+                    results.append(
+                        CheckResult(
+                            lvl,
+                            f"bridge_flow: sem seen_keys na janela={flow_window_min}m com audits_n={audits_n} "
+                            f"(seen={seen_total}, executed={executed_total}, last_seen_age={last_seen_age}s, "
+                            f"seen_rows={seen_rows}, skipped_rows={skipped_rows})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+            else:
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"bridge_flow: ok janela={flow_window_min}m seen={seen_total} executed={executed_total} "
+                        f"last_seen_age={last_seen_age}s audits_n={audits_n}",
+                    )
+                )
+    except Exception:
+        # Nunca quebra monitor por esse check.
+        pass
+
     # 5) Executor activity/health (via JSONL)
     try:
         # parâmetros
@@ -518,6 +816,10 @@ async def run_checks(
         warn_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_WARN", "0.20"))
         fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
         min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
+        min_audits_for_idle_warn = _safe_int(
+            os.getenv("OPS_EXECUTOR_NONHEARTBEAT_MIN_EVENTS_WARN", str(min_audits_for_idle_fail)),
+            min_audits_for_idle_fail,
+        )
         lat_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_MIN_EVENTS", "30"), 30)
         lat_call_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_WARN_MS", "12000"), 12000)
         lat_call_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_FAIL_MS", "20000"), 20000)
@@ -597,10 +899,24 @@ async def run_checks(
                 if ("execution context was destroyed" in e) or ("target closed" in e) or ("no_root_session_cookie" in e) or ("auth_error" in e) or ("http_401" in e):
                     fatal_n += 1
 
-            # idle: sem non-heartbeat por tempo alto *e* audit gerando oportunidades
+            # idle: sem non-heartbeat por tempo alto.
+            # Só alerta quando há volume mínimo de audits; evita WARN espúrio em baixa atividade real.
             if age_nonhb is None:
-                results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
-                exit_code = max(exit_code, 1)
+                if int(audits_n) >= int(min_audits_for_idle_warn):
+                    results.append(
+                        CheckResult(
+                            "WARN",
+                            f"executor: sem eventos não-heartbeat no tail (hb={len(hb)} audits_n={audits_n} >= {min_audits_for_idle_warn}).",
+                        )
+                    )
+                    exit_code = max(exit_code, 1)
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"executor: idle esperado sem non-heartbeat (hb={len(hb)} audits_n={audits_n} < {min_audits_for_idle_warn}).",
+                        )
+                    )
             else:
                 if age_nonhb > int(max_nonhb_age) and int(audits_n) >= int(min_audits_for_idle_fail):
                     results.append(
@@ -759,6 +1075,12 @@ async def run_checks(
             "best_odds_n": best_n,
             "audits_n": audits_n,
             "h3b_n": h3b_n,
+            "bridge_seen_total": int(bf.get("seen_total") or 0),
+            "bridge_executed_total": int(bf.get("executed_total") or 0),
+            "bridge_last_seen_utc": str(bf.get("last_seen_utc") or ""),
+            "bridge_seen_rows": int(bs.get("seen_rows") or 0),
+            "bridge_skipped_rows": int(bs.get("skipped_rows") or 0),
+            "bridge_skip_reasons": dict(bs.get("reason_counts") or {}),
         },
     }
 
@@ -939,6 +1261,26 @@ def _has_executor_latency_fail(results: List[CheckResult], executor_service: str
     return False
 
 
+def _has_bridge_flow_fail(results: List[CheckResult]) -> bool:
+    for r in results:
+        if r.level != "FAIL":
+            continue
+        msg = str(r.message or "").lower()
+        if "bridge_flow:" in msg and "sem seen_keys" in msg:
+            return True
+    return False
+
+
+def _has_bridge_flow_policy_warn(results: List[CheckResult]) -> bool:
+    for r in results:
+        if r.level != "WARN":
+            continue
+        msg = str(r.message or "").lower()
+        if "bridge_flow:" in msg and "no-bet por policy" in msg:
+            return True
+    return False
+
+
 def _get_executor_latency_fail_message(results: List[CheckResult], executor_service: str) -> Optional[str]:
     key = str(executor_service or "").strip().lower()
     for r in results:
@@ -1076,6 +1418,28 @@ def main() -> int:
         except Exception:
             pause_max_per_hour = 1
         latency_fail = _has_executor_latency_fail(results, str(args.executor_service))
+        bridge_flow_fail = _has_bridge_flow_fail(results)
+        bridge_pause_flag = os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_BRIDGES", "1")
+        bridge_flow_pause_enabled = str(bridge_pause_flag or "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        try:
+            bridge_pause_after_fails = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_BRIDGES_FAILS", "2") or 2))
+        except Exception:
+            bridge_pause_after_fails = 2
+        bridge_pause_after_fails = max(1, int(bridge_pause_after_fails))
+        try:
+            bridge_pause_cooldown = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_COOLDOWN_SEC", "1200") or 1200))
+        except Exception:
+            bridge_pause_cooldown = 1200
+        try:
+            bridge_pause_max_per_hour = int(float(os.getenv("OPS_BRIDGE_FLOW_FAIL_PAUSE_MAX_PER_HOUR", "2") or 2))
+        except Exception:
+            bridge_pause_max_per_hour = 2
         # streak de FAIL de latência (por executor_service) para evitar pausar por spikes únicos
         try:
             exsvc = str(args.executor_service or "").strip() or "betinasia-executor"
@@ -1087,6 +1451,16 @@ def main() -> int:
             latency_fail_streak = _safe_int(ex_state.get("latency_fail_streak"), 0)
         except Exception:
             latency_fail_streak = 0
+        # streak de FAIL de fluxo do bridge (executor_bridge_seen_keys zerado com audit alto)
+        try:
+            bf_state = state.setdefault("services", {}).setdefault("bridge_flow_detector", {})
+            if bridge_flow_fail:
+                bf_state["bridge_flow_fail_streak"] = _safe_int(bf_state.get("bridge_flow_fail_streak"), 0) + 1
+            else:
+                bf_state["bridge_flow_fail_streak"] = 0
+            bridge_flow_fail_streak = _safe_int(bf_state.get("bridge_flow_fail_streak"), 0)
+        except Exception:
+            bridge_flow_fail_streak = 0
 
         paused_now: List[str] = []
         if latency_pause_enabled and latency_fail and int(latency_fail_streak) >= int(pause_after_fails):
@@ -1116,6 +1490,35 @@ def main() -> int:
         elif latency_pause_enabled and latency_fail:
             autopilot_actions.append(
                 f"pause_on_latency_fail: aguardando streak (latency_fail_streak={int(latency_fail_streak)}/{int(pause_after_fails)})"
+            )
+        if bridge_flow_pause_enabled and bridge_flow_fail and int(bridge_flow_fail_streak) >= int(bridge_pause_after_fails):
+            to_pause = []
+            for svc in [str(args.bridge_back_service), str(args.bridge_lay_service)]:
+                s = str(svc or "").strip()
+                if not s or s.lower() in ("0", "off", "none", "false"):
+                    continue
+                to_pause.append(s)
+            for svc in to_pause:
+                allowed, reason = _rate_limited_action(
+                    state,
+                    svc,
+                    "pause_on_bridge_flow_fail",
+                    now=now,
+                    max_per_hour=int(bridge_pause_max_per_hour),
+                    cooldown_sec=int(bridge_pause_cooldown),
+                )
+                if not allowed:
+                    autopilot_actions.append(f"{svc}: pause bridge-flow bloqueado ({reason})")
+                    continue
+                ok = _systemctl_stop(svc)
+                _append_action(state, svc, "pause_on_bridge_flow_fail", now)
+                _set_paused(state, svc, now=now, reason="bridge_flow_fail")
+                autopilot_actions.append(f"{svc}: paused(stop) por bridge_flow FAIL ok={ok}")
+                paused_now.append(str(svc))
+        elif bridge_flow_pause_enabled and bridge_flow_fail:
+            autopilot_actions.append(
+                "pause_on_bridge_flow_fail: aguardando streak "
+                f"(bridge_flow_fail_streak={int(bridge_flow_fail_streak)}/{int(bridge_pause_after_fails)})"
             )
 
         # marca falhas por serviço
@@ -1161,6 +1564,14 @@ def main() -> int:
     # Atualiza estado de "último status"
     state["last_overall_utc"] = str(meta.get("now_utc") or now.isoformat())
     state["last_overall_code"] = int(code)
+    try:
+        db_meta = (meta or {}).get("db") if isinstance(meta, dict) else {}
+        state["last_bridge_seen_total"] = int((db_meta or {}).get("bridge_seen_total") or 0)
+        state["last_bridge_executed_total"] = int((db_meta or {}).get("bridge_executed_total") or 0)
+        state["last_bridge_audits_n"] = int((db_meta or {}).get("audits_n") or 0)
+        state["last_bridge_last_seen_utc"] = str((db_meta or {}).get("bridge_last_seen_utc") or "")
+    except Exception:
+        pass
     if int(code) > 0:
         state["last_non_ok_utc"] = str(meta.get("now_utc") or now.isoformat())
         state["last_non_ok_code"] = int(code)
@@ -1184,7 +1595,24 @@ def main() -> int:
     print(f"Exit code: {code}")
 
     should_send_recovery = bool(args.telegram_recovery) and recovered
-    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
+    should_send_non_ok = False
+    non_ok_send_reason = ""
+    non_ok_sig = ""
+    if int(code) > 0:
+        should_send_non_ok, non_ok_send_reason, non_ok_sig = _should_send_non_ok_alert(
+            state=state,
+            code=int(code),
+            results=results,
+            now=now,
+        )
+        if not should_send_non_ok:
+            print(f"[INFO] Telegram non-ok suprimido: {non_ok_send_reason}")
+
+    send_autopilot_only = _env_bool("OPS_TELEGRAM_AUTOPILOT_ONLY_ALERTS", "0")
+    should_send_autopilot_only = bool(
+        send_autopilot_only and args.autopilot and autopilot_actions and (not should_send_non_ok) and (not should_send_recovery)
+    )
+    if args.telegram and (should_send_non_ok or should_send_recovery or should_send_autopilot_only):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
         if token and chat_id:
@@ -1201,7 +1629,7 @@ def main() -> int:
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
                 _telegram_send(token, chat_id, "\n".join(lines))
-            else:
+            elif should_send_non_ok:
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
                 pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
                 # Alerta chamativo sempre que latência estiver alta (WARN/FAIL), mesmo sem pausar bridges.
@@ -1245,6 +1673,15 @@ def main() -> int:
                     lines.append("- Auto-pilot:")
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
+                sent = _telegram_send(token, chat_id, "\n".join(lines))
+                if sent:
+                    _mark_last_alert_state(state, code=int(code), sig=str(non_ok_sig), now=now)
+                    _save_state(state_path, state)
+            elif should_send_autopilot_only:
+                lines = [f"OPS HEALTH (AUTO-PILOT) @ {meta.get('now_utc')}"]
+                lines.append("- Auto-pilot:")
+                for a in autopilot_actions:
+                    lines.append(f"  - {a}")
                 _telegram_send(token, chat_id, "\n".join(lines))
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")

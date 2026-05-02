@@ -57,6 +57,79 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _safe_int_default(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _parse_iso_ts(x: Any) -> Optional[datetime]:
+    if not x:
+        return None
+    if isinstance(x, datetime):
+        dt = x
+    else:
+        s = str(x).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _load_health_monitor_state(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _recent_ops_incidents_from_health_state(state: Optional[Dict[str, Any]], *, now_utc: datetime) -> List[Dict[str, Any]]:
+    """
+    Extrai "incidentes abertos" do estado do health monitor para o daily:
+    - serviços com consecutive_fail > 0
+    - bridges pausadas pelo auto-pilot (paused=true)
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(state, dict):
+        return out
+    try:
+        services = state.get("services") if isinstance(state.get("services"), dict) else {}
+        for svc, raw in services.items():
+            row = raw if isinstance(raw, dict) else {}
+            nfail = _safe_int_default(row.get("consecutive_fail"), 0)
+            paused = bool(row.get("paused"))
+            paused_reason = str(row.get("paused_reason") or "")
+            paused_utc = _parse_iso_ts(row.get("paused_utc"))
+            if nfail <= 0 and not paused:
+                continue
+            item: Dict[str, Any] = {
+                "service": str(svc),
+                "consecutive_fail": int(nfail),
+                "paused": bool(paused),
+                "paused_reason": paused_reason,
+                "paused_utc": paused_utc.isoformat() if paused_utc else None,
+            }
+            if paused_utc is not None:
+                item["paused_age_min"] = max(0, int((now_utc - paused_utc).total_seconds() // 60))
+            out.append(item)
+    except Exception:
+        return out
+    return out
+
+
 def _pick_col(cols: list[str], needles: tuple[str, ...] | list[str]) -> Optional[str]:
     """
     Seleciona uma coluna por heurística, preferindo:
@@ -540,11 +613,12 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
 def _stake_bucket(stake: Any) -> str:
     """
     Bucket simples para acompanhamento operacional do sizing:
-    - "12" para stake≈12
+    - "12" para stake no intervalo [8,14]
     - "1.5" para stake≈1.5
     - "other" para valores diferentes/ausentes
     """
-    if _approx_eq(stake, 12.0, eps=0.02):
+    st = _safe_float_or_none(stake)
+    if st is not None and 8.0 <= float(st) <= 14.0:
         return "12"
     if _approx_eq(stake, 1.5, eps=0.02):
         return "1.5"
@@ -894,9 +968,11 @@ def _append_backpre_fast_slow_sections(
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake=HI (pós-início)
-                if _approx_eq(exp, float(stake_hi), eps=0.02):
-                    groups_thesis[f"Back Pre fast (stake≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"].append(row)
+                # tese = fast + stake no intervalo [8,14] (pós-início)
+                if 8.0 <= float(exp) <= 14.0:
+                    groups_thesis[
+                        f"Back Pre fast (stake em [8,14]; alvo≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"
+                    ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 
@@ -3408,6 +3484,43 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Pendências operacionais abertas (para reporte diário das 19h), a partir do state do health monitor.
+    try:
+        hm_state_path = Path(str(os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))).expanduser()
+        if not hm_state_path.is_absolute():
+            hm_state_path = (Path.cwd() / hm_state_path).resolve()
+        hm_state = _load_health_monitor_state(hm_state_path)
+        hm_incidents = _recent_ops_incidents_from_health_state(hm_state, now_utc=_utcnow())
+        last_non_ok_code = _safe_int_default((hm_state or {}).get("last_non_ok_code"), 0)
+        last_non_ok_utc = str((hm_state or {}).get("last_non_ok_utc") or "")
+        last_non_ok_lines = list((hm_state or {}).get("last_non_ok_lines") or [])
+
+        if hm_incidents or last_non_ok_code > 0:
+            s0.append("\n**Pendências operacionais p/ reporte 19h (health monitor)**\n\n")
+            s0.append(f"- Fonte: `{hm_state_path}`\n")
+            if last_non_ok_code > 0:
+                lvl = "FAIL" if int(last_non_ok_code) >= 2 else "WARN"
+                s0.append(f"- Último não-OK registrado: **{lvl}** @ `{last_non_ok_utc or '—'}`\n")
+                if last_non_ok_lines:
+                    for ln in last_non_ok_lines[:5]:
+                        s0.append(f"  - {str(ln)}\n")
+            if hm_incidents:
+                s0.append("\n| Serviço | consecutive_fail | paused | paused_reason | paused_age_min |\n")
+                s0.append("|---|---:|---|---|---:|\n")
+                for it in hm_incidents[:20]:
+                    svc = str(it.get("service") or "—")
+                    nfail = int(it.get("consecutive_fail") or 0)
+                    paused = "yes" if bool(it.get("paused")) else "no"
+                    reason = str(it.get("paused_reason") or "—").replace("|", "/")
+                    age_m = it.get("paused_age_min")
+                    age_txt = str(int(age_m)) if age_m is not None else "—"
+                    s0.append(f"| `{svc}` | {nfail} | {paused} | {reason} | {age_txt} |\n")
+            else:
+                s0.append("- Sem incidentes abertos por serviço.\n")
+            s0.append("\n")
+    except Exception:
+        pass
+
     # ------------------------------------------------------------
     # Prontidão para LIVE (go/no-go) — checklist objetivo
     # ------------------------------------------------------------
@@ -3610,6 +3723,92 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- Zerar `too_many_open_betslips` (caps/janelas + cleanup agressivo) para evitar bloqueio global.\n"
             "- Reduzir `STALE_QUEUE_WAIT` (fila/concurrency) para não operar atrasado.\n\n"
         )
+
+    # Árvore de causas v2 (acionável): Sintoma -> Causa -> Evidência -> Ação -> Resultado esperado -> Status D+1
+    try:
+        s0.append("\n**Árvore de causas v2 (operacional)**\n\n")
+        s0.append("| Sintoma | Causa provável | Evidência do dia | Ação aplicada/recomendada | Resultado esperado | Status D+1 |\n")
+        s0.append("|---|---|---|---|---|---|\n")
+
+        # 1) Latência alta sustentada (p90 call acima do alvo)
+        lat_fail = (p90_call_24h is not None and int(p90_call_24h) > int(thr_p90_ms))
+        if lat_fail:
+            if p50_queue_24h is not None and int(p50_queue_24h) >= 700:
+                lat_cause = "Backlog/fila no executor (workers/concurrency/burst no bridge)"
+                lat_action = (
+                    "Aumentar `EXECUTOR_WORKERS`, reduzir burst (`BRIDGE_MAX_PER_CYCLE`/`BRIDGE_POLL_SEC`) e "
+                    "validar queda de `queue_delay_ms` na janela seguinte."
+                )
+            elif (p50_post_24h is not None) and int(p50_post_24h) >= 2000:
+                lat_cause = "Submit/POST lento (UI/anti-bot/sessão)"
+                lat_action = (
+                    "Reforçar estabilidade de sessão (login/cookie), revisar timeout/retries e "
+                    "monitorar `post_ms` no health monitor."
+                )
+            else:
+                lat_cause = "Causa mista (fila + submit + ambiente)"
+                lat_action = (
+                    "Executar diagnóstico por componente (queue/post/overhead), depois ajustar "
+                    "thresholds e capacidade do executor."
+                )
+            lat_ev = (
+                f"p90_call_24h={_fmt_num(p90_call_24h,0)}ms (alvo≤{int(thr_p90_ms)}), "
+                f"p50_queue_24h={_fmt_num(p50_queue_24h,0)}ms, p50_post_24h={_fmt_num(p50_post_24h,0)}ms"
+            )
+            s0.append(
+                f"| Latência p90 alta | {lat_cause} | {lat_ev} | {lat_action} | "
+                "p50<5s e p90<8s sustentados | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| Latência p90 controlada | — | p90_call_24h={_fmt_num(p90_call_24h,0)}ms | "
+                "Manter tuning atual e monitoramento | Manter p90<=8s | Fechado |\n"
+            )
+
+        # 2) Sistema vivo porém sem operar (audit alto, bridge sem fluxo)
+        bridge_seen = _safe_int_default((hm_state or {}).get("last_bridge_seen_total"), 0)
+        bridge_exec = _safe_int_default((hm_state or {}).get("last_bridge_executed_total"), 0)
+        bridge_aud = _safe_int_default((hm_state or {}).get("last_bridge_audits_n"), 0)
+        bridge_issue = bool(bridge_aud >= 80 and bridge_seen <= 0)
+        if bridge_issue:
+            s0.append(
+                "| Audit com volume e bridge sem fluxo | Gate excessivo (policy/filtros) ou bridge sem varredura efetiva | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Revisar `wf_policy_current`/filtros e validar `executor_bridge_seen_keys`; autopilot pode pausar bridge para forçar ação humana | "
+                "Retomar seen/executed > 0 com mesma janela de auditoria | Aberto |\n"
+            )
+        else:
+            s0.append(
+                "| Fluxo bridge->executor normal | — | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Sem ação corretiva | Manter seen/executed coerente com audits | Fechado |\n"
+            )
+
+        # 3) Saturação de PMM/WS -> queda de conversão
+        if not chk_pmms:
+            s0.append(
+                "| Erro `No PMMs received` elevado | Timeout curto/WS instável/sessão degradada | "
+                f"no_pmms={int(err_pmms)} (24h) | Ajustar timeout/min_wait e estabilizar sessão WS; auditar ws_age nos eventos de erro | "
+                "Reduzir `No PMMs` para 0 (ou próximo de 0) | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| PMM/WS estável | — | no_pmms={int(err_pmms)} (24h) | "
+                "Sem ação corretiva | Manter ocorrência baixa/zero | Fechado |\n"
+            )
+
+        # 4) Excesso de alertas Telegram
+        tele_min_interval = _safe_int_default(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC"), 600)
+        s0.append(
+            "| Excesso de alertas Telegram | Repetição de assinatura sem dedup/rate-limit | "
+            f"anti_flood ativo (min_interval={tele_min_interval}s) | "
+            "Manter dedup por assinatura e envio forçado só em escalada | "
+            "Alertas relevantes, sem flood | Acompanhar |\n"
+        )
+
+        s0.append("\n")
+    except Exception:
+        pass
 
     # leitura executiva (heurística): onde atacar primeiro
     s0.append(
