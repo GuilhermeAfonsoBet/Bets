@@ -1067,8 +1067,8 @@ def _append_backpre_fast_slow_sections(
     )
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
-    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
-    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | n_win (P&L>0) | n_loss (P&L<0) | n_neutro (P&L≈0) | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 
     def _split_settled(rows: List[Dict[str, Any]]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
         # Sem open_stakes.csv não sabemos o que está liquidado vs aberto.
@@ -1084,18 +1084,35 @@ def _append_backpre_fast_slow_sections(
                 settled.append(r)
         return settled, open_rows
 
+    def _outcome_counts(rows: List[Dict[str, Any]], *, eps: float = 1e-9) -> Dict[str, int]:
+        n_win = 0
+        n_loss = 0
+        n_neutral = 0
+        for r in rows or []:
+            p = _safe_float_or_none(r.get("pnl"))
+            if p is None:
+                continue
+            if p > float(eps):
+                n_win += 1
+            elif p < -float(eps):
+                n_loss += 1
+            else:
+                n_neutral += 1
+        return {"n_win": int(n_win), "n_loss": int(n_loss), "n_neutral": int(n_neutral)}
+
     for g, rows in sorted((groups_thesis or {}).items(), key=lambda kv: kv[0]):
         settled_rows, open_rows = _split_settled(rows)
         if settled_rows is None or open_rows is None:
-            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
+            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — | — | — | — |\n")
         else:
             summ_set = _summarize_rows_pnl_exp(settled_rows)
+            occ = _outcome_counts(settled_rows)
             out_lines.append(
-                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {int(occ.get('n_win') or 0)} | {int(occ.get('n_loss') or 0)} | {int(occ.get('n_neutral') or 0)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
             )
     out_lines.append("\n")
     if open_order_ids is None:
-        out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
+        out_lines.append("_Nota: `n_liquidadas`/`n_win`/`n_loss`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
     # Performance auxiliar: fast com stake < limiar HI_min (impacto prático de latência/degradação)
     low_rows: List[Dict[str, Any]] = []
@@ -1105,16 +1122,17 @@ def _append_backpre_fast_slow_sections(
         if exp is not None and exp < float(thesis_hi_min):
             low_rows.append(r)
     out_lines.append("**Back Pre fast (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
-    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
-    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | n_win (P&L>0) | n_loss (P&L<0) | n_neutro (P&L≈0) | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
     settled_rows, open_rows = _split_settled(low_rows)
     label_low = f"Back Pre fast (stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
     if settled_rows is None or open_rows is None:
-        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
+        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — | — | — | — |\n")
     else:
         summ_set = _summarize_rows_pnl_exp(settled_rows)
+        occ = _outcome_counts(settled_rows)
         out_lines.append(
-            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {int(occ.get('n_win') or 0)} | {int(occ.get('n_loss') or 0)} | {int(occ.get('n_neutral') or 0)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
         )
     out_lines.append("\n")
 
