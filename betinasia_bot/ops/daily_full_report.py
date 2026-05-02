@@ -528,6 +528,24 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_bool_or_none(x: Any) -> Optional[bool]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return bool(x)
+        s = str(x).strip().lower()
+        if not s:
+            return None
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    except Exception:
+        return None
+    return None
+
+
 def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
     try:
         if a is None:
@@ -540,11 +558,12 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
 def _stake_bucket(stake: Any) -> str:
     """
     Bucket simples para acompanhamento operacional do sizing:
-    - "12" para stake≈12
+    - "12" para stake no intervalo [8,14]
     - "1.5" para stake≈1.5
     - "other" para valores diferentes/ausentes
     """
-    if _approx_eq(stake, 12.0, eps=0.02):
+    st = _safe_float_or_none(stake)
+    if st is not None and 8.0 <= float(st) <= 14.0:
         return "12"
     if _approx_eq(stake, 1.5, eps=0.02):
         return "1.5"
@@ -775,6 +794,8 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
         pre_submit_ms = _safe_int_or_none(vs.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(vs.get("slippage_pre_pct"))
         mreg = str(vs.get("market_regime") or "").strip() or None
+        vs_eligible = _safe_bool_or_none(vs.get("eligible"))
+        vs_stake_chosen = _safe_float_or_none(vs.get("stake_chosen"))
         # IMPORTANTE: no executor, `is_live` significa "modo LIVE (apostar de verdade)", não "in-play".
         is_live_mode = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
         rec = {
@@ -788,6 +809,8 @@ def _parse_executor_jsonl_back_live_orders(path: Path) -> Dict[str, Dict[str, An
             "pre_submit_ms": (int(pre_submit_ms) if pre_submit_ms is not None else None),
             "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
             "market_regime": mreg,
+            "vs_eligible": (bool(vs_eligible) if vs_eligible is not None else None),
+            "vs_stake_chosen": (float(vs_stake_chosen) if vs_stake_chosen is not None else None),
         }
         prev = out.get(str(oid))
         if prev is None or rec["created_at"] >= prev.get("created_at"):
@@ -873,8 +896,19 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
+        vs_eligible = _safe_bool_or_none(em.get("vs_eligible"))
+        vs_stake_chosen = _safe_float_or_none(em.get("vs_stake_chosen"))
         stake_b = _stake_bucket(exp)
         roi_i = float(pnl) / float(exp) * 100.0
+        # Classificação da tese em camadas:
+        # 1) preferir flag nativa de elegibilidade (value_sizing.eligible), pois permanece correta
+        #    mesmo quando multiplicadores dinâmicos alteram stake final executado;
+        # 2) fallback para stake executado na faixa HI [8,14] para manter compatibilidade histórica.
+        thesis_hi = False
+        if vs_eligible is True:
+            thesis_hi = True
+        elif 8.0 <= float(exp) <= 14.0:
+            thesis_hi = True
         row = {
             "order_id": str(oid),
             "pnl": float(pnl),
@@ -884,6 +918,9 @@ def _append_backpre_fast_slow_sections(
             "pre_submit_ms": pre_submit_ms,
             "slippage_pre_pct": slip_pre,
             "created_day": str(created.date().isoformat()),
+            "vs_eligible": (bool(vs_eligible) if vs_eligible is not None else None),
+            "vs_stake_chosen": (float(vs_stake_chosen) if vs_stake_chosen is not None else None),
+            "thesis_hi": bool(thesis_hi),
         }
 
         if bool(is_in):
@@ -894,9 +931,11 @@ def _append_backpre_fast_slow_sections(
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake=HI (pós-início)
-                if _approx_eq(exp, float(stake_hi), eps=0.02):
-                    groups_thesis[f"Back Pre fast (stake≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"].append(row)
+                # tese = fast + elegível HI (ou fallback stake HI na faixa [8,14]) (pós-início)
+                if bool(row.get("thesis_hi")):
+                    groups_thesis[
+                        f"Back Pre fast (elegível HI/flag; fallback stake em [8,14]; alvo≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"
+                    ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 
@@ -906,9 +945,13 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     # A) Performance da tese (stake=HI) com métricas “liquidadas”
     # -------------------------
-    out_lines.append("**Tese: Back Pre fast (pós-início; stake=HI) — performance (accounting; order_id)**\n\n")
+    out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
+    out_lines.append(
+        "- Regra de classificação: `value_sizing.eligible=True` (preferencial) "
+        "ou fallback `stake executado em [8,14]`.\n\n"
+    )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
 
@@ -2745,6 +2788,106 @@ def _fmt_status(ok: Optional[bool]) -> str:
     return "OK" if ok else "FAIL"
 
 
+def _append_operational_action_plan_section(
+    out_lines: List[str],
+    *,
+    p50_call_24h: Optional[int],
+    p90_call_24h: Optional[int],
+    p50_post_24h: Optional[int],
+    p50_queue_24h: Optional[int],
+    gaps15: Optional[int],
+    err_pmms: int,
+    err_open: int,
+    api_failed_pct: Optional[float],
+    stale_pct: Optional[float],
+) -> None:
+    """
+    Gera plano de ação automático (com comandos) a partir dos sinais do daily.
+    """
+    try:
+        out_lines.append("\n**Plano automático de atuação (daily → execução)**\n\n")
+        out_lines.append("| Trigger observado | Ação sugerida | Comando rápido |\n|---|---|---|\n")
+
+        # 1) fila/backlog
+        if p50_queue_24h is not None and int(p50_queue_24h) >= 1000:
+            cmd = (
+                "`upsert_env EXECUTOR_WORKERS 2 ; "
+                "upsert_env BRIDGE_POLL_SEC 1.5 ; "
+                "sudo systemctl restart betinasia-executor.service betinasia-executor-bridge-back.service betinasia-executor-bridge-lay.service`"
+            )
+            out_lines.append(
+                f"| `queue_delay_ms p50={int(p50_queue_24h)}ms` (alto) | reduzir backlog (mais workers + menos burst de bridge) | {cmd} |\n"
+            )
+
+        # 2) post lento (UI/sessão/anti-bot)
+        if p50_post_24h is not None and int(p50_post_24h) >= 2000:
+            cmd = (
+                "`upsert_env OPS_LATENCY_DEGRADE_ENABLE 1 ; "
+                "upsert_env OPS_LATENCY_DEGRADE_AFTER_FAILS 1 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `post_ms p50={int(p50_post_24h)}ms` (alto) | conter exposição automaticamente enquanto sessão/POST degrada | {cmd} |\n"
+            )
+
+        # 3) end-to-end latency
+        if p90_call_24h is not None and int(p90_call_24h) >= 8000:
+            cmd = (
+                "`upsert_env OPS_EXECUTOR_LAT_CALL_P90_WARN_MS 8000 ; "
+                "upsert_env OPS_EXECUTOR_LAT_CALL_P90_FAIL_MS 12000 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `call_to_done p90={int(p90_call_24h)}ms` (alto) | endurecer gatilho de latência p90 para atuar mais cedo | {cmd} |\n"
+            )
+
+        # 4) PMM/WS falhando
+        if int(err_pmms or 0) > 0:
+            cmd = (
+                "`sudo systemctl restart betinasia-audit-api-back.service ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                f"| `No PMMs received` ({int(err_pmms)}) | reciclar audit-api-back e manter monitor/autopilot ativos | {cmd} |\n"
+            )
+
+        # 5) too many open betslips
+        if int(err_open or 0) > 0:
+            cmd = (
+                "`upsert_env EXECUTOR_BETSLIP_CACHE_MAX_KEYS 0 ; "
+                "upsert_env EXECUTOR_TOO_MANY_OPEN_CLEANUP_MAX 16 ; "
+                "sudo systemctl restart betinasia-executor.service`"
+            )
+            out_lines.append(
+                f"| `too_many_open_betslips` ({int(err_open)}) | reduzir acúmulo de tickets e aumentar cleanup | {cmd} |\n"
+            )
+
+        # 6) stale queue / API failed
+        if (stale_pct is not None and float(stale_pct) > 10.0) or (api_failed_pct is not None and float(api_failed_pct) > 20.0):
+            cmd = (
+                "`upsert_env OPS_EXECUTOR_NONHEARTBEAT_MAX_AGE_SEC 900 ; "
+                "upsert_env OPS_EXECUTOR_FAIL_RATE_FAIL 0.35 ; "
+                "sudo systemctl restart betinasia-ops-monitor.timer betinasia-ops-autopilot.timer`"
+            )
+            out_lines.append(
+                "| `STALE_QUEUE_WAIT`/`API_FAILED` acima do alvo | aumentar sensibilidade de proteção no monitor | "
+                f"{cmd} |\n"
+            )
+
+        # 7) gaps longos
+        if gaps15 is not None and int(gaps15) > 8:
+            cmd = (
+                "`./venv/bin/python -m ops.health_monitor --since-minutes 60 --autopilot --telegram || true`"
+            )
+            out_lines.append(
+                f"| gaps>15min no JSONL ({int(gaps15)}) | executar check forçado e registrar ação imediata | {cmd} |\n"
+            )
+
+        out_lines.append("\n")
+    except Exception:
+        return
+
+
 def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     with file_path.open("rb") as f:
@@ -2753,6 +2896,71 @@ def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, captio
         r = requests.post(url, data=data, files=files, timeout=60)
         return bool(r.ok)
 
+
+def _load_json_best_effort(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _append_latency_feedback_loop_section(
+    out_lines: List[str],
+    *,
+    state_path: Path,
+) -> None:
+    """
+    Mostra no daily o que o auto-healing de latência aplicou/removou recentemente.
+    """
+    st = _load_json_best_effort(state_path)
+    if not isinstance(st, dict):
+        return
+    ld = st.get("latency_degrade") if isinstance(st.get("latency_degrade"), dict) else None
+    if not isinstance(ld, dict):
+        return
+
+    out_lines.append("\n**Feedback loop de latência (auto-healing → verificação D+1)**\n\n")
+    active = bool(ld.get("active"))
+    cause = str(ld.get("cause") or "—")
+    risk_json = str(ld.get("risk_params_json") or "logs/bridge_risk_params.json")
+    fail_streak = _safe_int(ld.get("fail_streak"))
+    pass_streak = _safe_int(ld.get("pass_streak"))
+    activated_utc = str(ld.get("activated_utc") or "—")
+    recovered_utc = str(ld.get("recovered_utc") or "—")
+    metrics = ld.get("last_latency_metrics") if isinstance(ld.get("last_latency_metrics"), dict) else {}
+
+    out_lines.append("| Item | Valor |\n|---|---|\n")
+    out_lines.append(f"| Estado atual | {'ATIVO' if active else 'INATIVO'} |\n")
+    out_lines.append(f"| Causa predominante (última) | `{cause}` |\n")
+    out_lines.append(f"| fail_streak / pass_streak | `{fail_streak if fail_streak is not None else '—'}` / `{pass_streak if pass_streak is not None else '—'}` |\n")
+    out_lines.append(f"| Ativado em | `{activated_utc}` |\n")
+    out_lines.append(f"| Recuperado em | `{recovered_utc}` |\n")
+    out_lines.append(f"| Arquivo de atuação | `{risk_json}` |\n")
+    out_lines.append(
+        f"| Últimas métricas de latência | "
+        f"p50_call=`{metrics.get('p50_call_ms', '—')}`ms; "
+        f"p90_call=`{metrics.get('p90_call_ms', '—')}`ms; "
+        f"p50_post=`{metrics.get('p50_post_ms', '—')}`ms; "
+        f"p50_queue=`{metrics.get('p50_queue_ms', '—')}`ms |\n"
+    )
+    out_lines.append("\n")
+
+    hist = list(ld.get("history") or [])
+    if hist:
+        out_lines.append("**Ações automáticas recentes (latência)**\n\n")
+        out_lines.append("| Quando (UTC) | Ação | Causa | Streak |\n|---|---|---|---:|\n")
+        for it in hist[-10:]:
+            if not isinstance(it, dict):
+                continue
+            ts = str(it.get("ts_utc") or "—")
+            action = str(it.get("action") or "—")
+            c0 = str(it.get("cause") or "—")
+            stv = it.get("streak") if it.get("streak") is not None else it.get("pass_streak")
+            out_lines.append(f"| `{ts}` | `{action}` | `{c0}` | `{stv if stv is not None else '—'}` |\n")
+        out_lines.append("\n")
 
 @dataclass
 class DailyReportCfg:
@@ -3611,6 +3819,92 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- Reduzir `STALE_QUEUE_WAIT` (fila/concurrency) para não operar atrasado.\n\n"
         )
 
+    # Árvore de causas v2 (acionável): Sintoma -> Causa -> Evidência -> Ação -> Resultado esperado -> Status D+1
+    try:
+        s0.append("\n**Árvore de causas v2 (operacional)**\n\n")
+        s0.append("| Sintoma | Causa provável | Evidência do dia | Ação aplicada/recomendada | Resultado esperado | Status D+1 |\n")
+        s0.append("|---|---|---|---|---|---|\n")
+
+        # 1) Latência alta sustentada (p90 call acima do alvo)
+        lat_fail = (p90_call_24h is not None and int(p90_call_24h) > int(thr_p90_ms))
+        if lat_fail:
+            if p50_queue_24h is not None and int(p50_queue_24h) >= 700:
+                lat_cause = "Backlog/fila no executor (workers/concurrency/burst no bridge)"
+                lat_action = (
+                    "Aumentar `EXECUTOR_WORKERS`, reduzir burst (`BRIDGE_MAX_PER_CYCLE`/`BRIDGE_POLL_SEC`) e "
+                    "validar queda de `queue_delay_ms` na janela seguinte."
+                )
+            elif (p50_post_24h is not None) and int(p50_post_24h) >= 2000:
+                lat_cause = "Submit/POST lento (UI/anti-bot/sessão)"
+                lat_action = (
+                    "Reforçar estabilidade de sessão (login/cookie), revisar timeout/retries e "
+                    "monitorar `post_ms` no health monitor."
+                )
+            else:
+                lat_cause = "Causa mista (fila + submit + ambiente)"
+                lat_action = (
+                    "Executar diagnóstico por componente (queue/post/overhead), depois ajustar "
+                    "thresholds e capacidade do executor."
+                )
+            lat_ev = (
+                f"p90_call_24h={_fmt_num(p90_call_24h,0)}ms (alvo≤{int(thr_p90_ms)}), "
+                f"p50_queue_24h={_fmt_num(p50_queue_24h,0)}ms, p50_post_24h={_fmt_num(p50_post_24h,0)}ms"
+            )
+            s0.append(
+                f"| Latência p90 alta | {lat_cause} | {lat_ev} | {lat_action} | "
+                "p50<5s e p90<8s sustentados | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| Latência p90 controlada | — | p90_call_24h={_fmt_num(p90_call_24h,0)}ms | "
+                "Manter tuning atual e monitoramento | Manter p90<=8s | Fechado |\n"
+            )
+
+        # 2) Sistema vivo porém sem operar (audit alto, bridge sem fluxo)
+        bridge_seen = _safe_int_default((hm_state or {}).get("last_bridge_seen_total"), 0)
+        bridge_exec = _safe_int_default((hm_state or {}).get("last_bridge_executed_total"), 0)
+        bridge_aud = _safe_int_default((hm_state or {}).get("last_bridge_audits_n"), 0)
+        bridge_issue = bool(bridge_aud >= 80 and bridge_seen <= 0)
+        if bridge_issue:
+            s0.append(
+                "| Audit com volume e bridge sem fluxo | Gate excessivo (policy/filtros) ou bridge sem varredura efetiva | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Revisar `wf_policy_current`/filtros e validar `executor_bridge_seen_keys`; autopilot pode pausar bridge para forçar ação humana | "
+                "Retomar seen/executed > 0 com mesma janela de auditoria | Aberto |\n"
+            )
+        else:
+            s0.append(
+                "| Fluxo bridge->executor normal | — | "
+                f"audits_n={bridge_aud}, seen={bridge_seen}, executed={bridge_exec} | "
+                "Sem ação corretiva | Manter seen/executed coerente com audits | Fechado |\n"
+            )
+
+        # 3) Saturação de PMM/WS -> queda de conversão
+        if not chk_pmms:
+            s0.append(
+                "| Erro `No PMMs received` elevado | Timeout curto/WS instável/sessão degradada | "
+                f"no_pmms={int(err_pmms)} (24h) | Ajustar timeout/min_wait e estabilizar sessão WS; auditar ws_age nos eventos de erro | "
+                "Reduzir `No PMMs` para 0 (ou próximo de 0) | Aberto |\n"
+            )
+        else:
+            s0.append(
+                f"| PMM/WS estável | — | no_pmms={int(err_pmms)} (24h) | "
+                "Sem ação corretiva | Manter ocorrência baixa/zero | Fechado |\n"
+            )
+
+        # 4) Excesso de alertas Telegram
+        tele_min_interval = _safe_int_default(os.getenv("OPS_TELEGRAM_ALERT_MIN_INTERVAL_SEC"), 600)
+        s0.append(
+            "| Excesso de alertas Telegram | Repetição de assinatura sem dedup/rate-limit | "
+            f"anti_flood ativo (min_interval={tele_min_interval}s) | "
+            "Manter dedup por assinatura e envio forçado só em escalada | "
+            "Alertas relevantes, sem flood | Acompanhar |\n"
+        )
+
+        s0.append("\n")
+    except Exception:
+        pass
+
     # leitura executiva (heurística): onde atacar primeiro
     s0.append(
         "\n**Conclusões operacionais (prioridades)**\n\n"
@@ -3618,6 +3912,23 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
         "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
     )
+    _append_operational_action_plan_section(
+        s0,
+        p50_call_24h=p50_call_24h,
+        p90_call_24h=p90_call_24h,
+        p50_post_24h=p50_post_24h if "p50_post_24h" in locals() else None,
+        p50_queue_24h=p50_queue_24h,
+        gaps15=gaps15,
+        err_pmms=int(err_pmms),
+        err_open=int(err_open),
+        api_failed_pct=api_failed_pct,
+        stale_pct=stale_pct,
+    )
+    try:
+        hm_state_path = Path(str(os.getenv("OPS_AUTOPILOT_STATE_FILE", "logs/ops_autopilot_state.json"))).expanduser()
+        _append_latency_feedback_loop_section(s0, state_path=hm_state_path)
+    except Exception:
+        pass
 
     # ------------------------------------------------------------
     # Carteira (active_keys): delta vs policy anterior + marginais OOS por key
