@@ -14,6 +14,8 @@ Endpoints:
 - GET  /history?limit=20
 - POST /approve
 - POST /reject
+- POST /query   (comandos shell read-only em allowlist)
+- POST /sql     (consulta SQL read-only)
 """
 
 from __future__ import annotations
@@ -444,6 +446,195 @@ def _run_action_command(cmd: List[str], *, timeout_sec: int) -> Tuple[int, str]:
     )
     out = str(p.stdout or "").strip()
     return int(p.returncode), out
+
+
+_READONLY_CMD_BLOCKLIST = {
+    "sudo",
+    "su",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "apt",
+    "apt-get",
+    "yum",
+    "dnf",
+    "apk",
+    "git",
+    "curl",
+    "wget",
+    "scp",
+    "rsync",
+    "mv",
+    "cp",
+    "rm",
+    "touch",
+    "tee",
+    "chmod",
+    "chown",
+    "kill",
+    "pkill",
+    "killall",
+    "reboot",
+    "shutdown",
+}
+
+_READONLY_CMD_ALLOWLIST = {
+    "journalctl",
+    "systemctl",
+    "tail",
+    "head",
+    "ls",
+    "pwd",
+    "date",
+    "uptime",
+    "df",
+    "free",
+    "ps",
+    "ss",
+    "ip",
+    "rg",
+    "wc",
+    "cut",
+    "sed",
+    "awk",
+}
+
+_SENSITIVE_ARG_SNIPPETS = (
+    ".env",
+    ".ssh",
+    "id_rsa",
+    "authorized_keys",
+    "/etc/shadow",
+)
+
+_SQL_WRITE_RE = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|vacuum|analyze|copy|call|do|merge|replace)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_query_argv(body: Dict[str, Any]) -> Tuple[Optional[List[str]], str]:
+    argv_raw = body.get("argv")
+    cmd_raw = body.get("command")
+    argv: List[str] = []
+    if isinstance(argv_raw, list) and argv_raw:
+        argv = [str(x) for x in argv_raw if str(x).strip()]
+    elif isinstance(cmd_raw, str) and cmd_raw.strip():
+        try:
+            argv = shlex.split(cmd_raw)
+        except Exception:
+            return None, "command inválido (falha no parser)"
+    else:
+        return None, "informe 'command' (string) ou 'argv' (lista)"
+    if not argv:
+        return None, "comando vazio"
+    if len(argv) > 64:
+        return None, "comando muito longo"
+    if any(len(str(x)) > 800 for x in argv):
+        return None, "argumento muito longo"
+    return argv, ""
+
+
+def _validate_readonly_command(argv: List[str]) -> Tuple[bool, str]:
+    exe = str(argv[0] or "").strip()
+    exe_l = exe.lower()
+    if (not exe_l) or (exe_l in _READONLY_CMD_BLOCKLIST):
+        return False, f"comando bloqueado: {exe}"
+    if exe_l not in _READONLY_CMD_ALLOWLIST:
+        return False, f"comando fora da allowlist read-only: {exe}"
+
+    # Guardrails específicos por comando.
+    rest = [str(x) for x in argv[1:]]
+    rest_l = [x.lower() for x in rest]
+    if exe_l == "systemctl":
+        if not rest:
+            return False, "systemctl requer subcomando"
+        sub = rest_l[0]
+        if sub not in {"status", "is-active", "is-failed", "show", "list-units"}:
+            return False, f"systemctl subcomando não permitido: {rest[0]}"
+    if exe_l == "journalctl":
+        forbidden_prefixes = ("--vacuum", "--rotate")
+        for arg in rest_l:
+            if arg.startswith(forbidden_prefixes):
+                return False, f"journalctl opção não permitida: {arg}"
+
+    # Bloqueia leitura de arquivos sensíveis.
+    for arg in rest_l:
+        for snip in _SENSITIVE_ARG_SNIPPETS:
+            if snip in arg:
+                return False, f"argumento sensível bloqueado: {arg}"
+    return True, ""
+
+
+def _run_readonly_query(argv: List[str], *, timeout_sec: int, max_output_chars: int) -> Tuple[int, str]:
+    p = subprocess.run(
+        argv,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=max(3, int(timeout_sec)),
+    )
+    out = str(p.stdout or "")
+    limit = max(500, int(max_output_chars))
+    if len(out) > limit:
+        out = out[:limit] + f"\n... [truncado em {limit} chars]"
+    return int(p.returncode), out
+
+
+def _normalize_sql_query(raw_query: Any) -> Tuple[Optional[str], str]:
+    if not isinstance(raw_query, str):
+        return None, "query deve ser string"
+    q = str(raw_query or "").strip()
+    if not q:
+        return None, "query vazia"
+    # Remove ; final para facilitar wrappers.
+    while q.endswith(";"):
+        q = q[:-1].rstrip()
+    if not q:
+        return None, "query vazia"
+    if ";" in q:
+        return None, "múltiplas instruções não permitidas"
+    q_l = q.lower()
+    if not (q_l.startswith("select ") or q_l.startswith("with ")):
+        return None, "somente SELECT/WITH read-only"
+    if _SQL_WRITE_RE.search(q):
+        return None, "query contém palavra-chave de escrita/bloqueada"
+    return q, ""
+
+
+def _jsonify_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+async def _run_readonly_sql(query: str, *, max_rows: int) -> Tuple[List[Dict[str, Any]], bool]:
+    max_rows = max(1, int(max_rows))
+    wrapped = f"SELECT * FROM ({query}) __ops_q LIMIT {max_rows + 1}"
+    db = Database()
+    await db.connect()
+    try:
+        async with db.async_session() as s:
+            r = await s.execute(text(wrapped))
+            fetched = r.fetchall() or []
+        rows: List[Dict[str, Any]] = []
+        truncated = len(fetched) > max_rows
+        for row in fetched[:max_rows]:
+            item = dict(row._mapping)
+            rows.append({str(k): _jsonify_value(v) for k, v in item.items()})
+        return rows, truncated
+    finally:
+        await db.close()
 
 
 def _openai_enrich(diag: Dict[str, Any]) -> Dict[str, Any]:
@@ -972,6 +1163,68 @@ class CopilotApiHandler(BaseHTTPRequestHandler):
         path = str(parsed.path or "")
         body = self._read_json_body()
         actor = str(body.get("actor") or "api")
+
+        if path == "/query":
+            if not _env_bool("OPS_AI_QUERY_ENABLE", "1"):
+                self._write_json(403, {"ok": False, "error": "query_disabled"})
+                return
+            argv, err = _normalize_query_argv(body)
+            if argv is None:
+                self._write_json(400, {"ok": False, "error": err})
+                return
+            ok_cmd, reason = _validate_readonly_command(argv)
+            if not ok_cmd:
+                self._write_json(403, {"ok": False, "error": reason, "argv": argv})
+                return
+            timeout = max(3, min(120, _safe_int(body.get("timeout_sec"), _safe_int(os.getenv("OPS_AI_QUERY_TIMEOUT_SEC", "30"), 30))))
+            out_limit = max(500, min(200_000, _safe_int(body.get("max_output_chars"), _safe_int(os.getenv("OPS_AI_QUERY_MAX_OUTPUT_CHARS", "12000"), 12000))))
+            try:
+                rc, out = _run_readonly_query(argv, timeout_sec=timeout, max_output_chars=out_limit)
+                self._write_json(
+                    200,
+                    {
+                        "ok": True,
+                        "argv": argv,
+                        "exit_code": int(rc),
+                        "output": out,
+                        "timeout_sec": timeout,
+                        "max_output_chars": out_limit,
+                    },
+                )
+                return
+            except subprocess.TimeoutExpired:
+                self._write_json(408, {"ok": False, "error": "timeout", "argv": argv})
+                return
+            except Exception as e:
+                self._write_json(500, {"ok": False, "error": str(e)[:240], "argv": argv})
+                return
+
+        if path == "/sql":
+            if not _env_bool("OPS_AI_SQL_ENABLE", "1"):
+                self._write_json(403, {"ok": False, "error": "sql_disabled"})
+                return
+            q, err = _normalize_sql_query(body.get("query"))
+            if q is None:
+                self._write_json(400, {"ok": False, "error": err})
+                return
+            max_rows = max(1, min(5000, _safe_int(body.get("max_rows"), _safe_int(os.getenv("OPS_AI_SQL_MAX_ROWS", "500"), 500))))
+            try:
+                rows, truncated = asyncio.run(_run_readonly_sql(q, max_rows=max_rows))
+                self._write_json(
+                    200,
+                    {
+                        "ok": True,
+                        "query": q,
+                        "row_count": len(rows),
+                        "truncated": bool(truncated),
+                        "max_rows": max_rows,
+                        "rows": rows,
+                    },
+                )
+                return
+            except Exception as e:
+                self._write_json(500, {"ok": False, "error": str(e)[:240]})
+                return
 
         if path == "/approve":
             pid = str(body.get("id") or "").strip()
