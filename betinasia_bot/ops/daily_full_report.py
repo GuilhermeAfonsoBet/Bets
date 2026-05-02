@@ -447,6 +447,149 @@ def _summarize_event_pnls(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def _event_tail_risk_metrics(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Métricas simples de risco de cauda por jogo (event_id), usando P&L agregado por jogo.
+    Retorna:
+      - p5_pnl_per_game: percentil 5% do P&L por jogo
+      - cvar5_pnl_per_game: média dos piores 5% jogos (ES/CVaR proxy)
+      - worst_game_pnl: pior jogo
+    """
+    out: Dict[str, Any] = {
+        "games_n": 0,
+        "p5_pnl_per_game": None,
+        "cvar5_pnl_per_game": None,
+        "worst_game_pnl": None,
+    }
+    try:
+        pnls = [float(v.get("pnl_sum") or 0.0) for v in (ev_map or {}).values() if isinstance(v, dict)]
+    except Exception:
+        pnls = []
+    if not pnls:
+        return out
+    xs = sorted(pnls)
+    n = len(xs)
+    out["games_n"] = int(n)
+    try:
+        q_idx = int(max(0, min(n - 1, math.floor((n - 1) * 0.05))))
+        qv = float(xs[q_idx])
+        out["p5_pnl_per_game"] = qv
+        tail = [x for x in xs if x <= qv]
+        if not tail:
+            tail = [xs[0]]
+        out["cvar5_pnl_per_game"] = float(sum(tail) / float(len(tail)))
+        out["worst_game_pnl"] = float(xs[0])
+    except Exception:
+        pass
+    return out
+
+
+def _top_event_exposures(ev_map: Dict[str, Dict[str, Any]], *, top_n: int = 5) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    rows: List[Tuple[str, float, float, str]] = []
+    for ev_id, rec in (ev_map or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            st = float(rec.get("stake_est_sum") or 0.0)
+            pnl = float(rec.get("pnl_sum") or 0.0)
+        except Exception:
+            continue
+        ev_name = str(rec.get("event_name") or "").strip()
+        rows.append((str(ev_id), st, pnl, ev_name))
+    rows.sort(key=lambda x: abs(float(x[1])), reverse=True)
+    total_abs = float(sum(abs(float(x[1])) for x in rows)) if rows else 0.0
+    for ev_id, st, pnl, ev_name in rows[: max(1, int(top_n))]:
+        share = (abs(float(st)) / total_abs * 100.0) if total_abs > 0 else None
+        out.append(
+            {
+                "event_id": ev_id,
+                "event_name": ev_name,
+                "stake_est_sum": float(st),
+                "pnl_sum": float(pnl),
+                "share_pct": share,
+            }
+        )
+    return out
+
+
+def _order_tail_risk_by_bucket(rows: List[Dict[str, Any]], *, top_n: int = 6) -> Dict[str, Any]:
+    """
+    Risco de cauda por bucket operacional (lado×regime), usando ordens com accounting.
+    rows: itens com {side, regime, pnl, exposure}.
+    """
+    out: Dict[str, Any] = {"by_bucket": [], "top_event_exposure": []}
+    if not rows:
+        return out
+
+    by: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        side = str(r.get("side") or "NA")
+        regime = str(r.get("regime") or "NA")
+        key = f"{side}_{regime}"
+        by[key].append(r)
+
+    # métrica por bucket (ordens)
+    metrics: List[Dict[str, Any]] = []
+    for key, sub in by.items():
+        pnls: List[float] = []
+        exps: List[float] = []
+        for r in sub:
+            try:
+                pnl = float(r.get("pnl") or 0.0)
+                exp = float(r.get("exposure") or 0.0)
+            except Exception:
+                continue
+            pnls.append(pnl)
+            exps.append(exp)
+        if not pnls:
+            continue
+        xs = sorted(pnls)
+        n = len(xs)
+        q_idx = int(max(0, min(n - 1, math.floor((n - 1) * 0.05))))
+        qv = float(xs[q_idx])
+        tail = [x for x in xs if x <= qv] or [xs[0]]
+        cvar5 = float(sum(tail) / float(len(tail)))
+        worst = float(xs[0])
+        exp_sum = float(sum(exps)) if exps else 0.0
+        metrics.append(
+            {
+                "bucket": key,
+                "n_orders": int(n),
+                "exp_sum": exp_sum,
+                "p5": qv,
+                "cvar5": cvar5,
+                "worst": worst,
+            }
+        )
+    metrics.sort(key=lambda d: float(d.get("cvar5") or 0.0))
+    out["by_bucket"] = metrics
+
+    # top jogos por exposição, por bucket (proxy de concentração em score-state)
+    top_rows: List[Dict[str, Any]] = []
+    for key, sub in by.items():
+        ev_agg: Dict[str, Dict[str, Any]] = {}
+        for r in sub:
+            ev_id = str(r.get("event_id") or "").strip()
+            if not ev_id:
+                continue
+            try:
+                st = float(r.get("exposure") or 0.0)
+                pnl = float(r.get("pnl") or 0.0)
+            except Exception:
+                continue
+            blk = ev_agg.setdefault(ev_id, {"event_id": ev_id, "stake_est_sum": 0.0, "pnl_sum": 0.0, "event_name": str(r.get("event_name") or "")})
+            blk["stake_est_sum"] = float(blk.get("stake_est_sum") or 0.0) + float(st)
+            blk["pnl_sum"] = float(blk.get("pnl_sum") or 0.0) + float(pnl)
+        tops = _top_event_exposures(ev_agg, top_n=max(1, int(top_n)))
+        for t in tops:
+            top_rows.append({"bucket": key, **t})
+    out["top_event_exposure"] = top_rows
+    return out
+
+
 def _safe_int(x: Any) -> Optional[int]:
     try:
         if x is None:
@@ -4900,6 +5043,35 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         f"{_fmt_num(summ.get('stake_est_sum'),2)} | {_fmt_pct((float(summ.get('stake_conc_max_share'))*100.0) if summ.get('stake_conc_max_share') is not None else None,2)} |\n"
                     )
                 s1.append("\n")
+                s1.append("**Risco de cauda por jogo (event_id; accounting)**\n\n")
+                s1.append(
+                    "| Dia | #jogos | P5 P&L/jogo | CVaR5 P&L/jogo (média piores 5%) | Pior jogo |\n"
+                )
+                s1.append("|---|---:|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    tail = _event_tail_risk_metrics(ev_map)
+                    s1.append(
+                        f"| {dayk} | {int(tail.get('games_n') or 0)} | {_fmt_num(tail.get('p5_pnl_per_game'),2)} | {_fmt_num(tail.get('cvar5_pnl_per_game'),2)} | {_fmt_num(tail.get('worst_game_pnl'),2)} |\n"
+                    )
+                s1.append("\n")
+                s1.append("**Top jogos por exposição (proxy) — concentração operacional**\n\n")
+                s1.append("| Dia | event_id | event_name | Exposição proxy (∑-amount) | Share da exposição do dia | P&L por jogo |\n")
+                s1.append("|---|---|---|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    tops = _top_event_exposures(ev_map, top_n=5)
+                    for t in tops:
+                        s1.append(
+                            f"| {dayk} | {t.get('event_id')} | {str(t.get('event_name') or '')[:48]} | {_fmt_num(t.get('stake_est_sum'),2)} | {_fmt_pct(t.get('share_pct'),2)} | {_fmt_num(t.get('pnl_sum'),2)} |\n"
+                        )
+                s1.append("\n")
             except Exception:
                 pass
 
@@ -4989,6 +5161,60 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"{_fmt_num(plp,2)} | {_fmt_pct(r_lp)} | {_fmt_num(pli,2)} | {_fmt_pct(r_li)} |\n"
                 )
             s1.append("\n")
+            # Risco de cauda por bucket operacional (ordens com accounting)
+            try:
+                recs: List[Dict[str, Any]] = []
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                    bt = ex.get("pnl_placar_by_type") if isinstance(ex.get("pnl_placar_by_type"), dict) else {}
+                    # usamos o bloco por tipo para construir uma proxy de ordens por bucket
+                    # (cada linha do bucket agrega ordens cobertas).
+                    for k, side, regime in (
+                        ("Back_Pre", "Back", "Pre"),
+                        ("Back_In", "Back", "In"),
+                        ("Lay_Pre", "Lay", "Pre"),
+                        ("Lay_In", "Lay", "In"),
+                    ):
+                        d = bt.get(k) if isinstance(bt.get(k), dict) else {}
+                        if not d:
+                            continue
+                        pnl = _safe_float(d.get("pnl"))
+                        exp = _safe_float(d.get("exposure"))
+                        n = _safe_int(d.get("n"))
+                        if pnl is None or exp is None or n is None or int(n) <= 0:
+                            continue
+                        # replica n registros sintéticos para permitir quantis/cauda por bucket;
+                        # cada item recebe média por ordem (aproximação operacional).
+                        pnlo = float(pnl) / float(max(1, int(n)))
+                        expo = float(exp) / float(max(1, int(n)))
+                        for _ in range(int(max(1, int(n)))):
+                            recs.append(
+                                {
+                                    "day": dayk,
+                                    "side": side,
+                                    "regime": regime,
+                                    "pnl": pnlo,
+                                    "exposure": expo,
+                                }
+                            )
+                tail_bucket = _order_tail_risk_by_bucket(recs, top_n=5)
+                byb = tail_bucket.get("by_bucket") if isinstance(tail_bucket.get("by_bucket"), list) else []
+                if byb:
+                    s1.append("**Risco de cauda por bucket operacional (proxy por ordem coberta)**\n\n")
+                    s1.append("| Bucket | n_ordens | Exposição (∑) | P5 P&L/ordem | CVaR5 P&L/ordem | Pior ordem |\n")
+                    s1.append("|---|---:|---:|---:|---:|---:|\n")
+                    for r in byb:
+                        if not isinstance(r, dict):
+                            continue
+                        s1.append(
+                            f"| {r.get('bucket')} | {int(r.get('n_orders') or 0)} | {_fmt_num(r.get('exp_sum'),2)} | {_fmt_num(r.get('p5'),2)} | {_fmt_num(r.get('cvar5'),2)} | {_fmt_num(r.get('worst'),2)} |\n"
+                        )
+                    s1.append("\n")
+            except Exception:
+                pass
         except Exception:
             pass
 
