@@ -1173,30 +1173,42 @@ def _append_backpre_fast_slow_sections(
     out_lines.append("\n")
 
     # Robustez: delta fast-slow
+    out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
     try:
         fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
         slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
-        if len(fast) >= min_n and len(slow) >= min_n:
+        fast_roi = [float(r.get("roi")) for r in fast if r.get("roi") is not None]
+        slow_roi = [float(r.get("roi")) for r in slow if r.get("roi") is not None]
+        out_lines.append(f"- Amostra líquida: fast=`{len(fast_roi)}` | slow=`{len(slow_roi)}` | min_n=`{min_n}`.\n")
+        if len(fast_roi) >= min_n and len(slow_roi) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
             rnd = random.Random(123)
             deltas: List[float] = []
-            nf = len(fast)
-            ns = len(slow)
+            nf = len(fast_roi)
+            ns = len(slow_roi)
             for _ in range(int(max(300, n_boot))):
                 mf = 0.0
                 ms = 0.0
                 for _j in range(nf):
-                    mf += float(fast[rnd.randrange(0, nf)].get("roi"))
+                    mf += float(fast_roi[rnd.randrange(0, nf)])
                 for _j in range(ns):
-                    ms += float(slow[rnd.randrange(0, ns)].get("roi"))
+                    ms += float(slow_roi[rnd.randrange(0, ns)])
                 deltas.append((mf / float(nf)) - (ms / float(ns)))
             deltas.sort()
-            lo = deltas[int(round(0.05 * (len(deltas) - 1)))]
-            hi = deltas[int(round(0.95 * (len(deltas) - 1)))]
-            out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
-            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo)} .. {_fmt_pct(hi)}` (min_n={min_n}).\n\n")
-    except Exception:
-        pass
+            lo90 = deltas[int(round(0.05 * (len(deltas) - 1)))]
+            hi90 = deltas[int(round(0.95 * (len(deltas) - 1)))]
+            lo95 = deltas[int(round(0.025 * (len(deltas) - 1)))]
+            hi95 = deltas[int(round(0.975 * (len(deltas) - 1)))]
+            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo90)} .. {_fmt_pct(hi90)}`.\n")
+            out_lines.append(f"- Delta (fast − slow) IC95 bootstrap: `{_fmt_pct(lo95)} .. {_fmt_pct(hi95)}`.\n\n")
+        else:
+            out_lines.append(
+                f"- _N insuficiente para inferência bootstrap (fast={len(fast_roi)}, slow={len(slow_roi)}, min_n={min_n})._\n\n"
+            )
+    except Exception as e:
+        out_lines.append(
+            f"- _Erro ao montar seção fast vs slow: `{type(e).__name__}: {str(e)[:180]}`._\n\n"
+        )
 
 
 def _acct_amount_by_order_day_from_balance_csv(
