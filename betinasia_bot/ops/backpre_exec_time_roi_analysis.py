@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,25 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _normalize_order_id(x: Any) -> Optional[str]:
+    s = str(x or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return s
+    # Casos comuns em CSV/API: "12345.0", "#12345", "order=12345"
+    try:
+        f = float(s.replace(",", "."))
+        if f >= 0 and abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+    except Exception:
+        pass
+    m = re.search(r"(\d{4,})", s)
+    if m:
+        return str(m.group(1))
+    return None
 
 
 def _parse_dt_any(s: str) -> Optional[datetime]:
@@ -37,21 +57,21 @@ def _parse_dt_any(s: str) -> Optional[datetime]:
 def _extract_order_id_from_raw(raw: Any) -> Optional[str]:
     try:
         if isinstance(raw, dict):
-            oid = str(raw.get("order_id") or "").strip()
-            if oid.isdigit():
+            oid = _normalize_order_id(raw.get("order_id"))
+            if oid:
                 return oid
             sent = raw.get("sent")
             if isinstance(sent, dict):
                 for k in ("id", "order_id", "orderId", "uuid", "uid"):
-                    v = sent.get(k)
-                    if v is not None and str(v).strip().isdigit():
-                        return str(v).strip()
+                    oid = _normalize_order_id(sent.get(k))
+                    if oid:
+                        return oid
             data = raw.get("data")
             if isinstance(data, dict):
                 for k in ("id", "order_id", "orderId", "uuid", "uid"):
-                    v = data.get(k)
-                    if v is not None and str(v).strip().isdigit():
-                        return str(v).strip()
+                    oid = _normalize_order_id(data.get(k))
+                    if oid:
+                        return oid
         return None
     except Exception:
         return None
@@ -137,8 +157,8 @@ def _load_pnl_by_order(balance_csv: Path, *, since_day: str) -> Dict[str, float]
         for row in r:
             if not isinstance(row, dict):
                 continue
-            oid = str(row.get(oid_col) or "").strip()
-            if not oid or not oid.isdigit():
+            oid = _normalize_order_id(row.get(oid_col))
+            if not oid:
                 continue
             dt = _parse_dt_any(str(row.get(dt_col) or ""))
             if dt is None or str(dt.date().isoformat()) < str(since_day):
@@ -233,10 +253,12 @@ def main() -> int:
     pnl_by_oid = _load_pnl_by_order(Path(str(args.balance_csv)), since_day=str(args.since_day))
 
     rows: List[Dict[str, float]] = []
+    n_join = 0
     for oid, em in exec_rows.items():
         pnl = _safe_float_or_none(pnl_by_oid.get(str(oid)))
         if pnl is None:
             continue
+        n_join += 1
         stake = float(em.stake)
         if stake <= 0:
             continue
@@ -260,7 +282,16 @@ def main() -> int:
     md.append(f"- since_day (UTC): `{args.since_day}`\n")
     md.append(f"- source exec_jsonl: `{args.exec_jsonl}`\n")
     md.append(f"- source balance_csv: `{args.balance_csv}`\n")
+    md.append(f"- n_exec_orders (Back LIVE_OK): `{len(exec_rows)}`\n")
+    md.append(f"- n_orders no balance (após filtro de data): `{len(pnl_by_oid)}`\n")
+    md.append(f"- n_orders com join exato: `{n_join}`\n")
     md.append(f"- n_total com join por order_id: `{len(rows)}`\n\n")
+    if n_join == 0:
+        ex_keys = list(exec_rows.keys())[:5]
+        ac_keys = list(pnl_by_oid.keys())[:5]
+        md.append("- _Diagnóstico_: join zerado. Verifique se `order_id` do balance CSV corresponde ao `raw.sent.id`/`raw.order_id` do executor.\n")
+        md.append(f"- Exemplos order_id executor: `{ex_keys}`\n")
+        md.append(f"- Exemplos order_id balance: `{ac_keys}`\n\n")
 
     md.append("| Grupo | n | stake_sum | ROI mean | ROIw |\n")
     md.append("|---|---:|---:|---:|---:|\n")
