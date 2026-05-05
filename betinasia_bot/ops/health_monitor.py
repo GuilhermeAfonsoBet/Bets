@@ -1069,6 +1069,43 @@ def _alert_keys(results: List[CheckResult], *, autopilot_actions: List[str]) -> 
     return uniq
 
 
+def _downgrade_audit_telemetry_false_fail(
+    results: List[CheckResult],
+    *,
+    telemetry_max_age_sec: int,
+    audit_db_age_sec: Optional[int],
+    resolved_audit_service: str,
+) -> List[CheckResult]:
+    """
+    Evita falso positivo de FAIL quando:
+    - arquivo de telemetria de audit está stale/mismatch
+    - mas DB mostra auditoria fresca
+    - e serviço de audit efetivo está rodando
+    """
+    out: List[CheckResult] = []
+    db_fresh = (audit_db_age_sec is not None) and (int(audit_db_age_sec) <= int(telemetry_max_age_sec))
+    svc_running = _service_is_running(str(resolved_audit_service or ""))
+    for r in (results or []):
+        msg = str(r.message or "")
+        low = msg.lower()
+        if (
+            str(r.level) == "FAIL"
+            and low.startswith("audit-api: telemetria")
+            and db_fresh
+            and svc_running
+        ):
+            out.append(
+                CheckResult(
+                    "WARN",
+                    msg
+                    + f" (downgrade: DB audit fresco age={audit_db_age_sec}s e serviço ativo={resolved_audit_service}; possível mismatch de telemetry file)",
+                )
+            )
+            continue
+        out.append(r)
+    return out
+
+
 def _rate_limited(
     state: Dict[str, Any],
     service: str,
@@ -1301,6 +1338,12 @@ def main() -> int:
             restart_on_fail=bool(args.restart_on_fail) and (not bool(args.autopilot)),
         )
     )
+    try:
+        resolved_audit = str(meta.get("resolved_audit_service") or "").strip()
+        if resolved_audit:
+            args.audit_service = resolved_audit
+    except Exception:
+        pass
 
     # Estado (para detectar RECOVERY e evitar spam)
     state_path = Path(str(args.state_file))
@@ -1310,6 +1353,24 @@ def main() -> int:
     prev_non_ok_utc = str(state.get("last_non_ok_utc") or "")
     prev_non_ok_lines = list(state.get("last_non_ok_lines") or [])
     recovered = (prev_code > 0 and int(code) == 0)
+
+    # Downgrade inteligente de falso FAIL de telemetria do audit quando DB+service estão saudáveis.
+    try:
+        a_audit_sec = None
+        db_meta = meta.get("db") if isinstance(meta.get("db"), dict) else {}
+        last_audit_raw = db_meta.get("last_audit_utc")
+        last_audit_dt = _parse_iso_ts(last_audit_raw)
+        if last_audit_dt is not None:
+            a_audit_sec = int((now - last_audit_dt).total_seconds())
+        results = _downgrade_audit_telemetry_false_fail(
+            results,
+            telemetry_max_age_sec=int(args.telemetry_max_age_sec),
+            audit_db_age_sec=a_audit_sec,
+            resolved_audit_service=str(args.audit_service or ""),
+        )
+        code = _exit_code_from_results(results)
+    except Exception:
+        pass
 
     # AUTO-PILOT (seguro): restarts com rate limit/cooldown, após FAILs consecutivos
     now = _utcnow()
