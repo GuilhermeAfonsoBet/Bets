@@ -10,7 +10,7 @@ import statistics
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -4535,7 +4535,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Slippage × ROI (accounting; por order_id): compara com "Slippage × ROI" via placar (subamostra coberta).
+        # Slippage × ROI (accounting; por order_id): janela móvel + acumulada (pós-início).
         try:
             if acct_pnl_by_oid_total and exec_by_oid_back:
                 rows_all: list[dict] = []
@@ -4544,19 +4544,38 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 rows_all_post: list[dict] = []
                 rows_pre_post: list[dict] = []
                 rows_in_post: list[dict] = []
+                rows_all_since_post: list[dict] = []
+                rows_pre_since_post: list[dict] = []
+                rows_in_since_post: list[dict] = []
                 post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
+                win_min = None
+                win_max = None
+                win_days = None
+                try:
+                    if days_utc_exec:
+                        d0 = sorted(list(days_utc_exec))
+                        if d0:
+                            win_min = d0[0]
+                            win_max = d0[-1]
+                            try:
+                                win_days = (datetime.fromisoformat(win_max).date() - datetime.fromisoformat(win_min).date()).days + 1
+                            except Exception:
+                                win_days = len(d0)
+                except Exception:
+                    win_min = None
+                    win_max = None
+                    win_days = None
                 for oid, em in (exec_by_oid_back or {}).items():
                     if not isinstance(em, dict):
                         continue
                     created = em.get("created_at")
                     if not isinstance(created, datetime):
                         continue
-                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
-                        continue
                     pnl = acct_pnl_by_oid_total.get(str(oid))
                     if pnl is None:
                         continue
                     row = {"pnl": float(pnl), "exposure": em.get("exposure"), "slip_raw_pct": em.get("slip_raw_pct")}
+                    created_day = str(created.date().isoformat())
                     rows_all.append(row)
                     # classifica Pre/In via audit quando possível
                     try:
@@ -4566,11 +4585,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     except Exception:
                         is_in = False
                     (rows_in if is_in else rows_pre).append(row)
+                    # janela móvel (days_utc_exec)
+                    if (not days_utc_exec) or (created_day in days_utc_exec):
+                        rows_all_post.append(row)
+                        (rows_in_post if is_in else rows_pre_post).append(row)
                     # corte pós-início (por created_at UTC)
                     try:
-                        if post_start and str(created.date().isoformat()) >= post_start:
-                            rows_all_post.append(row)
-                            (rows_in_post if is_in else rows_pre_post).append(row)
+                        if post_start and created_day >= post_start:
+                            rows_all_since_post.append(row)
+                            (rows_in_since_post if is_in else rows_pre_since_post).append(row)
                     except Exception:
                         pass
 
@@ -4587,13 +4610,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         )
                     s1.append("\n")
 
-                _render(rows_all, title="Slippage × ROI (accounting; order_id) — Back (janela Execução)")
-                _render(rows_pre, title="Slippage × ROI (accounting; order_id) — Back Pre (janela Execução)")
-                _render(rows_in, title="Slippage × ROI (accounting; order_id) — Back In (janela Execução)")
-                if rows_all_post:
-                    _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (pós-início >= {post_start})")
-                    _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (pós-início >= {post_start})")
-                    _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (pós-início >= {post_start})")
+                # Janela móvel explícita
+                win_lbl = f"{win_min}..{win_max}" if (win_min and win_max) else "janela móvel"
+                if win_days is not None and win_days > 0:
+                    win_lbl = f"{win_lbl} ({int(win_days)} dias)"
+                _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (janela móvel: {win_lbl})")
+                _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (janela móvel: {win_lbl})")
+                _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (janela móvel: {win_lbl})")
+
+                # Acumulado fixo desde post_start (independente da janela móvel)
+                if rows_all_since_post:
+                    _render(rows_all_since_post, title=f"Slippage × ROI (accounting; order_id) — Back (acumulado pós-início >= {post_start})")
+                    _render(rows_pre_since_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (acumulado pós-início >= {post_start})")
+                    _render(rows_in_since_post, title=f"Slippage × ROI (accounting; order_id) — Back In (acumulado pós-início >= {post_start})")
         except Exception:
             pass
 
