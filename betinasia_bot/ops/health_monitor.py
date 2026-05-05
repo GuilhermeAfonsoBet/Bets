@@ -221,6 +221,25 @@ def _systemctl_show(service: str) -> Dict[str, str]:
     return out
 
 
+def _service_is_running(service: str) -> bool:
+    s = _systemctl_show(str(service or ""))
+    return s.get("ActiveState") == "active" and s.get("SubState") == "running"
+
+
+def _audit_service_back_alias(service: str) -> Optional[str]:
+    svc = str(service or "").strip()
+    if not svc:
+        return None
+    if svc.endswith(".service"):
+        base = svc[:-8]
+        if base.endswith("-back"):
+            return None
+        return f"{base}-back.service"
+    if svc.endswith("-back"):
+        return None
+    return f"{svc}-back"
+
+
 def _systemctl_restart(service: str) -> bool:
     try:
         # Se estivermos rodando como root (comum em systemd units sem User=),
@@ -336,6 +355,32 @@ async def _db_audit_friction(db: Database, since: datetime) -> Dict[str, Any]:
         r = await session.execute(q, {"since": since})
         row = r.fetchone()
         return dict(row._mapping) if row else {}
+
+
+async def _db_bridge_reason_counts(db: Database, since: datetime) -> Dict[str, int]:
+    q = text(
+        """
+        SELECT
+          COALESCE(
+            meta->>'reason',
+            CASE WHEN (meta->>'accepted')='true' THEN 'accepted' ELSE 'other' END
+          ) AS reason,
+          COUNT(*)::bigint AS n
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action='live:Back'
+        GROUP BY 1
+        """
+    )
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since})
+        rows = r.fetchall() or []
+    out: Dict[str, int] = {}
+    for row in rows:
+        m = dict(row._mapping)
+        k = str(m.get("reason") or "other")
+        out[k] = int(m.get("n") or 0)
+    return out
 
 
 async def run_checks(
