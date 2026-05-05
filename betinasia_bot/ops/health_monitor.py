@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -964,10 +965,30 @@ def _alert_signature(*, level: str, lines: List[str], pause_alert: bool, latency
         "level": str(level or ""),
         "pause_alert": bool(pause_alert),
         "latency_alert": bool(latency_alert),
-        "lines": list(lines or []),
+        # Ordenação estável evita assinatura diferente por variação de ordem
+        # quando o incidente é o mesmo.
+        "lines": sorted(list(lines or [])),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _normalize_alert_message_key(msg: str) -> str:
+    """
+    Normaliza mensagens para reduzir churn de assinatura causado por números
+    variáveis (idades, contagens, percentuais).
+    """
+    s = str(msg or "").strip().lower()
+    if not s:
+        return ""
+    # timestamps ISO e variantes
+    s = re.sub(r"\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+\-]\d{2}:?\d{2})?", "#ts", s)
+    # números inteiros/decimais com sinal opcional e % opcional
+    s = re.sub(r"(?<![a-z0-9])-?\d+(?:[.,]\d+)?%?", "#", s)
+    # unidades de tempo comuns
+    s = s.replace("#s", "#s").replace("#m", "#m").replace("#h", "#h")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120]
 
 
 def _telegram_should_send_non_ok(
@@ -976,6 +997,7 @@ def _telegram_should_send_non_ok(
     now: datetime,
     signature: str,
     cooldown_sec: int,
+    pause_alert: bool = False,
 ) -> Tuple[bool, int]:
     """
     Retorna (send_now, suppressed_count).
@@ -987,6 +1009,13 @@ def _telegram_should_send_non_ok(
     last_ts = _parse_iso_ts(tg.get("last_alert_utc"))
     suppressed = _safe_int(tg.get("suppressed_count"), 0)
     if signature != last_sig:
+        # Anti-flood forte: mesmo com assinatura nova, respeita intervalo mínimo
+        # para incidentes não-críticos (variações de mensagem numérica em timers curtos).
+        if (not pause_alert) and (last_ts is not None):
+            age = int((now - last_ts).total_seconds())
+            if age < int(max(0, cooldown_sec)):
+                tg["suppressed_count"] = suppressed + 1
+                return False, suppressed + 1
         tg["suppressed_count"] = 0
         return True, suppressed
     if last_ts is None:
@@ -1051,7 +1080,22 @@ def _alert_keys(results: List[CheckResult], *, autopilot_actions: List[str]) -> 
         if "taxa alta de falhas" in msg:
             keys.append("executor_fail_rate_high")
             continue
-        keys.append(msg[:90])
+        if msg.startswith("bridge throughput:"):
+            keys.append("bridge_throughput")
+            continue
+        if "sem eventos não-heartbeat no tail" in msg:
+            keys.append("executor_only_heartbeat_tail")
+            continue
+        if "amostra baixa p/ taxa de falhas" in msg:
+            keys.append("executor_fail_rate_low_sample")
+            continue
+        if "amostra baixa p/ latência" in msg:
+            keys.append("executor_latency_low_sample")
+            continue
+        if "check falhou (ignored)" in msg:
+            keys.append("executor_check_ignored")
+            continue
+        keys.append(_normalize_alert_message_key(msg))
     for a in autopilot_actions or []:
         al = str(a or "").lower()
         if "paused(stop) por latência fail" in al:
@@ -1624,6 +1668,7 @@ def main() -> int:
                     now=now,
                     signature=signature,
                     cooldown_sec=int(cd),
+                    pause_alert=bool(pause_alert),
                 )
                 if latency_alert and not pause_alert:
                     lat_last = _parse_iso_ts(state.setdefault("telegram", {}).get("last_latency_alert_utc"))
@@ -1631,11 +1676,12 @@ def main() -> int:
                         lat_age = int((now - lat_last).total_seconds())
                         if lat_age < int(max(0, lat_cd)):
                             send_now = False
+                # Força reenvio apenas depois do mínimo de cooldown base.
                 if not send_now and force_resend > 0:
                     last_alert_dt = _parse_iso_ts(state.setdefault("telegram", {}).get("last_alert_utc"))
                     if last_alert_dt is not None:
                         age = int((now - last_alert_dt).total_seconds())
-                        if age >= int(force_resend):
+                        if age >= max(int(force_resend), int(cd)):
                             send_now = True
                 if send_now:
                     if suppressed > 0:
