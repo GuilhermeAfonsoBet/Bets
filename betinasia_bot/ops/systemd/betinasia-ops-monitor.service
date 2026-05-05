@@ -11,5 +11,5 @@ EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
 # Para não poluir o status do systemd com "Failed to start" em WARN/FAIL,
 # marcamos 1/2 como "sucesso" para o unit (os detalhes ficam no journal + Telegram).
 SuccessExitStatus=1 2
-ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram; fi'
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30; fi'
 

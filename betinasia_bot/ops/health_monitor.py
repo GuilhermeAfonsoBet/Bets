@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -782,6 +783,133 @@ def _save_state(path: Path, state: Dict[str, Any]) -> None:
         pass
 
 
+def _telegram_send_role_allowed(*, is_autopilot: bool) -> bool:
+    """
+    Evita duplicidade de alertas quando monitor e autopilot rodam em paralelo.
+    OPS_TELEGRAM_ALERT_SOURCE:
+      - autopilot (default): só o run com --autopilot envia Telegram
+      - monitor: só o run sem --autopilot envia
+      - both: ambos podem enviar (legado)
+    """
+    mode = str(os.getenv("OPS_TELEGRAM_ALERT_SOURCE", "autopilot") or "autopilot").strip().lower()
+    if mode in ("both", "all"):
+        return True
+    if mode in ("monitor", "health"):
+        return not bool(is_autopilot)
+    # default: autopilot
+    return bool(is_autopilot)
+
+
+def _alert_signature(*, level: str, lines: List[str], pause_alert: bool, latency_alert: bool) -> str:
+    payload = {
+        "level": str(level or ""),
+        "pause_alert": bool(pause_alert),
+        "latency_alert": bool(latency_alert),
+        "lines": list(lines or []),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _telegram_should_send_non_ok(
+    state: Dict[str, Any],
+    *,
+    now: datetime,
+    signature: str,
+    cooldown_sec: int,
+) -> Tuple[bool, int]:
+    """
+    Retorna (send_now, suppressed_count).
+    - Envia imediatamente se assinatura mudou.
+    - Se assinatura igual, respeita cooldown.
+    """
+    tg = state.setdefault("telegram", {})
+    last_sig = str(tg.get("last_alert_signature") or "")
+    last_ts = _parse_iso_ts(tg.get("last_alert_utc"))
+    suppressed = _safe_int(tg.get("suppressed_count"), 0)
+    if signature != last_sig:
+        tg["suppressed_count"] = 0
+        return True, suppressed
+    if last_ts is None:
+        tg["suppressed_count"] = 0
+        return True, suppressed
+    age = int((now - last_ts).total_seconds())
+    if age >= int(max(0, cooldown_sec)):
+        tg["suppressed_count"] = 0
+        return True, suppressed
+    tg["suppressed_count"] = suppressed + 1
+    return False, suppressed + 1
+
+
+def _telegram_mark_sent(state: Dict[str, Any], *, now: datetime, signature: str) -> None:
+    tg = state.setdefault("telegram", {})
+    tg["last_alert_utc"] = now.isoformat()
+    tg["last_alert_signature"] = str(signature or "")
+    tg["suppressed_count"] = 0
+
+
+def _telegram_recovery_allowed(state: Dict[str, Any], *, now: datetime, cooldown_sec: int) -> bool:
+    tg = state.setdefault("telegram", {})
+    last_rec = _parse_iso_ts(tg.get("last_recovery_utc"))
+    if last_rec is None:
+        return True
+    age = int((now - last_rec).total_seconds())
+    return age >= int(max(0, cooldown_sec))
+
+
+def _telegram_mark_recovery(state: Dict[str, Any], *, now: datetime) -> None:
+    tg = state.setdefault("telegram", {})
+    tg["last_recovery_utc"] = now.isoformat()
+
+
+def _alert_keys(results: List[CheckResult], *, autopilot_actions: List[str]) -> List[str]:
+    keys: List[str] = []
+    for r in results or []:
+        if str(r.level) not in ("WARN", "FAIL"):
+            continue
+        msg = str(r.message or "").strip().lower()
+        if not msg:
+            continue
+        if "latência alta" in msg:
+            keys.append("latency_high")
+            continue
+        if ": fora do esperado (" in msg:
+            svc = msg.split(": fora do esperado", 1)[0].strip()
+            keys.append(f"service_down:{svc}")
+            continue
+        if "telemetria parada" in msg:
+            keys.append("telemetry_stale")
+            continue
+        if "fricção crítica" in msg:
+            keys.append("audit_friction_critical")
+            continue
+        if "fricção elevada" in msg:
+            keys.append("audit_friction_high")
+            continue
+        if "sem execução recente" in msg:
+            keys.append("executor_idle")
+            continue
+        if "taxa alta de falhas" in msg:
+            keys.append("executor_fail_rate_high")
+            continue
+        keys.append(msg[:90])
+    for a in autopilot_actions or []:
+        al = str(a or "").lower()
+        if "paused(stop) por latência fail" in al:
+            keys.append("autopilot_pause_bridges_latency")
+        elif "restart acionado" in al:
+            keys.append("autopilot_restart")
+    # ordem estável sem duplicatas
+    uniq: List[str] = []
+    seen = set()
+    for k in keys:
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(k)
+    return uniq
+
+
 def _rate_limited(
     state: Dict[str, Any],
     service: str,
@@ -968,6 +1096,11 @@ def main() -> int:
     ap.add_argument("--audit-telemetry", default=os.getenv("AUDIT_TELEMETRY_FILE", "logs/audit_api_telemetry.jsonl"))
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--telegram", action="store_true", help="Envia alerta no Telegram em WARN/FAIL")
+    ap.add_argument(
+        "--telegram-source",
+        default=os.getenv("OPS_TELEGRAM_SOURCE", ""),
+        help="Rótulo de origem do alerta (ex.: ops-autopilot, ops-monitor).",
+    )
     ap.add_argument(
         "--telegram-recovery",
         action="store_true",
@@ -1184,23 +1317,30 @@ def main() -> int:
     print(f"Exit code: {code}")
 
     should_send_recovery = bool(args.telegram_recovery) and recovered
-    if args.telegram and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
+    telegram_role_allowed = _telegram_send_role_allowed(is_autopilot=bool(args.autopilot))
+    if args.telegram and telegram_role_allowed and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
         if token and chat_id:
             if should_send_recovery:
-                lines = [f"OPS HEALTH (RECOVERY/OK) @ {meta.get('now_utc')}"]
-                # Inclui o último problema conhecido (para contexto)
-                if prev_non_ok > 0:
-                    prev_level = "FAIL" if prev_non_ok >= 2 else "WARN"
-                    lines.append(f"Anterior: {prev_level} @ {prev_non_ok_utc}")
-                    for ln in prev_non_ok_lines[:20]:
-                        lines.append(f"- {ln}")
-                if args.autopilot and autopilot_actions:
-                    lines.append("- Auto-pilot:")
-                    for a in autopilot_actions:
-                        lines.append(f"  - {a}")
-                _telegram_send(token, chat_id, "\n".join(lines))
+                rec_cd = _safe_int(os.getenv("OPS_TELEGRAM_RECOVERY_MIN_INTERVAL_SEC", "600"), 600)
+                if _telegram_recovery_allowed(state, now=now, cooldown_sec=int(rec_cd)):
+                    lines = [f"OPS HEALTH (RECOVERY/OK) @ {meta.get('now_utc')}"]
+                    src = str(args.telegram_source or "").strip()
+                    if src:
+                        lines.append(f"source={src}")
+                    # Inclui o último problema conhecido (para contexto)
+                    if prev_non_ok > 0:
+                        prev_level = "FAIL" if prev_non_ok >= 2 else "WARN"
+                        lines.append(f"Anterior: {prev_level} @ {prev_non_ok_utc}")
+                        for ln in prev_non_ok_lines[:20]:
+                            lines.append(f"- {ln}")
+                    if args.autopilot and autopilot_actions:
+                        lines.append("- Auto-pilot:")
+                        for a in autopilot_actions:
+                            lines.append(f"  - {a}")
+                    _telegram_send(token, chat_id, "\n".join(lines))
+                    _telegram_mark_recovery(state, now=now)
             else:
                 level = "FAIL" if code >= 2 else "WARN" if code > 0 else "OK"
                 pause_alert = bool(args.autopilot) and any("paused(stop) por latência FAIL" in str(a) for a in (autopilot_actions or []))
@@ -1227,6 +1367,7 @@ def main() -> int:
                     lat_any_msg = None
 
                 lines = []
+                src = str(args.telegram_source or "").strip()
                 if pause_alert:
                     lat_msg = _get_executor_latency_fail_message(results, str(args.executor_service)) or ""
                     lines.append("!!! ALERTA CRÍTICO: BRIDGES PAUSADOS POR LATÊNCIA (FAIL) !!!")
@@ -1238,6 +1379,8 @@ def main() -> int:
                         lines.append(f"Latência: {lat_any_msg}")
 
                 lines.append(f"OPS HEALTH ({level}) @ {meta.get('now_utc')}")
+                if src:
+                    lines.append(f"source={src}")
                 for r in results:
                     if r.level in ("WARN", "FAIL"):
                         lines.append(f"- [{r.level}] {r.message}")
@@ -1245,7 +1388,42 @@ def main() -> int:
                     lines.append("- Auto-pilot:")
                     for a in autopilot_actions:
                         lines.append(f"  - {a}")
-                _telegram_send(token, chat_id, "\n".join(lines))
+                alert_keys = _alert_keys(results, autopilot_actions=autopilot_actions)
+                signature = _alert_signature(
+                    level=level,
+                    lines=alert_keys,
+                    pause_alert=bool(pause_alert),
+                    latency_alert=bool(latency_alert),
+                )
+                cd = _safe_int(os.getenv("OPS_TELEGRAM_MIN_INTERVAL_SEC", "600"), 600)
+                force_resend = _safe_int(os.getenv("OPS_TELEGRAM_FORCE_RESEND_SEC", "3600"), 3600)
+                lat_cd = _safe_int(os.getenv("OPS_TELEGRAM_LATENCY_ALERT_SUPPRESS_SEC", "1800"), 1800)
+                send_now, suppressed = _telegram_should_send_non_ok(
+                    state,
+                    now=now,
+                    signature=signature,
+                    cooldown_sec=int(cd),
+                )
+                if latency_alert and not pause_alert:
+                    lat_last = _parse_iso_ts(state.setdefault("telegram", {}).get("last_latency_alert_utc"))
+                    if lat_last is not None:
+                        lat_age = int((now - lat_last).total_seconds())
+                        if lat_age < int(max(0, lat_cd)):
+                            send_now = False
+                if not send_now and force_resend > 0:
+                    last_alert_dt = _parse_iso_ts(state.setdefault("telegram", {}).get("last_alert_utc"))
+                    if last_alert_dt is not None:
+                        age = int((now - last_alert_dt).total_seconds())
+                        if age >= int(force_resend):
+                            send_now = True
+                if send_now:
+                    if suppressed > 0:
+                        lines.append(f"- Observação: {suppressed} alertas similares suprimidos por anti-flood.")
+                    _telegram_send(token, chat_id, "\n".join(lines))
+                    _telegram_mark_sent(state, now=now, signature=signature)
+                    if latency_alert and not pause_alert:
+                        tg = state.setdefault("telegram", {})
+                        tg["last_latency_alert_utc"] = now.isoformat()
         else:
             print("[WARN] Telegram habilitado, mas TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não estão setados.")
 
