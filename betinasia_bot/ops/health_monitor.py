@@ -44,6 +44,23 @@ class CheckResult:
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
+def _load_env_file(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = str(raw or "").strip()
+            if (not line) or line.startswith("#") or ("=" not in line):
+                continue
+            k, v = line.split("=", 1)
+            k = str(k or "").strip()
+            if not k or k in os.environ:
+                continue
+            os.environ[k] = str(v or "").strip()
+    except Exception:
+        return
+
 def _safe_int(x: Any, default: int) -> int:
     try:
         return int(x)
@@ -410,6 +427,7 @@ async def run_checks(
         if not s or s.lower() in ("0", "off", "none", "false"):
             continue
         services.append(s)
+    resolved_audit_service = str(audit_service or "").strip()
     for svc in services:
         s = _systemctl_show(svc)
         active = s.get("ActiveState", "unknown")
@@ -418,6 +436,42 @@ async def run_checks(
         if active == "active" and sub == "running":
             results.append(CheckResult("PASS", f"{svc}: ativo (restarts={restarts})"))
         else:
+            # Tolerância operacional: se AUDIT_SERVICE padrão estiver down, mas alias/candidato
+            # estiver ativo (ex.: betinasia-audit-api-back), evita FAIL falso.
+            if str(svc) == str(audit_service):
+                candidates: List[str] = []
+                raw_cands = str(os.getenv("OPS_AUDIT_SERVICE_CANDIDATES", "") or "").strip()
+                if raw_cands:
+                    candidates.extend([x.strip() for x in raw_cands.split(",") if x.strip()])
+                alias = _audit_service_back_alias(str(svc))
+                if alias:
+                    candidates.append(str(alias))
+                # defaults comuns
+                candidates.extend(["betinasia-audit-api-back.service", "betinasia-audit-api-back"])
+                # dedup e remove o próprio svc
+                uniq: List[str] = []
+                seen = set()
+                for c in candidates:
+                    if not c or c == str(svc) or c in seen:
+                        continue
+                    seen.add(c)
+                    uniq.append(c)
+                fallback_ok = None
+                for cand in uniq:
+                    if _service_is_running(cand):
+                        fallback_ok = cand
+                        break
+                if fallback_ok:
+                    resolved_audit_service = str(fallback_ok)
+                    results.append(
+                        CheckResult(
+                            "WARN",
+                            f"{svc}: fora do esperado ({active}/{sub}, restarts={restarts}); fallback ativo={fallback_ok}",
+                        )
+                    )
+                    exit_code = max(exit_code, 1)
+                    continue
+
             results.append(CheckResult("FAIL", f"{svc}: fora do esperado ({active}/{sub}, restarts={restarts})"))
             exit_code = max(exit_code, 2)
             if restart_on_fail:
@@ -458,6 +512,11 @@ async def run_checks(
         fric_min = max(1, min(int(since_minutes), int(fric_min)))
         fric_since = now - timedelta(minutes=int(fric_min))
         fr = await _db_audit_friction(db, fric_since)
+        # Throughput do bridge (aceitação por razão) na janela operacional
+        br_win_min = _safe_int(os.getenv("OPS_BRIDGE_THROUGHPUT_WINDOW_MINUTES", "120"), 120)
+        br_win_min = max(5, int(br_win_min))
+        br_since = now - timedelta(minutes=int(br_win_min))
+        br = await _db_bridge_reason_counts(db, br_since)
     finally:
         await db.close()
 
@@ -552,6 +611,60 @@ async def run_checks(
             )
     except Exception:
         # Nunca deixa o monitor quebrar por esse check
+        pass
+
+    # 4b) Throughput operacional do bridge (causa comum de "sem apostas")
+    try:
+        bridge_enable = str(os.getenv("OPS_BRIDGE_THROUGHPUT_ENABLE", "1") or "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        if bridge_enable:
+            br_counts = dict(br or {})
+            seen_total = int(sum(int(v or 0) for v in br_counts.values()))
+            accepted_n = int(br_counts.get("accepted") or 0)
+            not_active_n = int(br_counts.get("not_active") or 0)
+            ah_n = int(br_counts.get("wf_ah_max_abs_line") or 0)
+
+            accepted_min = _safe_int(os.getenv("OPS_BRIDGE_ACCEPTED_MIN", "1"), 1)
+            warn_pct = float(os.getenv("OPS_BRIDGE_ACCEPTED_WARN_PCT", "0.08"))
+            fail_pct = float(os.getenv("OPS_BRIDGE_ACCEPTED_FAIL_PCT", "0.03"))
+            not_active_warn_pct = float(os.getenv("OPS_BRIDGE_NOT_ACTIVE_WARN_PCT", "0.35"))
+            ah_warn_pct = float(os.getenv("OPS_BRIDGE_AH_WARN_PCT", "0.45"))
+            min_seen = _safe_int(os.getenv("OPS_BRIDGE_THROUGHPUT_MIN_SEEN", "60"), 60)
+
+            denom = max(1, seen_total)
+            acc_rate = float(accepted_n) / float(denom)
+            na_rate = float(not_active_n) / float(denom)
+            ah_rate = float(ah_n) / float(denom)
+
+            if seen_total < int(min_seen):
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"bridge throughput: amostra baixa (seen={seen_total} < min_seen={min_seen})",
+                    )
+                )
+            else:
+                msg = (
+                    f"bridge throughput: accepted={accepted_n}/{seen_total} ({acc_rate:.1%}) "
+                    f"not_active={not_active_n}/{seen_total} ({na_rate:.1%}) "
+                    f"wf_ah_max_abs_line={ah_n}/{seen_total} ({ah_rate:.1%})"
+                )
+                hard_fail = (accepted_n < int(accepted_min)) or (acc_rate <= float(fail_pct))
+                hard_warn = (acc_rate <= float(warn_pct)) or (na_rate >= float(not_active_warn_pct)) or (ah_rate >= float(ah_warn_pct))
+                if hard_fail:
+                    results.append(CheckResult("FAIL", msg))
+                    exit_code = max(exit_code, 2)
+                elif hard_warn:
+                    results.append(CheckResult("WARN", msg))
+                    exit_code = max(exit_code, 1)
+                else:
+                    results.append(CheckResult("PASS", msg))
+    except Exception:
         pass
 
     # 5) Executor activity/health (via JSONL)
@@ -799,6 +912,7 @@ async def run_checks(
     return results, exit_code, {
         "now_utc": now.isoformat(),
         "since_utc": since.isoformat(),
+        "resolved_audit_service": resolved_audit_service,
         "db": {
             "last_best_odds_utc": str(last_best),
             "last_audit_utc": str(last_audit),
@@ -1129,6 +1243,7 @@ def _get_executor_latency_fail_message(results: List[CheckResult], executor_serv
 
 
 def main() -> int:
+    _load_env_file(Path(str(os.getenv("ENV_FILE", ".env") or ".env")))
     ap = argparse.ArgumentParser()
     ap.add_argument("--since-minutes", type=int, default=30)
     ap.add_argument("--telemetry-max-age-sec", type=int, default=int(os.getenv("OPS_TELEMETRY_MAX_AGE_SEC", "600")))
