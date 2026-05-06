@@ -2650,6 +2650,126 @@ def _filter_executor_jsonl_lines_window(lines: list[str], *, since_utc: datetime
     return out
 
 
+def _executor_post_accept_failures_24h(lines_24h: list[str]) -> Dict[str, Any]:
+    """
+    Diagnóstico pós-accepted no executor (janela 24h, a partir do JSONL):
+    - accepted: `result.status in {LIVE_OK, API_FAILED, NO_SESSION, RATE_LIMIT, CAP_BLOCKED}`
+      (i.e., requisições que passaram da etapa de enfileiramento e geraram resultado de execução)
+    - separa por fase:
+      - precheck_fail: erro antes do place_order (sinalizado por LIVE_PRECHECK_FAILED)
+      - place_fail: erro no place_order (LIVE_PLACE_FAILED)
+    """
+    out: Dict[str, Any] = {
+        "accepted_n": 0,
+        "live_ok_n": 0,
+        "accepted_fail_n": 0,
+        "precheck_fail_n": 0,
+        "place_fail_n": 0,
+        "api_failed_n": 0,
+        "no_session_n": 0,
+        "rate_limit_n": 0,
+        "cap_blocked_n": 0,
+        "no_pmms_n": 0,
+        "ctx_destroyed_n": 0,
+        "auth_401_n": 0,
+        "ws_stale_n": 0,
+        "precheck_pmm_wait_ms_p50": None,
+        "precheck_pmm_wait_ms_p90": None,
+        "precheck_ws_age_ms_p50": None,
+        "precheck_ws_age_ms_p90": None,
+        "top_errors": [],
+    }
+    try:
+        accepted_status = {"LIVE_OK", "API_FAILED", "NO_SESSION", "RATE_LIMIT", "CAP_BLOCKED"}
+        err_counts: Dict[str, int] = defaultdict(int)
+        pmm_wait_vals: list[float] = []
+        ws_age_vals: list[float] = []
+
+        for ln in lines_24h or []:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+            if not isinstance(res, dict):
+                continue
+            st = str(res.get("status") or "").upper().strip()
+            if st == "HEARTBEAT" or st not in accepted_status:
+                continue
+
+            out["accepted_n"] = int(out["accepted_n"]) + 1
+            if st == "LIVE_OK":
+                out["live_ok_n"] = int(out["live_ok_n"]) + 1
+                continue
+
+            out["accepted_fail_n"] = int(out["accepted_fail_n"]) + 1
+            if st == "API_FAILED":
+                out["api_failed_n"] = int(out["api_failed_n"]) + 1
+            elif st == "NO_SESSION":
+                out["no_session_n"] = int(out["no_session_n"]) + 1
+            elif st == "RATE_LIMIT":
+                out["rate_limit_n"] = int(out["rate_limit_n"]) + 1
+            elif st == "CAP_BLOCKED":
+                out["cap_blocked_n"] = int(out["cap_blocked_n"]) + 1
+
+            err = str(res.get("error") or "").strip()
+            err_low = err.lower()
+            if err:
+                err_counts[err[:180]] += 1
+
+            raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+            if "live_precheck_failed" in err_low:
+                out["precheck_fail_n"] = int(out["precheck_fail_n"]) + 1
+                try:
+                    t = raw.get("timing_breakdown") if isinstance(raw.get("timing_breakdown"), dict) else {}
+                    pmmw = _safe_float(t.get("pmm_wait_ms"))
+                    if pmmw is not None:
+                        pmm_wait_vals.append(float(pmmw))
+                except Exception:
+                    pass
+                try:
+                    ws_age = _safe_float(raw.get("ws_age_ms"))
+                    if ws_age is not None:
+                        ws_age_vals.append(float(ws_age))
+                except Exception:
+                    pass
+            if "live_place_failed" in err_low:
+                out["place_fail_n"] = int(out["place_fail_n"]) + 1
+
+            if "no pmms received" in err_low:
+                out["no_pmms_n"] = int(out["no_pmms_n"]) + 1
+            if ("execution context was destroyed" in err_low) or ("target closed" in err_low):
+                out["ctx_destroyed_n"] = int(out["ctx_destroyed_n"]) + 1
+            if ("http_401" in err_low) or ("auth_error" in err_low) or ("no_root_session_cookie" in err_low):
+                out["auth_401_n"] = int(out["auth_401_n"]) + 1
+            if "ws_age_ms=" in err_low or "ws stale" in err_low:
+                out["ws_stale_n"] = int(out["ws_stale_n"]) + 1
+
+        # percentis simples (numpy-free)
+        def _pct(xs: list[float], p: float) -> Optional[float]:
+            if not xs:
+                return None
+            ys = sorted(float(x) for x in xs)
+            if len(ys) == 1:
+                return float(ys[0])
+            k = int(round((len(ys) - 1) * float(p)))
+            k = max(0, min(len(ys) - 1, k))
+            return float(ys[k])
+
+        out["precheck_pmm_wait_ms_p50"] = _pct(pmm_wait_vals, 0.50)
+        out["precheck_pmm_wait_ms_p90"] = _pct(pmm_wait_vals, 0.90)
+        out["precheck_ws_age_ms_p50"] = _pct(ws_age_vals, 0.50)
+        out["precheck_ws_age_ms_p90"] = _pct(ws_age_vals, 0.90)
+
+        tops = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        out["top_errors"] = [{"error": k, "n": int(v)} for k, v in tops]
+    except Exception:
+        return out
+    return out
+
+
 def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
@@ -3089,6 +3209,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         exec_lines_24h = []
     kpi_ok_24h = compute_kpis_from_lines(exec_lines_24h, path=str(cfg.executor_jsonl), only_status=["LIVE_OK", "DRY_OK"])
     (day_dir / "execution_kpis_ok_24h.json").write_text(json.dumps(kpi_ok_24h, ensure_ascii=False, indent=2), encoding="utf-8")
+    exec_post_24h = _executor_post_accept_failures_24h(exec_lines_24h)
+    (day_dir / "execution_post_accept_24h.json").write_text(
+        json.dumps(exec_post_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # atividade recente (ajuda a diagnosticar "hoje não teve aposta" sem depender do DB)
     exec_activity: Dict[str, Any] = {"last_live_ok_ts": None, "live_ok_1h": 0, "live_ok_6h": 0, "live_ok_24h": 0}
@@ -3596,6 +3720,49 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if int(exec_activity.get("live_ok_6h") or 0) == 0:
             s0.append("- Se isso persistir com auditoria OK no DB, suspeite de sessão/PMM/timeout ou bridge travado (ver checklist abaixo).\n")
         s0.append("\n")
+    except Exception:
+        pass
+
+    # diagnóstico explícito pós-accepted (executor): separa pré-place vs place
+    try:
+        pa = exec_post_24h if isinstance(exec_post_24h, dict) else {}
+        acc_n = int(pa.get("accepted_n") or 0)
+        if acc_n > 0:
+            ok_n = int(pa.get("live_ok_n") or 0)
+            fail_n = int(pa.get("accepted_fail_n") or 0)
+            s0.append("**Falhas pós-accepted (executor, 24h)**\n\n")
+            s0.append("| Métrica | Valor |\n|---|---:|\n")
+            s0.append(f"| accepted | {acc_n} |\n")
+            s0.append(f"| LIVE_OK | {ok_n} ({_fmt_num((100.0*ok_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| accepted sem LIVE_OK | {fail_n} ({_fmt_num((100.0*fail_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| precheck fail (`LIVE_PRECHECK_FAILED`) | {int(pa.get('precheck_fail_n') or 0)} |\n")
+            s0.append(f"| place fail (`LIVE_PLACE_FAILED`) | {int(pa.get('place_fail_n') or 0)} |\n")
+            s0.append(f"| API_FAILED | {int(pa.get('api_failed_n') or 0)} |\n")
+            s0.append(f"| NO_SESSION | {int(pa.get('no_session_n') or 0)} |\n")
+            s0.append(f"| RATE_LIMIT | {int(pa.get('rate_limit_n') or 0)} |\n")
+            s0.append(f"| CAP_BLOCKED | {int(pa.get('cap_blocked_n') or 0)} |\n")
+            s0.append(f"| No PMMs received | {int(pa.get('no_pmms_n') or 0)} |\n")
+            s0.append(f"| Execution context destroyed/target closed | {int(pa.get('ctx_destroyed_n') or 0)} |\n")
+            s0.append(f"| Auth 401 / NO_ROOT_SESSION_COOKIE | {int(pa.get('auth_401_n') or 0)} |\n")
+            s0.append(
+                f"| p50/p90 `pmm_wait_ms` (precheck fail) | {_fmt_num(pa.get('precheck_pmm_wait_ms_p50'),0)} / {_fmt_num(pa.get('precheck_pmm_wait_ms_p90'),0)} |\n"
+            )
+            s0.append(
+                f"| p50/p90 `ws_age_ms` (precheck fail) | {_fmt_num(pa.get('precheck_ws_age_ms_p50'),0)} / {_fmt_num(pa.get('precheck_ws_age_ms_p90'),0)} |\n"
+            )
+            s0.append("\n")
+            tops = pa.get("top_errors") if isinstance(pa.get("top_errors"), list) else []
+            if tops:
+                s0.append("- Top erros pós-accepted:\n")
+                for it in tops[:6]:
+                    if not isinstance(it, dict):
+                        continue
+                    err = str(it.get("error") or "").strip()
+                    n = int(it.get("n") or 0)
+                    if err:
+                        err = (err[:180] + "…") if len(err) > 180 else err
+                        s0.append(f"  - ×{n}: `{err}`\n")
+                s0.append("\n")
     except Exception:
         pass
 
