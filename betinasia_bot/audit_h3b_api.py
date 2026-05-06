@@ -24,6 +24,7 @@ import time
 import gc
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
 from loguru import logger
@@ -173,6 +174,41 @@ class H3bApiAudit:
         self.api_sides = (str(api_sides or "both").strip().lower() or "both")
         if self.api_sides not in ("back", "lay", "both"):
             self.api_sides = "both"
+
+        # Prefiltro operacional (antes de abrir betslip) para reduzir custo de API.
+        # Objetivo: alinhar o audit com as mesmas famílias de filtros do bridge (policy/WF),
+        # evitando abrir ticket para oportunidades que seriam descartadas adiante.
+        self.prefilter_enabled = self._parse_env_bool(
+            "AUDIT_PREFILTER_ENABLE",
+            os.getenv("BRIDGE_ENFORCE_WF_FILTERS", "1"),
+        )
+        self.prefilter_policy_json = (
+            str(os.getenv("AUDIT_PREFILTER_POLICY_JSON") or "").strip()
+            or str(os.getenv("BRIDGE_POLICY_JSON") or "").strip()
+            or "logs/wf_policy_current.json"
+        )
+        self.prefilter_reload_sec = self._parse_env_float(
+            "AUDIT_PREFILTER_RELOAD_SEC",
+            self._parse_env_float("BRIDGE_POLICY_RELOAD_SEC", 5.0),
+        )
+        self.prefilter_enforce_wf = self._parse_env_bool(
+            "AUDIT_PREFILTER_ENFORCE_WF",
+            os.getenv("BRIDGE_ENFORCE_WF_FILTERS", "1"),
+        )
+        self.prefilter_use_base = self._parse_env_bool(
+            "AUDIT_PREFILTER_USE_BASE",
+            os.getenv("BRIDGE_POLICY_USE_BASE", "0"),
+        )
+        self.prefilter_prematch_only = self._parse_env_bool(
+            "AUDIT_PREFILTER_PREMATCH_ONLY",
+            os.getenv("BRIDGE_PREMATCH_ONLY", "0"),
+        )
+        self._prefilter_policy: Optional[Dict[str, Any]] = None
+        self._prefilter_wf: Dict[str, Any] = {}
+        self._prefilter_active_keys: Optional[set] = None
+        self._prefilter_active_keys_base: Optional[set] = None
+        self._prefilter_policy_mtime: Optional[float] = None
+        self._prefilter_last_check_ts: float = 0.0
 
         # Contadores (observabilidade)
         self.gate_seen = 0
@@ -489,6 +525,11 @@ class H3bApiAudit:
             return float(default)
 
     @staticmethod
+    def _parse_env_bool(name: str, default: str = "0") -> bool:
+        raw = os.getenv(name, default)
+        return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+    @staticmethod
     def _avg(values: List[float]) -> float:
         return (sum(values) / len(values)) if values else 0.0
 
@@ -500,6 +541,177 @@ class H3bApiAudit:
             return float(value)
         except Exception:
             return float(default)
+
+    @staticmethod
+    def _norm_line(line: Any) -> str:
+        return str(line or "").strip().replace(",", ".").replace("−", "-")
+
+    @staticmethod
+    def _wf_apply_scope(scope: str, *, is_live: bool) -> bool:
+        sc = (scope or "").strip().lower() or "pre"
+        if sc == "all":
+            return True
+        if sc == "in":
+            return bool(is_live)
+        return not bool(is_live)
+
+    @staticmethod
+    def _wf_float(wf: Dict[str, Any], *keys: str) -> Optional[float]:
+        for k in keys:
+            if not k:
+                continue
+            if k in wf and wf.get(k) is not None:
+                try:
+                    return float(wf.get(k))
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _wf_str(wf: Dict[str, Any], *keys: str, default: str = "") -> str:
+        for k in keys:
+            if not k:
+                continue
+            if k in wf and wf.get(k) is not None:
+                try:
+                    s = str(wf.get(k)).strip()
+                    if s:
+                        return s
+                except Exception:
+                    continue
+        return default
+
+    def _prefilter_row_is_live(self, h3b: Dict[str, Any]) -> bool:
+        try:
+            if h3b.get("is_live") is not None:
+                return bool(h3b.get("is_live"))
+        except Exception:
+            pass
+        try:
+            ko = h3b.get("kickoff")
+            if isinstance(ko, datetime):
+                k = ko.astimezone(timezone.utc) if ko.tzinfo is not None else ko.replace(tzinfo=timezone.utc)
+                return bool(datetime.now(timezone.utc) >= k)
+        except Exception:
+            pass
+        return False
+
+    def _prefilter_combo_key_back(self, h3b: Dict[str, Any], wf: Dict[str, Any]) -> str:
+        is_live = self._prefilter_row_is_live(h3b)
+        regime = "In" if bool(is_live) else "Pre"
+        comb = f"Back_{regime}_Any"
+        try:
+            key_by_league = bool(wf.get("key_by_league")) if isinstance(wf, dict) else False
+            key_scope = self._wf_str(wf if isinstance(wf, dict) else {}, "key_by_league_scope", default="pre")
+            if key_by_league and (key_scope == "all" or regime == "Pre"):
+                lg = str(h3b.get("league") or "").strip()
+                if lg:
+                    comb = f"{comb}__{lg}"
+        except Exception:
+            pass
+        return comb
+
+    def _prefilter_reload_policy_if_needed(self) -> None:
+        if not bool(self.prefilter_enabled):
+            return
+        now = time.time()
+        if (now - float(self._prefilter_last_check_ts or 0.0)) < float(max(0.5, float(self.prefilter_reload_sec or 5.0))):
+            return
+        self._prefilter_last_check_ts = now
+        try:
+            p = Path(str(self.prefilter_policy_json or "").strip())
+            if not str(p):
+                return
+            if not p.exists():
+                return
+            mt = float(p.stat().st_mtime)
+            if self._prefilter_policy_mtime is not None and mt <= float(self._prefilter_policy_mtime):
+                return
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                return
+            self._prefilter_policy = obj
+            self._prefilter_policy_mtime = mt
+            wf = obj.get("wf") if isinstance(obj.get("wf"), dict) else {}
+            self._prefilter_wf = wf if isinstance(wf, dict) else {}
+            last = None
+            if isinstance(obj.get("steps"), list) and obj.get("steps"):
+                last = obj.get("steps")[-1]
+            elif isinstance(obj.get("last_step"), dict):
+                last = obj.get("last_step")
+            if isinstance(last, dict):
+                if isinstance(last.get("active_keys"), list):
+                    self._prefilter_active_keys = set([str(x) for x in (last.get("active_keys") or []) if str(x)])
+                else:
+                    self._prefilter_active_keys = None
+                if isinstance(last.get("active_keys_base"), list):
+                    self._prefilter_active_keys_base = set(
+                        [str(x) for x in (last.get("active_keys_base") or []) if str(x)]
+                    )
+                else:
+                    self._prefilter_active_keys_base = None
+            logger.info(
+                f"[AUDIT_PREFILTER] policy reloaded mtime={int(mt)} path={p} "
+                f"active_keys={(len(self._prefilter_active_keys) if isinstance(self._prefilter_active_keys, set) else 'NA')} "
+                f"active_base={(len(self._prefilter_active_keys_base) if isinstance(self._prefilter_active_keys_base, set) else 'NA')}"
+            )
+        except Exception as e:
+            logger.warning(f"[AUDIT_PREFILTER] policy reload failed: {str(e)[:220]}")
+
+    def _prefilter_allow_back(self, h3b: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Retorna (allow, reason, meta) para o fluxo api/back.
+        reason segue nomenclatura do bridge quando possível (not_active, wf_ah_max_abs_line, prematch_only).
+        """
+        if not bool(self.prefilter_enabled):
+            return True, "", {"enabled": False}
+
+        self._prefilter_reload_policy_if_needed()
+        wf = self._prefilter_wf if isinstance(self._prefilter_wf, dict) else {}
+        is_live = self._prefilter_row_is_live(h3b)
+        meta: Dict[str, Any] = {
+            "enabled": True,
+            "is_live": bool(is_live),
+            "policy_path": str(self.prefilter_policy_json or ""),
+            "enforce_wf_filters": bool(self.prefilter_enforce_wf),
+            "use_base_cfg": bool(self.prefilter_use_base),
+        }
+
+        if bool(self.prefilter_prematch_only) and bool(is_live):
+            meta["reason"] = "prematch_only"
+            return False, "prematch_only", meta
+
+        try:
+            thr = self._wf_float(wf, "ah_max_abs_line")
+            scope = self._wf_str(wf, "ah_scope", default="pre")
+            if bool(self.prefilter_enforce_wf) and thr is not None and float(thr) > 0 and self._wf_apply_scope(scope, is_live=bool(is_live)):
+                ln = self._norm_line(h3b.get("line"))
+                if ln:
+                    x = abs(float(ln))
+                    if x > float(thr):
+                        meta.update({"reason": "wf_ah_max_abs_line", "line": ln, "abs_line": float(x), "thr": float(thr), "scope": scope})
+                        return False, "wf_ah_max_abs_line", meta
+        except Exception:
+            pass
+
+        if self._prefilter_active_keys is not None:
+            comb = self._prefilter_combo_key_back(h3b, wf)
+            use_base_eff = bool(self.prefilter_use_base) and (not bool(self.prefilter_enforce_wf))
+            ok = False
+            if use_base_eff and self._prefilter_active_keys_base:
+                ok = str(comb).split("__", 1)[0] in self._prefilter_active_keys_base
+            else:
+                ok = comb in self._prefilter_active_keys
+            if not ok:
+                meta.update(
+                    {
+                        "reason": "not_active",
+                        "combo": comb,
+                        "use_base_eff": bool(use_base_eff),
+                    }
+                )
+                return False, "not_active", meta
+        return True, "", meta
 
     def _build_finance_snapshot(self, r: dict) -> Optional[dict]:
         """
@@ -620,6 +832,15 @@ class H3bApiAudit:
         else:
             logger.info("AUDITORIA H3B VIA API (~2-3s)")
         logger.info(f"mode={self.mode} ws_offsets={self.ws_sample_offsets_sec}")
+        if self.mode == "api" and self.api_sides == "back":
+            logger.info(
+                "prefilter(back): "
+                f"enabled={int(bool(self.prefilter_enabled))} "
+                f"prematch_only={int(bool(self.prefilter_prematch_only))} "
+                f"enforce_wf={int(bool(self.prefilter_enforce_wf))} "
+                f"use_base={int(bool(self.prefilter_use_base))} "
+                f"policy_json={self.prefilter_policy_json}"
+            )
         if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
             logger.info(
                 f"gate: offset={self.gate_drop_offset_sec:.1f}s ratio={self.gate_drop_ratio:.3f} | "
@@ -1608,6 +1829,42 @@ class H3bApiAudit:
                 'telemetry': telemetry,
             })
             return base
+
+        # Prefiltro (modo API/back): aplica regras operacionais antes de abrir ticket.
+        # Mantém abertura de betslip apenas para oportunidades relevantes ao fluxo de execução.
+        try:
+            if self.mode == "api" and self.api_sides == "back":
+                ok_pf, reason_pf, meta_pf = self._prefilter_allow_back(h3b)
+                if not ok_pf:
+                    end_to_end_ms = int((time.time() - detected_at) * 1000)
+                    telemetry.update(
+                        {
+                            "prefilter_blocked": True,
+                            "prefilter_reason": str(reason_pf),
+                            "prefilter_meta": meta_pf if isinstance(meta_pf, dict) else {},
+                            "parallel_fetch_ms": 0,
+                            "temporal_total_ms": 0,
+                            "execution_ms": int((time.time() - execution_start) * 1000),
+                            "end_to_end_ms": end_to_end_ms,
+                            "pipeline_overhead_ms": max(0, end_to_end_ms - telemetry.get("queue_wait_ms", 0)),
+                        }
+                    )
+                    base.update(
+                        {
+                            "success": False,
+                            "status": "GATE_NOT_ELIGIBLE",
+                            "bs_odd": 0,
+                            "bs_limit": 0,
+                            "num_bk": 0,
+                            "diff_pct": 0,
+                            "error": f"AUDIT_PREFILTER:{reason_pf}",
+                            "total_ms": end_to_end_ms,
+                            "telemetry": telemetry,
+                        }
+                    )
+                    return base
+        except Exception as e:
+            telemetry["prefilter_error"] = str(e)[:220]
 
         # Constrói bet_types (somente os necessários)
         t_build = time.time()

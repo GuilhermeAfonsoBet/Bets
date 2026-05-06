@@ -3963,6 +3963,43 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Latência ponta a ponta (WS detectado -> executor_done) já no bloco inicial.
+    try:
+        e2e = exec_e2e_24h if isinstance(exec_e2e_24h, dict) else {}
+        grp_ok = e2e.get("success") if isinstance(e2e.get("success"), dict) else {}
+        n_ok = int(e2e.get("n_e2e_success") or 0)
+        n_all = int(e2e.get("n_e2e_all") or 0)
+        n_aid = int(e2e.get("n_with_audit_id") or 0)
+        n_det = int(e2e.get("n_with_detected_at") or 0)
+        if n_all > 0:
+            s0.append("**Latência ponta a ponta (24h; WS → executor_done)**\n\n")
+            s0.append(
+                f"- Cobertura: `n_jsonl_24h={int(e2e.get('n_jsonl_24h') or 0)}`, "
+                f"`com_audit_id={n_aid}`, `com_hypothesis_detected_at={n_det}`, "
+                f"`e2e_all={n_all}`, `e2e_success={n_ok}`.\n"
+            )
+            s0.append("| Etapa | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|\n")
+            rows = [
+                ("e2e_total", "e2e_total_ms"),
+                ("detect_to_submit", "detect_to_submit_ms"),
+                ("audit_total", "audit_total_ms"),
+                ("audit_detect_to_click", "audit_detect_to_click_ms"),
+                ("audit_click_to_betslip", "audit_click_to_betslip_ms"),
+                ("bridge_wait", "bridge_wait_ms"),
+                ("executor_submit_to_done", "executor_submit_to_done_ms"),
+                ("executor_queue_delay", "executor_queue_delay_ms"),
+                ("executor_post", "executor_post_ms"),
+                ("executor_total_api", "executor_total_api_ms"),
+            ]
+            for label, key in rows:
+                a = grp_ok.get(key) if isinstance(grp_ok.get(key), dict) else {}
+                s0.append(
+                    f"| {label} | {_fmt_num(a.get('p50'),0)} | {_fmt_num(a.get('p90'),0)} | {_fmt_num(a.get('p99'),0)} | {_fmt_num(a.get('mean'),0)} |\n"
+                )
+            s0.append("\n")
+    except Exception:
+        pass
+
     # ------------------------------------------------------------
     # Prontidão para LIVE (go/no-go) — checklist objetivo
     # ------------------------------------------------------------
@@ -6049,58 +6086,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(_timing_table("Latência (últimas 24h; somente LIVE_OK/DRY_OK) — ms", timing_ok24))
     except Exception:
         pass
-    try:
-        e2e = exec_e2e_24h if isinstance(exec_e2e_24h, dict) else {}
-        grp_ok = e2e.get("success") if isinstance(e2e.get("success"), dict) else {}
-        grp_all = e2e.get("all") if isinstance(e2e.get("all"), dict) else {}
-        n_ok = int(e2e.get("n_e2e_success") or 0)
-        n_all = int(e2e.get("n_e2e_all") or 0)
-        n_aid = int(e2e.get("n_with_audit_id") or 0)
-        n_det = int(e2e.get("n_with_detected_at") or 0)
-        if n_all > 0:
-            extra.append("**Latência ponta a ponta (WS → executor_done; 24h)**\n\n")
-            extra.append(
-                f"- Cobertura: `n_jsonl_24h={int(e2e.get('n_jsonl_24h') or 0)}`, "
-                f"`com_audit_id={n_aid}`, `com_hypothesis_detected_at={n_det}`, "
-                f"`e2e_all={n_all}`, `e2e_success={n_ok}`.\n"
-            )
-            extra.append(
-                "- Definições (ms):\n"
-                "  - `e2e_total`: detecção WS (`hypothesis_detected_at`) até `executor finished_at`.\n"
-                "  - `detect_to_submit`: detecção WS até `request.created_at` (entrada no executor).\n"
-                "  - `audit_total`: duração total do audit no DB (`audit_total_duration_ms`).\n"
-                "  - `bridge_wait`: `detect_to_submit - audit_total` (fila/poll/espera entre audit e bridge).\n"
-                "  - `executor_submit_to_done`: `request.created_at -> finished_at` (equivale ao `call_to_done`).\n\n"
-            )
-
-            def _e2e_tbl(title: str, grp: Dict[str, Any]) -> None:
-                extra.append(f"{title}\n\n")
-                extra.append("| Métrica | n | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|---:|\n")
-                rows = [
-                    ("e2e_total_ms", "e2e_total"),
-                    ("detect_to_submit_ms", "detect_to_submit"),
-                    ("audit_total_ms", "audit_total"),
-                    ("audit_detect_to_click_ms", "audit_detect_to_click"),
-                    ("audit_click_to_betslip_ms", "audit_click_to_betslip"),
-                    ("bridge_wait_ms", "bridge_wait"),
-                    ("executor_submit_to_done_ms", "executor_submit_to_done"),
-                    ("executor_queue_delay_ms", "executor_queue_delay"),
-                    ("executor_post_ms", "executor_post"),
-                    ("executor_total_api_ms", "executor_total_api"),
-                ]
-                for key, label in rows:
-                    a = grp.get(key) if isinstance(grp.get(key), dict) else {}
-                    extra.append(
-                        f"| {label} | {int(a.get('n') or 0)} | "
-                        f"{_fmt_num(a.get('p50'),0)} | {_fmt_num(a.get('p90'),0)} | {_fmt_num(a.get('p99'),0)} | {_fmt_num(a.get('mean'),0)} |\n"
-                    )
-                extra.append("\n")
-
-            _e2e_tbl("**Ponta a ponta — somente sucessos (`LIVE_OK/DRY_OK`)**", grp_ok)
-            _e2e_tbl("**Ponta a ponta — todos os status com vínculo de audit**", grp_all)
-    except Exception:
-        pass
-
     slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
     extra.append(
