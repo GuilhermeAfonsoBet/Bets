@@ -214,6 +214,10 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
           a.event_id,
           a.is_live,
           a.audited_at,
+          a.hypothesis_detected_at,
+          a.lag_detection_to_click_ms,
+          a.lag_click_to_betslip_ms,
+          a.audit_total_duration_ms,
           m.kickoff_time
         FROM betslip_audit_results a
         LEFT JOIN matches m ON m.external_id = a.event_id
@@ -2770,6 +2774,177 @@ def _executor_post_accept_failures_24h(lines_24h: list[str]) -> Dict[str, Any]:
     return out
 
 
+def _extract_audit_ids_from_exec_lines(lines: list[str]) -> list[int]:
+    out: set[int] = set()
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is not None and int(aid) > 0:
+            out.add(int(aid))
+    return sorted(out)
+
+
+def _ms_stats(xs: list[float]) -> Dict[str, Any]:
+    if not xs:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+    ys = sorted(float(x) for x in xs if x is not None)
+    if not ys:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+
+    def _q(p: float) -> Optional[float]:
+        if not ys:
+            return None
+        if len(ys) == 1:
+            return float(ys[0])
+        k = int(round((len(ys) - 1) * float(p)))
+        k = max(0, min(len(ys) - 1, k))
+        return float(ys[k])
+
+    return {
+        "n": int(len(ys)),
+        "p50": _q(0.50),
+        "p90": _q(0.90),
+        "p99": _q(0.99),
+        "mean": float(sum(ys) / float(len(ys))),
+    }
+
+
+def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Latência ponta a ponta em 24h:
+      WS detectado (hypothesis_detected_at) -> executor finished_at.
+
+    Breakdown principal:
+      1) detect_to_submit_ms   : detect -> request.created_at (bridge submit)
+      2) audit_total_ms        : detect -> fim do audit (quando disponível no DB)
+      3) bridge_wait_ms        : (detect->submit) - audit_total_ms
+      4) executor_submit_to_done_ms : submit -> finished_at (call_to_done efetivo)
+      5) e2e_total_ms          : detect -> finished_at
+    """
+    out: Dict[str, Any] = {
+        "n_jsonl_24h": int(len(lines_24h or [])),
+        "n_with_audit_id": 0,
+        "n_with_detected_at": 0,
+        "n_e2e_all": 0,
+        "n_e2e_success": 0,
+        "ok_statuses": ["LIVE_OK", "DRY_OK"],
+        "all": {},
+        "success": {},
+    }
+    metrics_all: Dict[str, list[float]] = defaultdict(list)
+    metrics_ok: Dict[str, list[float]] = defaultdict(list)
+    ok_status = {"LIVE_OK", "DRY_OK"}
+
+    for ln in lines_24h or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        if not isinstance(res, dict):
+            continue
+        st = str(res.get("status") or "").upper().strip()
+        if st == "HEARTBEAT":
+            continue
+
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is None or int(aid) <= 0:
+            continue
+        out["n_with_audit_id"] = int(out["n_with_audit_id"]) + 1
+
+        a = audit_by_id.get(int(aid)) if isinstance(audit_by_id, dict) else None
+        if not isinstance(a, dict):
+            continue
+
+        det = _parse_iso_dt_best(a.get("hypothesis_detected_at"))
+        if not isinstance(det, datetime):
+            continue
+        out["n_with_detected_at"] = int(out["n_with_detected_at"]) + 1
+
+        req_created = _parse_iso_dt_best(req.get("created_at") or res.get("created_at"))
+        fin = _parse_iso_dt_best(res.get("finished_at") or res.get("created_at"))
+        if not isinstance(req_created, datetime) or not isinstance(fin, datetime):
+            continue
+        if fin < det:
+            continue
+
+        detect_to_submit_ms = max(0.0, (req_created - det).total_seconds() * 1000.0)
+        submit_to_done_ms = _safe_float(
+            ((res.get("timing") or {}).get("call_to_done_ms"))
+            if isinstance(res.get("timing"), dict)
+            else None
+        )
+        if submit_to_done_ms is None:
+            submit_to_done_ms = max(0.0, (fin - req_created).total_seconds() * 1000.0)
+        e2e_total_ms = max(0.0, (fin - det).total_seconds() * 1000.0)
+
+        audit_total_ms = _safe_float(a.get("audit_total_duration_ms"))
+        audit_det_click_ms = _safe_float(a.get("lag_detection_to_click_ms"))
+        audit_click_bs_ms = _safe_float(a.get("lag_click_to_betslip_ms"))
+        bridge_wait_ms = (
+            max(0.0, float(detect_to_submit_ms) - float(audit_total_ms))
+            if audit_total_ms is not None
+            else None
+        )
+
+        t = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+        queue_delay_ms = _safe_float(t.get("queue_delay_ms")) if isinstance(t, dict) else None
+        post_ms = _safe_float(t.get("post_ms")) if isinstance(t, dict) else None
+        total_api_ms = _safe_float(t.get("total_ms")) if isinstance(t, dict) else None
+
+        vals = {
+            "e2e_total_ms": e2e_total_ms,
+            "detect_to_submit_ms": detect_to_submit_ms,
+            "audit_total_ms": audit_total_ms,
+            "audit_detect_to_click_ms": audit_det_click_ms,
+            "audit_click_to_betslip_ms": audit_click_bs_ms,
+            "bridge_wait_ms": bridge_wait_ms,
+            "executor_submit_to_done_ms": submit_to_done_ms,
+            "executor_queue_delay_ms": queue_delay_ms,
+            "executor_post_ms": post_ms,
+            "executor_total_api_ms": total_api_ms,
+        }
+        out["n_e2e_all"] = int(out["n_e2e_all"]) + 1
+        for k, v in vals.items():
+            if v is not None:
+                metrics_all[k].append(float(v))
+        if st in ok_status:
+            out["n_e2e_success"] = int(out["n_e2e_success"]) + 1
+            for k, v in vals.items():
+                if v is not None:
+                    metrics_ok[k].append(float(v))
+
+    keys = [
+        "e2e_total_ms",
+        "detect_to_submit_ms",
+        "audit_total_ms",
+        "audit_detect_to_click_ms",
+        "audit_click_to_betslip_ms",
+        "bridge_wait_ms",
+        "executor_submit_to_done_ms",
+        "executor_queue_delay_ms",
+        "executor_post_ms",
+        "executor_total_api_ms",
+    ]
+    out["all"] = {k: _ms_stats(metrics_all.get(k, [])) for k in keys}
+    out["success"] = {k: _ms_stats(metrics_ok.get(k, [])) for k in keys}
+    return out
+
+
 def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
@@ -3212,6 +3387,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     exec_post_24h = _executor_post_accept_failures_24h(exec_lines_24h)
     (day_dir / "execution_post_accept_24h.json").write_text(
         json.dumps(exec_post_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    exec_e2e_24h: Dict[str, Any] = {"error": None}
+    try:
+        audit_ids_24h = _extract_audit_ids_from_exec_lines(exec_lines_24h)
+        if audit_ids_24h:
+            from storage.database import Database  # local import para manter daily operável sem DB
+
+            db = Database()
+            await db.connect()
+            try:
+                audit_by_id_24h = await _fetch_audit_rows_for_ids_daily(db, audit_ids_24h)
+            finally:
+                await db.close()
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, audit_by_id_24h)
+            exec_e2e_24h["audit_ids_24h"] = int(len(audit_ids_24h))
+            exec_e2e_24h["audit_rows_found_24h"] = int(len(audit_by_id_24h))
+        else:
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, {})
+    except Exception as e:
+        exec_e2e_24h = {"error": str(e)[:240], "n_jsonl_24h": int(len(exec_lines_24h or []))}
+    (day_dir / "execution_latency_e2e_24h.json").write_text(
+        json.dumps(exec_e2e_24h, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     # atividade recente (ajuda a diagnosticar "hoje não teve aposta" sem depender do DB)
@@ -5850,6 +6047,57 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     try:
         timing_ok24 = (kpi_ok_24h.get("timing_ms") or {}) if isinstance(kpi_ok_24h, dict) else {}
         extra.append(_timing_table("Latência (últimas 24h; somente LIVE_OK/DRY_OK) — ms", timing_ok24))
+    except Exception:
+        pass
+    try:
+        e2e = exec_e2e_24h if isinstance(exec_e2e_24h, dict) else {}
+        grp_ok = e2e.get("success") if isinstance(e2e.get("success"), dict) else {}
+        grp_all = e2e.get("all") if isinstance(e2e.get("all"), dict) else {}
+        n_ok = int(e2e.get("n_e2e_success") or 0)
+        n_all = int(e2e.get("n_e2e_all") or 0)
+        n_aid = int(e2e.get("n_with_audit_id") or 0)
+        n_det = int(e2e.get("n_with_detected_at") or 0)
+        if n_all > 0:
+            extra.append("**Latência ponta a ponta (WS → executor_done; 24h)**\n\n")
+            extra.append(
+                f"- Cobertura: `n_jsonl_24h={int(e2e.get('n_jsonl_24h') or 0)}`, "
+                f"`com_audit_id={n_aid}`, `com_hypothesis_detected_at={n_det}`, "
+                f"`e2e_all={n_all}`, `e2e_success={n_ok}`.\n"
+            )
+            extra.append(
+                "- Definições (ms):\n"
+                "  - `e2e_total`: detecção WS (`hypothesis_detected_at`) até `executor finished_at`.\n"
+                "  - `detect_to_submit`: detecção WS até `request.created_at` (entrada no executor).\n"
+                "  - `audit_total`: duração total do audit no DB (`audit_total_duration_ms`).\n"
+                "  - `bridge_wait`: `detect_to_submit - audit_total` (fila/poll/espera entre audit e bridge).\n"
+                "  - `executor_submit_to_done`: `request.created_at -> finished_at` (equivale ao `call_to_done`).\n\n"
+            )
+
+            def _e2e_tbl(title: str, grp: Dict[str, Any]) -> None:
+                extra.append(f"{title}\n\n")
+                extra.append("| Métrica | n | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|---:|\n")
+                rows = [
+                    ("e2e_total_ms", "e2e_total"),
+                    ("detect_to_submit_ms", "detect_to_submit"),
+                    ("audit_total_ms", "audit_total"),
+                    ("audit_detect_to_click_ms", "audit_detect_to_click"),
+                    ("audit_click_to_betslip_ms", "audit_click_to_betslip"),
+                    ("bridge_wait_ms", "bridge_wait"),
+                    ("executor_submit_to_done_ms", "executor_submit_to_done"),
+                    ("executor_queue_delay_ms", "executor_queue_delay"),
+                    ("executor_post_ms", "executor_post"),
+                    ("executor_total_api_ms", "executor_total_api"),
+                ]
+                for key, label in rows:
+                    a = grp.get(key) if isinstance(grp.get(key), dict) else {}
+                    extra.append(
+                        f"| {label} | {int(a.get('n') or 0)} | "
+                        f"{_fmt_num(a.get('p50'),0)} | {_fmt_num(a.get('p90'),0)} | {_fmt_num(a.get('p99'),0)} | {_fmt_num(a.get('mean'),0)} |\n"
+                    )
+                extra.append("\n")
+
+            _e2e_tbl("**Ponta a ponta — somente sucessos (`LIVE_OK/DRY_OK`)**", grp_ok)
+            _e2e_tbl("**Ponta a ponta — todos os status com vínculo de audit**", grp_all)
     except Exception:
         pass
 
