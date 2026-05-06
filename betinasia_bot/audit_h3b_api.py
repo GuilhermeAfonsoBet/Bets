@@ -203,12 +203,25 @@ class H3bApiAudit:
             "AUDIT_PREFILTER_PREMATCH_ONLY",
             os.getenv("BRIDGE_PREMATCH_ONLY", "0"),
         )
+        self.prefilter_check_bridge_seen = self._parse_env_bool(
+            "AUDIT_PREFILTER_CHECK_BRIDGE_SEEN",
+            "1",
+        )
+        self.prefilter_bridge_action = str(
+            os.getenv("AUDIT_PREFILTER_BRIDGE_ACTION", "live:Back")
+        ).strip() or "live:Back"
+        self.prefilter_local_key_ttl_sec = self._parse_env_float(
+            "AUDIT_PREFILTER_LOCAL_KEY_TTL_SEC",
+            21600.0,
+        )
         self._prefilter_policy: Optional[Dict[str, Any]] = None
         self._prefilter_wf: Dict[str, Any] = {}
         self._prefilter_active_keys: Optional[set] = None
         self._prefilter_active_keys_base: Optional[set] = None
         self._prefilter_policy_mtime: Optional[float] = None
         self._prefilter_last_check_ts: float = 0.0
+        self._prefilter_bridge_seen_keys: set[str] = set()
+        self._prefilter_local_key_ts: Dict[str, float] = {}
 
         # Contadores (observabilidade)
         self.gate_seen = 0
@@ -611,6 +624,54 @@ class H3bApiAudit:
             pass
         return comb
 
+    def _prefilter_bridge_src_key_back(self, h3b: Dict[str, Any], *, mode: str = "live") -> str:
+        """
+        Replica a semântica de chave operacional do bridge (_event_key) para Back.
+        """
+        event_id = str(h3b.get("event_id") or "").strip()
+        market = str(h3b.get("market_type") or "AH").strip().upper()
+        line = self._norm_line(h3b.get("line"))
+        side = str(h3b.get("side") or "").strip().lower()
+        hyp = "H3B"
+        regime = "in" if self._prefilter_row_is_live(h3b) else "pre"
+        return f"{event_id}|{market}|{line}|{side}|Back|{str(mode)}|{regime}|{hyp}"
+
+    async def _prefilter_bridge_key_seen_db(self, src_key: str, action: Optional[str] = None) -> bool:
+        """
+        Verifica se o src_key já foi reservado/consumido pelo bridge.
+        Cacheia positivos em memória para reduzir round-trips ao DB.
+        """
+        sk = str(src_key or "").strip()
+        if not sk:
+            return False
+        if sk in self._prefilter_bridge_seen_keys:
+            return True
+        if not self.db:
+            return False
+        try:
+            q = text(
+                """
+                SELECT 1
+                FROM executor_bridge_seen_keys
+                WHERE src_table='betslip_audit_results'
+                  AND src_key=:src_key
+                  AND action=:action
+                LIMIT 1
+                """
+            )
+            async with self.db.async_session() as session:
+                r = await session.execute(
+                    q,
+                    {"src_key": sk, "action": str(action or self.prefilter_bridge_action)},
+                )
+                row = r.first()
+            if row:
+                self._prefilter_bridge_seen_keys.add(sk)
+                return True
+        except Exception:
+            return False
+        return False
+
     def _prefilter_reload_policy_if_needed(self) -> None:
         if not bool(self.prefilter_enabled):
             return
@@ -669,12 +730,15 @@ class H3bApiAudit:
         self._prefilter_reload_policy_if_needed()
         wf = self._prefilter_wf if isinstance(self._prefilter_wf, dict) else {}
         is_live = self._prefilter_row_is_live(h3b)
+        src_key = self._prefilter_bridge_src_key_back(h3b, mode="live")
         meta: Dict[str, Any] = {
             "enabled": True,
             "is_live": bool(is_live),
             "policy_path": str(self.prefilter_policy_json or ""),
             "enforce_wf_filters": bool(self.prefilter_enforce_wf),
             "use_base_cfg": bool(self.prefilter_use_base),
+            "bridge_src_key": src_key,
+            "bridge_action": str(self.prefilter_bridge_action),
         }
 
         if bool(self.prefilter_prematch_only) and bool(is_live):
@@ -711,6 +775,28 @@ class H3bApiAudit:
                     }
                 )
                 return False, "not_active", meta
+        # Dedup local com TTL (alinhado à chave do bridge) para reduzir reaberturas em runtime.
+        # Aplicamos após os filtros de elegibilidade para não "travar" chaves que já seriam descartadas
+        # por prematch_only/ah_max_abs_line/not_active.
+        try:
+            ttl = float(self.prefilter_local_key_ttl_sec or 0.0)
+            if ttl > 0 and src_key:
+                now = time.time()
+                ts = float(self._prefilter_local_key_ts.get(src_key, 0.0) or 0.0)
+                if ts > 0 and (now - ts) <= ttl:
+                    meta["reason"] = "audit_local_dup_key"
+                    return False, "audit_local_dup_key", meta
+                self._prefilter_local_key_ts[src_key] = now
+                # GC simples
+                if len(self._prefilter_local_key_ts) > 200000:
+                    cutoff = now - ttl
+                    self._prefilter_local_key_ts = {
+                        k: v
+                        for k, v in self._prefilter_local_key_ts.items()
+                        if float(v) >= cutoff
+                    }
+        except Exception:
+            pass
         return True, "", meta
 
     def _build_finance_snapshot(self, r: dict) -> Optional[dict]:
@@ -839,6 +925,9 @@ class H3bApiAudit:
                 f"prematch_only={int(bool(self.prefilter_prematch_only))} "
                 f"enforce_wf={int(bool(self.prefilter_enforce_wf))} "
                 f"use_base={int(bool(self.prefilter_use_base))} "
+                f"check_bridge_seen={int(bool(self.prefilter_check_bridge_seen))} "
+                f"bridge_action={self.prefilter_bridge_action} "
+                f"local_key_ttl_sec={int(float(self.prefilter_local_key_ttl_sec or 0.0))} "
                 f"policy_json={self.prefilter_policy_json}"
             )
         if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
@@ -1863,6 +1952,42 @@ class H3bApiAudit:
                         }
                     )
                     return base
+                if bool(self.prefilter_check_bridge_seen):
+                    try:
+                        src_key = str((meta_pf or {}).get("bridge_src_key") or "").strip()
+                        if src_key and await self._prefilter_bridge_key_seen_db(
+                            src_key=src_key,
+                            action=self.prefilter_bridge_action,
+                        ):
+                            end_to_end_ms = int((time.time() - detected_at) * 1000)
+                            telemetry.update(
+                                {
+                                    "prefilter_blocked": True,
+                                    "prefilter_reason": "bridge_dup_key",
+                                    "prefilter_meta": {**(meta_pf or {}), "bridge_action": str(self.prefilter_bridge_action)},
+                                    "parallel_fetch_ms": 0,
+                                    "temporal_total_ms": 0,
+                                    "execution_ms": int((time.time() - execution_start) * 1000),
+                                    "end_to_end_ms": end_to_end_ms,
+                                    "pipeline_overhead_ms": max(0, end_to_end_ms - telemetry.get("queue_wait_ms", 0)),
+                                }
+                            )
+                            base.update(
+                                {
+                                    "success": False,
+                                    "status": "GATE_NOT_ELIGIBLE",
+                                    "bs_odd": 0,
+                                    "bs_limit": 0,
+                                    "num_bk": 0,
+                                    "diff_pct": 0,
+                                    "error": "AUDIT_PREFILTER:bridge_dup_key",
+                                    "total_ms": end_to_end_ms,
+                                    "telemetry": telemetry,
+                                }
+                            )
+                            return base
+                    except Exception as e:
+                        telemetry["prefilter_bridge_seen_error"] = str(e)[:220]
         except Exception as e:
             telemetry["prefilter_error"] = str(e)[:220]
 
@@ -1888,15 +2013,19 @@ class H3bApiAudit:
         t_parallel = time.time()
         back_result = None
         lay_result = None
+        betslip_call_attempts = 0
         if self.api_sides == "back":
+            betslip_call_attempts = 1
             back_result = await self.api_client.get_betslip_odds(event_id=h3b['event_id'], bet_type=str(back_bet_type))
         elif self.api_sides == "lay":
+            betslip_call_attempts = 1
             lay_result = await self.api_client.get_betslip_odds(
                 event_id=h3b['event_id'],
                 bet_type=str(lay_bet_type),
                 betslip_type="lay",
             )
         else:
+            betslip_call_attempts = 2
             back_task = self.api_client.get_betslip_odds(event_id=h3b['event_id'], bet_type=str(back_bet_type))
             lay_task = self.api_client.get_betslip_odds(
                 event_id=h3b['event_id'],
@@ -1923,6 +2052,7 @@ class H3bApiAudit:
         telemetry.update({
             'build_bet_type_ms': build_bet_type_ms,
             'parallel_fetch_ms': parallel_fetch_ms,
+            'betslip_call_attempts': int(betslip_call_attempts),
             'back_post_ms': back_post_ms,
             'back_pmm_ms': back_pmm_ms,
             'back_total_ms': back_total_ms,
