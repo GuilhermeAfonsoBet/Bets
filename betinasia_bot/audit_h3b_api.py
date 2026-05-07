@@ -174,6 +174,22 @@ class H3bApiAudit:
         if self.api_sides not in ("back", "lay", "both"):
             self.api_sides = "both"
 
+        # Coalescência de enqueue alinhada à chave operacional do bridge (Back).
+        # Evita backlog por duplicidade antes de consumir worker/API.
+        self.prefilter_enabled = self._parse_env_bool("AUDIT_PREFILTER_ENABLE", "1")
+        self.prefilter_enqueue_dedup = self._parse_env_bool("AUDIT_PREFILTER_ENQUEUE_DEDUP", "1")
+        self.prefilter_local_key_ttl_sec = self._parse_env_float(
+            "AUDIT_PREFILTER_LOCAL_KEY_TTL_SEC",
+            21600.0,
+        )
+        self.prefilter_local_key_max = max(
+            1000,
+            int(self._parse_env_float("AUDIT_PREFILTER_LOCAL_KEY_MAX", 200000.0)),
+        )
+        self.prefilter_bridge_mode = str(os.getenv("AUDIT_PREFILTER_BRIDGE_MODE", "live") or "live").strip() or "live"
+        self._prefilter_local_key_ts: Dict[str, float] = {}
+        self._prefilter_pending_bridge_keys: set[str] = set()
+
         # Contadores (observabilidade)
         self.gate_seen = 0
         self.gate_ws_missing = 0
@@ -189,6 +205,35 @@ class H3bApiAudit:
         self.gate_back_ws_missing = 0
         self.gate_back_not_eligible = 0
         self.gate_back_eligible = 0
+        self.dropped_prefilter_local_dup = 0
+        self.dropped_prefilter_pending_dup = 0
+
+        # Tuning explícito do ApiBetslipClient para o audit (independente do executor).
+        self.audit_fast_pmm = self._parse_env_bool("AUDIT_FAST_PMM", "1")
+        self.audit_pmm_timeout_sec = max(
+            0.2,
+            self._parse_env_float("AUDIT_PMM_TIMEOUT_SEC", 1.2 if self.audit_fast_pmm else 4.0),
+        )
+        self.audit_pmm_min_wait_sec = max(
+            0.0,
+            self._parse_env_float("AUDIT_PMM_MIN_WAIT_SEC", 0.0 if self.audit_fast_pmm else 1.5),
+        )
+        self.audit_pmm_idle_timeout_sec = max(
+            0.05,
+            self._parse_env_float("AUDIT_PMM_IDLE_TIMEOUT_SEC", 0.15 if self.audit_fast_pmm else 0.8),
+        )
+        self.audit_betslip_id_timeout_sec = max(
+            0.5,
+            self._parse_env_float("AUDIT_BETSLIP_ID_TIMEOUT_SEC", 2.0 if self.audit_fast_pmm else 3.0),
+        )
+        self.audit_post_timeout_ms = max(
+            1000,
+            int(self._parse_env_float("AUDIT_BETSLIP_POST_TIMEOUT_MS", 7000.0 if self.audit_fast_pmm else 12000.0)),
+        )
+        self.audit_refresh_timeout_ms = max(
+            1000,
+            int(self._parse_env_float("AUDIT_BETSLIP_REFRESH_TIMEOUT_MS", 7000.0 if self.audit_fast_pmm else 12000.0)),
+        )
 
         # Política financeira (insumos para análise econômica posterior)
         # Não afeta execução, apenas persistência de variáveis para analytics.
@@ -489,6 +534,88 @@ class H3bApiAudit:
             return float(default)
 
     @staticmethod
+    def _parse_env_bool(name: str, default: Any = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            raw = default
+        return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+    @staticmethod
+    def _norm_line(value: Any) -> str:
+        s = str(value or "").strip().replace(",", ".").replace("−", "-")
+        if not s:
+            return ""
+        try:
+            f = float(s)
+            if abs(f) < 1e-9:
+                return "0"
+            return f"{f:g}"
+        except Exception:
+            return s
+
+    def _bridge_src_key_back_for_h3b(self, h3b: Dict[str, Any]) -> str:
+        event_id = str(h3b.get("event_id") or "").strip()
+        market = str(h3b.get("market_type") or "AH").strip().upper()
+        line = self._norm_line(h3b.get("line"))
+        side = str(h3b.get("side") or "").strip().lower()
+        regime = "in" if bool(h3b.get("is_live")) else "pre"
+        hyp = str(h3b.get("hypothesis_type") or "H3B").strip().upper() or "H3B"
+        mode = str(self.prefilter_bridge_mode or "live")
+        return f"{event_id}|{market}|{line}|{side}|Back|{mode}|{regime}|{hyp}"
+
+    def _enqueue_coalesce_back(self, h3b: Dict[str, Any]) -> Tuple[bool, str, str]:
+        if not bool(self.prefilter_enabled):
+            return False, "", ""
+        if not bool(self.prefilter_enqueue_dedup):
+            return False, "", ""
+        if self.mode != "api":
+            return False, "", ""
+        if self.api_sides not in ("back", "both"):
+            return False, "", ""
+        src_key = self._bridge_src_key_back_for_h3b(h3b)
+        if not src_key:
+            return False, "", ""
+
+        if src_key in self._prefilter_pending_bridge_keys:
+            return True, "pending_dup_key", src_key
+
+        ttl = float(self.prefilter_local_key_ttl_sec or 0.0)
+        if ttl > 0:
+            now = time.time()
+            ts = float(self._prefilter_local_key_ts.get(src_key, 0.0) or 0.0)
+            if ts > 0 and (now - ts) <= ttl:
+                return True, "audit_local_dup_key", src_key
+        return False, "", src_key
+
+    def _enqueue_mark_src_key(self, src_key: str, *, enqueued: bool) -> None:
+        sk = str(src_key or "").strip()
+        if not sk:
+            return
+        if enqueued:
+            self._prefilter_pending_bridge_keys.add(sk)
+            ttl = float(self.prefilter_local_key_ttl_sec or 0.0)
+            if ttl > 0:
+                self._prefilter_local_key_ts[sk] = time.time()
+                if len(self._prefilter_local_key_ts) > int(self.prefilter_local_key_max):
+                    cutoff = time.time() - ttl
+                    self._prefilter_local_key_ts = {
+                        k: v for k, v in self._prefilter_local_key_ts.items() if float(v) >= cutoff
+                    }
+        else:
+            self._prefilter_pending_bridge_keys.discard(sk)
+
+    def _apply_audit_api_client_tuning(self) -> None:
+        if not self.api_client:
+            return
+        c = self.api_client
+        c.PMM_TIMEOUT = float(self.audit_pmm_timeout_sec)
+        c.PMM_MIN_WAIT = float(self.audit_pmm_min_wait_sec)
+        c.PMM_IDLE_TIMEOUT = float(self.audit_pmm_idle_timeout_sec)
+        c.BETSLIP_ID_TIMEOUT = float(self.audit_betslip_id_timeout_sec)
+        c._betslip_post_timeout_ms = int(self.audit_post_timeout_ms)
+        c._betslip_refresh_timeout_ms = int(self.audit_refresh_timeout_ms)
+
+    @staticmethod
     def _avg(values: List[float]) -> float:
         return (sum(values) / len(values)) if values else 0.0
 
@@ -620,6 +747,23 @@ class H3bApiAudit:
         else:
             logger.info("AUDITORIA H3B VIA API (~2-3s)")
         logger.info(f"mode={self.mode} ws_offsets={self.ws_sample_offsets_sec}")
+        if self.mode == "api":
+            logger.info(
+                "enqueue_coalesce(back): "
+                f"enabled={int(bool(self.prefilter_enabled and self.prefilter_enqueue_dedup))} "
+                f"ttl_sec={int(float(self.prefilter_local_key_ttl_sec or 0.0))} "
+                f"mode={self.prefilter_bridge_mode}"
+            )
+            logger.info(
+                "audit_fast_pmm: "
+                f"fast={int(bool(self.audit_fast_pmm))} "
+                f"pmm_timeout={self.audit_pmm_timeout_sec:.2f}s "
+                f"pmm_min_wait={self.audit_pmm_min_wait_sec:.2f}s "
+                f"pmm_idle_timeout={self.audit_pmm_idle_timeout_sec:.2f}s "
+                f"betslip_id_timeout={self.audit_betslip_id_timeout_sec:.2f}s "
+                f"post_timeout_ms={self.audit_post_timeout_ms} "
+                f"refresh_timeout_ms={self.audit_refresh_timeout_ms}"
+            )
         if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
             logger.info(
                 f"gate: offset={self.gate_drop_offset_sec:.1f}s ratio={self.gate_drop_ratio:.3f} | "
@@ -679,6 +823,7 @@ class H3bApiAudit:
         # API client (usa o page do scraper)
         page = self.scraper._page
         self.api_client = ApiBetslipClient(page)
+        self._apply_audit_api_client_tuning()
 
         # Reduz carga/memória: bloqueia media/fonts (não necessário para WS + fetch).
         try:
@@ -1028,31 +1173,47 @@ class H3bApiAudit:
 
                 is_live = kickoff <= datetime.now(timezone.utc) if kickoff else None
 
+                h3b_payload = {
+                    'event_id': event_id,
+                    'audit_key': audit_key,
+                    'home_team': info.get('home', '?'),
+                    'away_team': info.get('away', '?'),
+                    'league': info.get('league', ''),
+                    'kickoff': kickoff,
+                    'is_live': is_live,
+                    'market_type': market_type,
+                    'market_period': period,
+                    'line': str(h3b.ah_line),
+                    'side': h3b.side,
+                    'websocket_odd': h3b.odd_at_reversal,
+                    'ws_state_key': self._ws_state_key(event_id, market_type, period, str(h3b.ah_line)),
+                    'direction': h3b.direction_after,
+                    'detected_at': time.time(),
+                    'hypothesis_type': 'H3B',
+                }
+
+                skip_enqueue, skip_reason, bridge_src_key = self._enqueue_coalesce_back(h3b_payload)
+                if skip_enqueue:
+                    if skip_reason == "pending_dup_key":
+                        self.dropped_prefilter_pending_dup += 1
+                    else:
+                        self.dropped_prefilter_local_dup += 1
+                    continue
+
                 queue_depth_at_enqueue = queue.qsize()
                 if self.max_queue_depth > 0 and queue_depth_at_enqueue >= self.max_queue_depth:
                     self.dropped_full_queue += 1
                     continue
+                if bridge_src_key:
+                    self._enqueue_mark_src_key(bridge_src_key, enqueued=True)
                 try:
-                    queue.put_nowait({
-                        'event_id': event_id,
-                        'audit_key': audit_key,
-                        'home_team': info.get('home', '?'),
-                        'away_team': info.get('away', '?'),
-                        'league': info.get('league', ''),
-                        'kickoff': kickoff,
-                        'is_live': is_live,
-                        'market_type': market_type,
-                        'market_period': period,
-                        'line': str(h3b.ah_line),
-                        'side': h3b.side,
-                        'websocket_odd': h3b.odd_at_reversal,
-                        'ws_state_key': self._ws_state_key(event_id, market_type, period, str(h3b.ah_line)),
-                        'direction': h3b.direction_after,
-                        'detected_at': time.time(),
-                        'queue_depth_at_enqueue': queue_depth_at_enqueue,
-                    })
+                    h3b_payload['queue_depth_at_enqueue'] = queue_depth_at_enqueue
+                    h3b_payload['bridge_src_key'] = bridge_src_key
+                    queue.put_nowait(h3b_payload)
                 except asyncio.QueueFull:
                     self.dropped_full_queue += 1
+                    if bridge_src_key:
+                        self._enqueue_mark_src_key(bridge_src_key, enqueued=False)
                     continue
                 self.max_queue_depth_observed = max(self.max_queue_depth_observed, queue.qsize())
                 try:
@@ -1082,6 +1243,7 @@ class H3bApiAudit:
             except asyncio.TimeoutError:
                 continue
 
+            bridge_src_key = str(h3b.get("bridge_src_key") or "").strip()
             h3b['dequeued_at'] = time.time()
             h3b['queue_depth_after_dequeue'] = queue.qsize()
             defer_temporal = self.save_to_db and self.temporal_workers > 0
@@ -1209,6 +1371,9 @@ class H3bApiAudit:
                         f"{result['market_type']} {result['line']} {result['side']} | "
                         f"ws={result['ws_odd']:.3f} | err={result.get('error','')} | "
                         f"lag={result['total_ms']}ms | {len(self.results)}")
+
+            if bridge_src_key:
+                self._enqueue_mark_src_key(bridge_src_key, enqueued=False)
 
             if len(self.results) % STATS_INTERVAL == 0:
                 self._log_stats()
@@ -2989,7 +3154,8 @@ class H3bApiAudit:
                 f"last {ws_age:.0f}s | "
                 f"Fila T+0: now={queue_now} max={self.max_queue_depth_observed} | "
                 f"Fila temporal: now={temporal_queue_now} max={self.max_temporal_queue_depth_observed} | "
-                f"drops: fullq={self.dropped_full_queue} staleq={self.dropped_stale_queue_wait} | "
+                f"drops: fullq={self.dropped_full_queue} staleq={self.dropped_stale_queue_wait} "
+                f"pref_local_dup={self.dropped_prefilter_local_dup} pref_pending_dup={self.dropped_prefilter_pending_dup} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
                 f"H3B: {self.h3b_detected} | Erros: {self.total_errors} | "
                 f"ws_buf_drop={self._ws_messages_dropped}")
@@ -3126,6 +3292,11 @@ class H3bApiAudit:
             f"db={int(self._avg(db_ms))} "
             f"pipeline={int(self._avg(pipeline_ms))}"
         )
+        logger.info(
+            "  Coalescência enqueue(back): "
+            f"local_dup={self.dropped_prefilter_local_dup} "
+            f"pending_dup={self.dropped_prefilter_pending_dup}"
+        )
         if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
             logger.info(
                 "  Gate (5s drop -> open LAY): "
@@ -3162,6 +3333,11 @@ class H3bApiAudit:
                 f"  Etapas avg(ms): fila={int(self._avg(queue_ms))} "
                 f"post={int(self._avg(post_ms))} pmm={int(self._avg(pmm_ms))} "
                 f"temporal={int(self._avg(temporal_ms))} pipeline={int(self._avg(pipeline_ms))}"
+            )
+            print(
+                "  Coalescência enqueue(back): "
+                f"local_dup={self.dropped_prefilter_local_dup} "
+                f"pending_dup={self.dropped_prefilter_pending_dup}"
             )
         print(f"{'=' * 60}")
 
