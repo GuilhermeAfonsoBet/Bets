@@ -289,6 +289,31 @@ class BridgeConfig:
     # Isso evita que linhas antigas/sem hint (ou geradas por outros auditores) sejam consumidas
     # pelo bridge do lado errado por engano.
     strict_exec_side_hint_live: bool = True
+    # Fase 1 (fast-path): permite limitar a origem de candidatos por versão/status do audit.
+    # Útil para rodar ws_gate_back como feed de execução e manter audit API em paralelo (shadow).
+    source_audit_versions: Tuple[str, ...] = tuple()
+    source_statuses: Tuple[str, ...] = tuple()
+
+
+def _parse_csv_tokens(raw: Optional[str], *, upper: bool = False) -> Tuple[str, ...]:
+    s = str(raw or "").strip()
+    if not s:
+        return tuple()
+    out: List[str] = []
+    for part in s.replace(";", ",").split(","):
+        tok = str(part or "").strip()
+        if not tok:
+            continue
+        out.append(tok.upper() if upper else tok)
+    # dedup mantendo ordem
+    seen = set()
+    uniq: List[str] = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return tuple(uniq)
 
 
 def _wf_float(wf: Dict[str, Any], *keys: str) -> Optional[float]:
@@ -825,16 +850,29 @@ async def _fetch_candidates(
       AND r.event_id IS NOT NULL AND r.event_id <> ''
       AND upper(r.market_type) = 'AH'
       AND r.hypothesis_type = :hyp
-    ORDER BY r.audited_at ASC
-    LIMIT :lim
     """
     params = {
         "since": since,
-        "lim": int(cfg.max_per_cycle),
         "action": f"{cfg.mode}:{cfg.exec_side.value}",
         "hyp": str(cfg.only_hypothesis),
         "exec_side_hint": str(cfg.exec_side.value),
     }
+    if cfg.source_statuses:
+        ph: List[str] = []
+        for i, st in enumerate(cfg.source_statuses):
+            k = f"src_status_{i}"
+            ph.append(f":{k}")
+            params[k] = str(st).upper()
+        q += f"\n      AND upper(COALESCE(r.status, '')) IN ({', '.join(ph)})"
+    if cfg.source_audit_versions:
+        ph2: List[str] = []
+        for i, ver in enumerate(cfg.source_audit_versions):
+            k = f"src_ver_{i}"
+            ph2.append(f":{k}")
+            params[k] = str(ver)
+        q += f"\n      AND COALESCE(r.audit_version, '') IN ({', '.join(ph2)})"
+    q += "\n    ORDER BY r.audited_at ASC\n    LIMIT :lim\n    "
+    params["lim"] = int(cfg.max_per_cycle)
     if cfg.only_prematch:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
     # Conexões DB podem cair em serviços long-running; fazemos 1 retry com reconnect.
@@ -1121,6 +1159,8 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
+        f"src_statuses={list(cfg.source_statuses) if cfg.source_statuses else ['*']} "
+        f"src_audit_versions={list(cfg.source_audit_versions) if cfg.source_audit_versions else ['*']} "
         f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
         f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
         f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
@@ -1916,6 +1956,16 @@ def main() -> int:
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
     ap.add_argument("--prematch-only", action="store_true", default=(os.getenv("BRIDGE_PREMATCH_ONLY", "1").strip() not in ("0", "false", "False", "no", "NO")))
+    ap.add_argument(
+        "--source-audit-versions",
+        default=os.getenv("BRIDGE_SOURCE_AUDIT_VERSIONS", "").strip(),
+        help="Lista CSV de audit_version para consumir (ex.: v5.3-ws-gate-back). Vazio=sem filtro.",
+    )
+    ap.add_argument(
+        "--source-statuses",
+        default=os.getenv("BRIDGE_SOURCE_STATUSES", "").strip(),
+        help="Lista CSV de status no betslip_audit_results (ex.: OK). Vazio=sem filtro.",
+    )
     ap.add_argument("--policy-json", default=os.getenv("BRIDGE_POLICY_JSON", "").strip() or None, help="Path para WF policy exportado (JSON).")
     ap.add_argument("--policy-reload-sec", type=float, default=float(os.getenv("BRIDGE_POLICY_RELOAD_SEC", "5.0")))
     ap.add_argument(
@@ -1983,6 +2033,8 @@ def main() -> int:
         http_url=(str(args.http_url) if args.http_url else None),
         only_hypothesis=str(args.hypothesis),
         only_prematch=bool(args.prematch_only),
+        source_audit_versions=_parse_csv_tokens(args.source_audit_versions, upper=False),
+        source_statuses=_parse_csv_tokens(args.source_statuses, upper=True),
         policy_json=(str(args.policy_json) if args.policy_json else None),
         policy_reload_sec=float(args.policy_reload_sec),
         policy_use_base=bool(args.policy_use_base),
