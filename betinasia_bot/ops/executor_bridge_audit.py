@@ -446,6 +446,27 @@ async def _ensure_seen_table(db: Database) -> None:
             await conn.execute(text(stmt))
 
 
+async def _table_columns(db: Database, table_name: str) -> set[str]:
+    q = """
+    SELECT lower(column_name) AS c
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name=:t
+    """
+    async with db.async_session() as session:
+        r = await session.execute(text(q), {"t": str(table_name)})
+        rows = r.fetchall() or []
+    out: set[str] = set()
+    for rr in rows:
+        try:
+            c = str(rr[0] or "").strip().lower()
+            if c:
+                out.add(c)
+        except Exception:
+            continue
+    return out
+
+
 def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -807,6 +828,7 @@ async def _fetch_candidates(
     *,
     since: datetime,
     cfg: BridgeConfig,
+    audit_columns: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     # Nota: betslip_audit_results está em models_hypothesis (tabela criada pela connect()).
     strict_hint = bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live)
@@ -857,20 +879,28 @@ async def _fetch_candidates(
         "hyp": str(cfg.only_hypothesis),
         "exec_side_hint": str(cfg.exec_side.value),
     }
-    if cfg.source_statuses:
+    has_status_col = (audit_columns is None) or ("status" in audit_columns)
+    has_audit_version_col = (audit_columns is None) or ("audit_version" in audit_columns)
+
+    if cfg.source_statuses and has_status_col:
         ph: List[str] = []
         for i, st in enumerate(cfg.source_statuses):
             k = f"src_status_{i}"
             ph.append(f":{k}")
             params[k] = str(st).upper()
         q += f"\n      AND upper(COALESCE(r.status, '')) IN ({', '.join(ph)})"
-    if cfg.source_audit_versions:
+    elif cfg.source_statuses and (not has_status_col):
+        logger.warning("[bridge] BRIDGE_SOURCE_STATUSES ignorado: coluna r.status ausente em betslip_audit_results")
+
+    if cfg.source_audit_versions and has_audit_version_col:
         ph2: List[str] = []
         for i, ver in enumerate(cfg.source_audit_versions):
             k = f"src_ver_{i}"
             ph2.append(f":{k}")
             params[k] = str(ver)
         q += f"\n      AND COALESCE(r.audit_version, '') IN ({', '.join(ph2)})"
+    elif cfg.source_audit_versions and (not has_audit_version_col):
+        logger.warning("[bridge] BRIDGE_SOURCE_AUDIT_VERSIONS ignorado: coluna r.audit_version ausente em betslip_audit_results")
     q += "\n    ORDER BY r.audited_at ASC\n    LIMIT :lim\n    "
     params["lim"] = int(cfg.max_per_cycle)
     if cfg.only_prematch:
@@ -1167,9 +1197,21 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         f"min_limit={cfg.min_limit} enforce_wf_filters={int(bool(cfg.enforce_wf_filters))}"
     )
 
+    audit_columns: Optional[set[str]] = None
+    audit_columns_last_check = 0.0
+
     while True:
         t0 = time.time()
         try:
+
+            # Descobre colunas disponíveis no betslip_audit_results (compatibilidade de schema).
+            if (time.time() - float(audit_columns_last_check or 0.0)) >= 300.0 or not audit_columns:
+                try:
+                    audit_columns = await _table_columns(db, "betslip_audit_results")
+                    audit_columns_last_check = time.time()
+                except Exception as e:
+                    logger.warning(f"[bridge] table_columns check failed: {str(e)[:180]}")
+                    audit_columns = None
 
             # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
             try:
@@ -1281,7 +1323,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
 
             since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
             try:
-                rows = await _fetch_candidates(db, since=since, cfg=cfg)
+                rows = await _fetch_candidates(db, since=since, cfg=cfg, audit_columns=audit_columns)
             except (InterfaceError, OperationalError, DBAPIError) as e:
                 if _is_db_disconnect_error(e):
                     await _db_reconnect(db, why="fetch_candidates_disconnect")
