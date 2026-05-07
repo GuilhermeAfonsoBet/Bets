@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import statistics
 import random
 from collections import defaultdict
@@ -2924,13 +2925,35 @@ def _fmt_status(ok: Optional[bool]) -> str:
     return "OK" if ok else "FAIL"
 
 
-def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
+def _telegram_send_document(
+    token: str,
+    chat_id: str,
+    *,
+    file_path: Path,
+    caption: str,
+) -> Tuple[bool, Optional[int], str]:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
-    with file_path.open("rb") as f:
-        files = {"document": (file_path.name, f, "application/pdf")}
-        data = {"chat_id": chat_id, "caption": caption[:900]}
-        r = requests.post(url, data=data, files=files, timeout=60)
-        return bool(r.ok)
+    try:
+        with file_path.open("rb") as f:
+            files = {"document": (file_path.name, f, "application/pdf")}
+            data = {"chat_id": chat_id, "caption": caption[:900]}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            if r.ok:
+                return True, int(r.status_code), ""
+            return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
+
+
+def _telegram_send_message(token: str, chat_id: str, text_msg: str) -> Tuple[bool, Optional[int], str]:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": str(text_msg)[:3900]}, timeout=30)
+        if r.ok:
+            return True, int(r.status_code), ""
+        return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
 
 
 @dataclass
@@ -6194,6 +6217,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "ts": ts.isoformat(),
         "day_dir": str(day_dir),
         "pdf": str(pdf),
+        "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
     }
 
@@ -6202,10 +6226,48 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if token and chat_id and pdf.exists():
-            ok = _telegram_send_document(token, chat_id, file_path=pdf, caption=f"Relatório diário BetinAsia ({day})")
+            retries = max(1, int(float(os.getenv("DAILY_TELEGRAM_RETRIES", "2") or 2)))
+            retry_sleep_sec = max(0.0, float(os.getenv("DAILY_TELEGRAM_RETRY_SLEEP_SEC", "3.0") or 3.0))
+
+            ok = False
+            last_status: Optional[int] = None
+            last_err = ""
+            for i in range(retries):
+                ok, st, err = _telegram_send_document(
+                    token,
+                    chat_id,
+                    file_path=pdf,
+                    caption=f"Relatório diário BetinAsia ({day})",
+                )
+                last_status = st
+                last_err = err
+                if ok:
+                    break
+                if i < (retries - 1) and retry_sleep_sec > 0:
+                    time.sleep(retry_sleep_sec)
+
             out["telegram_sent"] = bool(ok)
+            out["telegram_attempts"] = int(retries)
+            out["telegram_http_status"] = int(last_status) if last_status is not None else None
+            out["telegram_error"] = str(last_err or "")[:500] if not ok else ""
+
+            if not ok:
+                logger.warning(
+                    "Daily report Telegram send failed: "
+                    f"status={last_status} err={str(last_err or '')[:220]} pdf={pdf} size_mb={out.get('pdf_size_mb')}"
+                )
+                # fallback: tenta ao menos avisar no chat que o envio do PDF falhou.
+                _telegram_send_message(
+                    token,
+                    chat_id,
+                    (
+                        f"[daily_full_report] Falha ao enviar PDF ({day}). "
+                        f"status={last_status or '-'} err={str(last_err or '')[:220]}"
+                    ),
+                )
         else:
             out["telegram_sent"] = False
+            out["telegram_error"] = "missing_token_or_chat_or_pdf"
 
     return out
 
