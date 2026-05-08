@@ -219,6 +219,7 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
           a.lag_detection_to_click_ms,
           a.lag_click_to_betslip_ms,
           a.audit_total_duration_ms,
+          a.hypothesis_details,
           m.kickoff_time
         FROM betslip_audit_results a
         LEFT JOIN matches m ON m.external_id = a.event_id
@@ -2845,6 +2846,18 @@ def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[
     metrics_ok: Dict[str, list[float]] = defaultdict(list)
     ok_status = {"LIVE_OK", "DRY_OK"}
 
+    def _audit_telemetry(row: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            raw = row.get("hypothesis_details")
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, dict):
+                return {}
+            t = raw.get("telemetry")
+            return t if isinstance(t, dict) else {}
+        except Exception:
+            return {}
+
     for ln in lines_24h or []:
         try:
             obj = json.loads(ln)
@@ -2896,6 +2909,9 @@ def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[
         audit_total_ms = _safe_float(a.get("audit_total_duration_ms"))
         audit_det_click_ms = _safe_float(a.get("lag_detection_to_click_ms"))
         audit_click_bs_ms = _safe_float(a.get("lag_click_to_betslip_ms"))
+        tele = _audit_telemetry(a)
+        gate_wait_s = _safe_float(tele.get("gate_wait_s"))
+        gate_wait_ms = (float(gate_wait_s) * 1000.0) if gate_wait_s is not None else None
         bridge_wait_ms = (
             max(0.0, float(detect_to_submit_ms) - float(audit_total_ms))
             if audit_total_ms is not None
@@ -2913,6 +2929,13 @@ def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[
             "audit_total_ms": audit_total_ms,
             "audit_detect_to_click_ms": audit_det_click_ms,
             "audit_click_to_betslip_ms": audit_click_bs_ms,
+            "audit_queue_wait_ms": _safe_float(tele.get("queue_wait_ms")),
+            "audit_parallel_fetch_ms": _safe_float(tele.get("parallel_fetch_ms")),
+            "audit_temporal_total_ms": _safe_float(tele.get("temporal_total_ms")),
+            "audit_execution_ms": _safe_float(tele.get("execution_ms")),
+            "audit_pipeline_overhead_ms": _safe_float(tele.get("pipeline_overhead_ms")),
+            "audit_db_save_ms": _safe_float(tele.get("db_save_ms")),
+            "audit_gate_wait_ms": gate_wait_ms,
             "bridge_wait_ms": bridge_wait_ms,
             "executor_submit_to_done_ms": submit_to_done_ms,
             "executor_queue_delay_ms": queue_delay_ms,
@@ -2935,6 +2958,13 @@ def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[
         "audit_total_ms",
         "audit_detect_to_click_ms",
         "audit_click_to_betslip_ms",
+        "audit_queue_wait_ms",
+        "audit_parallel_fetch_ms",
+        "audit_temporal_total_ms",
+        "audit_execution_ms",
+        "audit_pipeline_overhead_ms",
+        "audit_db_save_ms",
+        "audit_gate_wait_ms",
         "bridge_wait_ms",
         "executor_submit_to_done_ms",
         "executor_queue_delay_ms",
@@ -4008,6 +4038,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 ("audit_total", "audit_total_ms"),
                 ("audit_detect_to_click", "audit_detect_to_click_ms"),
                 ("audit_click_to_betslip", "audit_click_to_betslip_ms"),
+                ("audit_queue_wait", "audit_queue_wait_ms"),
+                ("audit_parallel_fetch", "audit_parallel_fetch_ms"),
+                ("audit_temporal_total", "audit_temporal_total_ms"),
+                ("audit_execution", "audit_execution_ms"),
+                ("audit_pipeline_overhead", "audit_pipeline_overhead_ms"),
+                ("audit_db_save", "audit_db_save_ms"),
+                ("audit_gate_wait", "audit_gate_wait_ms"),
                 ("bridge_wait", "bridge_wait_ms"),
                 ("executor_submit_to_done", "executor_submit_to_done_ms"),
                 ("executor_queue_delay", "executor_queue_delay_ms"),
