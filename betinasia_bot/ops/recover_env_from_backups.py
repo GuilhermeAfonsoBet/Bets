@@ -101,7 +101,8 @@ def _latest_values(snaps: Iterable[EnvSnapshot]) -> Dict[str, str]:
 def _build_history(snaps: Iterable[EnvSnapshot]) -> Dict[str, List[str]]:
     hist: Dict[str, List[str]] = {}
     for s in snaps:
-        label = f"{s.path.name} @ {dt.datetime.utcfromtimestamp(s.mtime).isoformat()}Z"
+        when = dt.datetime.fromtimestamp(s.mtime, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        label = f"{s.path.name} @ {when}"
         for k in s.kv:
             hist.setdefault(k, []).append(label)
     return hist
@@ -114,7 +115,7 @@ def _rewrite_env(
     override_existing: bool,
 ) -> Tuple[int, int, Path]:
     existing_kv = _parse_env_file(env_path) if env_path.exists() else {}
-    now = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup_path = env_path.with_name(f"{env_path.name}.before_recover.{now}")
     if env_path.exists():
         backup_path.write_text(env_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
@@ -211,7 +212,7 @@ def main() -> None:
         "backup_inventory": [
             {
                 "file": s.path.name,
-                "mtime_utc": dt.datetime.utcfromtimestamp(s.mtime).isoformat() + "Z",
+                "mtime_utc": dt.datetime.fromtimestamp(s.mtime, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "keys": len(s.kv),
             }
             for s in snaps

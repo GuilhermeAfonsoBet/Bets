@@ -2256,10 +2256,19 @@ class H3bApiAudit:
         gate_ok = bool(float(ws5) < float(self.gate_drop_ratio) * float(ws0))
         telemetry['gate_eligible'] = gate_ok
         telemetry['gate_drop_ratio_obs'] = float(ws5) / float(ws0) if ws0 else None
+        telemetry['gate_drop_threshold_ratio'] = float(self.gate_drop_ratio)
 
         # Se não elegível, ainda salva para medir taxa do filtro
         if not gate_ok:
             self.gate_not_eligible += 1
+            ratio_obs = _safe_float(telemetry.get("gate_drop_ratio_obs"))
+            thr = float(self.gate_drop_ratio)
+            reject_reason = (
+                f"GATE_DROP_NOT_MET: ws5/ws0={ratio_obs:.6f} >= thr={thr:.6f}"
+                if ratio_obs is not None
+                else "GATE_DROP_NOT_MET: ratio_obs_missing"
+            )
+            telemetry["gate_reject_reason"] = reject_reason
             # se existir temporal worker, podemos coletar série completa WS depois (para análises)
             if defer_temporal:
                 base["_ws_series_refs"] = {
@@ -2276,7 +2285,7 @@ class H3bApiAudit:
                 'bs_limit': 0,
                 'num_bk': 0,
                 'diff_pct': None,
-                'error': '',
+                'error': reject_reason,
                 'total_ms': int((time.time() - detected_at) * 1000),
                 'telemetry': telemetry,
             })
@@ -2792,9 +2801,18 @@ class H3bApiAudit:
         telemetry['gate_eligible'] = gate_ok
         telemetry['gate_rise_ratio_obs'] = float(ws5) / float(ws0) if ws0 else None
         telemetry['gate_rise_pct_obs'] = ((float(ws5) - float(ws0)) / float(ws0) * 100.0) if ws0 else None
+        telemetry['gate_rise_threshold_ratio'] = float(self.gate_rise_ratio)
 
         if not gate_ok:
             self.gate_back_not_eligible += 1
+            ratio_obs = _safe_float(telemetry.get("gate_rise_ratio_obs"))
+            thr = float(self.gate_rise_ratio)
+            reject_reason = (
+                f"GATE_RISE_NOT_MET: ws5/ws0={ratio_obs:.6f} < thr={thr:.6f}"
+                if ratio_obs is not None
+                else "GATE_RISE_NOT_MET: ratio_obs_missing"
+            )
+            telemetry["gate_reject_reason"] = reject_reason
             if defer_temporal:
                 base["_ws_series_refs"] = {
                     "ws_state_key": ws_state_key,
@@ -2809,7 +2827,7 @@ class H3bApiAudit:
                 'bs_limit': 0,
                 'num_bk': 0,
                 'diff_pct': None,
-                'error': '',
+                'error': reject_reason,
                 'total_ms': int((time.time() - detected_at) * 1000),
                 'telemetry': telemetry,
                 'is_valid_opportunity': False,
