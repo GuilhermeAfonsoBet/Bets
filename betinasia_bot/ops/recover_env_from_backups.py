@@ -132,31 +132,35 @@ def _rewrite_env(
     already_written: set[str] = set()
 
     for raw in original_lines:
-        line = raw
-        striped = raw.strip()
-        if not striped or striped.startswith("#") or "=" not in striped:
-            out_lines.append(line)
-            continue
-        norm = striped
-        prefix = ""
-        if norm.startswith("export "):
-            prefix = "export "
-            norm = norm[7:].strip()
-        if "=" not in norm:
-            out_lines.append(line)
-            continue
-        key, _old_val = norm.split("=", 1)
-        key = key.strip()
-        if not ENV_KEY_RE.match(key):
-            out_lines.append(line)
-            continue
-        already_written.add(key)
-        if key in recovered_values and override_existing:
-            out_lines.append(f"{prefix}{key}={recovered_values[key]}")
-            updated += 1
-        else:
-            out_lines.append(line)
-            kept += 1
+        # Normaliza linhas corrompidas com "\n" literal (comum após copy/paste errado).
+        # Ex.: "# Foo\nKEY=VAL\nBAR=BAZ" vira múltiplas linhas reais no .env final.
+        chunks = raw.split("\\n") if "\\n" in raw else [raw]
+        for chunk in chunks:
+            line = chunk
+            striped = chunk.strip()
+            if not striped or striped.startswith("#") or "=" not in striped:
+                out_lines.append(line)
+                continue
+            norm = striped
+            prefix = ""
+            if norm.startswith("export "):
+                prefix = "export "
+                norm = norm[7:].strip()
+            if "=" not in norm:
+                out_lines.append(line)
+                continue
+            key, _old_val = norm.split("=", 1)
+            key = key.strip()
+            if not ENV_KEY_RE.match(key):
+                out_lines.append(line)
+                continue
+            already_written.add(key)
+            if key in recovered_values and override_existing:
+                out_lines.append(f"{prefix}{key}={recovered_values[key]}")
+                updated += 1
+            else:
+                out_lines.append(line)
+                kept += 1
 
     appended = 0
     for key in sorted(recovered_values):
