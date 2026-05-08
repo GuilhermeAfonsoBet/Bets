@@ -2970,6 +2970,16 @@ class H3bApiAudit:
                         hypothesis_details["exec_side_hint"] = "Lay"
                 except Exception:
                     pass
+            # Persistir motivo operacional também em hypothesis_details["error"].
+            # Isso evita "sem_reason" em consultas que leem apenas JSONB.
+            try:
+                err_common = r.get("error")
+                if not err_common:
+                    err_common = (telemetry or {}).get("gate_reject_reason")
+                if err_common:
+                    hypothesis_details["error"] = str(err_common)[:240]
+            except Exception:
+                pass
             # Sempre persistir causa de falha: alguns caminhos retornam status=API_FAILED mas `error=''`.
             # Nesses casos, usamos fallbacks da telemetria (back_error/lay_error) para não deixar falhas "mudas".
             if not r.get('success'):
@@ -3104,6 +3114,8 @@ class H3bApiAudit:
                         "audit_version": str(r.get("audit_version") or "v4.0-api"),
                         "exec_side_hint": str((r.get("exec_side_hint") or hypothesis_details.get("exec_side_hint") or "")).strip() or None,
                         "api_error": str((hypothesis_details or {}).get("api_error") or "")[:240] if isinstance(hypothesis_details, dict) else None,
+                        "error": str((hypothesis_details or {}).get("error") or "")[:240] if isinstance(hypothesis_details, dict) else None,
+                        "gate_reject_reason": str(((telemetry or {}).get("gate_reject_reason") or ""))[:240],
                     }
                     rec2 = BetslipAuditResult(
                         hypothesis_type="H3B",
