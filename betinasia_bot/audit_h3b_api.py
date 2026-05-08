@@ -2261,7 +2261,13 @@ class H3bApiAudit:
         # Se não elegível, ainda salva para medir taxa do filtro
         if not gate_ok:
             self.gate_not_eligible += 1
-            ratio_obs = _safe_float(telemetry.get("gate_drop_ratio_obs"))
+            ratio_obs = None
+            try:
+                v = telemetry.get("gate_drop_ratio_obs")
+                if v is not None:
+                    ratio_obs = float(v)
+            except Exception:
+                ratio_obs = None
             thr = float(self.gate_drop_ratio)
             reject_reason = (
                 f"GATE_DROP_NOT_MET: ws5/ws0={ratio_obs:.6f} >= thr={thr:.6f}"
@@ -2805,7 +2811,13 @@ class H3bApiAudit:
 
         if not gate_ok:
             self.gate_back_not_eligible += 1
-            ratio_obs = _safe_float(telemetry.get("gate_rise_ratio_obs"))
+            ratio_obs = None
+            try:
+                v = telemetry.get("gate_rise_ratio_obs")
+                if v is not None:
+                    ratio_obs = float(v)
+            except Exception:
+                ratio_obs = None
             thr = float(self.gate_rise_ratio)
             reject_reason = (
                 f"GATE_RISE_NOT_MET: ws5/ws0={ratio_obs:.6f} < thr={thr:.6f}"
