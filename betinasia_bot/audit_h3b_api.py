@@ -1244,139 +1244,151 @@ class H3bApiAudit:
                 continue
 
             bridge_src_key = str(h3b.get("bridge_src_key") or "").strip()
-            h3b['dequeued_at'] = time.time()
-            h3b['queue_depth_after_dequeue'] = queue.qsize()
-            defer_temporal = self.save_to_db and self.temporal_workers > 0
-            if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
-                # Gate precisa de WS(t0,t+5) inline para decidir; não pode ser deferred.
-                result = await self._execute_ws_gate_lay(h3b, defer_temporal=defer_temporal)
-            elif self.mode in ("ws_reversal_lay", "reversal_lay"):
-                result = await self._execute_ws_reversal_lay(h3b, defer_temporal=defer_temporal)
-            elif self.mode in ("ws_gate_back", "gate_back"):
-                # Gate Back decide via WS(t0,t+5) (sem abrir betslip).
-                result = await self._execute_ws_gate_back(h3b, defer_temporal=defer_temporal)
-            elif self.mode in ("ws_only", "ws"):
-                result = await self._execute_ws_only(h3b, run_ws_series=not defer_temporal)
-            elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
-                result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
-            else:
-                result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
-            telemetry = result.setdefault('telemetry', {})
-            telemetry['worker_id'] = worker_id
-            telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
-            telemetry['executor_total_ms_pre_db'] = int((time.time() - h3b['dequeued_at']) * 1000)
-            db_t0 = time.time()
-            record_id = None
-            if self.save_to_db:
-                record_id = await self._save_result(result)
-            telemetry['db_save_ms'] = int((time.time() - db_t0) * 1000) if self.save_to_db else 0
-            telemetry['pipeline_total_ms'] = int((time.time() - h3b['detected_at']) * 1000)
-            telemetry['executor_total_ms'] = int((time.time() - h3b['dequeued_at']) * 1000)
-            self._emit_audit_telemetry(result)
             try:
-                self.results.append(result)
-                mxr = int(self._results_max or 0)
-                if mxr > 0:
-                    while len(self.results) > mxr:
-                        self.results.popleft()
-            except Exception:
-                pass
+                h3b['dequeued_at'] = time.time()
+                h3b['queue_depth_after_dequeue'] = queue.qsize()
+                defer_temporal = self.save_to_db and self.temporal_workers > 0
+                if self.mode in ("ws_gate_lay", "gate_lay", "gate"):
+                    # Gate precisa de WS(t0,t+5) inline para decidir; não pode ser deferred.
+                    result = await self._execute_ws_gate_lay(h3b, defer_temporal=defer_temporal)
+                elif self.mode in ("ws_reversal_lay", "reversal_lay"):
+                    result = await self._execute_ws_reversal_lay(h3b, defer_temporal=defer_temporal)
+                elif self.mode in ("ws_gate_back", "gate_back"):
+                    # Gate Back decide via WS(t0,t+5) (sem abrir betslip).
+                    result = await self._execute_ws_gate_back(h3b, defer_temporal=defer_temporal)
+                elif self.mode in ("ws_only", "ws"):
+                    result = await self._execute_ws_only(h3b, run_ws_series=not defer_temporal)
+                elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
+                    result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
+                else:
+                    result = await self._execute_api_audit(h3b, run_temporal=not defer_temporal)
+                telemetry = result.setdefault('telemetry', {})
+                telemetry['worker_id'] = worker_id
+                telemetry['pipeline_total_ms_pre_db'] = int((time.time() - h3b['detected_at']) * 1000)
+                telemetry['executor_total_ms_pre_db'] = int((time.time() - h3b['dequeued_at']) * 1000)
+                db_t0 = time.time()
+                record_id = None
+                if self.save_to_db:
+                    record_id = await self._save_result(result)
+                telemetry['db_save_ms'] = int((time.time() - db_t0) * 1000) if self.save_to_db else 0
+                telemetry['pipeline_total_ms'] = int((time.time() - h3b['detected_at']) * 1000)
+                telemetry['executor_total_ms'] = int((time.time() - h3b['dequeued_at']) * 1000)
+                self._emit_audit_telemetry(result)
+                try:
+                    self.results.append(result)
+                    mxr = int(self._results_max or 0)
+                    if mxr > 0:
+                        while len(self.results) > mxr:
+                            self.results.popleft()
+                except Exception:
+                    pass
 
-            temporal_refs = result.get('_temporal_refs')
-            ws_refs = result.get('_ws_series_refs')
-            if defer_temporal and record_id and self._temporal_queue_ref:
-                job: Optional[dict] = None
-                if temporal_refs:
-                    job = {
-                        'kind': 'betslip_temporal',
-                        'record_id': record_id,
-                        'event_id': result.get('event_id'),
-                        'home_team': result.get('home_team'),
-                        'away_team': result.get('away_team'),
-                        'ws_odd': temporal_refs.get('ws_odd'),
-                        'ws_state_key': temporal_refs.get('ws_state_key'),
-                        'ws_side': temporal_refs.get('ws_side'),
-                        'refresh_times': temporal_refs.get('refresh_times'),
-                        'back_betslip_id': temporal_refs.get('back_betslip_id', ''),
-                        'lay_betslip_id': temporal_refs.get('lay_betslip_id', ''),
-                        'telemetry_base': dict(telemetry),
-                        'queued_at': time.time(),
-                    }
-                elif ws_refs:
-                    job = {
-                        'kind': 'ws_series',
-                        'record_id': record_id,
-                        'event_id': result.get('event_id'),
-                        'home_team': result.get('home_team'),
-                        'away_team': result.get('away_team'),
-                        'ws_state_key': ws_refs.get('ws_state_key'),
-                        'ws_side': ws_refs.get('ws_side'),
-                        'offsets_sec': ws_refs.get('offsets_sec'),
-                        'telemetry_base': dict(telemetry),
-                        'queued_at': time.time(),
-                    }
-                if job:
-                    self._temporal_queue_ref.put_nowait(job)
-                    self.max_temporal_queue_depth_observed = max(
-                        self.max_temporal_queue_depth_observed,
-                        self._temporal_queue_ref.qsize()
-                    )
+                temporal_refs = result.get('_temporal_refs')
+                ws_refs = result.get('_ws_series_refs')
+                if defer_temporal and record_id and self._temporal_queue_ref:
+                    job: Optional[dict] = None
+                    if temporal_refs:
+                        job = {
+                            'kind': 'betslip_temporal',
+                            'record_id': record_id,
+                            'event_id': result.get('event_id'),
+                            'home_team': result.get('home_team'),
+                            'away_team': result.get('away_team'),
+                            'ws_odd': temporal_refs.get('ws_odd'),
+                            'ws_state_key': temporal_refs.get('ws_state_key'),
+                            'ws_side': temporal_refs.get('ws_side'),
+                            'refresh_times': temporal_refs.get('refresh_times'),
+                            'back_betslip_id': temporal_refs.get('back_betslip_id', ''),
+                            'lay_betslip_id': temporal_refs.get('lay_betslip_id', ''),
+                            'telemetry_base': dict(telemetry),
+                            'queued_at': time.time(),
+                        }
+                    elif ws_refs:
+                        job = {
+                            'kind': 'ws_series',
+                            'record_id': record_id,
+                            'event_id': result.get('event_id'),
+                            'home_team': result.get('home_team'),
+                            'away_team': result.get('away_team'),
+                            'ws_state_key': ws_refs.get('ws_state_key'),
+                            'ws_side': ws_refs.get('ws_side'),
+                            'offsets_sec': ws_refs.get('offsets_sec'),
+                            'telemetry_base': dict(telemetry),
+                            'queued_at': time.time(),
+                        }
+                    if job:
+                        self._temporal_queue_ref.put_nowait(job)
+                        self.max_temporal_queue_depth_observed = max(
+                            self.max_temporal_queue_depth_observed,
+                            self._temporal_queue_ref.qsize()
+                        )
 
-            # Log
-            live = "LIVE" if result.get('is_live') else "PRE" if result.get('is_live') is not None else "?"
-            bs_odd = result.get('bs_odd', None)
-            has_bs = isinstance(bs_odd, (int, float)) and float(bs_odd) > 0
-            if result.get('success') and has_bs:
-                self.consecutive_errors = 0
-                lay_str = ""
-                if result.get('lay_odd'):
-                    lay_str = f" lay={result['lay_odd']:.3f}({result.get('lay_bookie','')})"
-                q_ms = telemetry.get('queue_wait_ms', 0)
-                temp_ms = telemetry.get('temporal_total_ms', 0)
-                temp_part = "deferred" if telemetry.get('temporal_deferred') else f"{temp_ms}ms"
-                logger.info(
-                    f"[OK][{live}] {result['home_team']} vs {result['away_team']} | "
-                    f"{result['market_type']} {result['line']} {result['side']} | "
-                    f"ws={result['ws_odd']:.3f} bs={result['bs_odd']:.3f} "
-                    f"diff={result['diff_pct']:+.2f}% lim=${result['bs_limit']:,.0f} "
-                    f"({result['num_bk']} bk){lay_str} | "
-                    f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_part} w={worker_id} | "
-                    f"{len(self.results)}")
-            elif result.get('success') and (not has_bs):
-                self.consecutive_errors = 0
-                q_ms = telemetry.get('queue_wait_ms', 0)
-                total_ms = result.get('total_ms')
-                ver = str(result.get("audit_version") or "")
-                ws_part = "ws_series=inline" if result.get("ws_series") else "ws_series=deferred" if result.get("_ws_series_refs") else "ws_series=none"
-                logger.info(
-                    f"[WS][{live}] {result['home_team']} vs {result['away_team']} | "
-                    f"{result['market_type']} {result['line']} {result['side']} | "
-                    f"ws={result['ws_odd']:.3f} | {ws_part} ver={ver} | "
-                    f"lag={total_ms}ms q={q_ms}ms w={worker_id} | {len(self.results)}"
-                )
-            else:
-                status = result.get("status", "FAIL")
-                if status == "STALE_QUEUE_WAIT":
+                # Log
+                live = "LIVE" if result.get('is_live') else "PRE" if result.get('is_live') is not None else "?"
+                bs_odd = result.get('bs_odd', None)
+                has_bs = isinstance(bs_odd, (int, float)) and float(bs_odd) > 0
+                if result.get('success') and has_bs:
+                    self.consecutive_errors = 0
+                    lay_str = ""
+                    if result.get('lay_odd'):
+                        lay_str = f" lay={result['lay_odd']:.3f}({result.get('lay_bookie','')})"
                     q_ms = telemetry.get('queue_wait_ms', 0)
+                    temp_ms = telemetry.get('temporal_total_ms', 0)
+                    temp_part = "deferred" if telemetry.get('temporal_deferred') else f"{temp_ms}ms"
                     logger.info(
-                        f"[STALE][{live}] {result['home_team']} vs {result['away_team']} | "
+                        f"[OK][{live}] {result['home_team']} vs {result['away_team']} | "
                         f"{result['market_type']} {result['line']} {result['side']} | "
-                        f"ws={result['ws_odd']:.3f} | q={q_ms}ms | "
-                        f"lag={result['total_ms']}ms | {len(self.results)}"
+                        f"ws={result['ws_odd']:.3f} bs={result['bs_odd']:.3f} "
+                        f"diff={result['diff_pct']:+.2f}% lim=${result['bs_limit']:,.0f} "
+                        f"({result['num_bk']} bk){lay_str} | "
+                        f"lag={result['total_ms']}ms q={q_ms}ms temp={temp_part} w={worker_id} | "
+                        f"{len(self.results)}")
+                elif result.get('success') and (not has_bs):
+                    self.consecutive_errors = 0
+                    q_ms = telemetry.get('queue_wait_ms', 0)
+                    total_ms = result.get('total_ms')
+                    ver = str(result.get("audit_version") or "")
+                    ws_part = "ws_series=inline" if result.get("ws_series") else "ws_series=deferred" if result.get("_ws_series_refs") else "ws_series=none"
+                    logger.info(
+                        f"[WS][{live}] {result['home_team']} vs {result['away_team']} | "
+                        f"{result['market_type']} {result['line']} {result['side']} | "
+                        f"ws={result['ws_odd']:.3f} | {ws_part} ver={ver} | "
+                        f"lag={total_ms}ms q={q_ms}ms w={worker_id} | {len(self.results)}"
                     )
                 else:
-                    self.total_errors += 1
-                    logger.warning(
-                        f"[FAIL][{live}] {result['home_team']} vs {result['away_team']} | "
-                        f"{result['market_type']} {result['line']} {result['side']} | "
-                        f"ws={result['ws_odd']:.3f} | err={result.get('error','')} | "
-                        f"lag={result['total_ms']}ms | {len(self.results)}")
+                    status = result.get("status", "FAIL")
+                    if status == "STALE_QUEUE_WAIT":
+                        q_ms = telemetry.get('queue_wait_ms', 0)
+                        logger.info(
+                            f"[STALE][{live}] {result['home_team']} vs {result['away_team']} | "
+                            f"{result['market_type']} {result['line']} {result['side']} | "
+                            f"ws={result['ws_odd']:.3f} | q={q_ms}ms | "
+                            f"lag={result['total_ms']}ms | {len(self.results)}"
+                        )
+                    else:
+                        self.total_errors += 1
+                        logger.warning(
+                            f"[FAIL][{live}] {result['home_team']} vs {result['away_team']} | "
+                            f"{result['market_type']} {result['line']} {result['side']} | "
+                            f"ws={result['ws_odd']:.3f} | err={result.get('error','')} | "
+                            f"lag={result['total_ms']}ms | {len(self.results)}")
 
-            if bridge_src_key:
-                self._enqueue_mark_src_key(bridge_src_key, enqueued=False)
-
-            if len(self.results) % STATS_INTERVAL == 0:
-                self._log_stats()
+                if len(self.results) % STATS_INTERVAL == 0:
+                    self._log_stats()
+            except Exception as e:
+                self.total_errors += 1
+                logger.opt(exception=True).error(
+                    f"[EXECUTOR_LOOP][worker={worker_id}] exceção processando item "
+                    f"event_id={h3b.get('event_id')} market={h3b.get('market_type')} "
+                    f"line={h3b.get('line')} side={h3b.get('side')}: {e}"
+                )
+            finally:
+                if bridge_src_key:
+                    self._enqueue_mark_src_key(bridge_src_key, enqueued=False)
+                try:
+                    queue.task_done()
+                except Exception:
+                    pass
 
     async def _collect_temporal_series(
         self,
