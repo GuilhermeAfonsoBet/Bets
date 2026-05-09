@@ -66,7 +66,9 @@ class H3bApiAudit:
         gate_rise_ratio: float = 1.02,
         gate_open_window_sec: int = 300,
         gate_open_max: int = 3,
-        gate_max_late_sec: float = 2.5,
+        gate_max_late_sec: float = 0.0,
+        gate_back_prefetch_betslip: bool = True,
+        gate_back_prefetch_settle_timeout_sec: float = 0.25,
         gate_lay_refresh: bool = False,
         gate_lay_refresh_times_sec: Optional[List[float]] = None,
         api_sides: str = "both",
@@ -142,7 +144,8 @@ class H3bApiAudit:
         # - ws_vs_bs: auditoria comparativa (WS + BS no mesmo timestamp)
         # - ws_gate_lay: WS-only para gate (t0,t+5), abre ticket LAY só quando elegível
         # - ws_reversal_lay: abre ticket LAY imediatamente quando houver reversão (H3B)
-        # - ws_gate_back: WS-only para gate (t0,t+5), marca oportunidade BACK quando elegível (sem abrir betslip)
+        # - ws_gate_back: WS gate (t0,t+5), marca oportunidade BACK quando elegível
+        #   e pode pre-abrir betslip em paralelo (opcional) para reduzir serialização.
         self.mode = str(mode or "api").strip().lower()
         self.ws_sample_offsets_sec = ws_sample_offsets_sec or [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]
 
@@ -153,7 +156,8 @@ class H3bApiAudit:
             # sane default: 0.98 (= queda >2%)
             self.gate_drop_ratio = 0.98
 
-        # Gate (H3B + subida em 5s) -> marca oportunidade BACK via WS (sem abrir betslip)
+        # Gate (H3B + subida em 5s) -> marca oportunidade BACK via WS.
+        # Opcionalmente, inicia prefetch do betslip BACK em paralelo.
         self.gate_rise_offset_sec = max(0.0, float(gate_rise_offset_sec))
         self.gate_rise_ratio = float(gate_rise_ratio)
         if self.gate_rise_ratio <= 1.0:
@@ -162,6 +166,8 @@ class H3bApiAudit:
         self.gate_open_window_sec = max(30, int(gate_open_window_sec))
         self.gate_open_max = max(0, int(gate_open_max))
         self.gate_max_late_sec = max(0.0, float(gate_max_late_sec))
+        self.gate_back_prefetch_betslip = bool(gate_back_prefetch_betslip)
+        self.gate_back_prefetch_settle_timeout_sec = max(0.0, float(gate_back_prefetch_settle_timeout_sec))
         self.gate_open_lock = asyncio.Lock()
         self.gate_open_times = deque()
         self.gate_lay_refresh = bool(gate_lay_refresh)
@@ -739,7 +745,7 @@ class H3bApiAudit:
         elif self.mode in ("ws_reversal_lay", "reversal_lay"):
             logger.info("MONITOR H3B (reversal) + abre LAY imediatamente (Exchange) sob cap")
         elif self.mode in ("ws_gate_back", "gate_back"):
-            logger.info("MONITOR H3B (WS gate t0/t+5) + marca BACK válido (sem abrir betslip)")
+            logger.info("MONITOR H3B (WS gate t0/t+5) + marca BACK válido (+ prefetch betslip opcional)")
         elif self.mode in ("ws_only", "ws"):
             logger.info("MONITOR H3B (WS-only) + série temporal (t0..t+30)")
         elif self.mode in ("ws_vs_bs", "wsbs", "ws_vs_betslip"):
@@ -771,14 +777,17 @@ class H3bApiAudit:
                 f"lay_refresh={self.gate_lay_refresh}"
             )
         if self.mode in ("ws_reversal_lay", "reversal_lay"):
+            max_late_str = "off" if float(self.gate_max_late_sec) <= 0 else f"{self.gate_max_late_sec:.1f}s"
             logger.info(
                 f"reversal_lay: cap={self.gate_open_max}/{self.gate_open_window_sec}s | "
-                f"max_late={self.gate_max_late_sec:.1f}s | lay_refresh={self.gate_lay_refresh}"
+                f"max_late={max_late_str} | lay_refresh={self.gate_lay_refresh}"
             )
         if self.mode in ("ws_gate_back", "gate_back"):
+            max_late_str = "off" if float(self.gate_max_late_sec) <= 0 else f"{self.gate_max_late_sec:.1f}s"
             logger.info(
                 f"gate_back: offset={self.gate_rise_offset_sec:.1f}s ratio={self.gate_rise_ratio:.3f} | "
-                f"max_late={self.gate_max_late_sec:.1f}s"
+                f"max_late={max_late_str} | prefetch_betslip={int(bool(self.gate_back_prefetch_betslip))} "
+                f"settle_timeout={self.gate_back_prefetch_settle_timeout_sec:.2f}s"
             )
         logger.info("=" * 60)
 
@@ -2193,7 +2202,7 @@ class H3bApiAudit:
         telemetry["gate_late_s_at_start"] = float(late_s)
 
         # Se já está tarde demais, marca stale e não tenta abrir ticket (evita distorção)
-        if late_s > float(self.gate_max_late_sec):
+        if float(self.gate_max_late_sec) > 0 and late_s > float(self.gate_max_late_sec):
             base['ws_gate_series'] = [
                 {"t_target_s": 0.0, "t_actual_s": max(0.0, float(now0 - float(detected_at))), "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
             ]
@@ -2529,7 +2538,7 @@ class H3bApiAudit:
         # Protege contra fila velha demais: se atrasou muito, não abre ticket.
         late_s = float(time.time()) - float(detected_at)
         telemetry["late_s_at_start"] = float(late_s)
-        if late_s > float(self.gate_max_late_sec):
+        if float(self.gate_max_late_sec) > 0 and late_s > float(self.gate_max_late_sec):
             base.update({
                 'success': True,
                 'status': 'GATE_STALE',
@@ -2692,7 +2701,7 @@ class H3bApiAudit:
         Gate Back (H3B UP + alta em 5s):
           - mede WS(t0) e WS(t+offset) no timestamp alvo (detected_at + offset)
           - se WS(t+offset) >= gate_rise_ratio * WS(t0): marca como oportunidade executável (Back)
-          - NÃO abre betslip (executor fará isso no momento da execução)
+          - pode pre-abrir betslip BACK em paralelo (opcional), sem bloquear o gate
         """
         self.gate_back_seen += 1
         detected_at = h3b['detected_at']
@@ -2706,6 +2715,9 @@ class H3bApiAudit:
             'gate_mode': 'ws_gate_back',
             'gate_rise_offset_sec': float(self.gate_rise_offset_sec),
             'gate_rise_ratio': float(self.gate_rise_ratio),
+            'gate_max_late_sec': float(self.gate_max_late_sec),
+            'gate_late_guard_enabled': bool(float(self.gate_max_late_sec) > 0),
+            'gate_back_prefetch_enabled': bool(self.gate_back_prefetch_betslip),
         }
 
         base: Dict[str, Any] = {
@@ -2745,8 +2757,60 @@ class H3bApiAudit:
         late_s = float(now0) - float(target_abs_ts)
         telemetry["gate_target_abs_ts"] = float(target_abs_ts)
         telemetry["gate_late_s_at_start"] = float(late_s)
+        prefetch_task: Optional[asyncio.Task] = None
+        prefetch_settled = False
 
-        if late_s > float(self.gate_max_late_sec):
+        async def _settle_prefetch(close_betslip: bool = True) -> Optional[Any]:
+            nonlocal prefetch_settled
+            if prefetch_settled or prefetch_task is None:
+                return None
+            prefetch_settled = True
+            res = None
+            err = ""
+            timeout_s = float(self.gate_back_prefetch_settle_timeout_sec)
+            try:
+                if timeout_s > 0:
+                    res = await asyncio.wait_for(prefetch_task, timeout=timeout_s)
+                else:
+                    res = await prefetch_task
+            except asyncio.TimeoutError:
+                err = f"PREFETCH_TIMEOUT>{timeout_s:.3f}s"
+                try:
+                    prefetch_task.cancel()
+                    await prefetch_task
+                except Exception:
+                    pass
+            except Exception as e:
+                err = str(e)
+
+            telemetry["gate_back_prefetch_settled"] = True
+            if err:
+                telemetry["gate_back_prefetch_error"] = str(err)[:220]
+                return None
+            if res is None:
+                return None
+
+            telemetry["gate_back_prefetch_success"] = bool(getattr(res, "success", False))
+            telemetry["gate_back_prefetch_http_status"] = int(getattr(res, "http_status", 0) or 0)
+            telemetry["gate_back_prefetch_post_ms"] = int(getattr(res, "request_time_ms", 0) or 0)
+            telemetry["gate_back_prefetch_total_ms"] = int(getattr(res, "total_time_ms", 0) or 0)
+            telemetry["gate_back_prefetch_pmm_count"] = int(getattr(res, "pmm_count", 0) or 0)
+            telemetry["gate_back_prefetch_ws_age_ms"] = getattr(res, "ws_age_ms", None)
+            if getattr(res, "error", ""):
+                telemetry["gate_back_prefetch_error"] = str(getattr(res, "error", ""))[:220]
+
+            if close_betslip:
+                bid = str(getattr(res, "betslip_id", "") or "")
+                if bid and self.api_client:
+                    try:
+                        await asyncio.wait_for(self.api_client.close_betslip(bid), timeout=1.2)
+                        telemetry["gate_back_prefetch_closed"] = True
+                    except Exception as e:
+                        telemetry["gate_back_prefetch_closed"] = False
+                        telemetry["gate_back_prefetch_close_error"] = str(e)[:180]
+            return res
+
+        if float(self.gate_max_late_sec) > 0 and late_s > float(self.gate_max_late_sec):
             base['ws_gate_series'] = [
                 {"t_target_s": 0.0, "t_actual_s": max(0.0, float(now0 - float(detected_at))), "ts": float(detected_at), "ws_side": ws_side, "ws_odd": ws0},
             ]
@@ -2762,6 +2826,28 @@ class H3bApiAudit:
                 'telemetry': telemetry,
             })
             return base
+
+        # Remove serializacao: abre betslip em paralelo ao wait de WS(t+offset).
+        if bool(self.gate_back_prefetch_betslip) and self.api_client and ws_state_key and ws_side and ws0:
+            try:
+                back_bet_type = ApiBetslipClient.build_bet_type(
+                    market_type=h3b['market_type'],
+                    side=h3b['side'],
+                    line=h3b['line'],
+                )
+                telemetry["gate_back_prefetch_started"] = True
+                telemetry["gate_back_prefetch_bet_type"] = str(back_bet_type)
+                prefetch_task = asyncio.create_task(
+                    self.api_client.get_betslip_odds(
+                        event_id=h3b['event_id'],
+                        bet_type=str(back_bet_type),
+                    )
+                )
+            except Exception as e:
+                telemetry["gate_back_prefetch_started"] = False
+                telemetry["gate_back_prefetch_error"] = f"PREFETCH_START_FAILED: {str(e)[:180]}"
+        else:
+            telemetry["gate_back_prefetch_started"] = False
 
         wait_s = max(0.0, float(target_abs_ts) - float(now0))
         telemetry["gate_wait_s"] = float(wait_s)
@@ -2787,6 +2873,7 @@ class H3bApiAudit:
 
         if not ws_state_key or not ws_side:
             self.gate_back_ws_missing += 1
+            await _settle_prefetch(close_betslip=True)
             base.update({
                 'success': True,
                 'status': 'GATE_WS_MISSING',
@@ -2802,6 +2889,7 @@ class H3bApiAudit:
 
         if not ws0 or not ws5:
             self.gate_back_ws_missing += 1
+            await _settle_prefetch(close_betslip=True)
             base.update({
                 'success': True,
                 'status': 'GATE_WS_POINT_MISSING',
@@ -2823,6 +2911,7 @@ class H3bApiAudit:
 
         if not gate_ok:
             self.gate_back_not_eligible += 1
+            await _settle_prefetch(close_betslip=True)
             ratio_obs = None
             try:
                 v = telemetry.get("gate_rise_ratio_obs")
@@ -2859,6 +2948,24 @@ class H3bApiAudit:
             return base
 
         self.gate_back_eligible += 1
+        prefetch_result = await _settle_prefetch(close_betslip=True)
+        if prefetch_result and bool(getattr(prefetch_result, "success", False)):
+            ws_odd = h3b.get('websocket_odd')
+            bs_odd = float(getattr(prefetch_result, "best_odd", 0) or 0)
+            diff_pct = None
+            try:
+                if isinstance(ws_odd, (int, float)) and float(ws_odd) > 0 and bs_odd > 0:
+                    diff_pct = ((bs_odd - float(ws_odd)) / float(ws_odd)) * 100.0
+            except Exception:
+                diff_pct = None
+            base.update({
+                'bs_odd': bs_odd if bs_odd > 0 else None,
+                'bs_bookie': str(getattr(prefetch_result, "best_bookie", "") or ""),
+                'bs_limit': float(getattr(prefetch_result, "best_limit", 0) or 0),
+                'num_bk': int(getattr(prefetch_result, "num_bookmakers", 0) or 0),
+                'diff_pct': diff_pct,
+            })
+
         end_to_end_ms = int((time.time() - detected_at) * 1000)
         telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
         telemetry['end_to_end_ms'] = end_to_end_ms
@@ -2867,10 +2974,10 @@ class H3bApiAudit:
         base.update({
             'success': True,
             'status': 'OK',
-            'bs_odd': None,
-            'bs_limit': 0,
-            'num_bk': 0,
-            'diff_pct': None,
+            'bs_odd': base.get('bs_odd'),
+            'bs_limit': base.get('bs_limit', 0),
+            'num_bk': base.get('num_bk', 0),
+            'diff_pct': base.get('diff_pct'),
             'error': '',
             'total_ms': end_to_end_ms,
             'telemetry': telemetry,
@@ -3426,9 +3533,11 @@ async def main():
     # Gate: H3B UP + alta em 5s -> oportunidade BACK via WS
     parser.add_argument("--gate-rise-offset-sec", type=float, default=float(os.getenv("GATE_RISE_OFFSET_SEC", "5")), help="Gate Back: offset (s) para comparar WS(t+offset) vs WS(t0). Default=5.")
     parser.add_argument("--gate-rise-ratio", type=float, default=float(os.getenv("GATE_RISE_RATIO", "1.02")), help="Gate Back: condição WS(t+offset) >= ratio * WS(t0). Default=1.02 (alta >=2%).")
+    parser.add_argument("--gate-back-prefetch-betslip", type=int, default=int(os.getenv("GATE_BACK_PREFETCH_BETSLIP", "1")), help="Gate Back: pre-abre betslip BACK em paralelo (1=sim, 0=nao). Default=1.")
+    parser.add_argument("--gate-back-prefetch-settle-timeout-sec", type=float, default=float(os.getenv("GATE_BACK_PREFETCH_SETTLE_TIMEOUT_SEC", "0.25")), help="Gate Back: timeout extra para consolidar o prefetch no final (s). Default=0.25.")
     parser.add_argument("--gate-open-window-sec", type=int, default=int(os.getenv("GATE_OPEN_WINDOW_SEC", "300")), help="Cap: janela (s) para contar aberturas (POST /v1/betslips/). Default=300 (5 min).")
     parser.add_argument("--gate-open-max", type=int, default=int(os.getenv("GATE_OPEN_MAX", "3")), help="Cap: máximo de aberturas por janela. Default=3 por 5 min (conservador).")
-    parser.add_argument("--gate-max-late-sec", type=float, default=float(os.getenv("GATE_MAX_LATE_SEC", "2.5")), help="Gate: tolerância de atraso (s). Se o worker começar >max_late após o t+offset, marca como stale e não abre ticket. Default=2.5.")
+    parser.add_argument("--gate-max-late-sec", type=float, default=float(os.getenv("GATE_MAX_LATE_SEC", "0")), help="Gate: tolerância de atraso (s). Se >0 e o worker começar >max_late apos o t+offset, marca stale. 0=desliga. Default=0.")
     parser.add_argument("--gate-lay-refresh", action="store_true", help="Se ligado, após abrir ticket LAY coleta lay_temporal via refresh (deferred).")
     parser.add_argument("--gate-lay-refresh-times-sec", type=str, default=os.getenv("GATE_LAY_REFRESH_TIMES_SEC", "0,5,10,15,20"), help="Tempos (s) para refresh do LAY após abrir ticket. Default=0,5,10,15,20.")
     parser.add_argument(
@@ -3488,9 +3597,11 @@ async def main():
         gate_drop_ratio=float(getattr(args, "gate_drop_ratio", 0.98)),
         gate_rise_offset_sec=float(getattr(args, "gate_rise_offset_sec", 5.0)),
         gate_rise_ratio=float(getattr(args, "gate_rise_ratio", 1.02)),
+        gate_back_prefetch_betslip=(int(getattr(args, "gate_back_prefetch_betslip", 1)) > 0),
+        gate_back_prefetch_settle_timeout_sec=float(getattr(args, "gate_back_prefetch_settle_timeout_sec", 0.25)),
         gate_open_window_sec=int(getattr(args, "gate_open_window_sec", 300)),
         gate_open_max=int(getattr(args, "gate_open_max", 3)),
-        gate_max_late_sec=float(getattr(args, "gate_max_late_sec", 2.5)),
+        gate_max_late_sec=float(getattr(args, "gate_max_late_sec", 0.0)),
         gate_lay_refresh=bool(getattr(args, "gate_lay_refresh", False)),
         gate_lay_refresh_times_sec=gate_refresh_times,
         api_sides=str(getattr(args, "api_sides", "both")),
