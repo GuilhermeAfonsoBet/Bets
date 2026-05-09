@@ -2778,8 +2778,10 @@ class H3bApiAudit:
                 try:
                     prefetch_task.cancel()
                     await prefetch_task
-                except Exception:
+                except BaseException:
                     pass
+            except asyncio.CancelledError:
+                err = "PREFETCH_CANCELLED"
             except Exception as e:
                 err = str(e)
 
