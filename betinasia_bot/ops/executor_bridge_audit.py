@@ -239,6 +239,7 @@ class BridgeConfig:
     poll_sec: float = 2.0
     lookback_sec: int = 120
     max_per_cycle: int = 3
+    fetch_newest_first: bool = True
     mode: str = "shadow"  # shadow|live
     exec_side: ExecSide = ExecSide.BACK
     stake: float = 3.0
@@ -901,7 +902,8 @@ async def _fetch_candidates(
         q += f"\n      AND COALESCE(r.audit_version, '') IN ({', '.join(ph2)})"
     elif cfg.source_audit_versions and (not has_audit_version_col):
         logger.warning("[bridge] BRIDGE_SOURCE_AUDIT_VERSIONS ignorado: coluna r.audit_version ausente em betslip_audit_results")
-    q += "\n    ORDER BY r.audited_at ASC\n    LIMIT :lim\n    "
+    order_dir = "DESC" if bool(cfg.fetch_newest_first) else "ASC"
+    q += f"\n    ORDER BY r.audited_at {order_dir}\n    LIMIT :lim\n    "
     params["lim"] = int(cfg.max_per_cycle)
     if cfg.only_prematch:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
@@ -1188,6 +1190,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
+        f"fetch_newest_first={int(bool(cfg.fetch_newest_first))} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
         f"src_statuses={list(cfg.source_statuses) if cfg.source_statuses else ['*']} "
         f"src_audit_versions={list(cfg.source_audit_versions) if cfg.source_audit_versions else ['*']} "
@@ -1994,6 +1997,21 @@ def main() -> int:
     ap.add_argument("--poll-sec", type=float, default=float(os.getenv("BRIDGE_POLL_SEC", "2.0")))
     ap.add_argument("--lookback-sec", type=int, default=int(os.getenv("BRIDGE_LOOKBACK_SEC", "120")))
     ap.add_argument("--max-per-cycle", type=int, default=int(os.getenv("BRIDGE_MAX_PER_CYCLE", "3")))
+    ap.set_defaults(
+        fetch_newest_first=(os.getenv("BRIDGE_FETCH_NEWEST_FIRST", "1").strip() not in ("0", "false", "False", "no", "NO"))
+    )
+    ap.add_argument(
+        "--fetch-newest-first",
+        dest="fetch_newest_first",
+        action="store_true",
+        help="Prioriza candidatos mais recentes (ORDER BY audited_at DESC).",
+    )
+    ap.add_argument(
+        "--fetch-oldest-first",
+        dest="fetch_newest_first",
+        action="store_false",
+        help="Modo legado: prioriza candidatos mais antigos (ORDER BY audited_at ASC).",
+    )
     ap.add_argument("--unix-socket", default=os.getenv("EXECUTOR_UNIX_SOCKET", "/tmp/betinasia-exec.sock"))
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
@@ -2067,6 +2085,7 @@ def main() -> int:
         poll_sec=float(args.poll_sec),
         lookback_sec=int(args.lookback_sec),
         max_per_cycle=int(args.max_per_cycle),
+        fetch_newest_first=bool(args.fetch_newest_first),
         mode=str(args.mode),
         exec_side=ExecSide(str(args.exec_side)),
         strict_exec_side_hint_live=bool(args.strict_exec_side_hint_live),
