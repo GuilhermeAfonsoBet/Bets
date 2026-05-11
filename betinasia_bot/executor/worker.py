@@ -1343,8 +1343,8 @@ class ExecutorWorker:
 
         # ------------------------------------------------------------
         # Stake sizing (Back Pre/In) — operacionalização:
-        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 12)
-        # - demais BACK (Back Pre lento + Back In) => stake_back_default (default 1.5)
+        # - Back Pre com pre_submit_ms <= 5s E slippage_pre_pct < +2% => stake_hi_pre_fast (default 20)
+        # - demais BACK (Back Pre lento + Back In + Pre com slippage >= limiar) => stake_back_default (default 1.5)
         # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
         market_is_live = False
@@ -1376,8 +1376,12 @@ class ExecutorWorker:
         # - EXECUTOR_BACKPRE_FAST_STAKE_HI / _LO
         sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
         pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
-        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 12.0))
+        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 20.0))
         stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
+        pre_fast_max_slip_pct = _env_float(
+            "EXECUTOR_BACKPRE_FAST_MAX_SLIPPAGE_PCT",
+            _env_float("EXECUTOR_BACKPRE_FAST_MAX_SLIP_PCT", 2.0),
+        )
 
         # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
         # imediatamente antes do place_order, mas já escrevemos o "regime" aqui).
@@ -1496,22 +1500,26 @@ class ExecutorWorker:
 
             if sizing_enabled and req.exec_side == ExecSide.BACK:
                 # regra solicitada:
-                # - pre & pre_submit_ms<=5s => 12
+                # - pre & pre_submit_ms<=max & slippage_pre_pct<max => 20
                 # - senão => 1.50
                 is_pre = not bool(market_is_live)
                 ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))
-                is_pre_fast = bool(is_pre and ok_time)
+                ok_slip = (slip_pre is not None) and (float(slip_pre) < float(pre_fast_max_slip_pct))
+                is_pre_fast = bool(is_pre and ok_time and ok_slip)
                 stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
                 vs.update(
                     {
                         "enabled": True,
                         "eligible": bool(is_pre_fast),
-                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max) else stake_back_default",
+                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max && slippage_pre_pct<max_slippage_pre_pct) else stake_back_default",
                         "params": {
                             "max_pre_submit_ms": float(pre_fast_max_ms),
+                            "max_slippage_pre_pct": float(pre_fast_max_slip_pct),
                             "stake_pre_fast": float(stake_pre_fast),
                             "stake_back_default": float(stake_back_default),
                         },
+                        "eligible_time": bool(ok_time),
+                        "eligible_slippage": bool(ok_slip),
                         "stake_chosen": float(stake),
                     }
                 )

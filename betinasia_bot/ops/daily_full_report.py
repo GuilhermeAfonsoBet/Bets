@@ -686,19 +686,22 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
         return False
 
 
-def _stake_bucket(stake: Any) -> str:
+def _stake_bucket(stake: Any, *, hi_min: float, lo_ref: float = 1.5) -> str:
     """
     Bucket simples para acompanhamento operacional do sizing:
-    - "12" para stake≈12
-    - "1.5" para stake≈1.5
+    - "HI" para stake > hi_min
+    - "LO" para stake≈lo_ref
     - "other" para valores diferentes/ausentes
     """
-    if _approx_eq(stake, 12.0, eps=0.02):
-        return "12"
-    if _approx_eq(stake, 1.5, eps=0.02):
-        return "1.5"
     if stake is None:
         return "NA"
+    try:
+        if float(stake) > float(hi_min):
+            return "HI"
+    except Exception:
+        return "NA"
+    if _approx_eq(stake, float(lo_ref), eps=0.02):
+        return "LO"
     return "other"
 
 
@@ -961,7 +964,7 @@ def _append_backpre_fast_slow_sections(
     open_order_ids: Optional[set[str]] = None,
 ) -> None:
     """
-    Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake 12 vs 1.5):
+    Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake HI vs LO):
     - contagem por grupo e por stake_bucket
     - P&L/ROIw (accounting ledger por order_id)
     - slippage_pre_pct por grupo
@@ -985,9 +988,18 @@ def _append_backpre_fast_slow_sections(
     # “início operacional” da tese (quando stake=HI foi habilitado em produção).
     # Se vazio, usa tudo (comportamento antigo).
     thesis_start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
-    stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0) or 12.0
+    stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "20") or 20.0) or 20.0
+    stake_lo = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_LO", "1.5") or 1.5) or 1.5
     thesis_hi_min = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MIN", "5.0") or 5.0) or 5.0
-    thesis_hi_max = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "14.0") or 14.0) or 14.0
+    thesis_hi_max_raw = str(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "") or "").strip()
+    thesis_hi_max = _safe_float_or_none(thesis_hi_max_raw) if thesis_hi_max_raw else None
+    if thesis_hi_max is not None and float(thesis_hi_max) <= float(thesis_hi_min):
+        thesis_hi_max = None
+    hi_label = (
+        f"stake > {_fmt_num(thesis_hi_min,2)}"
+        if thesis_hi_max is None
+        else f"stake em ({_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]"
+    )
 
     # rows com accounting (pnl) + stake (exposure)
     groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
@@ -1032,7 +1044,7 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
-        stake_b = _stake_bucket(exp)
+        stake_b = _stake_bucket(exp, hi_min=float(thesis_hi_min), lo_ref=float(stake_lo))
         roi_i = float(pnl) / float(exp) * 100.0
         row = {
             "order_id": str(oid),
@@ -1054,9 +1066,12 @@ def _append_backpre_fast_slow_sections(
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
                 # tese = fast + stake em faixa HI (pós-início)
-                if _in_range(exp, float(thesis_hi_min), float(thesis_hi_max)):
+                is_hi = (float(exp) > float(thesis_hi_min)) and (
+                    thesis_hi_max is None or float(exp) <= float(thesis_hi_max)
+                )
+                if is_hi:
                     groups_thesis[
-                        f"Back Pre fast (stake em [{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
+                        f"Back Pre fast ({hi_label}; pre_submit_ms<= {thr_ms}ms)"
                     ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
@@ -1069,7 +1084,8 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
     out_lines.append(
-        f"- Critério de elegibilidade HI (relatório): stake em `[{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]`.\n\n"
+        f"- Critério de elegibilidade HI (relatório): `{hi_label}`.\n"
+        f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
     )
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
@@ -1103,18 +1119,29 @@ def _append_backpre_fast_slow_sections(
     if open_order_ids is None:
         out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
-    # Performance auxiliar: fast com stake < limiar HI_min (impacto prático de latência/degradação)
+    # Performance auxiliar: fast fora da faixa HI (impacto prático de latência/degradação)
     low_rows: List[Dict[str, Any]] = []
     fast_key = f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"
     for r in (groups_all.get(fast_key) or []):
         exp = _safe_float_or_none(r.get("exposure"))
-        if exp is not None and exp < float(thesis_hi_min):
+        if exp is None:
+            continue
+        is_hi = (float(exp) > float(thesis_hi_min)) and (
+            thesis_hi_max is None or float(exp) <= float(thesis_hi_max)
+        )
+        if not is_hi:
             low_rows.append(r)
-    out_lines.append("**Back Pre fast (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
+    out_lines.append("**Back Pre fast (pós-início; stake fora de HI) — performance auxiliar (accounting; order_id)**\n\n")
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
     settled_rows, open_rows = _split_settled(low_rows)
-    label_low = f"Back Pre fast (stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
+    if thesis_hi_max is None:
+        label_low = f"Back Pre fast (stake <= {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
+    else:
+        label_low = (
+            "Back Pre fast "
+            f"(stake fora de ({_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
+        )
     if settled_rows is None or open_rows is None:
         out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
     else:
@@ -1125,13 +1152,13 @@ def _append_backpre_fast_slow_sections(
     out_lines.append("\n")
 
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
-        c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
+        c: Dict[str, int] = {"HI": 0, "LO": 0, "other": 0}
         for r in rows or []:
             sb = str(r.get("stake_bucket") or "")
-            if sb == "12":
-                c["12"] += 1
-            elif sb == "1.5":
-                c["1.5"] += 1
+            if sb == "HI":
+                c["HI"] += 1
+            elif sb == "LO":
+                c["LO"] += 1
             else:
                 c["other"] += 1
         return c
@@ -1141,7 +1168,7 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     out_lines.append("**Tese Back Pre fast — compliance (pós-início; distribuição de stake e pre_submit_ms)**\n\n")
     out_lines.append(
-        "| Grupo | n_ordens | stake=12 | stake=1.5 | stake=other/NA |\n"
+        f"| Grupo | n_ordens | {hi_label} | stake≈{_fmt_num(stake_lo,2)} | stake=other/NA |\n"
     )
     out_lines.append("|---|---:|---:|---:|---:|\n")
     order_diag = [
@@ -1155,7 +1182,7 @@ def _append_backpre_fast_slow_sections(
         if not rows:
             continue
         stc = _cnt_stake(rows)
-        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n")
+        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('HI') or 0)} | {int(stc.get('LO') or 0)} | {int(stc.get('other') or 0)} |\n")
     out_lines.append("\n")
 
     # Slippage_pre_pct por grupo (3 buckets)
@@ -6199,7 +6226,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- No operacional (shadow/live), o tamanho enviado pelo bridge é **FLAT** via `BRIDGE_STAKE`.\n"
             "- Em **Back**: stake padrão = `BRIDGE_STAKE`.\n"
             "  - **Exceção (sizing no executor)**: se `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1`, o executor pode sobrescrever stake em Back:\n"
-            "    - Back **Pre** com `pre_submit_ms <= EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS` ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_HI` (ex.: 12)\n"
+            "    - Back **Pre** com `pre_submit_ms <= EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS` **e** `slippage_pre_pct < EXECUTOR_BACKPRE_FAST_MAX_SLIPPAGE_PCT` ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_HI` (ex.: 20)\n"
             "    - demais Back ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_LO` (ex.: 1.50)\n"
             "- Em **Lay**: o executor recebe stake, mas o risco relevante é a **liability**, aproximadamente `liability ≈ stake × (odd - 1)`.\n"
             "- Importante: o Kelly/caps que aparece no relatório OOS é **simulação/diagnóstico** do walk-forward; ele não está sendo aplicado no executor/bridge neste momento.\n\n"
