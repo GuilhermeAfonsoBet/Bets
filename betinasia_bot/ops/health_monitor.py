@@ -1321,16 +1321,19 @@ def _should_restart_from_results(results: List[CheckResult], service: str) -> bo
     - se houver FAIL específico do serviço ou do seu subsistema (telemetria/DB)
     """
     key = str(service).strip()
+    key_l = key.lower()
     for r in results:
         if r.level != "FAIL":
             continue
         msg = r.message.lower()
-        if key.lower() in msg:
+        # Match estrito por prefixo "service: ...", evitando falso positivo por substring
+        # (ex.: betinasia-executor não deve casar com betinasia-executor-bridge-lay).
+        if key_l and msg.startswith(f"{key_l}:"):
             return True
         # mapeamentos simples
-        if "collector" in key.lower() and ("collector" in msg or "best_odds_history" in msg):
+        if "collector" in key_l and ("collector" in msg or "best_odds_history" in msg):
             return True
-        if "audit" in key.lower() and ("audit" in msg or "betslip_audit_results" in msg):
+        if "audit" in key_l and ("audit" in msg or "betslip_audit_results" in msg):
             return True
     return False
 

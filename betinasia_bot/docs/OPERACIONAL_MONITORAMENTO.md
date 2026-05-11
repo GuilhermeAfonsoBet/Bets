@@ -231,6 +231,12 @@ O auto-pilot roda a cada ~2 minutos e:
 - **só reinicia** serviços quando houver **FAIL por 2 execuções seguidas** (default)
 - aplica **cooldown** e **rate limit** para evitar flapping
 
+> O Telegram é apenas **notificação**. O fluxo de reação (restart/pause) roda sem intervenção humana
+> quando `betinasia-ops-autopilot.timer` está ativo e os thresholds estão configurados.
+>
+> Em operação Back-only, configure `BRIDGE_LAY_SERVICE=0` no `.env` para não gerar FAIL por service
+> propositalmente inativo.
+
 ### Instalar
 ```bash
 AUTO_SVC="$(git ls-files | grep -m1 'betinasia-ops-autopilot.service')"
