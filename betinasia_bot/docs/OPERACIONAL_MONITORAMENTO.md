@@ -236,6 +236,10 @@ O auto-pilot roda a cada ~2 minutos e:
 >
 > Em operação Back-only, configure `BRIDGE_LAY_SERVICE=0` no `.env` para não gerar FAIL por service
 > propositalmente inativo.
+>
+> Para reduzir ruído quando a policy bloqueia tudo (`bridge_accepted=0`), use:
+> - `OPS_EXECUTOR_IDLE_EXPECTED_WHEN_ZERO_ACCEPTED=1`
+> - `OPS_EXECUTOR_IDLE_WARN_ON_NO_NONHEARTBEAT=1` (ou `0` para não alertar WARN nesse caso)
 
 ### Instalar
 ```bash

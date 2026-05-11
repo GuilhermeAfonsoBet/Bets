@@ -864,6 +864,8 @@ async def run_checks(
         fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
         min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
         min_accepted_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_ACCEPTED", "1"), 1)
+        idle_warn_on_no_nonhb = _is_truthy(os.getenv("OPS_EXECUTOR_IDLE_WARN_ON_NO_NONHEARTBEAT", "1"))
+        idle_expected_on_zero_accepted = _is_truthy(os.getenv("OPS_EXECUTOR_IDLE_EXPECTED_WHEN_ZERO_ACCEPTED", "1"))
         lat_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_MIN_EVENTS", "30"), 30)
         lat_call_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_WARN_MS", "12000"), 12000)
         lat_call_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_FAIL_MS", "20000"), 20000)
@@ -994,8 +996,18 @@ async def run_checks(
 
             # idle: sem non-heartbeat por tempo alto *e* audit gerando oportunidades
             if age_nonhb is None:
-                results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
-                exit_code = max(exit_code, 1)
+                if idle_expected_on_zero_accepted and int(flow_n_accepted) == 0:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"executor: idle esperado (sem non-heartbeat no tail; bridge_accepted=0 hb={len(hb)}).",
+                        )
+                    )
+                elif idle_warn_on_no_nonhb:
+                    results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
+                    exit_code = max(exit_code, 1)
+                else:
+                    results.append(CheckResult("PASS", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
             else:
                 should_fail_idle = False
                 if age_nonhb > int(max_nonhb_age):
