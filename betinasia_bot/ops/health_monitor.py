@@ -58,6 +58,35 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _is_truthy(x: Any) -> bool:
+    try:
+        return str(x or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
+
+
+def _parse_csv_tokens(raw: Any, *, upper: bool = False) -> List[str]:
+    try:
+        s = str(raw or "").strip()
+    except Exception:
+        return []
+    if not s:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for t in s.split(","):
+        tok = str(t or "").strip()
+        if not tok:
+            continue
+        if upper:
+            tok = tok.upper()
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
 def _pctl(xs: List[float], p: float) -> Optional[float]:
     if not xs:
         return None
@@ -262,6 +291,152 @@ def _systemctl_stop(service: str) -> bool:
         return False
 
 
+def _executor_health_payload(*, unix_socket: str, http_url: str, timeout_sec: int = 3) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Consulta /health do executor via socket Unix (preferencial) e fallback HTTP.
+    Retorna (payload_json, err_code). err_code=None quando sucesso.
+    """
+    try:
+        to = int(max(1, timeout_sec))
+    except Exception:
+        to = 3
+
+    def _run(cmd: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            p = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=float(to),
+            )
+        except Exception:
+            return None, "CALL_ERROR"
+        if p.returncode != 0:
+            return None, "CALL_FAIL"
+        raw = (p.stdout or "").strip()
+        if not raw:
+            return None, "EMPTY"
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj, None
+            return None, "NOT_JSON_OBJECT"
+        except Exception:
+            return None, "INVALID_JSON"
+
+    sock = str(unix_socket or "").strip()
+    if sock:
+        payload, err = _run(["curl", "-sS", "--max-time", str(int(to)), "--unix-socket", sock, "http://localhost/health"])
+        if payload is not None:
+            return payload, None
+
+    url = str(http_url or "").strip() or "http://127.0.0.1:8089"
+    payload, err = _run(["curl", "-sS", "--max-time", str(int(to)), f"{url.rstrip('/')}/health"])
+    if payload is not None:
+        return payload, None
+    return None, "UNAVAILABLE"
+
+
+async def _db_bridge_flow(
+    db: Database,
+    *,
+    since: datetime,
+    action: str,
+    hypothesis_type: str,
+    prematch_only: bool,
+    source_statuses: List[str],
+    source_audit_versions: List[str],
+) -> Dict[str, Any]:
+    """
+    Sinais de fluxo audit -> bridge para detectar "travamento funcional":
+      - eligible_n: quantidade elegível no audit (janela)
+      - seen_n: quantidade consumida pelo bridge (executor_bridge_seen)
+      - accepted_n: quantidade aceita pelo bridge (meta.reason=accepted)
+    """
+    q_elig = """
+        SELECT count(*)::bigint AS n
+        FROM betslip_audit_results r
+        WHERE r.audited_at >= :since
+          AND r.is_valid_opportunity = TRUE
+          AND r.hypothesis_type = :hyp
+    """
+    params: Dict[str, Any] = {"since": since, "hyp": str(hypothesis_type or "H3B")}
+    if bool(prematch_only):
+        q_elig += "\n  AND (r.is_live IS NULL OR r.is_live = FALSE)"
+
+    if source_statuses:
+        ph: List[str] = []
+        for i, st in enumerate(source_statuses):
+            k = f"st_{i}"
+            params[k] = str(st).upper()
+            ph.append(f":{k}")
+        q_elig += f"\n  AND upper(COALESCE(r.status, '')) IN ({', '.join(ph)})"
+
+    if source_audit_versions:
+        ph2: List[str] = []
+        for i, ver in enumerate(source_audit_versions):
+            k = f"ver_{i}"
+            params[k] = str(ver)
+            ph2.append(f":{k}")
+        q_elig += f"\n  AND COALESCE(r.audit_version, '') IN ({', '.join(ph2)})"
+
+    q_seen = text(
+        """
+        SELECT
+          count(*)::bigint AS seen_n,
+          count(*) FILTER (
+            WHERE COALESCE(meta->>'reason', CASE WHEN meta->>'accepted'='true' THEN 'accepted' END) = 'accepted'
+          )::bigint AS accepted_n
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+        """
+    )
+
+    async with db.async_session() as session:
+        r1 = await session.execute(text(q_elig), params)
+        n_eligible = int((r1.scalar() or 0))
+        r2 = await session.execute(q_seen, {"since": since, "action": str(action)})
+        row2 = r2.fetchone()
+        seen_n = int(row2._mapping.get("seen_n") or 0) if row2 else 0
+        accepted_n = int(row2._mapping.get("accepted_n") or 0) if row2 else 0
+    return {
+        "eligible_n": int(n_eligible),
+        "seen_n": int(seen_n),
+        "accepted_n": int(accepted_n),
+    }
+
+
+async def _db_bridge_reason_counts(db: Database, *, since: datetime, action: str) -> Dict[str, int]:
+    q = text(
+        """
+        SELECT
+          COALESCE(meta->>'reason', CASE WHEN meta->>'accepted'='true' THEN 'accepted' END, 'unknown') AS reason,
+          count(*)::bigint AS n
+        FROM executor_bridge_seen
+        WHERE created_at >= :since
+          AND action = :action
+        GROUP BY 1
+        """
+    )
+    out: Dict[str, int] = {}
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since, "action": str(action)})
+        for row in (r.fetchall() or []):
+            try:
+                reason = str(row._mapping.get("reason") or "unknown")
+            except Exception:
+                reason = "unknown"
+            try:
+                n = int(row._mapping.get("n") or 0)
+            except Exception:
+                n = 0
+            out[reason] = n
+    return out
+
+
 def _exit_code_from_results(results: List[CheckResult]) -> int:
     code = 0
     for r in results:
@@ -402,11 +577,43 @@ async def run_checks(
     _check_telemetry("collector", collector_telemetry)
     _check_telemetry("audit-api", audit_telemetry)
 
-    # 3) DB freshness
+    # 3) DB freshness + fluxo audit->bridge
+    flow_n_eligible = 0
+    flow_n_seen = 0
+    flow_n_accepted = 0
+    flow_reason_counts: Dict[str, int] = {}
+    flow_minutes = max(1, _safe_int(os.getenv("OPS_BRIDGE_FLOW_WINDOW_MINUTES", str(since_minutes)), since_minutes))
+    flow_minutes = min(int(since_minutes), int(flow_minutes))
+    flow_since = now - timedelta(minutes=int(flow_minutes))
+
+    flow_action = str(
+        os.getenv(
+            "OPS_BRIDGE_ACTION",
+            f"{str(os.getenv('BRIDGE_MODE', 'live') or 'live').strip()}:{str(os.getenv('BRIDGE_EXEC_SIDE', 'Back') or 'Back').strip()}",
+        )
+    ).strip()
+    flow_hyp = str(os.getenv("OPS_BRIDGE_HYPOTHESIS", os.getenv("BRIDGE_HYPOTHESIS", "H3B")) or "H3B").strip()
+    flow_prematch_only = _is_truthy(os.getenv("OPS_BRIDGE_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1")))
+    flow_statuses = _parse_csv_tokens(os.getenv("OPS_BRIDGE_SOURCE_STATUSES", os.getenv("BRIDGE_SOURCE_STATUSES", "")), upper=True)
+    flow_versions = _parse_csv_tokens(os.getenv("OPS_BRIDGE_SOURCE_AUDIT_VERSIONS", os.getenv("BRIDGE_SOURCE_AUDIT_VERSIONS", "")), upper=False)
+
     db = Database()
     await db.connect()
     try:
         m = await _db_metrics(db, since)
+        flow = await _db_bridge_flow(
+            db,
+            since=flow_since,
+            action=str(flow_action),
+            hypothesis_type=str(flow_hyp or "H3B"),
+            prematch_only=bool(flow_prematch_only),
+            source_statuses=list(flow_statuses or []),
+            source_audit_versions=list(flow_versions or []),
+        )
+        flow_n_eligible = int(flow.get("eligible_n") or 0)
+        flow_n_seen = int(flow.get("seen_n") or 0)
+        flow_n_accepted = int(flow.get("accepted_n") or 0)
+        flow_reason_counts = await _db_bridge_reason_counts(db, since=flow_since, action=str(flow_action))
         # Sinais rápidos de fricção/bloqueio (janela menor)
         fric_min = _safe_int(os.getenv("OPS_AUDIT_FRICTION_MINUTES", "10"), 10)
         fric_min = max(1, min(int(since_minutes), int(fric_min)))
@@ -442,6 +649,144 @@ async def run_checks(
         exit_code = max(exit_code, 1)
 
     results.append(CheckResult("PASS", f"DB: h3b_temporal_reversal_events (n={h3b_n} desde {since_minutes}m)"))
+
+    # Audit estagnado: evita "serviço vivo sem progresso real"
+    try:
+        stale_fail_sec = _safe_int(os.getenv("OPS_AUDIT_DB_STALE_FAIL_SEC", "0"), 0)
+        stale_min_upstream = _safe_int(os.getenv("OPS_AUDIT_DB_STALE_MIN_UPSTREAM", "10"), 10)
+        upstream_n = int(best_n) + int(h3b_n)
+        if int(stale_fail_sec) > 0 and (a_audit is not None) and int(a_audit) > int(stale_fail_sec):
+            if upstream_n >= int(stale_min_upstream):
+                results.append(
+                    CheckResult(
+                        "FAIL",
+                        f"{audit_service or 'betinasia-audit'}: DB estagnado (last_audit_age={a_audit}s>{stale_fail_sec}s, upstream_n={upstream_n})",
+                    )
+                )
+                exit_code = max(exit_code, 2)
+    except Exception:
+        pass
+
+    # Fluxo audit -> bridge (detecção de travamento funcional)
+    try:
+        flow_enable = _is_truthy(os.getenv("OPS_BRIDGE_FLOW_ENABLE", "1"))
+        flow_min_eligible = _safe_int(os.getenv("OPS_BRIDGE_FLOW_MIN_ELIGIBLE", "20"), 20)
+        flow_warn_ratio = float(os.getenv("OPS_BRIDGE_FLOW_SEEN_RATIO_WARN", "0.50"))
+        flow_fail_ratio = float(os.getenv("OPS_BRIDGE_FLOW_SEEN_RATIO_FAIL", "0.20"))
+        flow_fail_on_zero = _is_truthy(os.getenv("OPS_BRIDGE_FLOW_FAIL_ON_ZERO", "1"))
+        if flow_enable:
+            denom_eligible = max(1, int(flow_n_eligible))
+            seen_ratio = float(flow_n_seen) / float(denom_eligible)
+            accepted_ratio = float(flow_n_accepted) / float(max(1, flow_n_seen))
+            if int(flow_n_eligible) >= int(flow_min_eligible):
+                if int(flow_n_seen) == 0 and flow_fail_on_zero:
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{bridge_back_service or 'betinasia-executor-bridge-back'}: bridge-flow zerado "
+                            f"(eligible={flow_n_eligible} seen=0 accepted=0 window={flow_minutes}m action={flow_action})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                elif seen_ratio < float(flow_fail_ratio):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{bridge_back_service or 'betinasia-executor-bridge-back'}: bridge-flow baixo "
+                            f"(eligible={flow_n_eligible} seen={flow_n_seen} ratio={seen_ratio:.0%}<{flow_fail_ratio:.0%} "
+                            f"accepted={flow_n_accepted} accepted_rate={accepted_ratio:.0%} window={flow_minutes}m action={flow_action})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                elif seen_ratio < float(flow_warn_ratio):
+                    results.append(
+                        CheckResult(
+                            "WARN",
+                            f"{bridge_back_service or 'betinasia-executor-bridge-back'}: bridge-flow reduzido "
+                            f"(eligible={flow_n_eligible} seen={flow_n_seen} ratio={seen_ratio:.0%}<{flow_warn_ratio:.0%} "
+                            f"accepted={flow_n_accepted} accepted_rate={accepted_ratio:.0%} window={flow_minutes}m action={flow_action})",
+                        )
+                    )
+                    exit_code = max(exit_code, 1)
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"bridge-flow: ok (eligible={flow_n_eligible} seen={flow_n_seen} ratio={seen_ratio:.0%} "
+                            f"accepted={flow_n_accepted} accepted_rate={accepted_ratio:.0%} window={flow_minutes}m action={flow_action})",
+                        )
+                    )
+            else:
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"bridge-flow: amostra baixa (eligible={flow_n_eligible} < min={flow_min_eligible}, window={flow_minutes}m action={flow_action})",
+                    )
+                )
+    except Exception:
+        pass
+
+    # Throughput/política do bridge (usa variáveis OPS_BRIDGE_* já comuns em produção)
+    try:
+        throughput_enable = _is_truthy(os.getenv("OPS_BRIDGE_THROUGHPUT_ENABLE", "0"))
+        throughput_min_seen = _safe_int(os.getenv("OPS_BRIDGE_THROUGHPUT_MIN_SEEN", "60"), 60)
+        accepted_warn_pct = float(os.getenv("OPS_BRIDGE_ACCEPTED_WARN_PCT", "0.08"))
+        accepted_fail_pct = float(os.getenv("OPS_BRIDGE_ACCEPTED_FAIL_PCT", "0.03"))
+        throughput_fail_hard = _is_truthy(os.getenv("OPS_BRIDGE_THROUGHPUT_FAIL_HARD", "0"))
+        if throughput_enable and int(flow_n_seen) >= int(throughput_min_seen):
+            acc_rate = float(flow_n_accepted) / float(max(1, flow_n_seen))
+            if acc_rate < float(accepted_fail_pct):
+                lvl = "FAIL" if throughput_fail_hard else "WARN"
+                results.append(
+                    CheckResult(
+                        lvl,
+                        f"bridge-throughput: accepted_rate baixo (accepted={flow_n_accepted}/{flow_n_seen}={acc_rate:.0%} "
+                        f"< {accepted_fail_pct:.0%}, window={flow_minutes}m)",
+                    )
+                )
+                exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+            elif acc_rate < float(accepted_warn_pct):
+                results.append(
+                    CheckResult(
+                        "WARN",
+                        f"bridge-throughput: accepted_rate em alerta (accepted={flow_n_accepted}/{flow_n_seen}={acc_rate:.0%} "
+                        f"< {accepted_warn_pct:.0%}, window={flow_minutes}m)",
+                    )
+                )
+                exit_code = max(exit_code, 1)
+            else:
+                results.append(
+                    CheckResult(
+                        "PASS",
+                        f"bridge-throughput: ok (accepted={flow_n_accepted}/{flow_n_seen}={acc_rate:.0%}, window={flow_minutes}m)",
+                    )
+                )
+    except Exception:
+        pass
+
+    try:
+        policy_as_warn = _is_truthy(os.getenv("OPS_BRIDGE_FLOW_POLICY_AS_WARN", "1"))
+        policy_ratio_min = float(os.getenv("OPS_BRIDGE_FLOW_POLICY_RATIO_MIN", "0.80"))
+        policy_reasons = _parse_csv_tokens(
+            os.getenv("OPS_BRIDGE_FLOW_POLICY_REASONS", "not_active,wf_ah_max_abs_line,min_limit,disabled_back,disabled_lay"),
+            upper=False,
+        )
+        if policy_as_warn and int(flow_n_seen) > 0 and policy_reasons:
+            n_policy = 0
+            for rr in policy_reasons:
+                n_policy += int(flow_reason_counts.get(rr, 0) or 0)
+            policy_ratio = float(n_policy) / float(max(1, flow_n_seen))
+            if policy_ratio >= float(policy_ratio_min):
+                results.append(
+                    CheckResult(
+                        "WARN",
+                        f"bridge-policy: bloqueio alto por política (policy={n_policy}/{flow_n_seen}={policy_ratio:.0%} "
+                        f">= {policy_ratio_min:.0%}, reasons={policy_reasons})",
+                    )
+                )
+                exit_code = max(exit_code, 1)
+    except Exception:
+        pass
 
     # 4) Audit API friction / possible block (Telegram alert)
     try:
@@ -518,6 +863,7 @@ async def run_checks(
         warn_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_WARN", "0.20"))
         fail_rate = float(os.getenv("OPS_EXECUTOR_FAIL_RATE_FAIL", "0.40"))
         min_audits_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_AUDITS", "10"), 10)
+        min_accepted_for_idle_fail = _safe_int(os.getenv("OPS_EXECUTOR_IDLE_MIN_ACCEPTED", "1"), 1)
         lat_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_MIN_EVENTS", "30"), 30)
         lat_call_p50_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_WARN_MS", "12000"), 12000)
         lat_call_p50_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P50_FAIL_MS", "20000"), 20000)
@@ -528,6 +874,55 @@ async def run_checks(
         # Opcional: p90 (mais robusto contra medianas "ok" com cauda explodindo)
         lat_call_p90_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_WARN_MS", "0"), 0)
         lat_call_p90_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_FAIL_MS", "0"), 0)
+
+        # health endpoint (ready/workers) para detectar serviço "up" porém não operacional
+        ex_health_enable = _is_truthy(os.getenv("OPS_EXECUTOR_HEALTH_ENABLE", "1"))
+        ex_health_require_ready = _is_truthy(os.getenv("OPS_EXECUTOR_HEALTH_REQUIRE_READY", "1"))
+        ex_health_min_workers = _safe_int(os.getenv("OPS_EXECUTOR_HEALTH_MIN_WORKERS", "1"), 1)
+        ex_health_sock = str(os.getenv("OPS_EXECUTOR_HEALTH_UNIX_SOCKET", "/tmp/betinasia-exec.sock") or "").strip()
+        ex_health_url = str(os.getenv("OPS_EXECUTOR_HEALTH_HTTP_URL", "http://127.0.0.1:8089") or "").strip()
+        ex_health_timeout = _safe_int(os.getenv("OPS_EXECUTOR_HEALTH_TIMEOUT_SEC", "3"), 3)
+        if ex_health_enable:
+            h_payload, h_err = _executor_health_payload(
+                unix_socket=ex_health_sock,
+                http_url=ex_health_url,
+                timeout_sec=int(max(1, ex_health_timeout)),
+            )
+            if h_payload is None:
+                results.append(
+                    CheckResult(
+                        "FAIL",
+                        f"{executor_service or 'betinasia-executor'}: /health indisponível (err={h_err}, sock={ex_health_sock}, url={ex_health_url})",
+                    )
+                )
+                exit_code = max(exit_code, 2)
+            else:
+                h_ready = bool(h_payload.get("ready"))
+                h_workers = _safe_int(h_payload.get("workers"), 0)
+                if ex_health_require_ready and (not h_ready):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{executor_service or 'betinasia-executor'}: /health ready=false (workers={h_workers})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                elif int(h_workers) < int(ex_health_min_workers):
+                    results.append(
+                        CheckResult(
+                            "FAIL",
+                            f"{executor_service or 'betinasia-executor'}: /health workers abaixo do mínimo "
+                            f"(workers={h_workers} < min={ex_health_min_workers})",
+                        )
+                    )
+                    exit_code = max(exit_code, 2)
+                else:
+                    results.append(
+                        CheckResult(
+                            "PASS",
+                            f"executor-health: ok (ready={int(h_ready)} workers={h_workers} queue={_safe_int(h_payload.get('queue'), 0)})",
+                        )
+                    )
 
         rows, err = _read_tail_jsonl(Path(str(executor_jsonl)), max_bytes=int(tail_bytes), max_lines=int(tail_lines))
         if err:
@@ -602,12 +997,20 @@ async def run_checks(
                 results.append(CheckResult("WARN", f"executor: sem eventos não-heartbeat no tail (hb={len(hb)})."))
                 exit_code = max(exit_code, 1)
             else:
-                if age_nonhb > int(max_nonhb_age) and int(audits_n) >= int(min_audits_for_idle_fail):
+                should_fail_idle = False
+                if age_nonhb > int(max_nonhb_age):
+                    if int(flow_n_accepted) >= int(min_accepted_for_idle_fail):
+                        should_fail_idle = True
+                    elif int(audits_n) >= int(min_audits_for_idle_fail) and int(flow_n_seen) == 0:
+                        # quando audit está gerando mas bridge não está consumindo, mantemos sinal forte para investigação/restart
+                        should_fail_idle = True
+                if should_fail_idle:
                     results.append(
                         CheckResult(
                             "FAIL",
                             f"{executor_service or 'betinasia-executor'}: sem execução recente (non_heartbeat_age={age_nonhb}s > {max_nonhb_age}s) "
-                            f"com audits_n={audits_n} desde {since_minutes}m (possível bridge/executor travado).",
+                            f"com audits_n={audits_n}, bridge_seen={flow_n_seen}, bridge_accepted={flow_n_accepted} desde {since_minutes}m "
+                            f"(possível bridge/executor travado).",
                         )
                     )
                     exit_code = max(exit_code, 2)
@@ -759,6 +1162,14 @@ async def run_checks(
             "best_odds_n": best_n,
             "audits_n": audits_n,
             "h3b_n": h3b_n,
+        },
+        "bridge_flow": {
+            "window_minutes": int(flow_minutes),
+            "action": str(flow_action),
+            "eligible_n": int(flow_n_eligible),
+            "seen_n": int(flow_n_seen),
+            "accepted_n": int(flow_n_accepted),
+            "reasons": dict(flow_reason_counts or {}),
         },
     }
 
@@ -969,6 +1380,11 @@ def main() -> int:
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--telegram", action="store_true", help="Envia alerta no Telegram em WARN/FAIL")
     ap.add_argument(
+        "--telegram-source",
+        default=os.getenv("OPS_TELEGRAM_SOURCE", ""),
+        help="Tag de origem para mensagem Telegram (ex.: ops-monitor, ops-autopilot).",
+    )
+    ap.add_argument(
         "--telegram-recovery",
         action="store_true",
         default=(os.getenv("OPS_TELEGRAM_SEND_RECOVERY", "1").strip() not in ("0", "false", "False", "no", "NO")),
@@ -984,7 +1400,12 @@ def main() -> int:
     ap.add_argument("--consecutive-fails-to-restart", type=int, default=int(os.getenv("OPS_FAILS_TO_RESTART", "2")))
     ap.add_argument("--cooldown-sec", type=int, default=int(os.getenv("OPS_RESTART_COOLDOWN_SEC", "1800")))
     ap.add_argument("--max-restarts-per-hour", type=int, default=int(os.getenv("OPS_MAX_RESTARTS_PER_HOUR", "2")))
-    args = ap.parse_args()
+    strict_args = _is_truthy(os.getenv("OPS_MONITOR_STRICT_ARGS", "0"))
+    if strict_args:
+        args = ap.parse_args()
+        unknown_args: List[str] = []
+    else:
+        args, unknown_args = ap.parse_known_args()
 
     # Se o user customizou --audit-service mas não customizou --audit-telemetry,
     # tenta inferir um default consistente.
@@ -1008,6 +1429,10 @@ def main() -> int:
             restart_on_fail=bool(args.restart_on_fail) and (not bool(args.autopilot)),
         )
     )
+
+    if unknown_args:
+        results.append(CheckResult("WARN", f"args desconhecidos ignorados: {' '.join(unknown_args)}"))
+        code = max(code, 1)
 
     # Estado (para detectar RECOVERY e evitar spam)
     state_path = Path(str(args.state_file))
@@ -1187,9 +1612,11 @@ def main() -> int:
     if args.telegram and (code > 0 or (args.autopilot and autopilot_actions) or should_send_recovery):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID") or ""
+        src = str(getattr(args, "telegram_source", "") or "").strip()
+        src_prefix = f"[{src}] " if src else ""
         if token and chat_id:
             if should_send_recovery:
-                lines = [f"OPS HEALTH (RECOVERY/OK) @ {meta.get('now_utc')}"]
+                lines = [f"{src_prefix}OPS HEALTH (RECOVERY/OK) @ {meta.get('now_utc')}"]
                 # Inclui o último problema conhecido (para contexto)
                 if prev_non_ok > 0:
                     prev_level = "FAIL" if prev_non_ok >= 2 else "WARN"
@@ -1237,7 +1664,7 @@ def main() -> int:
                     if lat_any_msg:
                         lines.append(f"Latência: {lat_any_msg}")
 
-                lines.append(f"OPS HEALTH ({level}) @ {meta.get('now_utc')}")
+                lines.append(f"{src_prefix}OPS HEALTH ({level}) @ {meta.get('now_utc')}")
                 for r in results:
                     if r.level in ("WARN", "FAIL"):
                         lines.append(f"- [{r.level}] {r.message}")
