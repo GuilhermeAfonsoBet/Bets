@@ -973,9 +973,13 @@ def _append_backpre_fast_slow_sections(
     if not exec_by_oid_back:
         return
     try:
-        thr_ms = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
+        thr_ms_post = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
     except Exception:
-        thr_ms = 5000
+        thr_ms_post = 5000
+    try:
+        thr_ms_old = int(float(os.getenv("DAILY_BACKPRE_FAST_OLD_MAX_PRE_SUBMIT_MS", "6000") or 6000))
+    except Exception:
+        thr_ms_old = 6000
     try:
         n_boot = int(float(os.getenv("DAILY_BACKPRE_FAST_BOOTSTRAP_N", "2000") or 2000))
     except Exception:
@@ -995,29 +999,59 @@ def _append_backpre_fast_slow_sections(
     thesis_hi_max = _safe_float_or_none(thesis_hi_max_raw) if thesis_hi_max_raw else None
     if thesis_hi_max is not None and float(thesis_hi_max) <= float(thesis_hi_min):
         thesis_hi_max = None
-    hi_label = (
+    old_hi_min = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_OLD_HI_MIN", "5.0") or 5.0) or 5.0
+    old_hi_max = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_OLD_HI_MAX", "14.0") or 14.0) or 14.0
+    if float(old_hi_max) < float(old_hi_min):
+        old_hi_max = float(old_hi_min)
+    has_transition = bool(thesis_start_day)
+    try:
+        old_period_end = (
+            (date.fromisoformat(thesis_start_day) - timedelta(days=1)).isoformat() if has_transition else None
+        )
+    except Exception:
+        old_period_end = None
+    old_period_label = (f"até {old_period_end}" if old_period_end else f"< {thesis_start_day}") if has_transition else ""
+    post_period_label = f"desde {thesis_start_day}" if has_transition else "janela analisada"
+    old_hi_label = f"stake em [{_fmt_num(old_hi_min,2)}, {_fmt_num(old_hi_max,2)}]"
+    post_hi_label = (
         f"stake > {_fmt_num(thesis_hi_min,2)}"
         if thesis_hi_max is None
         else f"stake em ({_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]"
     )
+    fast_dyn_key = "Back Pre fast (critério dinâmico por período)"
+    slow_dyn_key = "Back Pre slow (critério dinâmico por período)"
+    if has_transition:
+        fast_old_diag_key = f"Back Pre fast ({old_period_label}; pre_submit_ms<= {thr_ms_old}ms)"
+        fast_post_diag_key = f"Back Pre fast ({post_period_label}; pre_submit_ms<= {thr_ms_post}ms)"
+        slow_old_diag_key = f"Back Pre slow ({old_period_label}; pre_submit_ms> {thr_ms_old}ms)"
+        slow_post_diag_key = f"Back Pre slow ({post_period_label}; pre_submit_ms> {thr_ms_post}ms)"
+        thesis_old_key = f"Back Pre fast ({old_period_label}; {old_hi_label}; pre_submit_ms<= {thr_ms_old}ms)"
+    else:
+        fast_old_diag_key = None
+        fast_post_diag_key = f"Back Pre fast (pre_submit_ms<= {thr_ms_post}ms)"
+        slow_old_diag_key = None
+        slow_post_diag_key = f"Back Pre slow (pre_submit_ms> {thr_ms_post}ms)"
+        thesis_old_key = None
+    thesis_post_key = f"Back Pre fast ({post_period_label}; {post_hi_label}; pre_submit_ms<= {thr_ms_post}ms)"
+    aux_low_old_key = (
+        f"Back Pre slow ({old_period_label}; stake < {_fmt_num(old_hi_min,2)}; pre_submit_ms> {thr_ms_old}ms)"
+        if has_transition
+        else None
+    )
+    aux_low_post_key = (
+        f"Back Pre slow ({post_period_label}; stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms> {thr_ms_post}ms)"
+    )
 
     # rows com accounting (pnl) + stake (exposure)
     groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
-    groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake=HI)
+    groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake HI)
+    groups_aux_low: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # slow + stake abaixo do limiar
     for oid, em in (exec_by_oid_back or {}).items():
         if not isinstance(em, dict):
             continue
         created = em.get("created_at")
         if not isinstance(created, datetime):
             continue
-        # filtro de janela (>= start_day)
-        if thesis_start_day:
-            try:
-                if str(created.date().isoformat()) < thesis_start_day:
-                    continue
-            except Exception:
-                pass
-
         exp = _safe_float_or_none(em.get("exposure"))
         if exp is None or exp <= 0:
             continue
@@ -1044,7 +1078,35 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
-        stake_b = _stake_bucket(exp, hi_min=float(thesis_hi_min), lo_ref=float(stake_lo))
+        created_day = str(created.date().isoformat())
+        is_post = bool(has_transition and created_day >= thesis_start_day)
+        if is_post:
+            fast_thr = int(thr_ms_post)
+            hi_min = float(thesis_hi_min)
+            hi_max = (float(thesis_hi_max) if thesis_hi_max is not None else None)
+            hi_inclusive_min = False
+            fast_reg_key = fast_post_diag_key
+            slow_reg_key = slow_post_diag_key
+            thesis_key = thesis_post_key
+            low_key = aux_low_post_key
+        else:
+            fast_thr = int(thr_ms_old)
+            hi_min = float(old_hi_min)
+            hi_max = float(old_hi_max)
+            hi_inclusive_min = True
+            fast_reg_key = fast_old_diag_key
+            slow_reg_key = slow_old_diag_key
+            thesis_key = thesis_old_key
+            low_key = aux_low_old_key
+        is_hi = ((float(exp) >= hi_min) if hi_inclusive_min else (float(exp) > hi_min)) and (
+            hi_max is None or float(exp) <= float(hi_max)
+        )
+        if is_hi:
+            stake_b = "HI"
+        elif _approx_eq(exp, float(stake_lo), eps=0.02):
+            stake_b = "LO"
+        else:
+            stake_b = "other"
         roi_i = float(pnl) / float(exp) * 100.0
         row = {
             "order_id": str(oid),
@@ -1054,7 +1116,7 @@ def _append_backpre_fast_slow_sections(
             "stake_bucket": stake_b,
             "pre_submit_ms": pre_submit_ms,
             "slippage_pre_pct": slip_pre,
-            "created_day": str(created.date().isoformat()),
+            "created_day": created_day,
         }
 
         if bool(is_in):
@@ -1063,18 +1125,18 @@ def _append_backpre_fast_slow_sections(
             # Pre
             if pre_submit_ms is None:
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
-            elif int(pre_submit_ms) <= int(thr_ms):
-                groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake em faixa HI (pós-início)
-                is_hi = (float(exp) > float(thesis_hi_min)) and (
-                    thesis_hi_max is None or float(exp) <= float(thesis_hi_max)
-                )
-                if is_hi:
-                    groups_thesis[
-                        f"Back Pre fast ({hi_label}; pre_submit_ms<= {thr_ms}ms)"
-                    ].append(row)
+            elif int(pre_submit_ms) <= int(fast_thr):
+                groups_all[fast_dyn_key].append(row)
+                if fast_reg_key:
+                    groups_all[fast_reg_key].append(row)
+                if is_hi and thesis_key:
+                    groups_thesis[thesis_key].append(row)
             else:
-                groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
+                groups_all[slow_dyn_key].append(row)
+                if slow_reg_key:
+                    groups_all[slow_reg_key].append(row)
+                if low_key and float(exp) < float(thesis_hi_min if is_post else old_hi_min):
+                    groups_aux_low[low_key].append(row)
 
     if not groups_all and not groups_thesis:
         return
@@ -1083,12 +1145,17 @@ def _append_backpre_fast_slow_sections(
     # A) Performance da tese (stake=HI) com métricas “liquidadas”
     # -------------------------
     out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
-    out_lines.append(
-        f"- Critério de elegibilidade HI (relatório): `{hi_label}`.\n"
-        f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
-    )
-    if thesis_start_day:
-        out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
+    if has_transition:
+        out_lines.append(
+            f"- Critério antigo (`{old_period_label}`): `{old_hi_label}` e `pre_submit_ms<= {int(thr_ms_old)}ms`.\n"
+            f"- Critério atual (`{post_period_label}`): `{post_hi_label}` e `pre_submit_ms<= {int(thr_ms_post)}ms`.\n"
+            f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
+        )
+    else:
+        out_lines.append(
+            f"- Critério aplicado: `{post_hi_label}` e `pre_submit_ms<= {int(thr_ms_post)}ms`.\n"
+            f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
+        )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
 
@@ -1106,7 +1173,12 @@ def _append_backpre_fast_slow_sections(
                 settled.append(r)
         return settled, open_rows
 
-    for g, rows in sorted((groups_thesis or {}).items(), key=lambda kv: kv[0]):
+    thesis_order: List[str] = []
+    if thesis_old_key:
+        thesis_order.append(thesis_old_key)
+    thesis_order.append(thesis_post_key)
+    for g in sorted((groups_thesis or {}).keys(), key=lambda x: (thesis_order.index(x) if x in thesis_order else 999, x)):
+        rows = groups_thesis.get(g) or []
         settled_rows, open_rows = _split_settled(rows)
         if settled_rows is None or open_rows is None:
             out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
@@ -1119,36 +1191,33 @@ def _append_backpre_fast_slow_sections(
     if open_order_ids is None:
         out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
-    # Performance auxiliar: fast fora da faixa HI (impacto prático de latência/degradação)
-    low_rows: List[Dict[str, Any]] = []
-    fast_key = f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"
-    for r in (groups_all.get(fast_key) or []):
-        exp = _safe_float_or_none(r.get("exposure"))
-        if exp is None:
-            continue
-        is_hi = (float(exp) > float(thesis_hi_min)) and (
-            thesis_hi_max is None or float(exp) <= float(thesis_hi_max)
+    # Performance auxiliar: slow/fallback abaixo do limiar HI (ex.: latência acima do limiar do período)
+    out_lines.append("**Back Pre slow (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
+    if has_transition:
+        out_lines.append(
+            f"- Critério antigo (`{old_period_label}`): `pre_submit_ms> {int(thr_ms_old)}ms` e `stake < {_fmt_num(old_hi_min,2)}`.\n"
+            f"- Critério atual (`{post_period_label}`): `pre_submit_ms> {int(thr_ms_post)}ms` e `stake < {_fmt_num(thesis_hi_min,2)}`.\n\n"
         )
-        if not is_hi:
-            low_rows.append(r)
-    out_lines.append("**Back Pre fast (pós-início; stake fora de HI) — performance auxiliar (accounting; order_id)**\n\n")
+    else:
+        out_lines.append(
+            f"- Critério aplicado: `pre_submit_ms> {int(thr_ms_post)}ms` e `stake < {_fmt_num(thesis_hi_min,2)}`.\n\n"
+        )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
-    settled_rows, open_rows = _split_settled(low_rows)
-    if thesis_hi_max is None:
-        label_low = f"Back Pre fast (stake <= {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
-    else:
-        label_low = (
-            "Back Pre fast "
-            f"(stake fora de ({_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
-        )
-    if settled_rows is None or open_rows is None:
-        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
-    else:
-        summ_set = _summarize_rows_pnl_exp(settled_rows)
-        out_lines.append(
-            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
-        )
+    aux_order: List[str] = []
+    if aux_low_old_key:
+        aux_order.append(aux_low_old_key)
+    aux_order.append(aux_low_post_key)
+    for g in sorted((groups_aux_low or {}).keys(), key=lambda x: (aux_order.index(x) if x in aux_order else 999, x)):
+        rows = groups_aux_low.get(g) or []
+        settled_rows, open_rows = _split_settled(rows)
+        if settled_rows is None or open_rows is None:
+            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
+        else:
+            summ_set = _summarize_rows_pnl_exp(settled_rows)
+            out_lines.append(
+                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+            )
     out_lines.append("\n")
 
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -1168,15 +1237,19 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     out_lines.append("**Tese Back Pre fast — compliance (pós-início; distribuição de stake e pre_submit_ms)**\n\n")
     out_lines.append(
-        f"| Grupo | n_ordens | {hi_label} | stake≈{_fmt_num(stake_lo,2)} | stake=other/NA |\n"
+        f"| Grupo | n_ordens | stake=HI (critério por período) | stake≈{_fmt_num(stake_lo,2)} | stake=other/NA |\n"
     )
     out_lines.append("|---|---:|---:|---:|---:|\n")
-    order_diag = [
-        f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)",
-        f"Back Pre slow (pre_submit_ms> {thr_ms}ms)",
-        "Back Pre (pre_submit_ms NA)",
-        "Back In",
-    ]
+    order_diag = [fast_dyn_key, slow_dyn_key]
+    if fast_old_diag_key:
+        order_diag.append(fast_old_diag_key)
+    if fast_post_diag_key:
+        order_diag.append(fast_post_diag_key)
+    if slow_old_diag_key:
+        order_diag.append(slow_old_diag_key)
+    if slow_post_diag_key:
+        order_diag.append(slow_post_diag_key)
+    order_diag.extend(["Back Pre (pre_submit_ms NA)", "Back In"])
     for g in order_diag:
         rows = groups_all.get(g) or []
         if not rows:
@@ -1208,10 +1281,13 @@ def _append_backpre_fast_slow_sections(
     # Robustez: delta fast-slow
     out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
     try:
-        fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
-        slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
+        fast = groups_all.get(fast_dyn_key) or []
+        slow = groups_all.get(slow_dyn_key) or []
         fast_roi = [float(r.get("roi")) for r in fast if r.get("roi") is not None]
         slow_roi = [float(r.get("roi")) for r in slow if r.get("roi") is not None]
+        out_lines.append(
+            f"- Critério dinâmico por período (pré: `<= {int(thr_ms_old)}ms`; pós: `<= {int(thr_ms_post)}ms`).\n"
+        )
         out_lines.append(f"- Amostra líquida: fast=`{len(fast_roi)}` | slow=`{len(slow_roi)}` | min_n=`{min_n}`.\n")
         if len(fast_roi) >= min_n and len(slow_roi) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
