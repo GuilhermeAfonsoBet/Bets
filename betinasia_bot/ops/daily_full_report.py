@@ -5500,6 +5500,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     try:
                         s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back Pre somente)**\n\n")
                         s1.append(
+                            "_Nota: `Base P&L` usa todas as ordens Back Pre com `order_id` no ledger daquele dia. "
+                            "O filtro contrafactual usa `slippage_raw_pct` (pós-execução, `odd_final` vs `odd_at_decision`) e pode mudar o P&L "
+                            "mesmo quando o runtime usa `slippage_pre_pct` para sizing (isso não bloqueia a ordem, só altera stake)._"
+                            "\n\n"
+                        )
+                        s1.append(
                             "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders Back Pre com acct no dia) |\n"
                         )
                         s1.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
