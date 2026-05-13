@@ -256,6 +256,7 @@ def run_ab(
     bad_roi_max: float,
     bad_min_n: int,
     bad_streak_cycles: int,
+    min_n_universe: int,
 ) -> Dict[str, Any]:
     days = sorted({str(r.day) for r in rows_all})
     if len(days) <= int(train_days):
@@ -263,12 +264,16 @@ def run_ab(
 
     base_rows: List[ExecRow] = []
     a_rows: List[ExecRow] = []
+    b_rows: List[ExecRow] = []
     c_rows: List[ExecRow] = []
 
     active_a_ns: List[int] = []
+    active_b_ns: List[int] = []
     active_c_ns: List[int] = []
+    active_d_ns: List[int] = []
     bad_streak: Dict[str, int] = {}
     blocked_count: Dict[str, int] = {}
+    active_b_prev: Set[str] = set()
     active_c_prev: Set[str] = set()
 
     for idx in range(int(train_days), len(days)):
@@ -287,6 +292,16 @@ def run_ab(
             if n >= int(min_n_current) and roiw is not None and float(roiw) > 0.0:
                 active_a.add(str(lg))
 
+        # Cenário 2: estabilidade (A + histerese), sem bloqueio de ruins.
+        active_b: Set[str] = set(active_a)
+        for lg in list(active_b_prev):
+            m = met_all.get(str(lg)) or {}
+            n = int(m.get("n") or 0)
+            roiw = m.get("roiw")
+            if n >= int(min_n_keep) and roiw is not None and float(roiw) >= float(keep_roi_min):
+                active_b.add(str(lg))
+        active_b_prev = set(active_b)
+
         blocked: Set[str] = set()
         for lg, m in met_all.items():
             n = int(m.get("n") or 0)
@@ -300,29 +315,34 @@ def run_ab(
                 blocked.add(str(lg))
                 blocked_count[str(lg)] = int(blocked_count.get(str(lg), 0)) + 1
 
-        active_c: Set[str] = set(x for x in active_a if x not in blocked)
+        # Cenário 3: excluir ruins (não exige ROI>0 para entrar).
+        universe_c = {
+            str(lg) for lg, m in met_all.items()
+            if int(m.get("n") or 0) >= int(min_n_universe)
+        }
+        active_c: Set[str] = set(x for x in universe_c if x not in blocked)
         for lg in list(active_c_prev):
-            if lg in blocked:
-                continue
-            m = met_all.get(str(lg)) or {}
-            n = int(m.get("n") or 0)
-            roiw = m.get("roiw")
-            if n >= int(min_n_keep) and roiw is not None and float(roiw) >= float(keep_roi_min):
+            if lg not in blocked:
                 active_c.add(str(lg))
         active_c_prev = set(active_c)
 
         base_day = [r for r in rows_all if str(r.day) == str(test_day) and (r.slip_pre is not None and float(r.slip_pre) <= float(slip_max))]
         a_day = [r for r in base_day if str(r.league) in active_a]
+        b_day = [r for r in base_day if str(r.league) in active_b]
         c_day = [r for r in base_day if str(r.league) in active_c]
 
         base_rows.extend(base_day)
         a_rows.extend(a_day)
+        b_rows.extend(b_day)
         c_rows.extend(c_day)
         active_a_ns.append(len(active_a))
+        active_b_ns.append(len(active_b))
         active_c_ns.append(len(active_c))
+        active_d_ns.append(len({str(r.league) for r in base_day}))
 
     base = _aggregate(base_rows)
     a = _aggregate(a_rows)
+    b = _aggregate(b_rows)
     c = _aggregate(c_rows)
 
     return {
@@ -330,13 +350,21 @@ def run_ab(
         "cycles": len(active_a_ns),
         "baseline": base,
         "policy_a": a,
+        "policy_b": b,
         "policy_c": c,
+        "policy_d": base,
         "active_a_avg": (float(mean(active_a_ns)) if active_a_ns else 0.0),
+        "active_b_avg": (float(mean(active_b_ns)) if active_b_ns else 0.0),
         "active_c_avg": (float(mean(active_c_ns)) if active_c_ns else 0.0),
+        "active_d_avg": (float(mean(active_d_ns)) if active_d_ns else 0.0),
         "active_a_min": (int(min(active_a_ns)) if active_a_ns else 0),
         "active_a_max": (int(max(active_a_ns)) if active_a_ns else 0),
+        "active_b_min": (int(min(active_b_ns)) if active_b_ns else 0),
+        "active_b_max": (int(max(active_b_ns)) if active_b_ns else 0),
         "active_c_min": (int(min(active_c_ns)) if active_c_ns else 0),
         "active_c_max": (int(max(active_c_ns)) if active_c_ns else 0),
+        "active_d_min": (int(min(active_d_ns)) if active_d_ns else 0),
+        "active_d_max": (int(max(active_d_ns)) if active_d_ns else 0),
         "blocked_top": sorted(blocked_count.items(), key=lambda kv: kv[1], reverse=True)[:20],
     }
 
@@ -344,21 +372,27 @@ def run_ab(
 def _print_report(rep: Dict[str, Any], *, slip_max: float) -> None:
     b = rep.get("baseline") or {}
     a = rep.get("policy_a") or {}
+    b2 = rep.get("policy_b") or {}
     c = rep.get("policy_c") or {}
+    d = rep.get("policy_d") or {}
 
     def _n(x: Dict[str, Any], k: str) -> float:
         return float(x.get(k) or 0.0)
 
-    print("\n=== A/B: Política atual (A) vs Política estável (C) ===")
+    print("\n=== Comparação de cenários por liga ===")
     print(f"dias={int(rep.get('days_total') or 0)} | ciclos={int(rep.get('cycles') or 0)} | avaliação: slippage_pre_pct <= {float(slip_max):.2f}")
 
-    print("\n[BASE COMUM]")
+    print("\n[Cenário 4 - sem filtro de ligas]")
     print(
         f"n={int(_n(b,'n'))} stake={_fmt_num(_n(b,'stake'))} pnl={_fmt_num(_n(b,'pnl'))} "
         f"ROIw={_fmt_pct(b.get('roiw'))}"
     )
+    print(
+        f"active_leagues_avg={_fmt_num(rep.get('active_d_avg'))} "
+        f"(min={int(rep.get('active_d_min') or 0)}, max={int(rep.get('active_d_max') or 0)})"
+    )
 
-    print("\n[POLÍTICA A - atual emulada]")
+    print("\n[Cenário 1 - política atual (A)]")
     print(
         f"n={int(_n(a,'n'))} stake={_fmt_num(_n(a,'stake'))} pnl={_fmt_num(_n(a,'pnl'))} "
         f"ROIw={_fmt_pct(a.get('roiw'))}"
@@ -372,7 +406,21 @@ def _print_report(rep: Dict[str, Any], *, slip_max: float) -> None:
         f"(min={int(rep.get('active_a_min') or 0)}, max={int(rep.get('active_a_max') or 0)})"
     )
 
-    print("\n[POLÍTICA C - estável (A + histerese + bloqueio de ruins)]")
+    print("\n[Cenário 2 - estabilidade (A + histerese)]")
+    print(
+        f"n={int(_n(b2,'n'))} stake={_fmt_num(_n(b2,'stake'))} pnl={_fmt_num(_n(b2,'pnl'))} "
+        f"ROIw={_fmt_pct(b2.get('roiw'))}"
+    )
+    print(
+        f"turnover_n={_fmt_pct(_pct(_n(b2,'n'), _n(b,'n')), 1)} | "
+        f"turnover_stake={_fmt_pct(_pct(_n(b2,'stake'), _n(b,'stake')), 1)}"
+    )
+    print(
+        f"active_leagues_avg={_fmt_num(rep.get('active_b_avg'))} "
+        f"(min={int(rep.get('active_b_min') or 0)}, max={int(rep.get('active_b_max') or 0)})"
+    )
+
+    print("\n[Cenário 3 - excluir ruins (sem seleção de boas)]")
     print(
         f"n={int(_n(c,'n'))} stake={_fmt_num(_n(c,'stake'))} pnl={_fmt_num(_n(c,'pnl'))} "
         f"ROIw={_fmt_pct(c.get('roiw'))}"
@@ -393,7 +441,7 @@ def _print_report(rep: Dict[str, Any], *, slip_max: float) -> None:
     delta_turn_stake = None
     if _n(b, "stake") > 0:
         delta_turn_stake = (100.0 * _n(c, "stake") / _n(b, "stake")) - (100.0 * _n(a, "stake") / _n(b, "stake"))
-    print("\n[DELTA C vs A]")
+    print("\n[DELTA cenário 3 vs cenário 1]")
     print(
         f"delta_pnl={_fmt_num(delta_pnl)} | "
         f"delta_ROIw_pp={_fmt_num(delta_roiw, 3)} | "
@@ -410,8 +458,8 @@ def _print_report(rep: Dict[str, Any], *, slip_max: float) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
-            "A/B de política por liga: "
-            "A (atual: ROIw_train_all>0) vs C (estável: A + histerese + bloqueio de ruins)."
+            "Comparação de cenários de política por liga: "
+            "1) atual, 2) estabilidade, 3) excluir ruins, 4) sem filtro."
         )
     )
     ap.add_argument("--days", type=int, default=int(os.getenv("AB_DAYS", "60")))
@@ -423,6 +471,7 @@ def main() -> int:
     ap.add_argument("--bad-roi-max", type=float, default=float(os.getenv("AB_BAD_ROI_MAX", "-3.0")))
     ap.add_argument("--bad-min-n", type=int, default=int(os.getenv("AB_BAD_MIN_N", "20")))
     ap.add_argument("--bad-streak-cycles", type=int, default=int(os.getenv("AB_BAD_STREAK_CYCLES", "2")))
+    ap.add_argument("--min-n-universe", type=int, default=int(os.getenv("AB_MIN_N_UNIVERSE", "1")))
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--accounting-dir", default=os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting"))
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
@@ -475,6 +524,7 @@ def main() -> int:
             bad_roi_max=float(args.bad_roi_max),
             bad_min_n=int(args.bad_min_n),
             bad_streak_cycles=int(args.bad_streak_cycles),
+            min_n_universe=int(args.min_n_universe),
         )
         _print_report(rep, slip_max=float(args.slip_max))
 
