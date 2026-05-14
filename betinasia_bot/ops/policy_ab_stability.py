@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
@@ -257,6 +257,7 @@ def run_ab(
     bad_min_n: int,
     bad_streak_cycles: int,
     min_n_universe: int,
+    min_cycle_n_compare: int,
 ) -> Dict[str, Any]:
     days = sorted({str(r.day) for r in rows_all})
     if len(days) <= int(train_days):
@@ -275,6 +276,7 @@ def run_ab(
     blocked_count: Dict[str, int] = {}
     active_b_prev: Set[str] = set()
     active_c_prev: Set[str] = set()
+    cycle_stats: List[Dict[str, Any]] = []
 
     for idx in range(int(train_days), len(days)):
         train_set = set(days[idx - int(train_days):idx])
@@ -330,6 +332,7 @@ def run_ab(
         a_day = [r for r in base_day if str(r.league) in active_a]
         b_day = [r for r in base_day if str(r.league) in active_b]
         c_day = [r for r in base_day if str(r.league) in active_c]
+        d_day = base_day
 
         base_rows.extend(base_day)
         a_rows.extend(a_day)
@@ -340,10 +343,65 @@ def run_ab(
         active_c_ns.append(len(active_c))
         active_d_ns.append(len({str(r.league) for r in base_day}))
 
+        ma = _aggregate(a_day)
+        mb = _aggregate(b_day)
+        mc = _aggregate(c_day)
+        md = _aggregate(d_day)
+        cycle_stats.append(
+            {
+                "day": str(test_day),
+                "n_a": int(ma.get("n") or 0),
+                "n_b": int(mb.get("n") or 0),
+                "n_c": int(mc.get("n") or 0),
+                "n_d": int(md.get("n") or 0),
+                "roiw_a": ma.get("roiw"),
+                "roiw_b": mb.get("roiw"),
+                "roiw_c": mc.get("roiw"),
+                "roiw_d": md.get("roiw"),
+            }
+        )
+
     base = _aggregate(base_rows)
     a = _aggregate(a_rows)
     b = _aggregate(b_rows)
     c = _aggregate(c_rows)
+
+    def _cycle_n_summary(key: str) -> Dict[str, Any]:
+        arr = [int(r.get(key) or 0) for r in cycle_stats]
+        if not arr:
+            return {"avg": 0.0, "med": 0.0, "min": 0, "max": 0, "ge": 0}
+        return {
+            "avg": float(mean(arr)),
+            "med": float(median(arr)),
+            "min": int(min(arr)),
+            "max": int(max(arr)),
+            "ge": int(sum(1 for x in arr if int(x) >= int(min_cycle_n_compare))),
+        }
+
+    def _delta_roiw_vs_d(policy: str) -> Dict[str, Any]:
+        vals: List[float] = []
+        nk = f"n_{policy}"
+        rk = f"roiw_{policy}"
+        for r in cycle_stats:
+            np = int(r.get(nk) or 0)
+            nd = int(r.get("n_d") or 0)
+            rp = r.get(rk)
+            rd = r.get("roiw_d")
+            if np < int(min_cycle_n_compare) or nd < int(min_cycle_n_compare):
+                continue
+            if rp is None or rd is None:
+                continue
+            try:
+                vals.append(float(rp) - float(rd))
+            except Exception:
+                continue
+        if not vals:
+            return {"n_cycles": 0, "median": None, "mean": None}
+        return {
+            "n_cycles": int(len(vals)),
+            "median": float(median(vals)),
+            "mean": float(mean(vals)),
+        }
 
     return {
         "days_total": len(days),
@@ -365,6 +423,18 @@ def run_ab(
         "active_c_max": (int(max(active_c_ns)) if active_c_ns else 0),
         "active_d_min": (int(min(active_d_ns)) if active_d_ns else 0),
         "active_d_max": (int(max(active_d_ns)) if active_d_ns else 0),
+        "cycle_n_threshold": int(min_cycle_n_compare),
+        "cycle_n_summary": {
+            "a": _cycle_n_summary("n_a"),
+            "b": _cycle_n_summary("n_b"),
+            "c": _cycle_n_summary("n_c"),
+            "d": _cycle_n_summary("n_d"),
+        },
+        "delta_roiw_vs_d": {
+            "a": _delta_roiw_vs_d("a"),
+            "b": _delta_roiw_vs_d("b"),
+            "c": _delta_roiw_vs_d("c"),
+        },
         "blocked_top": sorted(blocked_count.items(), key=lambda kv: kv[1], reverse=True)[:20],
     }
 
@@ -448,6 +518,30 @@ def _print_report(rep: Dict[str, Any], *, slip_max: float) -> None:
         f"delta_turnover_stake_pp={_fmt_num(delta_turn_stake, 3)}"
     )
 
+    th = int(rep.get("cycle_n_threshold") or 0)
+    csum = rep.get("cycle_n_summary") or {}
+    dsum = rep.get("delta_roiw_vs_d") or {}
+    print("\n[Qualidade por ciclo]")
+    print(f"límite de comparação por ciclo: n >= {th}")
+    for tag, lbl in (("d", "C4"), ("a", "C1"), ("b", "C2"), ("c", "C3")):
+        s = csum.get(tag) if isinstance(csum, dict) else None
+        if not isinstance(s, dict):
+            continue
+        print(
+            f"- {lbl}: n/ciclo avg={_fmt_num(s.get('avg'))} med={_fmt_num(s.get('med'))} "
+            f"min={int(s.get('min') or 0)} max={int(s.get('max') or 0)} "
+            f"| ciclos com n>={th}: {int(s.get('ge') or 0)}"
+        )
+    for tag, lbl in (("a", "C1−C4"), ("b", "C2−C4"), ("c", "C3−C4")):
+        s = dsum.get(tag) if isinstance(dsum, dict) else None
+        if not isinstance(s, dict):
+            continue
+        print(
+            f"- delta ROIw por ciclo {lbl}: ciclos={int(s.get('n_cycles') or 0)} "
+            f"mediana={_fmt_num(s.get('median'), 3)} p.p. "
+            f"média={_fmt_num(s.get('mean'), 3)} p.p."
+        )
+
     tops = rep.get("blocked_top") or []
     if tops:
         print("\n[TOP ligas bloqueadas por regra de ruim persistente]")
@@ -472,6 +566,7 @@ def main() -> int:
     ap.add_argument("--bad-min-n", type=int, default=int(os.getenv("AB_BAD_MIN_N", "20")))
     ap.add_argument("--bad-streak-cycles", type=int, default=int(os.getenv("AB_BAD_STREAK_CYCLES", "2")))
     ap.add_argument("--min-n-universe", type=int, default=int(os.getenv("AB_MIN_N_UNIVERSE", "1")))
+    ap.add_argument("--min-cycle-n-compare", type=int, default=int(os.getenv("AB_MIN_CYCLE_N_COMPARE", "5")))
     ap.add_argument("--executor-jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--accounting-dir", default=os.getenv("ACCOUNTING_OUT_DIR", "logs/accounting"))
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
@@ -525,6 +620,7 @@ def main() -> int:
             bad_min_n=int(args.bad_min_n),
             bad_streak_cycles=int(args.bad_streak_cycles),
             min_n_universe=int(args.min_n_universe),
+            min_cycle_n_compare=int(args.min_cycle_n_compare),
         )
         _print_report(rep, slip_max=float(args.slip_max))
 
