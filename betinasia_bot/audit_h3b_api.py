@@ -53,6 +53,7 @@ class H3bApiAudit:
         self,
         num_audits: int = 0,
         direction: str = "up",
+        hypothesis_type: str = "H3B",
         save_to_db: bool = True,
         executor_workers: int = 4,
         temporal_workers: int = 2,
@@ -75,6 +76,8 @@ class H3bApiAudit:
     ):
         self.num_audits = num_audits
         self.direction = direction
+        hyp = str(hypothesis_type or "H3B").strip().upper()
+        self.hypothesis_type = hyp or "H3B"
         self.save_to_db = save_to_db
         self.executor_workers = max(1, int(executor_workers))
         self.temporal_workers = max(0, int(temporal_workers))
@@ -1114,7 +1117,7 @@ class H3bApiAudit:
                     continue
 
             if self.events_processed > 0 and self.events_processed % 500 == 0:
-                logger.info(f"Processados: {self.events_processed} | H3B: {self.h3b_detected} | "
+                logger.info(f"Processados: {self.events_processed} | {self.hypothesis_type}: {self.h3b_detected} | "
                             f"Auditados: {len(self.results)} | WS: {self._ws_msg_count}")
 
     def _process_odds(self, event_id, odds_data, market_type, period, queue, over_under=False):
@@ -1220,7 +1223,7 @@ class H3bApiAudit:
                     'ws_state_key': self._ws_state_key(event_id, market_type, period, str(h3b.ah_line)),
                     'direction': h3b.direction_after,
                     'detected_at': time.time(),
-                    'hypothesis_type': 'H3B',
+                    'hypothesis_type': str(self.hypothesis_type),
                 }
 
                 skip_enqueue, skip_reason, bridge_src_key = self._enqueue_coalesce_back(h3b_payload)
@@ -3335,7 +3338,7 @@ class H3bApiAudit:
                 pass
 
             record = BetslipAuditResult(
-                hypothesis_type="H3B",
+                hypothesis_type=str(self.hypothesis_type),
                 event_id=_clip(r.get('event_id'), 100),
                 sport="football",
                 league=_clip(r.get('league', ''), 100),
@@ -3393,7 +3396,7 @@ class H3bApiAudit:
                         "gate_reject_reason": str(((telemetry or {}).get("gate_reject_reason") or ""))[:240],
                     }
                     rec2 = BetslipAuditResult(
-                        hypothesis_type="H3B",
+                        hypothesis_type=str(self.hypothesis_type),
                         event_id=_clip(r.get("event_id"), 100),
                         sport="football",
                         league=_clip(r.get("league", ""), 100),
@@ -3462,7 +3465,7 @@ class H3bApiAudit:
                 f"drops: fullq={self.dropped_full_queue} staleq={self.dropped_stale_queue_wait} "
                 f"pref_local_dup={self.dropped_prefilter_local_dup} pref_pending_dup={self.dropped_prefilter_pending_dup} | "
                 f"Auditorias: {len(self.results)} (OK:{ok_count}) | "
-                f"H3B: {self.h3b_detected} | Erros: {self.total_errors} | "
+                f"{self.hypothesis_type}: {self.h3b_detected} | Erros: {self.total_errors} | "
                 f"ws_buf_drop={self._ws_messages_dropped}")
 
             # Mitigação OOM: monitora RSS e força restart limpo antes do killer.
@@ -3651,6 +3654,7 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-audits", type=int, default=0, help="0=infinito")
     parser.add_argument("--direction", choices=["up", "down", "all"], default="up")
+    parser.add_argument("--hypothesis-type", default=(os.getenv("AUDIT_HYPOTHESIS_TYPE", "H3B") or "H3B").strip(), help="Rótulo salvo em betslip_audit_results.hypothesis_type (ex.: H3B, DT).")
     parser.add_argument("--no-db", action="store_true")
     default_mode = (os.getenv("AUDIT_MODE") or getattr(settings, "audit_mode", None) or "api").strip() or "api"
     default_offsets = os.getenv("AUDIT_WS_SAMPLE_OFFSETS_SEC") or getattr(settings, "audit_ws_sample_offsets_sec", None) or "0,3,6,9,12,15,18,21,24,27,30"
@@ -3730,6 +3734,7 @@ async def main():
     audit = H3bApiAudit(
         num_audits=args.num_audits,
         direction=args.direction,
+        hypothesis_type=str(getattr(args, "hypothesis_type", "H3B")),
         save_to_db=not args.no_db,
         executor_workers=args.executor_workers,
         temporal_workers=args.temporal_workers,
