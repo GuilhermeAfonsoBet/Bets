@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
+import os
 from loguru import logger
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,20 @@ from storage.models_hypothesis import (
 # CONFIGURAÇÕES
 # ============================================================================
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return float(default)
+
+
 # H1 - Precificação
 H1_DEVIATION_THRESHOLD = 0.02  # 2% de desvio para considerar mispricing
 H1_ARB_THRESHOLD = 1.0  # overround < 1 = arbitragem
@@ -39,6 +54,13 @@ H3_MIN_LINES = 2  # mínimo de linhas para verificar
 # H3b - Reversões temporais
 H3B_MIN_HISTORY = 3  # mínimo de pontos para detectar reversão
 H3B_WINDOW_SECONDS = 3600  # janela de 1 hora para contar reversões
+
+# DT - Downward Trend (queda consecutiva, sem reversão)
+DT_MIN_CONSEC_DOWNS = max(2, _env_int("DT_MIN_CONSEC_DOWNS", 3))
+DT_MIN_STEP_DROP_PCT = max(0.01, _env_float("DT_MIN_STEP_DROP_PCT", 0.20))  # queda mínima por passo (%)
+DT_MIN_CUM_DROP_PCT = max(0.05, _env_float("DT_MIN_CUM_DROP_PCT", 0.80))  # queda acumulada mínima na sequência (%)
+DT_MAX_STEP_GAP_SEC = max(0.1, _env_float("DT_MAX_STEP_GAP_SEC", 30.0))  # máximo entre passos consecutivos
+DT_SIGNAL_COOLDOWN_SEC = max(0.0, _env_float("DT_SIGNAL_COOLDOWN_SEC", 45.0))
 
 # H6 - Correlação/Lag
 # Com ciclo de 10s, conseguimos detectar lags menores
@@ -71,6 +93,31 @@ class MarketSnapshot:
     home_odd: float  # ou over para OU
     away_odd: float  # ou under para OU
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class DTDownwardTrendEvent:
+    """
+    Evento de tendência de queda (DT) para uso operacional no pipeline de auditoria.
+
+    Observação:
+    - Mantemos o campo `odd_at_reversal` por compatibilidade de payload com o fluxo
+      atual do auditor (sem implicar reversão de fato).
+    """
+
+    match_id: int
+    market_type: str
+    ah_line: str
+    side: str
+    direction_before: str
+    direction_after: str
+    consecutive_downs: int
+    step_drop_pct: float
+    cumulative_drop_pct: float
+    odd_start: float
+    odd_before: float
+    odd_at_reversal: float
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ============================================================================
@@ -464,6 +511,110 @@ class H3bTemporalReversalDetector:
 
 
 # ============================================================================
+# DT - DETECTOR DE TENDÊNCIA DE QUEDA (SEM REVERSÃO)
+# ============================================================================
+
+class DTDownwardTrendDetector:
+    """
+    Detector de tendência de queda por sequência consecutiva.
+
+    Regra:
+      - K quedas consecutivas (cada queda >= min_step_drop_pct)
+      - Queda acumulada da sequência >= min_cum_drop_pct
+      - Gap máximo entre passos para manter a sequência
+      - Cooldown por chave para evitar flood
+    """
+
+    def __init__(self):
+        self._state: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
+        self._last_emit_ts: Dict[Tuple[int, str, str, str], float] = {}
+        self.min_consecutive = int(DT_MIN_CONSEC_DOWNS)
+        self.min_step_drop_pct = float(DT_MIN_STEP_DROP_PCT)
+        self.min_cum_drop_pct = float(DT_MIN_CUM_DROP_PCT)
+        self.max_step_gap_sec = float(DT_MAX_STEP_GAP_SEC)
+        self.cooldown_sec = float(DT_SIGNAL_COOLDOWN_SEC)
+
+    def update_odd(self, snapshot: OddSnapshot) -> Optional[DTDownwardTrendEvent]:
+        key = (snapshot.match_id, snapshot.market_type, snapshot.line, snapshot.side)
+        now = snapshot.timestamp
+        curr = float(snapshot.odd)
+        if curr <= 1.0:
+            return None
+
+        st = self._state.get(key)
+        if st is None:
+            self._state[key] = {
+                "last_odd": curr,
+                "last_ts": now,
+                "start_odd": curr,
+                "consecutive": 0,
+                "signaled_in_streak": False,
+            }
+            return None
+
+        prev = float(st.get("last_odd") or curr)
+        prev_ts = st.get("last_ts") or now
+        gap_s = max(0.0, (now - prev_ts).total_seconds())
+        if gap_s > float(self.max_step_gap_sec):
+            # Sequência interrompida por hiato temporal.
+            st["start_odd"] = prev
+            st["consecutive"] = 0
+            st["signaled_in_streak"] = False
+
+        step_drop_pct = ((curr - prev) / prev * 100.0) if prev > 0 else 0.0
+        qualifies_down_step = step_drop_pct <= -float(self.min_step_drop_pct)
+
+        if qualifies_down_step:
+            if int(st.get("consecutive") or 0) <= 0:
+                st["start_odd"] = prev
+                st["consecutive"] = 1
+            else:
+                st["consecutive"] = int(st.get("consecutive") or 0) + 1
+            start_odd = float(st.get("start_odd") or prev)
+            cum_drop_pct = ((curr - start_odd) / start_odd * 100.0) if start_odd > 0 else 0.0
+
+            is_ready = (
+                int(st.get("consecutive") or 0) >= int(self.min_consecutive)
+                and cum_drop_pct <= -float(self.min_cum_drop_pct)
+            )
+            if is_ready and not bool(st.get("signaled_in_streak")):
+                now_ts = now.timestamp()
+                last_emit = float(self._last_emit_ts.get(key) or 0.0)
+                if (now_ts - last_emit) >= float(self.cooldown_sec):
+                    st["signaled_in_streak"] = True
+                    self._last_emit_ts[key] = now_ts
+                    ev = DTDownwardTrendEvent(
+                        match_id=snapshot.match_id,
+                        market_type=snapshot.market_type,
+                        ah_line=snapshot.line,
+                        side=snapshot.side,
+                        direction_before="down",
+                        direction_after="down",
+                        consecutive_downs=int(st.get("consecutive") or 0),
+                        step_drop_pct=float(step_drop_pct),
+                        cumulative_drop_pct=float(cum_drop_pct),
+                        odd_start=float(start_odd),
+                        odd_before=float(prev),
+                        odd_at_reversal=float(curr),  # compat payload do auditor
+                        detected_at=now,
+                    )
+                    st["last_odd"] = curr
+                    st["last_ts"] = now
+                    self._state[key] = st
+                    return ev
+        else:
+            # Qualquer passo não-qualificado reinicia a sequência.
+            st["start_odd"] = curr
+            st["consecutive"] = 0
+            st["signaled_in_streak"] = False
+
+        st["last_odd"] = curr
+        st["last_ts"] = now
+        self._state[key] = st
+        return None
+
+
+# ============================================================================
 # H6 - DETECTOR DE ATRASOS EM CORRELAÇÕES
 # ============================================================================
 
@@ -675,6 +826,7 @@ class HypothesisDetector:
         self.h1_detector = H1PricingDetector()
         self.h3_detector = H3LineMonotonicityDetector()
         self.h3b_detector = H3bTemporalReversalDetector()
+        self.dt_detector = DTDownwardTrendDetector()
         self.h6_detector = H6CorrelationLagDetector()
         
         # Contadores para logging
@@ -682,6 +834,7 @@ class HypothesisDetector:
             "h1": 0,
             "h3": 0,
             "h3b": 0,
+            "dt": 0,
             "h6": 0,
         }
     
@@ -719,6 +872,7 @@ class HypothesisDetector:
             "h1_events": [],
             "h3_events": [],
             "h3b_events": [],
+            "dt_events": [],
             "h6_events": [],
         }
         
@@ -786,6 +940,18 @@ class HypothesisDetector:
             h3b_event_away.is_live = is_live  # Adiciona flag is_live
             results["h3b_events"].append(h3b_event_away)
             self.event_counts["h3b"] += 1
+
+        # DT - Tendência de queda (sem reversão)
+        dt_event_home = self.dt_detector.update_odd(home_snap)
+        dt_event_away = self.dt_detector.update_odd(away_snap)
+        if dt_event_home:
+            dt_event_home.is_live = is_live
+            results["dt_events"].append(dt_event_home)
+            self.event_counts["dt"] += 1
+        if dt_event_away:
+            dt_event_away.is_live = is_live
+            results["dt_events"].append(dt_event_away)
+            self.event_counts["dt"] += 1
         
         # H6 - Correlação/Lag
         h6_events_home = self.h6_detector.update_odd(home_snap)

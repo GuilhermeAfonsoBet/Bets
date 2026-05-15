@@ -1187,12 +1187,28 @@ class H3bApiAudit:
                 away_odd=away_odds,
             )
 
-            for h3b in det.get("h3b_events", []):
+            signal_key = "dt_events" if str(self.hypothesis_type).upper() == "DT" else "h3b_events"
+            for sig in det.get(signal_key, []):
                 self.h3b_detected += 1
-                if self.direction != "all" and h3b.direction_after != self.direction:
+                sig_direction = str(getattr(sig, "direction_after", "") or "").strip().lower()
+                if self.direction != "all" and sig_direction != self.direction:
                     continue
 
-                audit_key = f"{event_id}|{market_type}|{period}|{h3b.ah_line}|{h3b.side}"
+                sig_line = str(getattr(sig, "ah_line", line_val))
+                sig_side = str(getattr(sig, "side", "") or "").strip()
+                if not sig_side:
+                    continue
+                sig_odd = getattr(sig, "odd_at_reversal", None)
+                if sig_odd is None:
+                    sig_odd = getattr(sig, "odd_at_signal", None)
+                try:
+                    sig_odd = float(sig_odd) if sig_odd is not None else None
+                except Exception:
+                    sig_odd = None
+                if sig_odd is None or sig_odd <= 0:
+                    continue
+
+                audit_key = f"{event_id}|{market_type}|{period}|{sig_line}|{sig_side}"
                 # Dedup com TTL
                 try:
                     now = time.time()
@@ -1217,14 +1233,22 @@ class H3bApiAudit:
                     'is_live': is_live,
                     'market_type': market_type,
                     'market_period': period,
-                    'line': str(h3b.ah_line),
-                    'side': h3b.side,
-                    'websocket_odd': h3b.odd_at_reversal,
-                    'ws_state_key': self._ws_state_key(event_id, market_type, period, str(h3b.ah_line)),
-                    'direction': h3b.direction_after,
+                    'line': str(sig_line),
+                    'side': sig_side,
+                    'websocket_odd': sig_odd,
+                    'ws_state_key': self._ws_state_key(event_id, market_type, period, str(sig_line)),
+                    'direction': sig_direction,
                     'detected_at': time.time(),
                     'hypothesis_type': str(self.hypothesis_type),
                 }
+                if str(self.hypothesis_type).upper() == "DT":
+                    h3b_payload["dt"] = {
+                        "consecutive_downs": int(getattr(sig, "consecutive_downs", 0) or 0),
+                        "step_drop_pct": float(getattr(sig, "step_drop_pct", 0.0) or 0.0),
+                        "cumulative_drop_pct": float(getattr(sig, "cumulative_drop_pct", 0.0) or 0.0),
+                        "odd_start": float(getattr(sig, "odd_start", sig_odd) or sig_odd),
+                        "odd_before": float(getattr(sig, "odd_before", sig_odd) or sig_odd),
+                    }
 
                 skip_enqueue, skip_reason, bridge_src_key = self._enqueue_coalesce_back(h3b_payload)
                 if skip_enqueue:
@@ -3227,6 +3251,8 @@ class H3bApiAudit:
                 hypothesis_details['temporal'] = r.get('temporal')
             if r.get('lay_temporal'):
                 hypothesis_details['lay_temporal'] = r.get('lay_temporal')
+            if r.get('dt'):
+                hypothesis_details['dt'] = r.get('dt')
             # WS series (para ws_only / ws_gate_lay). Pode vir inline.
             if r.get('ws_series'):
                 hypothesis_details['ws_series'] = r.get('ws_series')
