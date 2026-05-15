@@ -1397,9 +1397,10 @@ class ExecutorWorker:
             return dry
 
         # ------------------------------------------------------------
-        # Stake sizing (Back Pre/In) — operacionalização:
-        # - Back Pre com pre_submit_ms <= 5s E slippage_pre_pct < +2% => stake_hi_pre_fast (default 20)
-        # - demais BACK (Back Pre lento + Back In + Pre com slippage >= limiar) => stake_back_default (default 1.5)
+        # Stake sizing (BACK) — operacionalização por slippage pré-submit:
+        # - slippage_pre_pct < limite_negativo           => stake_neg (default 40)
+        # - limite_negativo <= slippage_pre_pct <= limite_positivo => stake_mid (default 20)
+        # - slippage_pre_pct > limite_positivo           => stake_pos (default 20, configurável)
         # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
         market_is_live = False
@@ -1424,19 +1425,29 @@ class ExecutorWorker:
             except Exception:
                 return float(default)
 
-        # Novo modo (recomendado): Back Pre fast => HI, demais Back => LO
+        # Sizing BACK (compatível com o toggle atual)
         # envs:
         # - EXECUTOR_BACKPRE_FAST_STAKE_ENABLE
-        # - EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS
-        # - EXECUTOR_BACKPRE_FAST_STAKE_HI / _LO
+        # - EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT / POS_LIMIT_PCT
+        # - EXECUTOR_BACK_STAKE_SLIP_NEG / MID / POS
+        # Gate opcional de latência (bloqueio de execução):
+        # - EXECUTOR_BACK_LATENCY_GATE_ENABLE
+        # - EXECUTOR_BACK_LATENCY_GATE_MAX_SEC
         sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
-        pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
-        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 20.0))
-        stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
-        pre_fast_max_slip_pct = _env_float(
+        legacy_hi = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 20.0))
+        legacy_max_slip = _env_float(
             "EXECUTOR_BACKPRE_FAST_MAX_SLIPPAGE_PCT",
             _env_float("EXECUTOR_BACKPRE_FAST_MAX_SLIP_PCT", 2.0),
         )
+        slip_neg_limit_pct = _env_float("EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT", -2.0)
+        slip_pos_limit_pct = _env_float("EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT", legacy_max_slip)
+        if slip_neg_limit_pct > slip_pos_limit_pct:
+            slip_neg_limit_pct, slip_pos_limit_pct = slip_pos_limit_pct, slip_neg_limit_pct
+        stake_back_neg = _env_float("EXECUTOR_BACK_STAKE_SLIP_NEG", 40.0)
+        stake_back_mid = _env_float("EXECUTOR_BACK_STAKE_SLIP_MID", legacy_hi)
+        stake_back_pos = _env_float("EXECUTOR_BACK_STAKE_SLIP_POS", stake_back_mid)
+        latency_gate_enabled = _env_bool("EXECUTOR_BACK_LATENCY_GATE_ENABLE", "0")
+        latency_gate_max_sec = max(0.0, _env_float("EXECUTOR_BACK_LATENCY_GATE_MAX_SEC", 0.0))
 
         # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
         # imediatamente antes do place_order, mas já escrevemos o "regime" aqui).
@@ -1554,30 +1565,65 @@ class ExecutorWorker:
             )
 
             if sizing_enabled and req.exec_side == ExecSide.BACK:
-                # regra solicitada:
-                # - pre & pre_submit_ms<=max & slippage_pre_pct<max => 20
-                # - senão => 1.50
-                is_pre = not bool(market_is_live)
-                ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))
-                ok_slip = (slip_pre is not None) and (float(slip_pre) < float(pre_fast_max_slip_pct))
-                is_pre_fast = bool(is_pre and ok_time and ok_slip)
-                stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
+                slip_bucket = "na"
+                if slip_pre is not None:
+                    if float(slip_pre) < float(slip_neg_limit_pct):
+                        slip_bucket = "lt_neg"
+                        stake = float(stake_back_neg)
+                    elif float(slip_pre) <= float(slip_pos_limit_pct):
+                        slip_bucket = "mid"
+                        stake = float(stake_back_mid)
+                    else:
+                        slip_bucket = "gt_pos"
+                        stake = float(stake_back_pos)
+                else:
+                    # Falha de telemetria de slippage: não aumenta stake agressivamente.
+                    slip_bucket = "na"
+                    stake = float(stake_back_mid)
+                pre_submit_ok = bool(
+                    (not latency_gate_enabled)
+                    or (latency_gate_max_sec <= 0.0)
+                    or ((pre_ms is not None) and (float(pre_ms) <= float(latency_gate_max_sec) * 1000.0))
+                )
                 vs.update(
                     {
                         "enabled": True,
-                        "eligible": bool(is_pre_fast),
-                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max && slippage_pre_pct<max_slippage_pre_pct) else stake_back_default",
+                        "eligible": bool(pre_submit_ok),
+                        "rule": "stake_by_slippage: (<neg_limit=>stake_neg, [neg_limit,pos_limit]=>stake_mid, >pos_limit=>stake_pos)",
                         "params": {
-                            "max_pre_submit_ms": float(pre_fast_max_ms),
-                            "max_slippage_pre_pct": float(pre_fast_max_slip_pct),
-                            "stake_pre_fast": float(stake_pre_fast),
-                            "stake_back_default": float(stake_back_default),
+                            "slip_neg_limit_pct": float(slip_neg_limit_pct),
+                            "slip_pos_limit_pct": float(slip_pos_limit_pct),
+                            "stake_back_neg": float(stake_back_neg),
+                            "stake_back_mid": float(stake_back_mid),
+                            "stake_back_pos": float(stake_back_pos),
+                            "latency_gate_enabled": bool(latency_gate_enabled),
+                            "latency_gate_max_sec": float(latency_gate_max_sec),
                         },
-                        "eligible_time": bool(ok_time),
-                        "eligible_slippage": bool(ok_slip),
+                        "eligible_latency": bool(pre_submit_ok),
+                        "slip_bucket": str(slip_bucket),
                         "stake_chosen": float(stake),
                     }
                 )
+
+                # Gate opcional: em live BACK, bloqueia se pre_submit_ms exceder X segundos.
+                if not pre_submit_ok:
+                    try:
+                        await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+                    except Exception:
+                        pass
+                    dry.status = ExecStatus.CAP_BLOCKED
+                    dry.http_status = 200
+                    dry.raw["value_sizing"] = vs
+                    dry.raw["latency_gate"] = {
+                        "enabled": bool(latency_gate_enabled),
+                        "max_sec": float(latency_gate_max_sec),
+                        "pre_submit_ms": (int(pre_ms) if pre_ms is not None else None),
+                    }
+                    dry.error = (
+                        f"LATENCY_GATE_BACK pre_submit_ms={int(pre_ms) if pre_ms is not None else -1} "
+                        f"max_ms={int(float(latency_gate_max_sec) * 1000.0)}"
+                    )
+                    return dry
             else:
                 if req.exec_side != ExecSide.BACK:
                     vs.setdefault("skip_reason", "not_back")

@@ -6309,8 +6309,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- No operacional (shadow/live), o tamanho enviado pelo bridge é **FLAT** via `BRIDGE_STAKE`.\n"
             "- Em **Back**: stake padrão = `BRIDGE_STAKE`.\n"
             "  - **Exceção (sizing no executor)**: se `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1`, o executor pode sobrescrever stake em Back:\n"
-            "    - Back **Pre** com `pre_submit_ms <= EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS` **e** `slippage_pre_pct < EXECUTOR_BACKPRE_FAST_MAX_SLIPPAGE_PCT` ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_HI` (ex.: 20)\n"
-            "    - demais Back ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_LO` (ex.: 1.50)\n"
+            "    - `slippage_pre_pct < EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_NEG` (ex.: 40)\n"
+            "    - `EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT <= slippage_pre_pct <= EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_MID` (ex.: 20)\n"
+            "    - `slippage_pre_pct > EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_POS` (default pode ser 20)\n"
+            "    - opcional: gate de latência com `EXECUTOR_BACK_LATENCY_GATE_ENABLE=1` e `EXECUTOR_BACK_LATENCY_GATE_MAX_SEC`.\n"
             "- Em **Lay**: o executor recebe stake, mas o risco relevante é a **liability**, aproximadamente `liability ≈ stake × (odd - 1)`.\n"
             "- Importante: o Kelly/caps que aparece no relatório OOS é **simulação/diagnóstico** do walk-forward; ele não está sendo aplicado no executor/bridge neste momento.\n\n"
         )
@@ -6338,6 +6340,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "EXECUTOR_QUEUE_MAX",
         "EXECUTOR_CAP_WINDOW_SEC",
         "EXECUTOR_CAP_MAX",
+        "EXECUTOR_BACKPRE_FAST_STAKE_ENABLE",
+        "EXECUTOR_BACK_STAKE_SIZING_ENABLE",
+        "EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT",
+        "EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT",
+        "EXECUTOR_BACK_STAKE_SLIP_NEG",
+        "EXECUTOR_BACK_STAKE_SLIP_MID",
+        "EXECUTOR_BACK_STAKE_SLIP_POS",
+        "EXECUTOR_BACK_LATENCY_GATE_ENABLE",
+        "EXECUTOR_BACK_LATENCY_GATE_MAX_SEC",
         "EXECUTOR_FAST_PMM",
         "EXECUTOR_PMM_TIMEOUT_SEC",
         "EXECUTOR_PMM_MIN_WAIT_SEC",
