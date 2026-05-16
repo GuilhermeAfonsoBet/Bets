@@ -85,9 +85,10 @@ class ExecSample:
     e2e_ms: Optional[float] = None
     d2s_ms: Optional[float] = None
     s2d_ms: Optional[float] = None
+    regime: Optional[str] = None
 
 
-def _read_exec_samples(exec_jsonl: Path, since_utc: datetime) -> Dict[str, ExecSample]:
+def _read_exec_samples(exec_jsonl: Path, since_utc: datetime, regime_filter: str = "all") -> Dict[str, ExecSample]:
     out: Dict[str, ExecSample] = {}
     if not exec_jsonl.exists():
         return out
@@ -105,10 +106,19 @@ def _read_exec_samples(exec_jsonl: Path, since_utc: datetime) -> Dict[str, ExecS
         side = str(res.get("exec_side") or req.get("exec_side") or "").strip().lower()
         if side != "back":
             continue
+        raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+        vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
+        meta = req.get("meta") if isinstance(req.get("meta"), dict) else {}
+        market = meta.get("market") if isinstance(meta.get("market"), dict) else {}
+        regime = str(vs.get("market_regime") or market.get("regime") or "").strip().lower()
+        if regime not in ("pre", "in"):
+            regime = "in" if bool(market.get("is_live")) else "pre"
+        if str(regime_filter or "all").strip().lower() in ("pre", "in"):
+            if regime != str(regime_filter).strip().lower():
+                continue
         created = _parse_dt_any(res.get("created_at") or req.get("created_at"))
         if created is None or created < since_utc:
             continue
-        raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
         oid = _extract_order_id(raw)
         if not oid:
             continue
@@ -135,6 +145,7 @@ def _read_exec_samples(exec_jsonl: Path, since_utc: datetime) -> Dict[str, ExecS
             e2e_ms=float(e2e),
             d2s_ms=float(d2s) if d2s is not None else None,
             s2d_ms=float(s2d) if s2d is not None else None,
+            regime=str(regime),
         )
         old = out.get(rec.order_id)
         if old is None or rec.created_at >= old.created_at:
@@ -305,6 +316,7 @@ def main() -> int:
     ap.add_argument("--exec-jsonl", default="logs/executor_live.jsonl")
     ap.add_argument("--balance-csv", default="logs/accounting/latest__balance.csv")
     ap.add_argument("--since-day", default=(datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat())
+    ap.add_argument("--regime", default="all", choices=["pre", "in", "all"], help="Filtra regime de mercado no executor.")
     ap.add_argument("--out-md", default="logs/e2e_roi_attribution.md")
     ap.add_argument("--out-json", default="logs/e2e_roi_attribution.json")
     args = ap.parse_args()
@@ -313,7 +325,11 @@ def main() -> int:
     if since_utc is None:
         raise SystemExit(f"since_day inválido: {args.since_day}")
 
-    exec_rows = _read_exec_samples(Path(str(args.exec_jsonl)), since_utc=since_utc)
+    exec_rows = _read_exec_samples(
+        Path(str(args.exec_jsonl)),
+        since_utc=since_utc,
+        regime_filter=str(getattr(args, "regime", "all")),
+    )
     pnl_by_oid = _read_balance_pnl(Path(str(args.balance_csv)), since_day=str(args.since_day))
 
     rows: List[ExecSample] = []
@@ -330,6 +346,7 @@ def main() -> int:
     if n == 0:
         report = {
             "since_day": str(args.since_day),
+            "regime": str(args.regime),
             "n_exec_live_ok": len(exec_rows),
             "n_joined": 0,
             "note": "Sem join entre executor_live.jsonl e balance.csv para o período.",
@@ -379,6 +396,7 @@ def main() -> int:
 
     result = {
         "since_day": str(args.since_day),
+        "regime": str(args.regime),
         "n_exec_live_ok": len(exec_rows),
         "n_joined": n,
         "roi_weighted_pct": _weighted_roi_pct(rows),
@@ -392,6 +410,7 @@ def main() -> int:
     md: List[str] = []
     md.append("# Atribuição ROI × latência (E2E)\n")
     md.append(f"- since_day: `{args.since_day}`")
+    md.append(f"- regime: `{args.regime}`")
     md.append(f"- LIVE_OK(back) no executor: **{len(exec_rows)}**")
     md.append(f"- join executor×balance: **{n}**")
     md.append(f"- ROI ponderado (join): **{_fmt(result['roi_weighted_pct'], 2)}%**\n")
