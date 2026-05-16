@@ -876,6 +876,25 @@ async def run_checks(
         # Opcional: p90 (mais robusto contra medianas "ok" com cauda explodindo)
         lat_call_p90_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_WARN_MS", "0"), 0)
         lat_call_p90_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_CALL_P90_FAIL_MS", "0"), 0)
+        # Amostra baixa: ainda pode alertar quando latência está claramente ruim,
+        # mesmo sem atingir lat_min_events.
+        lat_low_sample_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_LOW_SAMPLE_MIN_EVENTS", "5"), 5)
+        lat_low_sample_fail_hard = _is_truthy(os.getenv("OPS_EXECUTOR_LAT_LOW_SAMPLE_FAIL_HARD", "0"))
+        # Degradação relativa (janela recente vs baseline no tail histórico).
+        lat_degrade_enable = _is_truthy(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_ENABLE", "1"))
+        lat_degrade_min_recent = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_MIN_RECENT_EVENTS", "5"), 5)
+        lat_degrade_min_baseline = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_MIN_BASE_EVENTS", "30"), 30)
+        lat_degrade_baseline_lookback = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_BASE_LOOKBACK_EVENTS", "300"), 300)
+        try:
+            lat_degrade_warn_ratio = float(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_WARN_RATIO", "1.40"))
+        except Exception:
+            lat_degrade_warn_ratio = 1.40
+        try:
+            lat_degrade_fail_ratio = float(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_FAIL_RATIO", "1.80"))
+        except Exception:
+            lat_degrade_fail_ratio = 1.80
+        lat_degrade_warn_delta_ms = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_WARN_DELTA_MS", "2500"), 2500)
+        lat_degrade_fail_delta_ms = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_FAIL_DELTA_MS", "5000"), 5000)
 
         # health endpoint (ready/workers) para detectar serviço "up" porém não operacional
         ex_health_enable = _is_truthy(os.getenv("OPS_EXECUTOR_HEALTH_ENABLE", "1"))
@@ -1151,13 +1170,171 @@ async def run_checks(
                             )
                         )
                 else:
-                    results.append(
-                        CheckResult(
-                            "PASS",
-                            f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
-                            f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                    # Em amostra baixa, ainda podemos sinalizar quando os números
+                    # já estão claramente acima dos limites.
+                    if len(call_ms) >= int(lat_low_sample_min_events):
+                        p50_call = _pctl(call_ms, 50) or 0.0
+                        p90_call = _pctl(call_ms, 90) or 0.0
+                        p50_post = _pctl(post_ms, 50) if post_ms else None
+                        p50_queue = _pctl(queue_ms, 50) if queue_ms else None
+                        hard_fail = False
+                        hard_warn = False
+                        reasons: List[str] = []
+                        if p50_call >= float(lat_call_p50_fail):
+                            hard_fail = True
+                            reasons.append(f"call_p50={int(p50_call)}ms>={int(lat_call_p50_fail)}")
+                        elif p50_call >= float(lat_call_p50_warn):
+                            hard_warn = True
+                            reasons.append(f"call_p50={int(p50_call)}ms>={int(lat_call_p50_warn)}")
+
+                        if p50_post is not None:
+                            if float(p50_post) >= float(lat_post_p50_fail):
+                                hard_fail = True
+                                reasons.append(f"post_p50={int(p50_post)}ms>={int(lat_post_p50_fail)}")
+                            elif float(p50_post) >= float(lat_post_p50_warn):
+                                hard_warn = True
+                                reasons.append(f"post_p50={int(p50_post)}ms>={int(lat_post_p50_warn)}")
+
+                        if p50_queue is not None:
+                            if float(p50_queue) >= float(lat_queue_p50_fail):
+                                hard_fail = True
+                                reasons.append(f"queue_p50={int(p50_queue)}ms>={int(lat_queue_p50_fail)}")
+                            elif float(p50_queue) >= float(lat_queue_p50_warn):
+                                hard_warn = True
+                                reasons.append(f"queue_p50={int(p50_queue)}ms>={int(lat_queue_p50_warn)}")
+
+                        if int(lat_call_p90_fail) > 0 and p90_call >= float(lat_call_p90_fail):
+                            hard_fail = True
+                            reasons.append(f"call_p90={int(p90_call)}ms>={int(lat_call_p90_fail)}")
+                        elif int(lat_call_p90_warn) > 0 and p90_call >= float(lat_call_p90_warn):
+                            hard_warn = True
+                            reasons.append(f"call_p90={int(p90_call)}ms>={int(lat_call_p90_warn)}")
+
+                        if hard_fail:
+                            lvl = "FAIL" if lat_low_sample_fail_hard else "WARN"
+                            results.append(
+                                CheckResult(
+                                    lvl,
+                                    f"{executor_service or 'betinasia-executor'}: latência alta (amostra baixa) "
+                                    f"(n_ok={len(call_ms)}<{lat_min_events} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms"
+                                    + (f" p50_post={int(p50_post)}ms" if p50_post is not None else "")
+                                    + (f" p50_queue={int(p50_queue)}ms" if p50_queue is not None else "")
+                                    + f") [{', '.join(reasons)}]",
+                                )
+                            )
+                            exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+                        elif hard_warn:
+                            results.append(
+                                CheckResult(
+                                    "WARN",
+                                    f"{executor_service or 'betinasia-executor'}: latência em alerta (amostra baixa) "
+                                    f"(n_ok={len(call_ms)}<{lat_min_events} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms"
+                                    + (f" p50_post={int(p50_post)}ms" if p50_post is not None else "")
+                                    + (f" p50_queue={int(p50_queue)}ms" if p50_queue is not None else "")
+                                    + f") [{', '.join(reasons)}]",
+                                )
+                            )
+                            exit_code = max(exit_code, 1)
+                        else:
+                            results.append(
+                                CheckResult(
+                                    "PASS",
+                                    f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
+                                    f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                                )
+                            )
+                    else:
+                        results.append(
+                            CheckResult(
+                                "PASS",
+                                f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
+                                f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                            )
                         )
-                    )
+
+                # Degradação relativa: compara p50 recente (janela since) vs baseline do tail
+                # anterior ao since. Captura piora mesmo quando ainda não estourou threshold absoluto.
+                if lat_degrade_enable:
+                    ok_statuses = {"LIVE_OK", "DRY_OK"}
+                    recent_call_ms: List[float] = []
+                    for o in recent:
+                        if _get_status(o) not in ok_statuses:
+                            continue
+                        t = _timing_from_exec_jsonl(o)
+                        c = t.get("call_to_done_ms")
+                        if c is not None and c > 0:
+                            recent_call_ms.append(float(c))
+
+                    baseline_call_ms: List[float] = []
+                    for o in rows:
+                        ts = _get_ts(o)
+                        if ts is None or ts >= since:
+                            continue
+                        if _get_status(o) not in ok_statuses:
+                            continue
+                        t = _timing_from_exec_jsonl(o)
+                        c = t.get("call_to_done_ms")
+                        if c is not None and c > 0:
+                            baseline_call_ms.append(float(c))
+
+                    if int(lat_degrade_baseline_lookback) > 0 and len(baseline_call_ms) > int(lat_degrade_baseline_lookback):
+                        baseline_call_ms = baseline_call_ms[-int(lat_degrade_baseline_lookback) :]
+
+                    if (
+                        len(recent_call_ms) >= int(lat_degrade_min_recent)
+                        and len(baseline_call_ms) >= int(lat_degrade_min_baseline)
+                    ):
+                        p50_recent = _pctl(recent_call_ms, 50) or 0.0
+                        p50_base = _pctl(baseline_call_ms, 50) or 0.0
+                        if p50_base > 0:
+                            ratio = float(p50_recent) / float(p50_base)
+                            delta = float(p50_recent - p50_base)
+                            fail_cond = (
+                                ratio >= float(max(1.0, lat_degrade_fail_ratio))
+                                and delta >= float(max(0, lat_degrade_fail_delta_ms))
+                            )
+                            warn_cond = (
+                                ratio >= float(max(1.0, lat_degrade_warn_ratio))
+                                and delta >= float(max(0, lat_degrade_warn_delta_ms))
+                            )
+                            msg = (
+                                f"{executor_service or 'betinasia-executor'}: degradação de latência (call_to_done p50) "
+                                f"(recent={int(p50_recent)}ms vs base={int(p50_base)}ms, "
+                                f"ratio={ratio:.2f}x, delta={int(delta)}ms, "
+                                f"n_recent={len(recent_call_ms)}, n_base={len(baseline_call_ms)})"
+                            )
+                            if fail_cond:
+                                results.append(CheckResult("FAIL", msg))
+                                exit_code = max(exit_code, 2)
+                            elif warn_cond:
+                                results.append(CheckResult("WARN", msg))
+                                exit_code = max(exit_code, 1)
+                            else:
+                                results.append(
+                                    CheckResult(
+                                        "PASS",
+                                        f"{executor_service or 'betinasia-executor'}: degradação de latência não detectada "
+                                        f"(recent={int(p50_recent)}ms base={int(p50_base)}ms, ratio={ratio:.2f}x, "
+                                        f"n_recent={len(recent_call_ms)} n_base={len(baseline_call_ms)})",
+                                    )
+                                )
+                        else:
+                            results.append(
+                                CheckResult(
+                                    "PASS",
+                                    f"{executor_service or 'betinasia-executor'}: degradação de latência sem baseline válido "
+                                    f"(p50_base={int(p50_base)}ms, n_base={len(baseline_call_ms)})",
+                                )
+                            )
+                    else:
+                        results.append(
+                            CheckResult(
+                                "PASS",
+                                f"{executor_service or 'betinasia-executor'}: amostra baixa p/ degradação de latência "
+                                f"(recent={len(recent_call_ms)}/{lat_degrade_min_recent}, "
+                                f"base={len(baseline_call_ms)}/{lat_degrade_min_baseline})",
+                            )
+                        )
             except Exception:
                 # não quebra monitor por esse check
                 pass

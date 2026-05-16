@@ -176,6 +176,10 @@ Além disso, o monitor atual valida:
 - estagnação de `betslip_audit_results` no DB (opcional, com limiar)
 - fluxo audit -> bridge (`eligible`, `seen`, `accepted`) para detectar travamento funcional
 - composição de motivos do bridge (ex.: `not_active`, `wf_ah_max_abs_line`) para distinguir bloqueio de política vs. falha técnica
+- degradação de latência do executor:
+  - por threshold absoluto (p50/p90 de `call_to_done_ms`, `post_ms`, `queue_delay_ms`)
+  - por degradação relativa (`call_to_done_ms` recente vs baseline histórico no tail do JSONL)
+  - com modo de **amostra baixa** (alerta WARN mesmo com poucos `LIVE_OK/DRY_OK` quando latência já está alta)
 
 > Nota: o `ops.health_monitor` usa **exit codes** (0=PASS, 1=WARN, 2=FAIL).  
 > Nos units `betinasia-ops-monitor.service` e `betinasia-ops-autopilot.service` nós já incluímos `SuccessExitStatus=1 2` para o systemd **não** marcar o unit como "failed" em WARN/FAIL (o que é esperado e não significa que o timer quebrou).
@@ -206,6 +210,9 @@ Variáveis úteis (no `.env`):
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
 - `OPS_MONITOR_STRICT_ARGS` (default `0`)
 - `OPS_EXECUTOR_HEALTH_*`
+- `OPS_EXECUTOR_LAT_*` (thresholds absolutos de latência)
+- `OPS_EXECUTOR_LAT_LOW_SAMPLE_*` (alerta de latência alta com poucos OKs)
+- `OPS_EXECUTOR_LAT_DEGRADE_*` (degradação relativa recente vs baseline)
 - `OPS_AUDIT_DB_STALE_FAIL_*`
 - `OPS_BRIDGE_FLOW_*`, `OPS_BRIDGE_THROUGHPUT_*`
 
