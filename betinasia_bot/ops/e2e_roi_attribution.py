@@ -154,43 +154,76 @@ def _read_exec_samples(exec_jsonl: Path, since_utc: datetime, regime_filter: str
 
 
 def _read_balance_pnl(balance_csv: Path, since_day: str) -> Dict[str, float]:
+    return _read_balance_pnl_many([balance_csv], since_day=since_day)
+
+
+def _pick_balance_files(*, balance_csv: str, balance_dir: str) -> List[Path]:
+    raw_csv = str(balance_csv or "").strip()
+    if raw_csv:
+        p = Path(raw_csv)
+        return [p] if p.exists() else []
+
+    out: List[Path] = []
+    root = Path(str(balance_dir or "logs/accounting"))
+    if root.exists():
+        out.extend(sorted(root.glob("*__balance.csv")))
+        # fallback comum em alguns ambientes
+        latest = root / "latest__balance.csv"
+        if latest.exists() and latest not in out:
+            out.append(latest)
+    return out
+
+
+def _read_balance_pnl_many(balance_csvs: Iterable[Path], since_day: str) -> Dict[str, float]:
+    """
+    Lê vários balance.csv e deduplica linhas repetidas entre snapshots por:
+      (order_id, timestamp, pnl)
+    Isso evita double-count quando o mesmo extrato diário é reexportado.
+    """
     out: Dict[str, float] = {}
-    if not balance_csv.exists():
-        return out
-    with balance_csv.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-        reader = csv.DictReader(fh)
-        cols = [str(c or "") for c in (reader.fieldnames or [])]
-        if not cols:
-            return out
+    seen_rows: set[Tuple[str, str, float]] = set()
 
-        def pick(*needles: str) -> Optional[str]:
-            for needle in needles:
-                n = needle.lower()
-                for col in cols:
-                    c = col.lower()
-                    if c == n or c.startswith(n) or n in c:
-                        return col
-            return None
+    for balance_csv in balance_csvs:
+        if not balance_csv.exists():
+            continue
+        with balance_csv.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+            reader = csv.DictReader(fh)
+            cols = [str(c or "") for c in (reader.fieldnames or [])]
+            if not cols:
+                continue
 
-        dt_col = pick("post date", "post_date", "date", "settled", "closed", "time")
-        oid_col = pick("order_id", "order id", "order", "bet id", "bet_id", "id")
-        pnl_col = pick("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl")
-        if not dt_col or not oid_col or not pnl_col:
-            return out
+            def pick(*needles: str) -> Optional[str]:
+                for needle in needles:
+                    n = needle.lower()
+                    for col in cols:
+                        c = col.lower()
+                        if c == n or c.startswith(n) or n in c:
+                            return col
+                return None
 
-        for row in reader:
-            if not isinstance(row, dict):
+            dt_col = pick("post date", "post_date", "date", "settled", "closed", "time")
+            oid_col = pick("order_id", "order id", "order", "bet id", "bet_id", "id")
+            pnl_col = pick("amount", "profit_loss", "profit", "p&l", "pnl", "net", "pl")
+            if not dt_col or not oid_col or not pnl_col:
                 continue
-            oid = _normalize_order_id(row.get(oid_col))
-            if not oid:
-                continue
-            dt = _parse_dt_any(row.get(dt_col))
-            if dt is None or dt.date().isoformat() < since_day:
-                continue
-            pnl = _safe_float(row.get(pnl_col))
-            if pnl is None:
-                continue
-            out[oid] = float(out.get(oid) or 0.0) + float(pnl)
+
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                oid = _normalize_order_id(row.get(oid_col))
+                if not oid:
+                    continue
+                dt = _parse_dt_any(row.get(dt_col))
+                if dt is None or dt.date().isoformat() < since_day:
+                    continue
+                pnl = _safe_float(row.get(pnl_col))
+                if pnl is None:
+                    continue
+                sig = (str(oid), dt.isoformat(), float(pnl))
+                if sig in seen_rows:
+                    continue
+                seen_rows.add(sig)
+                out[oid] = float(out.get(oid) or 0.0) + float(pnl)
     return out
 
 
@@ -314,7 +347,8 @@ def main() -> int:
         description="Atribuição de ROI por componentes de latência (e2e, detect_to_submit, submit_to_done)."
     )
     ap.add_argument("--exec-jsonl", default="logs/executor_live.jsonl")
-    ap.add_argument("--balance-csv", default="logs/accounting/latest__balance.csv")
+    ap.add_argument("--balance-csv", default="", help="Opcional: caminho único para balance.csv.")
+    ap.add_argument("--balance-dir", default="logs/accounting", help="Diretório para buscar *__balance.csv.")
     ap.add_argument("--since-day", default=(datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat())
     ap.add_argument("--regime", default="all", choices=["pre", "in", "all"], help="Filtra regime de mercado no executor.")
     ap.add_argument("--out-md", default="logs/e2e_roi_attribution.md")
@@ -330,7 +364,8 @@ def main() -> int:
         since_utc=since_utc,
         regime_filter=str(getattr(args, "regime", "all")),
     )
-    pnl_by_oid = _read_balance_pnl(Path(str(args.balance_csv)), since_day=str(args.since_day))
+    balance_files = _pick_balance_files(balance_csv=str(args.balance_csv), balance_dir=str(args.balance_dir))
+    pnl_by_oid = _read_balance_pnl_many(balance_files, since_day=str(args.since_day))
 
     rows: List[ExecSample] = []
     for oid, sample in exec_rows.items():
@@ -347,6 +382,7 @@ def main() -> int:
         report = {
             "since_day": str(args.since_day),
             "regime": str(args.regime),
+            "balance_files_n": len(balance_files),
             "n_exec_live_ok": len(exec_rows),
             "n_joined": 0,
             "note": "Sem join entre executor_live.jsonl e balance.csv para o período.",
@@ -397,6 +433,7 @@ def main() -> int:
     result = {
         "since_day": str(args.since_day),
         "regime": str(args.regime),
+        "balance_files_n": len(balance_files),
         "n_exec_live_ok": len(exec_rows),
         "n_joined": n,
         "roi_weighted_pct": _weighted_roi_pct(rows),
@@ -411,6 +448,7 @@ def main() -> int:
     md.append("# Atribuição ROI × latência (E2E)\n")
     md.append(f"- since_day: `{args.since_day}`")
     md.append(f"- regime: `{args.regime}`")
+    md.append(f"- balance_files_n: **{len(balance_files)}**")
     md.append(f"- LIVE_OK(back) no executor: **{len(exec_rows)}**")
     md.append(f"- join executor×balance: **{n}**")
     md.append(f"- ROI ponderado (join): **{_fmt(result['roi_weighted_pct'], 2)}%**\n")
