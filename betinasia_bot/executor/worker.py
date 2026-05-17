@@ -106,6 +106,16 @@ def _is_auth_error(api_result: Optional[BetslipApiResult]) -> bool:
         return False
 
 
+def _is_no_pmms_error(api_result: Optional[BetslipApiResult]) -> bool:
+    try:
+        if not api_result:
+            return False
+        err = str(getattr(api_result, "error", "") or "")
+        return _err_contains(err, "No PMMs received", "No PMMs after refresh")
+    except Exception:
+        return False
+
+
 def _err_contains(err: Any, *needles: str) -> bool:
     try:
         s = str(err or "")
@@ -753,6 +763,51 @@ class ExecutorWorker:
                             self._betslip_cache.move_to_end(cache_key)
                         except Exception:
                             pass
+
+            # Mitigação operacional: em "No PMMs", re-tenta 1x com timeout mais folgado.
+            if _is_no_pmms_error(api_result):
+                retry_enabled = str(os.getenv("EXECUTOR_NO_PMMS_RETRY_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+                if retry_enabled and self._api is not None:
+                    old_timeout = float(getattr(self._api, "PMM_TIMEOUT", 0.8) or 0.8)
+                    old_min_wait = float(getattr(self._api, "PMM_MIN_WAIT", 0.0) or 0.0)
+                    old_idle = float(getattr(self._api, "PMM_IDLE_TIMEOUT", 0.12) or 0.12)
+                    retry_mult = max(1.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_TIMEOUT_MULT", "2.0")) or 2.0))
+                    retry_floor = max(0.5, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_TIMEOUT_FLOOR_SEC", "1.6")) or 1.6))
+                    retry_timeout = max(old_timeout * retry_mult, retry_floor)
+                    retry_min_wait = max(old_min_wait, max(0.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_MIN_WAIT_SEC", "0.15")) or 0.15)))
+                    retry_idle = max(old_idle, max(0.05, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_IDLE_TIMEOUT_SEC", "0.25")) or 0.25)))
+                    retry_sleep = max(0.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_SLEEP_SEC", "0.2")) or 0.2))
+                    try:
+                        await self._api.close_visible_betslip_ui()
+                    except Exception:
+                        pass
+                    if retry_sleep > 0:
+                        await asyncio.sleep(retry_sleep)
+                    try:
+                        self._api.PMM_TIMEOUT = float(retry_timeout)
+                        self._api.PMM_MIN_WAIT = float(retry_min_wait)
+                        self._api.PMM_IDLE_TIMEOUT = float(retry_idle)
+                        logger.warning(
+                            f"[executor:{self.name}] NO_PMMS retry 1x with relaxed PMM "
+                            f"timeout={self._api.PMM_TIMEOUT:.2f}s min_wait={self._api.PMM_MIN_WAIT:.2f}s idle={self._api.PMM_IDLE_TIMEOUT:.2f}s"
+                        )
+                        api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+                    finally:
+                        try:
+                            self._api.PMM_TIMEOUT = float(old_timeout)
+                            self._api.PMM_MIN_WAIT = float(old_min_wait)
+                            self._api.PMM_IDLE_TIMEOUT = float(old_idle)
+                        except Exception:
+                            pass
+            # Se PMM continuar falhando e WS parecer "stale", força reciclagem da sessão do worker.
+            if _is_no_pmms_error(api_result):
+                ws_stale_ms = int(float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_WS_STALE_MS", "12000")) or 12000.0))
+                force_restart = str(os.getenv("EXECUTOR_NO_PMMS_FORCE_RESTART", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+                ws_age_ms = int(getattr(api_result, "ws_age_ms", 0) or 0)
+                ws_msg_count = int(getattr(api_result, "ws_msg_count", 0) or 0)
+                ws_stale = (ws_msg_count <= 0) or (ws_age_ms > 0 and ws_age_ms >= max(1000, ws_stale_ms))
+                if force_restart and ws_stale:
+                    await self._restart_browser_session(reason=f"NO_PMMS ws_msg_count={ws_msg_count} ws_age_ms={ws_age_ms}")
         except Exception as e:
             return ExecutionResult(
                 execution_id=req.execution_id,
@@ -1342,9 +1397,10 @@ class ExecutorWorker:
             return dry
 
         # ------------------------------------------------------------
-        # Stake sizing (Back Pre/In) — operacionalização:
-        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 12)
-        # - demais BACK (Back Pre lento + Back In) => stake_back_default (default 1.5)
+        # Stake sizing (BACK) — operacionalização por slippage pré-submit:
+        # - slippage_pre_pct < limite_negativo           => stake_neg (default 40)
+        # - limite_negativo <= slippage_pre_pct <= limite_positivo => stake_mid (default 20)
+        # - slippage_pre_pct > limite_positivo           => stake_pos (default 20, configurável)
         # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
         market_is_live = False
