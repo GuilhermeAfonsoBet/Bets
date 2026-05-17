@@ -3404,6 +3404,7 @@ class DailyReportCfg:
     # Default atualizado: inclui Back API moderno (v5.2) e mantém Lay gate (v5.1).
     # Isso evita OOS truncar (ex.: parar em 03/04) quando as versões antigas não têm histórico recente.
     versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.2-api-back,v5.1-ws-gate-lay")
+    hypothesis_type: str = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", "H3B")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
     lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
@@ -3459,6 +3460,7 @@ class DailyReportCfg:
     def __post_init__(self) -> None:
         # Releitura de env em runtime (importante quando rodando manualmente e carregando .env em main()).
         self.versions = os.getenv("DAILY_OOS_VERSIONS", self.versions)
+        self.hypothesis_type = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", self.hypothesis_type)
         self.direction = os.getenv("DAILY_OOS_DIRECTION", self.direction)
         self.lookback_days = os.getenv("DAILY_OOS_LOOKBACK_DAYS", self.lookback_days)
         self.report_mode = os.getenv("DAILY_REPORT_MODE", self.report_mode)
@@ -3625,6 +3627,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     args = [
         sys.executable,
         str(Path(__file__).resolve().parent.parent / "analyze_contexto_operacao_b808_robust_report.py"),
+        "--hypothesis-type",
+        str(cfg.hypothesis_type),
         "--direction",
         str(cfg.direction),
         "--versions",
@@ -6358,7 +6362,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(f"| {k} | `{_env(k)}` |\n")
     extra.append("\n")
 
-    extra.append("**Audit H3B**\n\n")
+    extra.append(f"**Audit {str(cfg.hypothesis_type).upper()}**\n\n")
     extra.append("| chave | valor |\n|---|---|\n")
     for k in [
         "AUDIT_MODE",

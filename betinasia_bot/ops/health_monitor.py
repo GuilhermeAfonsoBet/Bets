@@ -1533,7 +1533,26 @@ def _has_executor_latency_fail(results: List[CheckResult], executor_service: str
         if r.level != "FAIL":
             continue
         msg = str(r.message or "").lower()
-        if "latência alta" not in msg:
+        if ("latência alta" not in msg) and ("degradação de latência" not in msg):
+            continue
+        if key and key in msg:
+            return True
+        if (not key) and ("executor" in msg):
+            return True
+    return False
+
+
+def _has_executor_latency_alert(results: List[CheckResult], executor_service: str) -> bool:
+    key = str(executor_service or "").strip().lower()
+    for r in results:
+        if r.level not in ("WARN", "FAIL"):
+            continue
+        msg = str(r.message or "").lower()
+        if (
+            ("latência alta" not in msg)
+            and ("latência em alerta" not in msg)
+            and ("degradação de latência" not in msg)
+        ):
             continue
         if key and key in msg:
             return True
@@ -1693,6 +1712,7 @@ def main() -> int:
         except Exception:
             pause_max_per_hour = 1
         latency_fail = _has_executor_latency_fail(results, str(args.executor_service))
+        latency_alert = _has_executor_latency_alert(results, str(args.executor_service))
         # streak de FAIL de latência (por executor_service) para evitar pausar por spikes únicos
         try:
             exsvc = str(args.executor_service or "").strip() or "betinasia-executor"
@@ -1702,8 +1722,14 @@ def main() -> int:
             else:
                 ex_state["latency_fail_streak"] = 0
             latency_fail_streak = _safe_int(ex_state.get("latency_fail_streak"), 0)
+            if latency_alert:
+                ex_state["latency_alert_streak"] = _safe_int(ex_state.get("latency_alert_streak"), 0) + 1
+            else:
+                ex_state["latency_alert_streak"] = 0
+            latency_alert_streak = _safe_int(ex_state.get("latency_alert_streak"), 0)
         except Exception:
             latency_fail_streak = 0
+            latency_alert_streak = 0
 
         paused_now: List[str] = []
         if latency_pause_enabled and latency_fail and int(latency_fail_streak) >= int(pause_after_fails):
@@ -1734,6 +1760,50 @@ def main() -> int:
             autopilot_actions.append(
                 f"pause_on_latency_fail: aguardando streak (latency_fail_streak={int(latency_fail_streak)}/{int(pause_after_fails)})"
             )
+
+        # Ação moderada: refresh controlado quando latência fica em WARN/FAIL de forma persistente.
+        # Útil para cenários de degradação progressiva observados após algumas horas de operação.
+        try:
+            latency_refresh_enabled = _is_truthy(os.getenv("OPS_LATENCY_DEGRADE_REFRESH_ENABLE", "0"))
+            refresh_after_alerts = _safe_int(os.getenv("OPS_LATENCY_DEGRADE_REFRESH_ALERTS", "3"), 3)
+            refresh_after_alerts = max(1, int(refresh_after_alerts))
+            refresh_cooldown = _safe_int(os.getenv("OPS_LATENCY_DEGRADE_REFRESH_COOLDOWN_SEC", "1800"), 1800)
+            refresh_cooldown = max(1, int(refresh_cooldown))
+            refresh_max_per_hour = _safe_int(os.getenv("OPS_LATENCY_DEGRADE_REFRESH_MAX_PER_HOUR", "1"), 1)
+            refresh_max_per_hour = max(1, int(refresh_max_per_hour))
+            targets_raw = _parse_csv_tokens(os.getenv("OPS_LATENCY_DEGRADE_REFRESH_SERVICES", ""), upper=False)
+            refresh_targets = list(targets_raw) if targets_raw else [str(args.audit_service), str(args.bridge_back_service)]
+            refresh_targets = [
+                str(s or "").strip()
+                for s in refresh_targets
+                if str(s or "").strip() and str(s or "").strip().lower() not in ("0", "off", "none", "false")
+            ]
+            if latency_refresh_enabled and latency_alert and int(latency_alert_streak) >= int(refresh_after_alerts):
+                for svc in refresh_targets:
+                    allowed, reason = _rate_limited_action(
+                        state,
+                        svc,
+                        "refresh_on_latency_alert",
+                        now=now,
+                        max_per_hour=int(refresh_max_per_hour),
+                        cooldown_sec=int(refresh_cooldown),
+                    )
+                    if not allowed:
+                        autopilot_actions.append(f"{svc}: refresh bloqueado ({reason})")
+                        continue
+                    ok = _systemctl_restart(svc)
+                    _append_action(state, svc, "refresh_on_latency_alert", now)
+                    autopilot_actions.append(
+                        f"{svc}: refresh por latência persistente ok={ok} "
+                        f"(streak={int(latency_alert_streak)})"
+                    )
+            elif latency_refresh_enabled and latency_alert:
+                autopilot_actions.append(
+                    "refresh_on_latency_alert: aguardando streak "
+                    f"(latency_alert_streak={int(latency_alert_streak)}/{int(refresh_after_alerts)})"
+                )
+        except Exception:
+            pass
 
         # marca falhas por serviço
         for svc in autopilot_svcs:

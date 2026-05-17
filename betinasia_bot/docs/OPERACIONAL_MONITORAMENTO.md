@@ -102,11 +102,28 @@ Relatório diário completo (OOS + execução + accounting + PDF + Telegram):
 python3 -m ops.daily_full_report
 ```
 
+Relatório diário DT (segunda trilha, com recorte DT/down):
+
+```bash
+python3 -m ops.daily_dt_report
+```
+
 Saídas importantes do daily:
 - `logs/daily_reports/YYYYMMDD/report_daily.pdf`: relatório completo (inclui seção 99)
+- `logs/daily_reports_dt/YYYYMMDD/report_daily.pdf`: relatório completo da trilha DT
 - `logs/wf_policy_current.json`: policy “corrente” (export do walk-forward, usado pelo bridge)
 - `logs/policy_history/wf_policy_YYYYMMDD.json`: histórico diário do export
 - `logs/daily_reports/YYYYMMDD/oos_adherence.json`: aderência (portfolio por dia × execução × ROI por placar)
+
+Agendamento diário DT (systemd):
+
+```bash
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-daily-dt-report.service')" /etc/systemd/system/
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-daily-dt-report.timer')" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-daily-dt-report.timer
+sudo systemctl status --no-pager -n 80 betinasia-daily-dt-report.service
+```
 
 ### Policy OOS ativa (mecânica de atualização)
 O `ops.daily_full_report` roda o walk-forward e faz:
@@ -213,6 +230,7 @@ Variáveis úteis (no `.env`):
 - `OPS_EXECUTOR_LAT_*` (thresholds absolutos de latência)
 - `OPS_EXECUTOR_LAT_LOW_SAMPLE_*` (alerta de latência alta com poucos OKs)
 - `OPS_EXECUTOR_LAT_DEGRADE_*` (degradação relativa recente vs baseline)
+- `OPS_LATENCY_DEGRADE_REFRESH_*` (refresh controlado em degradação persistente de latência)
 - `OPS_AUDIT_DB_STALE_FAIL_*`
 - `OPS_BRIDGE_FLOW_*`, `OPS_BRIDGE_THROUGHPUT_*`
 
