@@ -106,6 +106,16 @@ def _is_auth_error(api_result: Optional[BetslipApiResult]) -> bool:
         return False
 
 
+def _is_no_pmms_error(api_result: Optional[BetslipApiResult]) -> bool:
+    try:
+        if not api_result:
+            return False
+        err = str(getattr(api_result, "error", "") or "")
+        return _err_contains(err, "No PMMs received", "No PMMs after refresh")
+    except Exception:
+        return False
+
+
 def _err_contains(err: Any, *needles: str) -> bool:
     try:
         s = str(err or "")
@@ -753,6 +763,51 @@ class ExecutorWorker:
                             self._betslip_cache.move_to_end(cache_key)
                         except Exception:
                             pass
+
+            # Mitigação operacional: em "No PMMs", re-tenta 1x com timeout mais folgado.
+            if _is_no_pmms_error(api_result):
+                retry_enabled = str(os.getenv("EXECUTOR_NO_PMMS_RETRY_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+                if retry_enabled and self._api is not None:
+                    old_timeout = float(getattr(self._api, "PMM_TIMEOUT", 0.8) or 0.8)
+                    old_min_wait = float(getattr(self._api, "PMM_MIN_WAIT", 0.0) or 0.0)
+                    old_idle = float(getattr(self._api, "PMM_IDLE_TIMEOUT", 0.12) or 0.12)
+                    retry_mult = max(1.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_TIMEOUT_MULT", "2.0")) or 2.0))
+                    retry_floor = max(0.5, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_TIMEOUT_FLOOR_SEC", "1.6")) or 1.6))
+                    retry_timeout = max(old_timeout * retry_mult, retry_floor)
+                    retry_min_wait = max(old_min_wait, max(0.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_MIN_WAIT_SEC", "0.15")) or 0.15)))
+                    retry_idle = max(old_idle, max(0.05, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_IDLE_TIMEOUT_SEC", "0.25")) or 0.25)))
+                    retry_sleep = max(0.0, float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_RETRY_SLEEP_SEC", "0.2")) or 0.2))
+                    try:
+                        await self._api.close_visible_betslip_ui()
+                    except Exception:
+                        pass
+                    if retry_sleep > 0:
+                        await asyncio.sleep(retry_sleep)
+                    try:
+                        self._api.PMM_TIMEOUT = float(retry_timeout)
+                        self._api.PMM_MIN_WAIT = float(retry_min_wait)
+                        self._api.PMM_IDLE_TIMEOUT = float(retry_idle)
+                        logger.warning(
+                            f"[executor:{self.name}] NO_PMMS retry 1x with relaxed PMM "
+                            f"timeout={self._api.PMM_TIMEOUT:.2f}s min_wait={self._api.PMM_MIN_WAIT:.2f}s idle={self._api.PMM_IDLE_TIMEOUT:.2f}s"
+                        )
+                        api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+                    finally:
+                        try:
+                            self._api.PMM_TIMEOUT = float(old_timeout)
+                            self._api.PMM_MIN_WAIT = float(old_min_wait)
+                            self._api.PMM_IDLE_TIMEOUT = float(old_idle)
+                        except Exception:
+                            pass
+            # Se PMM continuar falhando e WS parecer "stale", força reciclagem da sessão do worker.
+            if _is_no_pmms_error(api_result):
+                ws_stale_ms = int(float(_safe_float(os.getenv("EXECUTOR_NO_PMMS_WS_STALE_MS", "12000")) or 12000.0))
+                force_restart = str(os.getenv("EXECUTOR_NO_PMMS_FORCE_RESTART", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+                ws_age_ms = int(getattr(api_result, "ws_age_ms", 0) or 0)
+                ws_msg_count = int(getattr(api_result, "ws_msg_count", 0) or 0)
+                ws_stale = (ws_msg_count <= 0) or (ws_age_ms > 0 and ws_age_ms >= max(1000, ws_stale_ms))
+                if force_restart and ws_stale:
+                    await self._restart_browser_session(reason=f"NO_PMMS ws_msg_count={ws_msg_count} ws_age_ms={ws_age_ms}")
         except Exception as e:
             return ExecutionResult(
                 execution_id=req.execution_id,
@@ -1342,9 +1397,10 @@ class ExecutorWorker:
             return dry
 
         # ------------------------------------------------------------
-        # Stake sizing (Back Pre/In) — operacionalização:
-        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 12)
-        # - demais BACK (Back Pre lento + Back In) => stake_back_default (default 1.5)
+        # Stake sizing (BACK) — operacionalização por slippage pré-submit:
+        # - slippage_pre_pct < limite_negativo           => stake_neg (default 40)
+        # - limite_negativo <= slippage_pre_pct <= limite_positivo => stake_mid (default 20)
+        # - slippage_pre_pct > limite_positivo           => stake_pos (default 20, configurável)
         # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
         market_is_live = False
@@ -1370,14 +1426,23 @@ class ExecutorWorker:
                 return float(default)
 
         # Novo modo (recomendado): Back Pre fast => HI, demais Back => LO
+        # Gate de aprovação por slippage no pre-match:
+        # - aprovado se slippage_pre_pct < limiar (default 0.0)
+        # - quando fail_closed=1 e slippage não estiver disponível, bloqueia
         # envs:
         # - EXECUTOR_BACKPRE_FAST_STAKE_ENABLE
         # - EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS
         # - EXECUTOR_BACKPRE_FAST_STAKE_HI / _LO
+        # - EXECUTOR_BACKPRE_FAST_APPROVAL_GATE_ENABLE
+        # - EXECUTOR_BACKPRE_FAST_APPROVAL_MAX_SLIPPAGE_PCT
+        # - EXECUTOR_BACKPRE_FAST_APPROVAL_FAIL_CLOSED
         sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
         pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
         stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 12.0))
         stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
+        pre_fast_approval_gate_enable = _env_bool("EXECUTOR_BACKPRE_FAST_APPROVAL_GATE_ENABLE", "1")
+        pre_fast_slip_approval_max_pct = _env_float("EXECUTOR_BACKPRE_FAST_APPROVAL_MAX_SLIPPAGE_PCT", 0.0)
+        pre_fast_slip_fail_closed = _env_bool("EXECUTOR_BACKPRE_FAST_APPROVAL_FAIL_CLOSED", "1")
 
         # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
         # imediatamente antes do place_order, mas já escrevemos o "regime" aqui).
@@ -1496,25 +1561,58 @@ class ExecutorWorker:
 
             if sizing_enabled and req.exec_side == ExecSide.BACK:
                 # regra solicitada:
-                # - pre & pre_submit_ms<=5s => 12
+                # - pre & pre_submit_ms<=5s & slippage_pre_pct<limiar => stake HI
                 # - senão => 1.50
                 is_pre = not bool(market_is_live)
                 ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))
-                is_pre_fast = bool(is_pre and ok_time)
+                slippage_approved = (
+                    (slip_pre is not None and float(slip_pre) < float(pre_fast_slip_approval_max_pct))
+                    or (slip_pre is None and (not bool(pre_fast_slip_fail_closed)))
+                )
+                is_pre_fast = bool(is_pre and ok_time and slippage_approved)
                 stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
                 vs.update(
                     {
                         "enabled": True,
                         "eligible": bool(is_pre_fast),
-                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max) else stake_back_default",
+                        "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max && slippage_pre_pct<approval_max) else stake_back_default",
                         "params": {
                             "max_pre_submit_ms": float(pre_fast_max_ms),
+                            "slippage_approval_max_pct": float(pre_fast_slip_approval_max_pct),
+                            "slippage_approval_fail_closed": bool(pre_fast_slip_fail_closed),
                             "stake_pre_fast": float(stake_pre_fast),
                             "stake_back_default": float(stake_back_default),
                         },
+                        "eligible_slippage": bool(slippage_approved),
                         "stake_chosen": float(stake),
                     }
                 )
+                if bool(pre_fast_approval_gate_enable) and bool(is_pre) and (not bool(slippage_approved)):
+                    try:
+                        await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv("EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC", "1.2")))
+                    except Exception:
+                        pass
+                    dry.status = ExecStatus.CAP_BLOCKED
+                    dry.http_status = 200
+                    dry.raw["value_sizing"] = vs
+                    dry.raw["slippage_pre_approval_gate"] = {
+                        "enabled": True,
+                        "max_slippage_pct_exclusive": float(pre_fast_slip_approval_max_pct),
+                        "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+                        "fail_closed": bool(pre_fast_slip_fail_closed),
+                    }
+                    if slip_pre is None:
+                        dry.error = (
+                            "BACKPRE_SLIPPAGE_APPROVAL_MISSING_PRE "
+                            f"thr_lt={float(pre_fast_slip_approval_max_pct):.2f}"
+                        )
+                    else:
+                        dry.error = (
+                            "BACKPRE_SLIPPAGE_APPROVAL_REJECTED "
+                            f"slippage_pre_pct={float(slip_pre):.2f} "
+                            f"thr_lt={float(pre_fast_slip_approval_max_pct):.2f}"
+                        )
+                    return dry
             else:
                 if req.exec_side != ExecSide.BACK:
                     vs.setdefault("skip_reason", "not_back")

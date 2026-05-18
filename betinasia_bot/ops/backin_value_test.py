@@ -361,6 +361,8 @@ async def _run(
     slip_bucket: str,
     lat_min_ms: Optional[float],
     lat_max_ms: Optional[float],
+    e2e_min_ms: Optional[float],
+    e2e_max_ms: Optional[float],
     pre_submit_min_ms: Optional[float],
     pre_submit_max_ms: Optional[float],
     slip_pre_min_pct: Optional[float],
@@ -514,6 +516,8 @@ async def _run(
             timing = res.get("timing") if isinstance(res.get("timing"), dict) else {}
             lat_ms = _safe_float(timing.get("call_to_done_ms"))
             lat_ms_i = int(lat_ms) if lat_ms is not None else None
+            e2e_ms = _safe_float(timing.get("e2e_total_ms"))
+            fin = _parse_dt_any(str(res.get("finished_at") or "")) or res_created
             odd_dec = _safe_float(res.get("odd_at_decision") if res.get("odd_at_decision") is not None else req.get("odd_at_decision"))
             odd_fin = _safe_float(res.get("odd_final"))
             slip = None
@@ -562,11 +566,13 @@ async def _run(
                 "created_at": created.astimezone(timezone.utc),
                 "slip_raw_pct": slip,
                 "lat_ms": (float(lat_ms_i) if lat_ms_i is not None else None),
+                "e2e_ms": (float(e2e_ms) if e2e_ms is not None else None),
                 "pre_submit_ms": (float(pre_submit_ms) if pre_submit_ms is not None else None),
                 "slip_pre_pct": (float(slip_pre_pct) if slip_pre_pct is not None else None),
                 "odd_pre_submit": (float(odd_pre_submit) if odd_pre_submit is not None else None),
                 "exposure": (float(stake) if stake is not None else None),
                 "audit_id": (int(audit_id) if audit_id is not None else None),
+                "finished_at": fin,
             }
             prev = out.get(str(oid))
             if prev is None or rec["created_at"] >= prev.get("created_at"):
@@ -716,6 +722,7 @@ async def _run(
               a.event_id,
               a.is_live,
               a.audited_at,
+              a.hypothesis_detected_at,
               a.betslip_limit,
               a.hypothesis_details,
               m.kickoff_time
@@ -758,6 +765,7 @@ async def _run(
     rows_sub: List[dict] = []
     missing_slip = 0
     missing_lat = 0
+    missing_e2e = 0
     missing_pre_submit = 0
     missing_slip_pre = 0
     missing_event = 0
@@ -813,9 +821,21 @@ async def _run(
         lat = em.get("lat_ms")
         slip = em.get("slip_raw_pct")
         lat_v = _safe_float(lat)
+        e2e_v = _safe_float(em.get("e2e_ms"))
+        if e2e_v is None:
+            det_dt = _to_utc_dt((arow or {}).get("hypothesis_detected_at"))
+            fin_dt = _to_utc_dt(em.get("finished_at"))
+            if isinstance(det_dt, datetime) and isinstance(fin_dt, datetime):
+                try:
+                    if fin_dt >= det_dt:
+                        e2e_v = max(0.0, (fin_dt - det_dt).total_seconds() * 1000.0)
+                except Exception:
+                    e2e_v = None
         slip_v = _safe_float(slip)
         if lat_v is None:
             missing_lat += 1
+        if e2e_v is None:
+            missing_e2e += 1
         if slip_v is None:
             missing_slip += 1
         pre_submit_v = _safe_float(em.get("pre_submit_ms"))
@@ -836,6 +856,7 @@ async def _run(
             "pnl": float(pnl),
             "exposure": _safe_float(em.get("exposure")) or 0.0,
             "lat_ms": lat_v,
+            "e2e_ms": e2e_v,
             "slip_raw_pct": slip_v,
             "pre_submit_ms": pre_submit_v,
             "slip_pre_pct": slip_pre_v,
@@ -859,6 +880,15 @@ async def _run(
             ok_lat = True if _is_wildcard_bucket(lat_bucket) else bool(lab_lat == str(lat_bucket))
         ok_slip_raw = True if _is_wildcard_bucket(slip_bucket) else bool(lab_slip == str(slip_bucket))
 
+        e2e_use_range = (e2e_min_ms is not None) or (e2e_max_ms is not None)
+        ok_e2e = True
+        if e2e_use_range:
+            ok_e2e = e2e_v is not None
+            if ok_e2e and e2e_min_ms is not None:
+                ok_e2e = bool(float(e2e_v) >= float(e2e_min_ms))
+            if ok_e2e and e2e_max_ms is not None:
+                ok_e2e = bool(float(e2e_v) <= float(e2e_max_ms))
+
         pre_use_range = (pre_submit_min_ms is not None) or (pre_submit_max_ms is not None)
         ok_pre = True
         if pre_use_range:
@@ -877,7 +907,7 @@ async def _run(
             if ok_slip_pre and slip_pre_max_pct is not None:
                 ok_slip_pre = bool(float(slip_pre_v) <= float(slip_pre_max_pct))
 
-        if ok_lat and ok_slip_raw and ok_pre and ok_slip_pre:
+        if ok_lat and ok_slip_raw and ok_pre and ok_slip_pre and ok_e2e:
             rows_sub.append(row)
  
     summ_base = _summ(rows_base)
@@ -1049,6 +1079,8 @@ async def _run(
                 "slip_bucket": str(slip_bucket),
                 "lat_min_ms": (float(lat_min_ms) if lat_min_ms is not None else None),
                 "lat_max_ms": (float(lat_max_ms) if lat_max_ms is not None else None),
+                "e2e_min_ms": (float(e2e_min_ms) if e2e_min_ms is not None else None),
+                "e2e_max_ms": (float(e2e_max_ms) if e2e_max_ms is not None else None),
                 "pre_submit_min_ms": (float(pre_submit_min_ms) if pre_submit_min_ms is not None else None),
                 "pre_submit_max_ms": (float(pre_submit_max_ms) if pre_submit_max_ms is not None else None),
                 "slip_pre_min_pct": (float(slip_pre_min_pct) if slip_pre_min_pct is not None else None),
@@ -1075,6 +1107,7 @@ async def _run(
             "subset_pass_exposure_pct": _pct(summ_sub.exposure_sum, summ_base.exposure_sum),
             "missing_event_skipped": int(missing_event),
             "missing_lat_seen": int(missing_lat),
+            "missing_e2e_seen": int(missing_e2e),
             "missing_slip_seen": int(missing_slip),
             "missing_pre_submit_seen": int(missing_pre_submit),
             "missing_slip_pre_seen": int(missing_slip_pre),
@@ -1279,7 +1312,7 @@ def _walkforward_by_day(
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Teste estatístico (ledger) de hipótese Back (Pre/In): subset por latência (call_to_done_ms) × slippage_raw_pct, com bootstrap por jogo."
+        description="Teste estatístico (ledger) de hipótese Back (Pre/In): subset por latência (call_to_done/e2e) × slippage_raw_pct, com bootstrap por jogo."
     )
     ap.add_argument("--day-dir", required=True, help="Pasta do dia (ex.: .../20260413) gerada pelo daily_full_report.")
     ap.add_argument("--start-day", default="2026-04-04", help="Filtra por created_at UTC (YYYY-MM-DD). Default=2026-04-04.")
@@ -1307,6 +1340,18 @@ def main() -> int:
         type=float,
         default=None,
         help="Opcional: em vez de filtrar latência por bucket, filtre o subset por faixa numérica (ms). Ex.: --lat-max-ms 3000 (equivale a <3s).",
+    )
+    ap.add_argument(
+        "--e2e-min-ms",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por e2e_total_ms (detect->done), quando disponível em timing ou audit+finished_at.",
+    )
+    ap.add_argument(
+        "--e2e-max-ms",
+        type=float,
+        default=None,
+        help="Opcional: filtra subset por e2e_total_ms (detect->done). Ex.: --e2e-max-ms 7000",
     )
     ap.add_argument(
         "--pre-submit-min-ms",
@@ -1376,6 +1421,8 @@ def main() -> int:
             slip_bucket=str(args.slip_bucket),
             lat_min_ms=(float(args.lat_min_ms) if args.lat_min_ms is not None else None),
             lat_max_ms=(float(args.lat_max_ms) if args.lat_max_ms is not None else None),
+            e2e_min_ms=(float(args.e2e_min_ms) if args.e2e_min_ms is not None else None),
+            e2e_max_ms=(float(args.e2e_max_ms) if args.e2e_max_ms is not None else None),
             pre_submit_min_ms=(float(args.pre_submit_min_ms) if args.pre_submit_min_ms is not None else None),
             pre_submit_max_ms=(float(args.pre_submit_max_ms) if args.pre_submit_max_ms is not None else None),
             slip_pre_min_pct=(float(args.slip_pre_min_pct) if args.slip_pre_min_pct is not None else None),

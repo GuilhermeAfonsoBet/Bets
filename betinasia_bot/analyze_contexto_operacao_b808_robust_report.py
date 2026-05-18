@@ -4,7 +4,7 @@
 Gera relatório estatístico ROBUSTO (cluster por jogo) no estilo do:
   docs/analise_h3b_resultados_v4_somente.md
 
-Foco: H3B (reversal_direction), comparando modelos por audit_version.
+Foco: hipótese configurável (ex.: H3B/DT + reversal_direction), comparando modelos por audit_version.
 
 Robustez adicionada:
 - métricas reportadas com N_eventos e N_jogos
@@ -417,6 +417,7 @@ def exec_time_bucket(ms: Optional[float]) -> str:
 
 async def fetch_h3b_audit_rows(
     db: Database,
+    hypothesis_type: str,
     direction: str,
     versions: List[str],
     lookback_days: Optional[int] = None,
@@ -424,7 +425,7 @@ async def fetch_h3b_audit_rows(
 ) -> List[Tuple[Any, ...]]:
     """
     Traz a base principal:
-    - betslip_audit_results (H3B, direction) + match (kickoff passado)
+    - betslip_audit_results (hypothesis_type, direction) + match (kickoff passado)
     - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
     """
     # OBS importante de performance:
@@ -469,7 +470,7 @@ async def fetch_h3b_audit_rows(
                 m.status AS match_status
             FROM betslip_audit_results a
             JOIN matches m ON m.external_id = a.event_id
-            WHERE a.hypothesis_type = 'H3B'
+            WHERE a.hypothesis_type = :hypothesis_type
               AND a.reversal_direction = :direction
               AND m.kickoff_time < :end_utc
               AND a.audit_version = ANY(:versions)
@@ -488,6 +489,7 @@ async def fetch_h3b_audit_rows(
         res = await session.execute(
             q,
             {
+                "hypothesis_type": str(hypothesis_type or "H3B"),
                 "direction": direction,
                 "versions": versions,
                 "lookback_days": lookback_days,
@@ -562,7 +564,8 @@ def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optio
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
+    parser.add_argument("--hypothesis-type", default="H3B", help="Hypothesis type da auditoria (default: H3B)")
+    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção da hipótese (default: up)")
     parser.add_argument(
         "--versions",
         default="v4.0-api,v5.2-api-back,v5.1-ws-gate-lay",
@@ -1100,13 +1103,15 @@ async def main() -> int:
         end_lbl = end_utc.isoformat().replace("+00:00", "Z")
         start_lbl = (start_utc.isoformat().replace("+00:00", "Z") if isinstance(start_utc, datetime) else None)
         print(
-            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, "
+            f"[INFO] Carregando dados {str(args.hypothesis_type).upper()} "
+            f"(direction={args.direction}, versions={versions}, "
             f"lookback_days={args.lookback_days}, start_utc={start_lbl}, end_utc={end_lbl})...",
             flush=True,
         )
         t0 = time.perf_counter()
         rows = await fetch_h3b_audit_rows(
             db,
+            hypothesis_type=str(args.hypothesis_type or "H3B"),
             direction=str(args.direction),
             versions=versions,
             lookback_days=args.lookback_days,
@@ -1536,14 +1541,20 @@ async def main() -> int:
             title += f" — Regime(s): {args.exec_bucket}"
         lines.append(f"# {title}\n")
         lines.append(f"**Data da execução:** {now_utc}  \n")
-        lines.append("**Escopo:** H3B (auditoria), com comparação por `audit_version` e inferência robusta por jogo (cluster bootstrap).  \n")
+        hyp_lbl = str(args.hypothesis_type or "H3B").upper()
+        lines.append(
+            f"**Escopo:** {hyp_lbl} (auditoria), com comparação por `audit_version` e "
+            "inferência robusta por jogo (cluster bootstrap).  \n"
+        )
         lines.append("**Nota:** a robustez aqui significa que intervalos de confiança consideram correlação intra-jogo (múltiplas auditorias por partida).\n")
         lines.append("---\n")
 
         # 1) Contexto
         lines.append("## 1) Contexto do corte (b808)\n")
         lines.append("| Indicador | Valor |\n|---|---:|\n")
-        lines.append(f"| Auditorias H3B `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n")
+        lines.append(
+            f"| Auditorias {hyp_lbl} `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n"
+        )
         lines.append(f"| Betslip bruto | {len(with_bs_raw)} |\n")
         lines.append(f"| Betslip confiável (diff -10% a +10%) | {len(with_bs)} |\n")
         lines.append(f"| Descartados no filtro de qualidade | {len(with_bs_raw) - len(with_bs)} |\n")
