@@ -174,11 +174,12 @@ def _iter_exec_rows(
     executor_jsonl: Path,
     start_day: str,
     thr_ms: int,
-    stake_hi: float,
+    hi_min: float,
+    hi_max: Optional[float],
 ) -> List[Dict[str, Any]]:
     """
     Retorna rows com {oid, roi, fast(bool), stake, pre_submit_ms, market_regime}
-    Somente Back LIVE_OK, market_regime=pre, stake≈stake_hi e created>=start_day.
+    Somente Back LIVE_OK, market_regime=pre, stake na faixa HI e created>=start_day.
     """
     rows: List[Dict[str, Any]] = []
     if not executor_jsonl.exists():
@@ -212,7 +213,9 @@ def _iter_exec_rows(
             st = _safe_float(res.get("policy", {}).get("stake_requested"))
         if st is None:
             continue
-        if not _approx_eq(st, float(stake_hi), eps=0.02):
+        if float(st) <= float(hi_min):
+            continue
+        if hi_max is not None and float(st) > float(hi_max):
             continue
         vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
         if str(vs.get("market_regime") or "") != "pre":
@@ -279,8 +282,18 @@ def main() -> int:
     ts = _utcnow().strftime("%Y-%m-%d %H:%M UTC")
     start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
     thr_ms = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
-    stake_hi = float(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0)
+    stake_hi = float(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "20") or 20.0)
     stake_lo = str(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_LO", "1.50") or "1.50").strip()
+    hi_min = float(os.getenv("DAILY_BACKPRE_FAST_HI_MIN", "5.0") or 5.0)
+    hi_max_raw = str(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "") or "").strip()
+    hi_max = _safe_float(hi_max_raw) if hi_max_raw else None
+    if hi_max is not None and float(hi_max) <= float(hi_min):
+        hi_max = None
+    hi_label = (
+        f"stake > {float(hi_min):.2f}"
+        if hi_max is None
+        else f"stake em ({float(hi_min):.2f}, {float(hi_max):.2f}]"
+    )
     n_boot = int(float(os.getenv("DAILY_BACKPRE_FAST_BOOTSTRAP_N", "2000") or 2000))
     min_n = int(float(os.getenv("DAILY_BACKPRE_FAST_MIN_ORDERS", "25") or 25))
 
@@ -290,7 +303,13 @@ def main() -> int:
     open_csv = _latest_csv(acct_dir, "open_stakes")
     open_oids = _open_order_ids_from_open_stakes_csv(open_csv) if open_csv else None
     ledger = _ledger_pnl_like_by_order(bal_csv) if bal_csv else {}
-    exec_rows = _iter_exec_rows(executor_jsonl=exec_path, start_day=start_day, thr_ms=thr_ms, stake_hi=stake_hi)
+    exec_rows = _iter_exec_rows(
+        executor_jsonl=exec_path,
+        start_day=start_day,
+        thr_ms=thr_ms,
+        hi_min=hi_min,
+        hi_max=hi_max,
+    )
 
     # join com ledger -> ROI por ordem
     joined = []
@@ -386,7 +405,8 @@ Gerado em: **{ts}**
 ## Definição da tese (operacional)
 - Universo: **Back Pre** (pre-match), apostas efetivas (`LIVE_OK`).
 - “Fast”: `pre_submit_ms <= {thr_ms}ms`.
-- Sizing operacional (quando habilitado): fast ⇒ **stake={stake_hi}**, demais Back ⇒ **stake={stake_lo}**.
+- Sizing operacional (quando habilitado): fast **e** `slippage_pre_pct < EXECUTOR_BACKPRE_FAST_MAX_SLIPPAGE_PCT` ⇒ **stake={stake_hi}**, demais Back ⇒ **stake={stake_lo}**.
+- Critério HI no relatório: **{hi_label}**.
 - Início operacional (recorte recomendado): `{start_day or '—'}` (UTC).  
   (Use a data em que você ligou `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1` em produção.)
 
@@ -394,10 +414,10 @@ Gerado em: **{ts}**
 - executor_jsonl: `{exec_path}`
 - balance_csv (último): `{str(bal_csv) if bal_csv else '—'}`
 - open_stakes_csv (último): `{str(open_csv) if open_csv else '—'}`
-- n ordens elegíveis (pre, stake=HI, pós-início): `{len(exec_rows)}`
+- n ordens elegíveis (pre, {hi_label}, pós-início): `{len(exec_rows)}`
 - n com join no ledger por order_id: `{len(joined)}`
 
-## Resultado principal (ROI por ordem; stake=HI)
+## Resultado principal (ROI por ordem; faixa HI)
 | Grupo | n ordens | ROI mean | ROIw | IC90 ROI mean (bootstrap) |
 |---|---:|---:|---:|---:|
 | Fast (pre_submit_ms<= {thr_ms}ms) | {len(fast)} | {_fmt_pct(statistics.fmean([x['roi'] for x in fast]) if fast else None)} | {_fmt_pct(_roiw(fast))} | {(_fmt_pct(ci_fast90[0])+' .. '+_fmt_pct(ci_fast90[1])) if ci_fast90 else '—'} |
