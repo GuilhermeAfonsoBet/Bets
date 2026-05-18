@@ -415,6 +415,41 @@ def exec_time_bucket(ms: Optional[float]) -> str:
     return "> 40s"
 
 
+def _parse_minutes_bucket_spec(spec: str) -> List[Tuple[str, float, float]]:
+    """
+    Parse de buckets de minutos no formato:
+      "0-15,16-30,31-45,46-60,61-75,76-90,91-120"
+    Retorna lista [(label, lo, hi)].
+    """
+    out: List[Tuple[str, float, float]] = []
+    try:
+        parts = [p.strip() for p in str(spec or "").split(",") if str(p).strip()]
+        for p in parts:
+            m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*$", p)
+            if not m:
+                continue
+            lo = float(m.group(1))
+            hi = float(m.group(2))
+            if hi < lo:
+                lo, hi = hi, lo
+            lbl = f"{int(lo) if float(lo).is_integer() else lo:g}-{int(hi) if float(hi).is_integer() else hi:g}"
+            out.append((lbl, float(lo), float(hi)))
+    except Exception:
+        return []
+    return out
+
+
+def _minute_since_kickoff(audited_at: Any, kickoff: Any) -> Optional[float]:
+    try:
+        if not isinstance(audited_at, datetime) or not isinstance(kickoff, datetime):
+            return None
+        a = audited_at.astimezone(timezone.utc) if audited_at.tzinfo else audited_at.replace(tzinfo=timezone.utc)
+        k = kickoff.astimezone(timezone.utc) if kickoff.tzinfo else kickoff.replace(tzinfo=timezone.utc)
+        return float((a - k).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
 async def fetch_h3b_audit_rows(
     db: Database,
     direction: str,
@@ -591,6 +626,22 @@ async def main() -> int:
         default=None,
         help="Opcional. Filtra o relatório para um (ou mais) regimes operacionais por tempo total. "
         "Ex.: \"< 5s\" ou \"< 5s,5-10s\".",
+    )
+    parser.add_argument(
+        "--only-back-in",
+        action="store_true",
+        help="Restringe o recorte para oportunidades in-play (`is_live=true`) do lado Back. "
+        "Útil para estudos dedicados de Back In.",
+    )
+    parser.add_argument(
+        "--include-inplay-minute-start",
+        action="store_true",
+        help="Inclui no relatório uma seção nativa de Back In por minuto desde kickoff (audited_at - kickoff).",
+    )
+    parser.add_argument(
+        "--inplay-minute-buckets",
+        default="0-15,16-30,31-45,46-60,61-75,76-90,91-120",
+        help="Buckets de minuto desde kickoff para a seção Back In (CSV de faixas lo-hi).",
     )
     parser.add_argument(
         "--only-oos",
@@ -1151,6 +1202,7 @@ async def main() -> int:
                 "match_status": r[27],
                 "closing_odd": None,
             }
+            d["minute_since_kickoff"] = _minute_since_kickoff(d.get("audited_at"), d.get("kickoff"))
 
             # Lag fim-a-fim (proxy) e overhead:
             # - fim-a-fim = detecção->click + click->betslip
@@ -1420,6 +1472,9 @@ async def main() -> int:
         if args.exec_bucket:
             wanted = {x.strip() for x in str(args.exec_bucket).split(",") if x.strip()}
             all_data = [d for d in all_data if str(d.get("exec_bucket")) in wanted]
+        # Filtro opcional de estudo dedicado: somente Back In.
+        if bool(getattr(args, "only_back_in", False)):
+            all_data = [d for d in all_data if (d.get("is_live") is True)]
 
         # Diagnóstico de cobertura do closing e distribuição de mercado (após filtros de recorte)
         mt_counts = Counter(str(d.get("market_type") or "NA") for d in all_data)
@@ -1699,6 +1754,40 @@ async def main() -> int:
                 f"| {label} | {len(sub_all)} | {len(sub_bs)} | {len(sub_ok)} | {len(sub_back)} | {len(sub_lay)} | {_fmt_pct(diff_mean)} |\n"
             )
         lines.append("\n---\n")
+
+        # 2.2d) Back In por minuto desde kickoff (flag nativo)
+        if bool(getattr(args, "include_inplay_minute_start", False)):
+            lines.append("### 2.2d Back In (in-play) por minuto desde kickoff\n")
+            lines.append(
+                "Objetivo: medir como volume/qualidade variam ao longo do relógio do jogo. "
+                "Bucket usa `minute_since_kickoff = audited_at - kickoff_time`.\n\n"
+            )
+            specs = _parse_minutes_bucket_spec(str(getattr(args, "inplay_minute_buckets", "") or ""))
+            if not specs:
+                specs = _parse_minutes_bucket_spec("0-15,16-30,31-45,46-60,61-75,76-90,91-120")
+            in_live = [d for d in with_bs if d.get("is_live") is True and d.get("minute_since_kickoff") is not None]
+            back_in_live = [
+                d for d in in_live
+                if (d.get("diff_pct") is not None and float(d.get("diff_pct")) >= float(back_cut))
+            ]
+            lines.append("| Bucket minuto | N betslip conf. | Jogos | N Back edge | Diff médio (Back edge) | ROI BS (Back edge) |\n")
+            lines.append("|---|---:|---:|---:|---:|---:|\n")
+            for lbl, lo, hi in specs:
+                sub = [d for d in in_live if lo <= float(d.get("minute_since_kickoff") or -10**9) <= hi]
+                sub_back = [d for d in back_in_live if lo <= float(d.get("minute_since_kickoff") or -10**9) <= hi]
+                n_games = len({int(d["match_id"]) for d in sub if d.get("match_id") is not None})
+                diff_mean = _mean([_safe_float(d.get("diff_pct")) for d in sub_back if _safe_float(d.get("diff_pct")) is not None])
+                roi_sum = summarize_metric(
+                    [d.get("roi_bs") for d in sub_back],
+                    [d.get("match_id") for d in sub_back],
+                    clip_low=-100,
+                    clip_high=500,
+                )
+                roi_txt = f"{_fmt_pct(roi_sum.mean_cluster,2)} {_fmt_ci(roi_sum.ci90_cluster,2)}" if roi_sum.n_events else "—"
+                lines.append(
+                    f"| {lbl} | {len(sub)} | {n_games} | {len(sub_back)} | {_fmt_pct(diff_mean,2)} | {roi_txt} |\n"
+                )
+            lines.append("\n---\n")
 
         # 2.2c Quebra por liga (top por volume)
         lines.append("### 2.2c Quebra por liga (top por volume)\n")
