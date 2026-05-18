@@ -986,6 +986,101 @@ def _append_backpre_fast_slow_sections(
     # rows com accounting (pnl) + stake (exposure)
     groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
     groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake=HI)
+    cov_fast_slow: Dict[str, Dict[str, int]] = {
+        "fast": {"n_exec": 0, "n_with_acct": 0},
+        "slow": {"n_exec": 0, "n_with_acct": 0},
+    }
+
+    def _pct_bucket_counts(rows: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+        bc = {"<= -2%": 0, "(-2, 2]": 0, "> 2%": 0, "NA": 0}
+        for r in rows or []:
+            b = _slip_bucket_3(r.get(key))
+            bc[b] = int(bc.get(b) or 0) + 1
+        return bc
+
+    def _quantile(xs: List[float], q: float) -> Optional[float]:
+        try:
+            ys = sorted(float(x) for x in (xs or []))
+        except Exception:
+            ys = []
+        if not ys:
+            return None
+        if len(ys) == 1:
+            return float(ys[0])
+        qq = float(max(0.0, min(1.0, q)))
+        pos = qq * float(len(ys) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(ys[lo])
+        w = float(pos - lo)
+        return float(ys[lo] * (1.0 - w) + ys[hi] * w)
+
+    def _group_metrics(
+        rows_all: List[Dict[str, Any]],
+        settled_rows: Optional[List[Dict[str, Any]]],
+        open_rows: Optional[List[Dict[str, Any]]],
+        *,
+        n_exec: Optional[int] = None,
+        n_with_acct: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if settled_rows is None:
+            settled_rows = []
+        if open_rows is None:
+            open_rows = []
+        n_orders = int(n_exec) if n_exec is not None else int(len(rows_all or []))
+        n_acct = int(n_with_acct) if n_with_acct is not None else int(len(rows_all or []))
+        oid_cov = (float(n_acct) / float(n_orders) * 100.0) if n_orders > 0 else None
+        n_liq = int(len(settled_rows))
+        n_open = int(len(open_rows))
+        occ = _outcome_counts(settled_rows)
+        exp_sum = float(sum(float(r.get("exposure") or 0.0) for r in settled_rows)) if settled_rows else 0.0
+        pnl_sum = float(sum(float(r.get("pnl") or 0.0) for r in settled_rows)) if settled_rows else 0.0
+        stake_avg = (float(exp_sum) / float(n_liq)) if n_liq > 0 else None
+        roiw = (float(pnl_sum) / float(exp_sum) * 100.0) if exp_sum > 0 else None
+        roi_ord = [float(r.get("roi")) for r in settled_rows if r.get("roi") is not None]
+        pnl_ord = [float(r.get("pnl")) for r in settled_rows if r.get("pnl") is not None]
+        roi_mean = float(statistics.fmean(roi_ord)) if roi_ord else None
+        pnl_med = float(statistics.median(pnl_ord)) if pnl_ord else None
+        roi_ci95 = _bootstrap_ci_mean(roi_ord, ci=0.95, n_boot=n_boot, seed=223) if len(roi_ord) >= 5 else None
+        slips = [float(r.get("slippage_pre_pct")) for r in settled_rows if r.get("slippage_pre_pct") is not None]
+        slip_mean = float(statistics.fmean(slips)) if slips else None
+        slip_med = float(statistics.median(slips)) if slips else None
+        slip_bc = _pct_bucket_counts(settled_rows, "slippage_pre_pct")
+        lats = [float(r.get("lat_ms")) for r in settled_rows if r.get("lat_ms") is not None]
+        lat_p50 = _quantile(lats, 0.50)
+        lat_p90 = _quantile(lats, 0.90)
+        odds = [float(r.get("odd_at_decision")) for r in settled_rows if r.get("odd_at_decision") is not None]
+        odd_mean = float(statistics.fmean(odds)) if odds else None
+        odd_med = float(statistics.median(odds)) if odds else None
+        # Cobertura de placar por grupo fast/slow não está disponível de forma robusta no pipeline atual.
+        placar_cov = None
+        return {
+            "n_orders": n_orders,
+            "n_with_acct": n_acct,
+            "oid_cov_pct": oid_cov,
+            "n_liq": n_liq,
+            "n_open": n_open,
+            "n_win": int(occ.get("n_win") or 0),
+            "n_loss": int(occ.get("n_loss") or 0),
+            "n_neutral": int(occ.get("n_neutral") or 0),
+            "stake_sum": exp_sum,
+            "stake_avg": stake_avg,
+            "pnl_sum": pnl_sum,
+            "roiw": roiw,
+            "roi_mean": roi_mean,
+            "pnl_median": pnl_med,
+            "roi_ci95": roi_ci95,
+            "slip_mean": slip_mean,
+            "slip_median": slip_med,
+            "slip_bc": slip_bc,
+            "lat_p50": lat_p50,
+            "lat_p90": lat_p90,
+            "odd_mean": odd_mean,
+            "odd_median": odd_med,
+            "placar_cov_pct": placar_cov,
+        }
+
     for oid, em in (exec_by_oid_back or {}).items():
         if not isinstance(em, dict):
             continue
@@ -1026,34 +1121,85 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
+        lat_ms = _safe_float_or_none(em.get("lat_ms"))
+        odd_dec = _safe_float_or_none(em.get("odd_at_decision"))
         stake_b = _stake_bucket(exp)
-        roi_i = float(pnl) / float(exp) * 100.0
-        row = {
-            "order_id": str(oid),
-            "pnl": float(pnl),
-            "exposure": float(exp),
-            "roi": float(roi_i),
-            "stake_bucket": stake_b,
-            "pre_submit_ms": pre_submit_ms,
-            "slippage_pre_pct": slip_pre,
-            "created_day": str(created.date().isoformat()),
-        }
 
         if bool(is_in):
-            groups_all["Back In"].append(row)
+            if pnl is not None:
+                roi_i = float(pnl) / float(exp) * 100.0
+                row = {
+                    "order_id": str(oid),
+                    "pnl": float(pnl),
+                    "exposure": float(exp),
+                    "roi": float(roi_i),
+                    "stake_bucket": stake_b,
+                    "pre_submit_ms": pre_submit_ms,
+                    "slippage_pre_pct": slip_pre,
+                    "lat_ms": lat_ms,
+                    "odd_at_decision": odd_dec,
+                    "created_day": str(created.date().isoformat()),
+                }
+                groups_all["Back In"].append(row)
         else:
             # Pre
             if pre_submit_ms is None:
-                groups_all["Back Pre (pre_submit_ms NA)"].append(row)
+                if pnl is not None:
+                    roi_i = float(pnl) / float(exp) * 100.0
+                    row = {
+                        "order_id": str(oid),
+                        "pnl": float(pnl),
+                        "exposure": float(exp),
+                        "roi": float(roi_i),
+                        "stake_bucket": stake_b,
+                        "pre_submit_ms": pre_submit_ms,
+                        "slippage_pre_pct": slip_pre,
+                        "lat_ms": lat_ms,
+                        "odd_at_decision": odd_dec,
+                        "created_day": str(created.date().isoformat()),
+                    }
+                    groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
-                groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
+                cov_fast_slow["fast"]["n_exec"] = int(cov_fast_slow["fast"]["n_exec"] or 0) + 1
+                if pnl is not None:
+                    cov_fast_slow["fast"]["n_with_acct"] = int(cov_fast_slow["fast"]["n_with_acct"] or 0) + 1
+                    roi_i = float(pnl) / float(exp) * 100.0
+                    row = {
+                        "order_id": str(oid),
+                        "pnl": float(pnl),
+                        "exposure": float(exp),
+                        "roi": float(roi_i),
+                        "stake_bucket": stake_b,
+                        "pre_submit_ms": pre_submit_ms,
+                        "slippage_pre_pct": slip_pre,
+                        "lat_ms": lat_ms,
+                        "odd_at_decision": odd_dec,
+                        "created_day": str(created.date().isoformat()),
+                    }
+                    groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
                 # tese = fast + stake em faixa HI (pós-início)
-                if _in_range(exp, float(thesis_hi_min), float(thesis_hi_max)):
-                    groups_thesis[
-                        f"Back Pre fast (stake em [{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
-                    ].append(row)
+                    if _in_range(exp, float(thesis_hi_min), float(thesis_hi_max)):
+                        groups_thesis[
+                            f"Back Pre fast (stake em [{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
+                        ].append(row)
             else:
-                groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
+                cov_fast_slow["slow"]["n_exec"] = int(cov_fast_slow["slow"]["n_exec"] or 0) + 1
+                if pnl is not None:
+                    cov_fast_slow["slow"]["n_with_acct"] = int(cov_fast_slow["slow"]["n_with_acct"] or 0) + 1
+                    roi_i = float(pnl) / float(exp) * 100.0
+                    row = {
+                        "order_id": str(oid),
+                        "pnl": float(pnl),
+                        "exposure": float(exp),
+                        "roi": float(roi_i),
+                        "stake_bucket": stake_b,
+                        "pre_submit_ms": pre_submit_ms,
+                        "slippage_pre_pct": slip_pre,
+                        "lat_ms": lat_ms,
+                        "odd_at_decision": odd_dec,
+                        "created_day": str(created.date().isoformat()),
+                    }
+                    groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 
     if not groups_all and not groups_thesis:
         return
@@ -1067,8 +1213,8 @@ def _append_backpre_fast_slow_sections(
     )
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
-    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
-    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | n_win (P&L>0) | n_loss (P&L<0) | n_neutro (P&L≈0) | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 
     def _split_settled(rows: List[Dict[str, Any]]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
         # Sem open_stakes.csv não sabemos o que está liquidado vs aberto.
@@ -1084,18 +1230,35 @@ def _append_backpre_fast_slow_sections(
                 settled.append(r)
         return settled, open_rows
 
+    def _outcome_counts(rows: List[Dict[str, Any]], *, eps: float = 1e-9) -> Dict[str, int]:
+        n_win = 0
+        n_loss = 0
+        n_neutral = 0
+        for r in rows or []:
+            p = _safe_float_or_none(r.get("pnl"))
+            if p is None:
+                continue
+            if p > float(eps):
+                n_win += 1
+            elif p < -float(eps):
+                n_loss += 1
+            else:
+                n_neutral += 1
+        return {"n_win": int(n_win), "n_loss": int(n_loss), "n_neutral": int(n_neutral)}
+
     for g, rows in sorted((groups_thesis or {}).items(), key=lambda kv: kv[0]):
         settled_rows, open_rows = _split_settled(rows)
         if settled_rows is None or open_rows is None:
-            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
+            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — | — | — | — |\n")
         else:
             summ_set = _summarize_rows_pnl_exp(settled_rows)
+            occ = _outcome_counts(settled_rows)
             out_lines.append(
-                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {int(occ.get('n_win') or 0)} | {int(occ.get('n_loss') or 0)} | {int(occ.get('n_neutral') or 0)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
             )
     out_lines.append("\n")
     if open_order_ids is None:
-        out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
+        out_lines.append("_Nota: `n_liquidadas`/`n_win`/`n_loss`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
     # Performance auxiliar: fast com stake < limiar HI_min (impacto prático de latência/degradação)
     low_rows: List[Dict[str, Any]] = []
@@ -1105,16 +1268,17 @@ def _append_backpre_fast_slow_sections(
         if exp is not None and exp < float(thesis_hi_min):
             low_rows.append(r)
     out_lines.append("**Back Pre fast (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
-    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
-    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | n_win (P&L>0) | n_loss (P&L<0) | n_neutro (P&L≈0) | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
     settled_rows, open_rows = _split_settled(low_rows)
     label_low = f"Back Pre fast (stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
     if settled_rows is None or open_rows is None:
-        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
+        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — | — | — | — |\n")
     else:
         summ_set = _summarize_rows_pnl_exp(settled_rows)
+        occ = _outcome_counts(settled_rows)
         out_lines.append(
-            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {int(occ.get('n_win') or 0)} | {int(occ.get('n_loss') or 0)} | {int(occ.get('n_neutral') or 0)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
         )
     out_lines.append("\n")
 
@@ -1172,29 +1336,93 @@ def _append_backpre_fast_slow_sections(
         )
     out_lines.append("\n")
 
-    # Robustez: delta fast-slow
+    # Robustez + contexto detalhado: fast vs slow
     try:
         fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
         slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
-        if len(fast) >= min_n and len(slow) >= min_n:
+        fast_set, fast_open = _split_settled(fast)
+        slow_set, slow_open = _split_settled(slow)
+        fast_cov = cov_fast_slow.get("fast") or {}
+        slow_cov = cov_fast_slow.get("slow") or {}
+        m_fast = _group_metrics(
+            fast,
+            fast_set,
+            fast_open,
+            n_exec=int(fast_cov.get("n_exec") or len(fast)),
+            n_with_acct=int(fast_cov.get("n_with_acct") or len(fast)),
+        )
+        m_slow = _group_metrics(
+            slow,
+            slow_set,
+            slow_open,
+            n_exec=int(slow_cov.get("n_exec") or len(slow)),
+            n_with_acct=int(slow_cov.get("n_with_acct") or len(slow)),
+        )
+
+        out_lines.append("**Tese: Back Pre fast vs slow — detalhamento operacional (por ordem)**\n\n")
+        out_lines.append("| Métrica | Fast (`pre_submit_ms<=limiar`) | Slow (`pre_submit_ms>limiar`) |\n")
+        out_lines.append("|---|---:|---:|\n")
+        out_lines.append(f"| n_orders (exec) | {int(m_fast.get('n_orders') or 0)} | {int(m_slow.get('n_orders') or 0)} |\n")
+        out_lines.append(f"| n_orders com accounting (`oid`) | {int(m_fast.get('n_with_acct') or 0)} | {int(m_slow.get('n_with_acct') or 0)} |\n")
+        out_lines.append(f"| cobertura oid% | {_fmt_pct(m_fast.get('oid_cov_pct'))} | {_fmt_pct(m_slow.get('oid_cov_pct'))} |\n")
+        out_lines.append(f"| n_liquidadas / n_abertas | {int(m_fast.get('n_liq') or 0)} / {int(m_fast.get('n_open') or 0)} | {int(m_slow.get('n_liq') or 0)} / {int(m_slow.get('n_open') or 0)} |\n")
+        out_lines.append(f"| n_win / n_loss / n_neutro | {int(m_fast.get('n_win') or 0)} / {int(m_fast.get('n_loss') or 0)} / {int(m_fast.get('n_neutral') or 0)} | {int(m_slow.get('n_win') or 0)} / {int(m_slow.get('n_loss') or 0)} / {int(m_slow.get('n_neutral') or 0)} |\n")
+        out_lines.append(f"| stake total (∑ liquidadas) | {_fmt_num(m_fast.get('stake_sum'),2)} | {_fmt_num(m_slow.get('stake_sum'),2)} |\n")
+        out_lines.append(f"| stake médio (liq) | {_fmt_num(m_fast.get('stake_avg'),2)} | {_fmt_num(m_slow.get('stake_avg'),2)} |\n")
+        out_lines.append(f"| P&L total accounting (liq) | {_fmt_num(m_fast.get('pnl_sum'),2)} | {_fmt_num(m_slow.get('pnl_sum'),2)} |\n")
+        out_lines.append(f"| ROIw accounting (liq) | {_fmt_pct(m_fast.get('roiw'))} | {_fmt_pct(m_slow.get('roiw'))} |\n")
+        out_lines.append(f"| ROI mean por ordem (liq) | {_fmt_pct(m_fast.get('roi_mean'))} | {_fmt_pct(m_slow.get('roi_mean'))} |\n")
+        out_lines.append(f"| mediana P&L por ordem (liq) | {_fmt_num(m_fast.get('pnl_median'),2)} | {_fmt_num(m_slow.get('pnl_median'),2)} |\n")
+        f_ci95 = m_fast.get("roi_ci95") if isinstance(m_fast.get("roi_ci95"), tuple) else None
+        s_ci95 = m_slow.get("roi_ci95") if isinstance(m_slow.get("roi_ci95"), tuple) else None
+        out_lines.append(
+            f"| IC95 ROI mean (bootstrap) | {(_fmt_pct(f_ci95[0]) + ' .. ' + _fmt_pct(f_ci95[1])) if f_ci95 else '—'} | {(_fmt_pct(s_ci95[0]) + ' .. ' + _fmt_pct(s_ci95[1])) if s_ci95 else '—'} |\n"
+        )
+        out_lines.append(f"| slippage_pre mean / mediana | {_fmt_pct(m_fast.get('slip_mean'))} / {_fmt_pct(m_fast.get('slip_median'))} | {_fmt_pct(m_slow.get('slip_mean'))} / {_fmt_pct(m_slow.get('slip_median'))} |\n")
+        fbc = m_fast.get("slip_bc") if isinstance(m_fast.get("slip_bc"), dict) else {}
+        sbc = m_slow.get("slip_bc") if isinstance(m_slow.get("slip_bc"), dict) else {}
+        out_lines.append(f"| slippage 3-way (`<=-2% / (-2,2] / >2% / NA`) | {int(fbc.get('<= -2%') or 0)} / {int(fbc.get('(-2, 2]') or 0)} / {int(fbc.get('> 2%') or 0)} / {int(fbc.get('NA') or 0)} | {int(sbc.get('<= -2%') or 0)} / {int(sbc.get('(-2, 2]') or 0)} / {int(sbc.get('> 2%') or 0)} / {int(sbc.get('NA') or 0)} |\n")
+        out_lines.append(f"| latência real `call_to_done_ms` p50 / p90 (liq) | {_fmt_num(m_fast.get('lat_p50'),0)} / {_fmt_num(m_fast.get('lat_p90'),0)} | {_fmt_num(m_slow.get('lat_p50'),0)} / {_fmt_num(m_slow.get('lat_p90'),0)} |\n")
+        out_lines.append(f"| odds médias/medianas (`odd_at_decision`) | {_fmt_num(m_fast.get('odd_mean'),3)} / {_fmt_num(m_fast.get('odd_median'),3)} | {_fmt_num(m_slow.get('odd_mean'),3)} / {_fmt_num(m_slow.get('odd_median'),3)} |\n")
+        out_lines.append(f"| cobertura placar% (por grupo) | {_fmt_pct(m_fast.get('placar_cov_pct'))} | {_fmt_pct(m_slow.get('placar_cov_pct'))} |\n")
+        out_lines.append("\n")
+
+        fast_roi = [float(r.get("roi")) for r in (fast_set or []) if r.get("roi") is not None]
+        slow_roi = [float(r.get("roi")) for r in (slow_set or []) if r.get("roi") is not None]
+        if len(fast_roi) >= min_n and len(slow_roi) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
             rnd = random.Random(123)
             deltas: List[float] = []
-            nf = len(fast)
-            ns = len(slow)
+            nf = len(fast_roi)
+            ns = len(slow_roi)
             for _ in range(int(max(300, n_boot))):
                 mf = 0.0
                 ms = 0.0
                 for _j in range(nf):
-                    mf += float(fast[rnd.randrange(0, nf)].get("roi"))
+                    mf += float(fast_roi[rnd.randrange(0, nf)])
                 for _j in range(ns):
-                    ms += float(slow[rnd.randrange(0, ns)].get("roi"))
+                    ms += float(slow_roi[rnd.randrange(0, ns)])
                 deltas.append((mf / float(nf)) - (ms / float(ns)))
             deltas.sort()
-            lo = deltas[int(round(0.05 * (len(deltas) - 1)))]
-            hi = deltas[int(round(0.95 * (len(deltas) - 1)))]
-            out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
-            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo)} .. {_fmt_pct(hi)}` (min_n={min_n}).\n\n")
+            lo90 = deltas[int(round(0.05 * (len(deltas) - 1)))]
+            hi90 = deltas[int(round(0.95 * (len(deltas) - 1)))]
+            lo95 = deltas[int(round(0.025 * (len(deltas) - 1)))]
+            hi95 = deltas[int(round(0.975 * (len(deltas) - 1)))]
+            d_roiw = None
+            if m_fast.get("roiw") is not None and m_slow.get("roiw") is not None:
+                d_roiw = float(m_fast.get("roiw")) - float(m_slow.get("roiw"))
+            d_mean = None
+            if m_fast.get("roi_mean") is not None and m_slow.get("roi_mean") is not None:
+                d_mean = float(m_fast.get("roi_mean")) - float(m_slow.get("roi_mean"))
+            out_lines.append("**Tese: Back Pre fast vs slow — diferença (fast − slow)**\n\n")
+            out_lines.append(f"- Delta ROI mean por ordem (liq): `{_fmt_pct(d_mean)}`.\n")
+            out_lines.append(f"- Delta ROIw accounting (liq): `{_fmt_pct(d_roiw)}`.\n")
+            out_lines.append(f"- Delta ROI mean IC90 bootstrap: `{_fmt_pct(lo90)} .. {_fmt_pct(hi90)}` (min_n={min_n}).\n")
+            out_lines.append(f"- Delta ROI mean IC95 bootstrap: `{_fmt_pct(lo95)} .. {_fmt_pct(hi95)}`.\n\n")
+        else:
+            out_lines.append(
+                f"_Nota: Fast vs Slow requer >= `{min_n}` ordens **liquidadas** por grupo para inferência bootstrap (atual: fast={len(fast_roi)}, slow={len(slow_roi)})._\n\n"
+            )
     except Exception:
         pass
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=BetinAsia Ops AI Copilot API (diag + approval queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Restart=always
+RestartSec=5
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.ai_copilot_api; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot /home/betbot/Bets/venv/bin/python -m ops.ai_copilot_api; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.ai_copilot_api; fi'
+
+[Install]
+WantedBy=multi-user.target
