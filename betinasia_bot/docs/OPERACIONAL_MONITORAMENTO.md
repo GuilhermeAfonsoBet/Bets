@@ -171,9 +171,16 @@ SELECT
 ## 2) Monitor automático (timer)
 
 O monitor executa a cada ~2 minutos e envia alerta no Telegram quando houver WARN/FAIL.
+Além disso, o monitor atual valida:
+- `executor /health` (ready/workers)
+- estagnação de `betslip_audit_results` no DB (opcional, com limiar)
+- fluxo audit -> bridge (`eligible`, `seen`, `accepted`) para detectar travamento funcional
+- composição de motivos do bridge (ex.: `not_active`, `wf_ah_max_abs_line`) para distinguir bloqueio de política vs. falha técnica
 
 > Nota: o `ops.health_monitor` usa **exit codes** (0=PASS, 1=WARN, 2=FAIL).  
 > Nos units `betinasia-ops-monitor.service` e `betinasia-ops-autopilot.service` nós já incluímos `SuccessExitStatus=1 2` para o systemd **não** marcar o unit como "failed" em WARN/FAIL (o que é esperado e não significa que o timer quebrou).
+>  
+> Para evitar quebra por drift de argumentos entre unit e script, o monitor aceita `--telegram-source` e, por padrão, ignora argumentos desconhecidos (`OPS_MONITOR_STRICT_ARGS=0`).
 
 ### Instalar systemd unit + timer
 ```bash
@@ -191,12 +198,16 @@ systemctl list-timers --all | grep -i betinasia-ops-monitor || true
 
 ### Rodar manualmente
 ```bash
-PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --telegram
+PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --telegram --telegram-source manual
 ```
 
 Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
+- `OPS_MONITOR_STRICT_ARGS` (default `0`)
+- `OPS_EXECUTOR_HEALTH_*`
+- `OPS_AUDIT_DB_STALE_FAIL_*`
+- `OPS_BRIDGE_FLOW_*`, `OPS_BRIDGE_THROUGHPUT_*`
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.
@@ -220,6 +231,16 @@ O auto-pilot roda a cada ~2 minutos e:
 - **só reinicia** serviços quando houver **FAIL por 2 execuções seguidas** (default)
 - aplica **cooldown** e **rate limit** para evitar flapping
 
+> O Telegram é apenas **notificação**. O fluxo de reação (restart/pause) roda sem intervenção humana
+> quando `betinasia-ops-autopilot.timer` está ativo e os thresholds estão configurados.
+>
+> Em operação Back-only, configure `BRIDGE_LAY_SERVICE=0` no `.env` para não gerar FAIL por service
+> propositalmente inativo.
+>
+> Para reduzir ruído quando a policy bloqueia tudo (`bridge_accepted=0`), use:
+> - `OPS_EXECUTOR_IDLE_EXPECTED_WHEN_ZERO_ACCEPTED=1`
+> - `OPS_EXECUTOR_IDLE_WARN_ON_NO_NONHEARTBEAT=1` (ou `0` para não alertar WARN nesse caso)
+
 ### Instalar
 ```bash
 AUTO_SVC="$(git ls-files | grep -m1 'betinasia-ops-autopilot.service')"
@@ -237,6 +258,8 @@ systemctl list-timers --all | grep -i betinasia-ops-autopilot || true
 - `OPS_RESTART_COOLDOWN_SEC=1800`  (30min)
 - `OPS_MAX_RESTARTS_PER_HOUR=2`
 - `OPS_AUTOPILOT_STATE_FILE=logs/ops_autopilot_state.json`
+- `OPS_LATENCY_FAIL_PAUSE_BRIDGES=0/1` (opcional)
+- `OPS_BRIDGE_FLOW_FAIL_ON_ZERO=1` (recomendado para detectar bridge “up” mas sem consumo)
 
 ### Importante: sudo sem prompt (para o timer conseguir reiniciar)
 O restart usa `sudo systemctl restart ...`. Configure uma regra NOPASSWD (exemplo):

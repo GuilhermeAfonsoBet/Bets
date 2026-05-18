@@ -53,6 +53,7 @@ class Row:
 
     stake_sent: Optional[float]
     pre_submit_ms: Optional[int]
+    slippage_pre_pct: Optional[float]
     rule: Optional[str]
     eligible: Optional[bool]
     stake_chosen: Optional[float]
@@ -106,7 +107,9 @@ def _expected_stake_for_back(
     *,
     market_regime: Optional[str],
     pre_submit_ms: Optional[int],
+    slippage_pre_pct: Optional[float],
     pre_fast_max_ms: int,
+    pre_fast_max_slip_pct: float,
     stake_hi: float,
     stake_lo: float,
 ) -> Optional[float]:
@@ -114,15 +117,17 @@ def _expected_stake_for_back(
         return None
     is_pre = (market_regime == "pre")
     ok_time = (pre_submit_ms is not None) and (int(pre_submit_ms) <= int(pre_fast_max_ms))
-    return float(stake_hi if (is_pre and ok_time) else stake_lo)
+    ok_slip = (slippage_pre_pct is not None) and (float(slippage_pre_pct) < float(pre_fast_max_slip_pct))
+    return float(stake_hi if (is_pre and ok_time and ok_slip) else stake_lo)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Auditoria de staking (Back Pre fast=12; senão=1.50) no executor_jsonl.")
+    ap = argparse.ArgumentParser(description="Auditoria de staking (Back Pre fast+slippage=20; senão=1.50) no executor_jsonl.")
     ap.add_argument("--jsonl", default=os.getenv("EXECUTOR_JSONL", "logs/executor_live.jsonl"))
     ap.add_argument("--last", type=int, default=20000, help="Ler os últimos N registros do JSONL.")
     ap.add_argument("--pre-fast-max-ms", type=int, default=5000)
-    ap.add_argument("--stake-hi", type=float, default=12.0)
+    ap.add_argument("--pre-fast-max-slip-pct", type=float, default=2.0)
+    ap.add_argument("--stake-hi", type=float, default=20.0)
     ap.add_argument("--stake-lo", type=float, default=1.5)
     ap.add_argument("--eps", type=float, default=1e-6)
     ap.add_argument("--max-print", type=int, default=40, help="Quantas violações imprimir.")
@@ -168,6 +173,7 @@ def main() -> int:
 
         stake_sent = _safe_float(sent.get("stake"))
         pre_submit_ms = _safe_int(vs.get("pre_submit_ms"))
+        slippage_pre_pct = _safe_float(vs.get("slippage_pre_pct"))
         rule = str(vs.get("rule") or "") or None
         eligible = (bool(vs.get("eligible")) if vs.get("eligible") is not None else None)
         stake_chosen = _safe_float(vs.get("stake_chosen"))
@@ -187,6 +193,7 @@ def main() -> int:
                 market_is_live=market_is_live,
                 stake_sent=stake_sent,
                 pre_submit_ms=pre_submit_ms,
+                slippage_pre_pct=slippage_pre_pct,
                 rule=rule,
                 eligible=eligible,
                 stake_chosen=stake_chosen,
@@ -200,7 +207,20 @@ def main() -> int:
         )
 
     stake_counts = Counter([r.stake_sent for r in rows])
-    exp_counts = Counter([_expected_stake_for_back(market_regime=r.market_regime, pre_submit_ms=r.pre_submit_ms, pre_fast_max_ms=int(args.pre_fast_max_ms), stake_hi=float(args.stake_hi), stake_lo=float(args.stake_lo)) for r in rows])
+    exp_counts = Counter(
+        [
+            _expected_stake_for_back(
+                market_regime=r.market_regime,
+                pre_submit_ms=r.pre_submit_ms,
+                slippage_pre_pct=r.slippage_pre_pct,
+                pre_fast_max_ms=int(args.pre_fast_max_ms),
+                pre_fast_max_slip_pct=float(args.pre_fast_max_slip_pct),
+                stake_hi=float(args.stake_hi),
+                stake_lo=float(args.stake_lo),
+            )
+            for r in rows
+        ]
+    )
 
     mismatches: List[Dict[str, Any]] = []
     hi_wrong: List[Dict[str, Any]] = []
@@ -210,7 +230,9 @@ def main() -> int:
         exp = _expected_stake_for_back(
             market_regime=r.market_regime,
             pre_submit_ms=r.pre_submit_ms,
+            slippage_pre_pct=r.slippage_pre_pct,
             pre_fast_max_ms=int(args.pre_fast_max_ms),
+            pre_fast_max_slip_pct=float(args.pre_fast_max_slip_pct),
             stake_hi=float(args.stake_hi),
             stake_lo=float(args.stake_lo),
         )
@@ -226,6 +248,7 @@ def main() -> int:
                     "expected_stake": exp,
                     "market_regime": r.market_regime,
                     "pre_submit_ms": r.pre_submit_ms,
+                    "slippage_pre_pct": r.slippage_pre_pct,
                     "rule": r.rule,
                     "stake_chosen": r.stake_chosen,
                     "skip_reason": r.skip_reason,
@@ -239,7 +262,13 @@ def main() -> int:
 
         # stake_hi deveria implicar pre&fast
         if abs(float(r.stake_sent) - float(args.stake_hi)) <= float(args.eps):
-            ok = (r.market_regime == "pre") and (r.pre_submit_ms is not None) and (int(r.pre_submit_ms) <= int(args.pre_fast_max_ms))
+            ok = (
+                (r.market_regime == "pre")
+                and (r.pre_submit_ms is not None)
+                and (int(r.pre_submit_ms) <= int(args.pre_fast_max_ms))
+                and (r.slippage_pre_pct is not None)
+                and (float(r.slippage_pre_pct) < float(args.pre_fast_max_slip_pct))
+            )
             if not ok:
                 hi_wrong.append(
                     {
@@ -249,13 +278,20 @@ def main() -> int:
                         "stake_sent": r.stake_sent,
                         "market_regime": r.market_regime,
                         "pre_submit_ms": r.pre_submit_ms,
+                        "slippage_pre_pct": r.slippage_pre_pct,
                         "rule": r.rule,
                         "stake_chosen": r.stake_chosen,
                     }
                 )
 
         # deveria ser stake_hi mas foi stake_lo
-        if (r.market_regime == "pre") and (r.pre_submit_ms is not None) and (int(r.pre_submit_ms) <= int(args.pre_fast_max_ms)):
+        if (
+            (r.market_regime == "pre")
+            and (r.pre_submit_ms is not None)
+            and (int(r.pre_submit_ms) <= int(args.pre_fast_max_ms))
+            and (r.slippage_pre_pct is not None)
+            and (float(r.slippage_pre_pct) < float(args.pre_fast_max_slip_pct))
+        ):
             if abs(float(r.stake_sent) - float(args.stake_hi)) > float(args.eps):
                 missed_hi.append(
                     {
@@ -265,6 +301,7 @@ def main() -> int:
                         "stake_sent": r.stake_sent,
                         "market_regime": r.market_regime,
                         "pre_submit_ms": r.pre_submit_ms,
+                        "slippage_pre_pct": r.slippage_pre_pct,
                         "rule": r.rule,
                         "stake_chosen": r.stake_chosen,
                         "skip_reason": r.skip_reason,
@@ -279,6 +316,7 @@ def main() -> int:
         "expected_stake_counts": {str(k): v for k, v in exp_counts.items()},
         "params": {
             "pre_fast_max_ms": int(args.pre_fast_max_ms),
+            "pre_fast_max_slip_pct": float(args.pre_fast_max_slip_pct),
             "stake_hi": float(args.stake_hi),
             "stake_lo": float(args.stake_lo),
         },
