@@ -108,6 +108,11 @@ Relatório diário DT (segunda trilha, com recorte DT/down):
 python3 -m ops.daily_dt_report
 ```
 
+Governança de policy (H3B como fonte única):
+- `DAILY_WF_PUBLISH_CURRENT=1` no daily H3B (publica `logs/wf_policy_current.json`)
+- `DAILY_DT_WF_PUBLISH_CURRENT=0` no daily DT (não sobrescreve policy global)
+- Assim o DT usa a policy vigente para análise operacional, sem alterar a carteira ativa.
+
 Saídas importantes do daily:
 - `logs/daily_reports/YYYYMMDD/report_daily.pdf`: relatório completo (inclui seção 99)
 - `logs/daily_reports_dt/YYYYMMDD/report_daily.pdf`: relatório completo da trilha DT
@@ -229,6 +234,7 @@ Variáveis úteis (no `.env`):
 - `OPS_EXECUTOR_HEALTH_*`
 - `OPS_EXECUTOR_LAT_*` (thresholds absolutos de latência)
 - `OPS_EXECUTOR_LAT_LOW_SAMPLE_*` (alerta de latência alta com poucos OKs)
+- `OPS_EXECUTOR_LAT_SINGLE_EVENT_*` (detecção de outlier extremo com 1-4 OKs)
 - `OPS_EXECUTOR_LAT_DEGRADE_*` (degradação relativa recente vs baseline)
 - `OPS_LATENCY_DEGRADE_REFRESH_*` (refresh controlado em degradação persistente de latência)
 - `OPS_AUDIT_DB_STALE_FAIL_*`

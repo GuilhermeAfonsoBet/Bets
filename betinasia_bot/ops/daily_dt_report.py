@@ -32,6 +32,8 @@ def main() -> int:
     os.environ["DAILY_OOS_DIRECTION"] = str(args.direction)
     os.environ["DAILY_OOS_VERSIONS"] = str(args.versions)
     os.environ["DAILY_REPORT_OUT_DIR"] = str(args.out_dir)
+    # Por padrão, o daily DT não publica policy_current global.
+    os.environ["DAILY_WF_PUBLISH_CURRENT"] = str(os.getenv("DAILY_DT_WF_PUBLISH_CURRENT", "0"))
 
     # Permite canal de Telegram separado para o report DT.
     if "DAILY_DT_REPORT_TELEGRAM" in os.environ:

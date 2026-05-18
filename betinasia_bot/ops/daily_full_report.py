@@ -3413,6 +3413,7 @@ class DailyReportCfg:
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
+    publish_policy_current: bool = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1").strip() in ("1", "true", "True", "yes", "YES"))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
     wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
@@ -3467,6 +3468,7 @@ class DailyReportCfg:
         self.wf_policy_current = Path(os.getenv("DAILY_WF_POLICY_CURRENT", str(self.wf_policy_current)))
         self.wf_policy_history_dir = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", str(self.wf_policy_history_dir)))
         self.wf_policy_history_jsonl = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", str(self.wf_policy_history_jsonl)))
+        self.publish_policy_current = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1" if self.publish_policy_current else "0").strip() in ("1", "true", "True", "yes", "YES"))
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
@@ -3748,10 +3750,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 tmpc.replace(policy_canon)
         except Exception:
             pass
-        cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cfg.wf_policy_current.with_suffix(".tmp")
-        tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
-        tmp.replace(cfg.wf_policy_current)
+        if bool(cfg.publish_policy_current):
+            cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cfg.wf_policy_current.with_suffix(".tmp")
+            tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
+            tmp.replace(cfg.wf_policy_current)
 
     active_keys = None
     active_keys_base = None

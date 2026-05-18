@@ -880,6 +880,10 @@ async def run_checks(
         # mesmo sem atingir lat_min_events.
         lat_low_sample_min_events = _safe_int(os.getenv("OPS_EXECUTOR_LAT_LOW_SAMPLE_MIN_EVENTS", "5"), 5)
         lat_low_sample_fail_hard = _is_truthy(os.getenv("OPS_EXECUTOR_LAT_LOW_SAMPLE_FAIL_HARD", "0"))
+        # Com poucos LIVE_OK/DRY_OK, ainda detecta outliers extremos.
+        # Defaults conservadores para evitar ruído operacional.
+        lat_single_event_warn = _safe_int(os.getenv("OPS_EXECUTOR_LAT_SINGLE_EVENT_WARN_MS", "20000"), 20000)
+        lat_single_event_fail = _safe_int(os.getenv("OPS_EXECUTOR_LAT_SINGLE_EVENT_FAIL_MS", "35000"), 35000)
         # Degradação relativa (janela recente vs baseline no tail histórico).
         lat_degrade_enable = _is_truthy(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_ENABLE", "1"))
         lat_degrade_min_recent = _safe_int(os.getenv("OPS_EXECUTOR_LAT_DEGRADE_MIN_RECENT_EVENTS", "5"), 5)
@@ -1244,13 +1248,46 @@ async def run_checks(
                                 )
                             )
                     else:
-                        results.append(
-                            CheckResult(
-                                "PASS",
-                                f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
-                                f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                        if len(call_ms) >= 1:
+                            p50_call = _pctl(call_ms, 50) or 0.0
+                            p90_call = _pctl(call_ms, 90) or 0.0
+                            if int(lat_single_event_fail) > 0 and float(p50_call) >= float(lat_single_event_fail):
+                                lvl = "FAIL" if lat_low_sample_fail_hard else "WARN"
+                                results.append(
+                                    CheckResult(
+                                        lvl,
+                                        f"{executor_service or 'betinasia-executor'}: latência alta (amostra ultra-baixa) "
+                                        f"(n_ok={len(call_ms)} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms "
+                                        f">= fail={int(lat_single_event_fail)}ms)",
+                                    )
+                                )
+                                exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+                            elif int(lat_single_event_warn) > 0 and float(p50_call) >= float(lat_single_event_warn):
+                                results.append(
+                                    CheckResult(
+                                        "WARN",
+                                        f"{executor_service or 'betinasia-executor'}: latência em alerta (amostra ultra-baixa) "
+                                        f"(n_ok={len(call_ms)} p50_call={int(p50_call)}ms p90_call={int(p90_call)}ms "
+                                        f">= warn={int(lat_single_event_warn)}ms)",
+                                    )
+                                )
+                                exit_code = max(exit_code, 1)
+                            else:
+                                results.append(
+                                    CheckResult(
+                                        "PASS",
+                                        f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
+                                        f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                                    )
+                                )
+                        else:
+                            results.append(
+                                CheckResult(
+                                    "PASS",
+                                    f"{executor_service or 'betinasia-executor'}: amostra baixa p/ latência "
+                                    f"(n_ok={len(call_ms)} < lat_min_events={lat_min_events})",
+                                )
                             )
-                        )
 
                 # Degradação relativa: compara p50 recente (janela since) vs baseline do tail
                 # anterior ao since. Captura piora mesmo quando ainda não estourou threshold absoluto.
