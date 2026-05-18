@@ -1,0 +1,40 @@
+[Unit]
+Description=BetinAsia Collector - Coleta Contínua de Odds
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+# Tenta usar venv local (betinasia_bot/venv) e faz fallback para ~/Bets/venv.
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python -m collector.continuous_collector; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec /home/betbot/Bets/venv/bin/python -m collector.continuous_collector; else exec /usr/bin/python3 -m collector.continuous_collector; fi'
+Restart=always
+RestartSec=30
+
+# Logs
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/collector.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/collector_error.log
+
+# Limites
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Recursos
+MemoryMax=2G
+MemoryHigh=1500M
+CPUQuota=80%
+
+# Watchdog - reinicia se travar por mais de 10 min
+WatchdogSec=600
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,847 @@
+======================================================================
+ANALISE ABRANGENTE H3B — CLV + ROI
+======================================================================
+Data: 2026-02-12 20:33 UTC
+
+Dados carregados: 3993 auditorias H3B UP com match e kickoff passado
+
+  FILTRO DE QUALIDADE:
+    Betslip total (bruto): 2029
+    Com diff entre -10% e +10% (confiavel): 901
+    Descartados (diff fora do range): 1128
+
+  CORRELACAO INTRA-JOGO:
+    Jogos unicos: 352
+    Observacoes: 3993
+    Media obs/jogo: 11.3
+    Jogos unicos (betslip): 157
+
+Resumo:
+  Total com match+kickoff: 3993
+  Com betslip: 901
+  Com CLV WS bruto: 1666
+  Com CLV WS adicional: 1667
+  Com CLV BS bruto: 133
+  Com CLV BS adicional: 132
+  Com ROI WS (resultado do jogo): 3278
+  Com ROI BS: 787
+  Pre-match: 1578
+  In-match: 1660
+
+======================================================================
+(vii) REVALIDACAO CLV WEBSOCKET (todos os dados atuais)
+======================================================================
+
+  --- CLV BRUTO ---
+
+  PRE-MATCH:
+   CLV Bruto WS Pre-Match:
+     N = 1061
+     Media   = +0.160%
+     Mediana = +0.000%
+     P25/P75 = [-1.009%, +1.298%]
+     Erro padrao = 0.084%
+     IC 90% media = [+0.022%, +0.297%]
+     [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+     Win/Loss/Push = 495/466/100
+     Win rate = 51.5%
+
+  IN-MATCH:
+   CLV Bruto WS In-Match:
+     N = 231
+     Media   = +1.157%
+     Mediana = +0.809%
+     P25/P75 = [-3.175%, +5.263%]
+     Erro padrao = 0.625%
+     IC 90% media = [+0.129%, +2.185%]
+     [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+     Win/Loss/Push = 129/99/3
+     Win rate = 56.6%
+
+  --- CLV ADICIONAL (com baseline v6) ---
+
+  PRE-MATCH:
+   CLV Adicional WS Pre-Match:
+     N = 1061
+     Media   = -0.353%
+     Mediana = -0.254%
+     P25/P75 = [-1.619%, +1.152%]
+     Erro padrao = 0.096%
+     IC 90% media = [-0.510%, -0.195%]
+     [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+     Win/Loss/Push = 473/588/0
+     Win rate = 44.6%
+
+  IN-MATCH:
+   CLV Adicional WS In-Match:
+     N = 228
+     Media   = -0.098%
+     Mediana = +0.712%
+     P25/P75 = [-4.253%, +5.071%]
+     Erro padrao = 0.789%
+     IC 90% media = [-1.396%, +1.199%]
+     [~] Nao significativo
+     Win/Loss/Push = 127/101/0
+     Win rate = 55.7%
+
+======================================================================
+(i) CLV BRUTO, CLV ADICIONAL E ROI COM ODD BETSLIP
+======================================================================
+
+  --- CLV BRUTO BETSLIP (pre-match apenas) ---
+   CLV Bruto BS Pre-Match:
+     N = 87
+     Media   = -0.938%
+     Mediana = -1.222%
+     P25/P75 = [-2.990%, +1.269%]
+     Erro padrao = 0.438%
+     IC 90% media = [-1.659%, -0.216%]
+     [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+     Win/Loss/Push = 32/54/1
+     Win rate = 37.2%
+
+  --- CLV ADICIONAL BETSLIP (pre-match, com baseline v6) ---
+   CLV Adicional BS Pre-Match:
+     N = 87
+     Media   = -1.724%
+     Mediana = -1.374%
+     P25/P75 = [-3.958%, +1.818%]
+     Erro padrao = 0.546%
+     IC 90% media = [-2.622%, -0.825%]
+     [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+     Win/Loss/Push = 31/56/0
+     Win rate = 35.6%
+
+  --- CLV ADICIONAL WS (pre-match, com baseline v6) ---
+   CLV Adicional WS Pre-Match:
+     N = 1061
+     Media   = -0.353%
+     Mediana = -0.254%
+     P25/P75 = [-1.619%, +1.152%]
+     Erro padrao = 0.096%
+     IC 90% media = [-0.510%, -0.195%]
+     [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+     Win/Loss/Push = 473/588/0
+     Win rate = 44.6%
+
+  --- ROI BETSLIP (pre-match) ---
+   ROI Betslip Pre-Match:
+     N = 379
+     Media   = -2.877%
+     Mediana = +0.000%
+     P25/P75 = [-100.000%, +91.100%]
+     Erro padrao = 4.519%
+     IC 90% media = [-10.311%, +4.558%]
+     [~] Nao significativo
+     Win/Loss/Push = 152/155/72
+     Win rate = 49.5%
+
+  --- ROI WEBSOCKET (pre-match, referencia) ---
+   ROI WS Pre-Match:
+     N = 1430
+     Media   = -4.140%
+     Mediana = +0.000%
+     P25/P75 = [-100.000%, +93.100%]
+     Erro padrao = 2.422%
+     IC 90% media = [-8.125%, -0.155%]
+     [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+     Win/Loss/Push = 594/636/200
+     Win rate = 48.3%
+
+  --- ROI BETSLIP (in-match) ---
+   ROI Betslip In-Match:
+     N = 405
+     Media   = +0.409%
+     Mediana = +0.000%
+     P25/P75 = [-100.000%, +86.900%]
+     Erro padrao = 4.394%
+     IC 90% media = [-6.819%, +7.638%]
+     [~] Nao significativo
+     Win/Loss/Push = 166/154/85
+     Win rate = 51.9%
+     N estimado p/ significancia: ~126271
+
+  --- ROI WEBSOCKET (in-match) ---
+   ROI WS In-Match:
+     N = 1258
+     Media   = +2.867%
+     Mediana = +0.000%
+     P25/P75 = [-100.000%, +91.000%]
+     Erro padrao = 3.634%
+     IC 90% media = [-3.112%, +8.845%]
+     [~] Nao significativo
+     Win/Loss/Push = 503/525/230
+     Win rate = 48.9%
+     N estimado p/ significancia: ~5472
+
+======================================================================
+(ii) ANALISE POR DIFERENCA BETSLIP vs WEBSOCKET
+======================================================================
+
+  === BS < WS (-10% a -2%) (N=187) ===
+     CLV Betslip (pre-match):
+       N = 21
+       Media   = -4.639%
+       Mediana = -4.654%
+       P25/P75 = [-7.429%, -2.664%]
+       Erro padrao = 0.817%
+       IC 90% media = [-5.983%, -3.295%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 2/19/0
+       Win rate = 9.5%
+     ROI Betslip (todos):
+       N = 159
+       Media   = +3.852%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +84.400%]
+       Erro padrao = 6.316%
+       IC 90% media = [-6.538%, +14.242%]
+       [~] Nao significativo
+       Win/Loss/Push = 63/49/47
+       Win rate = 56.2%
+       N estimado p/ significancia: ~1157
+
+  === BS ~ WS (-2% a +2%) (N=563) ===
+     CLV Betslip (pre-match):
+       N = 57
+       Media   = -0.300%
+       Mediana = -0.495%
+       P25/P75 = [-2.124%, +1.070%]
+       Erro padrao = 0.402%
+       IC 90% media = [-0.962%, +0.362%]
+       [~] Nao significativo
+       Win/Loss/Push = 23/33/1
+       Win rate = 41.1%
+     ROI Betslip (todos):
+       N = 488
+       Media   = -4.185%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +88.900%]
+       Erro padrao = 3.978%
+       IC 90% media = [-10.728%, +2.359%]
+       [~] Nao significativo
+       Win/Loss/Push = 195/201/92
+       Win rate = 49.2%
+
+  === BS > WS (+2% a +10%) (N=151) ===
+     CLV Betslip (pre-match):
+       N = 9
+       Media   = +3.661%
+       Mediana = +3.729%
+       P25/P75 = [+2.321%, +5.403%]
+       Erro padrao = 1.396%
+       IC 90% media = [+1.365%, +5.958%]
+       [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+       Win/Loss/Push = 7/2/0
+       Win rate = 77.8%
+     ROI Betslip (todos):
+       N = 140
+       Media   = +3.464%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +99.800%]
+       Erro padrao = 8.266%
+       IC 90% media = [-10.134%, +17.062%]
+       [~] Nao significativo
+       Win/Loss/Push = 61/60/19
+       Win rate = 50.4%
+       N estimado p/ significancia: ~2158
+
+======================================================================
+(iii) PRE-MATCH vs IN-MATCH
+======================================================================
+
+  === PRE-MATCH (N=443) ===
+     CLV Betslip:
+       N = 87
+       Media   = -0.938%
+       Mediana = -1.222%
+       P25/P75 = [-2.990%, +1.269%]
+       Erro padrao = 0.438%
+       IC 90% media = [-1.659%, -0.216%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 32/54/1
+       Win rate = 37.2%
+     ROI Betslip:
+       N = 379
+       Media   = -2.877%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +91.100%]
+       Erro padrao = 4.519%
+       IC 90% media = [-10.311%, +4.558%]
+       [~] Nao significativo
+       Win/Loss/Push = 152/155/72
+       Win rate = 49.5%
+     Diff BS vs WS:
+       N = 443
+       Media   = -0.032%
+       Mediana = -0.200%
+       P25/P75 = [-0.549%, +0.294%]
+       Erro padrao = 0.143%
+       IC 90% media = [-0.267%, +0.204%]
+       [~] Nao significativo
+       Win/Loss/Push = 137/263/43
+       Win rate = 34.2%
+
+  === IN-MATCH (N=453) ===
+     CLV Betslip:
+       N = 42
+       Media   = -1.443%
+       Mediana = -1.884%
+       P25/P75 = [-8.047%, +3.119%]
+       Erro padrao = 1.447%
+       IC 90% media = [-3.823%, +0.937%]
+       [~] Nao significativo
+       Win/Loss/Push = 15/27/0
+       Win rate = 35.7%
+     ROI Betslip:
+       N = 405
+       Media   = +0.409%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +86.900%]
+       Erro padrao = 4.394%
+       IC 90% media = [-6.819%, +7.638%]
+       [~] Nao significativo
+       Win/Loss/Push = 166/154/85
+       Win rate = 51.9%
+       N estimado p/ significancia: ~126271
+     Diff BS vs WS:
+       N = 453
+       Media   = -0.450%
+       Mediana = -0.158%
+       P25/P75 = [-2.591%, +1.336%]
+       Erro padrao = 0.195%
+       IC 90% media = [-0.770%, -0.130%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 166/237/50
+       Win rate = 41.2%
+
+======================================================================
+(iv) POR LIGA (top 10 com mais dados)
+======================================================================
+
+  England Premier League: N=110 (ROI: 103, CLV: 48)
+     ROI:
+       N = 103
+       Media   = -0.450%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +89.900%]
+       Erro padrao = 8.751%
+       IC 90% media = [-14.845%, +13.944%]
+       [~] Nao significativo
+       Win/Loss/Push = 41/40/22
+       Win rate = 50.6%
+
+  England National League: N=107 (ROI: 100, CLV: 0)
+     ROI:
+       N = 100
+       Media   = -3.754%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +90.200%]
+       Erro padrao = 9.278%
+       IC 90% media = [-19.016%, +11.508%]
+       [~] Nao significativo
+       Win/Loss/Push = 44/45/11
+       Win rate = 49.4%
+
+  England National League North: N=82 (ROI: 82, CLV: 0)
+     ROI:
+       N = 82
+       Media   = -8.452%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +86.900%]
+       Erro padrao = 9.809%
+       IC 90% media = [-24.588%, +7.683%]
+       [~] Nao significativo
+       Win/Loss/Push = 32/36/14
+       Win rate = 47.1%
+
+  England National League South: N=79 (ROI: 76, CLV: 0)
+     ROI:
+       N = 76
+       Media   = -3.880%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +94.000%]
+       Erro padrao = 10.733%
+       IC 90% media = [-21.536%, +13.775%]
+       [~] Nao significativo
+       Win/Loss/Push = 34/35/7
+       Win rate = 49.3%
+
+  AFC Asian Champions League: N=73 (ROI: 73, CLV: 0)
+     ROI:
+       N = 73
+       Media   = +4.197%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +97.400%]
+       Erro padrao = 11.071%
+       IC 90% media = [-14.015%, +22.409%]
+       [~] Nao significativo
+       Win/Loss/Push = 33/30/10
+       Win rate = 52.4%
+       N estimado p/ significancia: ~1375
+
+  England Football League Championship: N=66 (ROI: 62, CLV: 7)
+     ROI:
+       N = 62
+       Media   = +5.526%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +96.400%]
+       Erro padrao = 11.649%
+       IC 90% media = [-13.637%, +24.689%]
+       [~] Nao significativo
+       Win/Loss/Push = 27/23/12
+       Win rate = 54.0%
+       N estimado p/ significancia: ~746
+
+  Scotland Premier League: N=55 (ROI: 37, CLV: 0)
+     ROI:
+       N = 37
+       Media   = -11.257%
+       Mediana = -100.000%
+       P25/P75 = [-100.000%, +97.400%]
+       Erro padrao = 15.822%
+       IC 90% media = [-37.285%, +14.771%]
+       [~] Nao significativo
+       Win/Loss/Push = 15/19/3
+       Win rate = 44.1%
+
+  Club Friendly: N=53 (ROI: 19, CLV: 0)
+     ROI:
+       N = 19
+       Media   = -23.021%
+       Mediana = -100.000%
+       P25/P75 = [-100.000%, +84.700%]
+       Erro padrao = 20.052%
+       IC 90% media = [-56.006%, +9.964%]
+       [~] Nao significativo
+       Win/Loss/Push = 7/10/2
+       Win rate = 41.2%
+
+  England League 1: N=35 (ROI: 26, CLV: 0)
+     ROI:
+       N = 26
+       Media   = -3.931%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +87.300%]
+       Erro padrao = 16.811%
+       IC 90% media = [-31.586%, +23.724%]
+       [~] Nao significativo
+       Win/Loss/Push = 10/10/6
+       Win rate = 50.0%
+
+  England League 2: N=35 (ROI: 34, CLV: 0)
+     ROI:
+       N = 34
+       Media   = +4.894%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +95.900%]
+       Erro padrao = 15.587%
+       IC 90% media = [-20.747%, +30.535%]
+       [~] Nao significativo
+       Win/Loss/Push = 16/13/5
+       Win rate = 55.2%
+       N estimado p/ significancia: ~934
+
+======================================================================
+(v) POR FAIXA DE LINHA AH
+======================================================================
+
+  === AH 0-1 (liquida) (N=379) ===
+     CLV Betslip (pre-match):
+       N = 46
+       Media   = -2.551%
+       Mediana = -1.884%
+       P25/P75 = [-4.703%, -0.111%]
+       Erro padrao = 0.529%
+       IC 90% media = [-3.421%, -1.682%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 9/36/1
+       Win rate = 20.0%
+     ROI Betslip:
+       N = 337
+       Media   = -1.349%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +82.000%]
+       Erro padrao = 4.121%
+       IC 90% media = [-8.128%, +5.431%]
+       [~] Nao significativo
+       Win/Loss/Push = 104/100/133
+       Win rate = 51.0%
+     Diff BS vs WS:
+       N = 379
+       Media   = -0.942%
+       Mediana = -0.475%
+       P25/P75 = [-2.228%, +0.000%]
+       Erro padrao = 0.186%
+       IC 90% media = [-1.248%, -0.635%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 87/265/27
+       Win rate = 24.7%
+
+  === AH 1-2 (media) (N=124) ===
+     CLV Betslip (pre-match):
+       N = 8
+       Media   = +0.882%
+       Mediana = +2.405%
+       P25/P75 = [-2.404%, +3.729%]
+       Erro padrao = 1.156%
+       IC 90% media = [-1.020%, +2.785%]
+       [~] Nao significativo
+       Win/Loss/Push = 5/3/0
+       Win rate = 62.5%
+       N estimado p/ significancia: ~38
+     ROI Betslip:
+       N = 103
+       Media   = +8.983%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +97.000%]
+       Erro padrao = 9.085%
+       IC 90% media = [-5.963%, +23.928%]
+       [~] Nao significativo
+       Win/Loss/Push = 46/38/19
+       Win rate = 54.8%
+       N estimado p/ significancia: ~286
+     Diff BS vs WS:
+       N = 124
+       Media   = +0.738%
+       Mediana = +0.205%
+       P25/P75 = [-0.326%, +1.800%]
+       Erro padrao = 0.326%
+       IC 90% media = [+0.201%, +1.275%]
+       [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+       Win/Loss/Push = 66/50/8
+       Win rate = 56.9%
+
+  === AH 2+ (extrema) (N=398) ===
+     CLV Betslip (pre-match):
+       N = 33
+       Media   = +0.871%
+       Mediana = +0.201%
+       P25/P75 = [-2.212%, +2.321%]
+       Erro padrao = 0.709%
+       IC 90% media = [-0.296%, +2.037%]
+       [~] Nao significativo
+       Win/Loss/Push = 18/15/0
+       Win rate = 54.5%
+       N estimado p/ significancia: ~60
+     ROI Betslip:
+       N = 347
+       Media   = -4.079%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +94.100%]
+       Erro padrao = 5.243%
+       IC 90% media = [-12.703%, +4.545%]
+       [~] Nao significativo
+       Win/Loss/Push = 169/172/6
+       Win rate = 49.6%
+     Diff BS vs WS:
+       N = 398
+       Media   = +0.076%
+       Mediana = +0.000%
+       P25/P75 = [-0.796%, +0.972%]
+       Erro padrao = 0.177%
+       IC 90% media = [-0.215%, +0.367%]
+       [~] Nao significativo
+       Win/Loss/Push = 150/190/58
+       Win rate = 44.1%
+       N estimado p/ significancia: ~5825
+
+======================================================================
+(vi) POR FAIXA DE LAG
+======================================================================
+
+  === Lag < 10s (N=646) ===
+     CLV Betslip (pre-match):
+       N = 38
+       Media   = -0.020%
+       Mediana = +0.201%
+       P25/P75 = [-2.124%, +1.515%]
+       Erro padrao = 0.456%
+       IC 90% media = [-0.770%, +0.729%]
+       [~] Nao significativo
+       Win/Loss/Push = 20/18/0
+       Win rate = 52.6%
+     ROI Betslip:
+       N = 560
+       Media   = -1.938%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +90.200%]
+       Erro padrao = 3.824%
+       IC 90% media = [-8.228%, +4.352%]
+       [~] Nao significativo
+       Win/Loss/Push = 242/236/82
+       Win rate = 50.6%
+     Diff BS vs WS:
+       N = 646
+       Media   = -0.148%
+       Mediana = -0.053%
+       P25/P75 = [-0.550%, +0.531%]
+       Erro padrao = 0.118%
+       IC 90% media = [-0.342%, +0.047%]
+       [~] Nao significativo
+       Win/Loss/Push = 227/330/89
+       Win rate = 40.8%
+
+  === Lag 10-20s (N=107) ===
+     CLV Betslip (pre-match):
+       N = 39
+       Media   = -2.237%
+       Mediana = -1.939%
+       P25/P75 = [-4.703%, -0.111%]
+       Erro padrao = 0.693%
+       IC 90% media = [-3.378%, -1.097%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 8/30/1
+       Win rate = 21.1%
+     ROI Betslip:
+       N = 87
+       Media   = +5.202%
+       Mediana = +0.000%
+       P25/P75 = [+0.000%, +0.000%]
+       Erro padrao = 7.000%
+       IC 90% media = [-6.312%, +16.717%]
+       [~] Nao significativo
+       Win/Loss/Push = 21/16/50
+       Win rate = 56.8%
+       N estimado p/ significancia: ~427
+     Diff BS vs WS:
+       N = 107
+       Media   = -2.393%
+       Mediana = -2.074%
+       P25/P75 = [-4.618%, -0.947%]
+       Erro padrao = 0.395%
+       IC 90% media = [-3.043%, -1.743%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 13/93/1
+       Win rate = 12.3%
+
+  === Lag 20-30s (N=79) ===
+     CLV Betslip (pre-match):
+       N = 6
+       Media   = +1.268%
+       Mediana = -1.451%
+       P25/P75 = [-2.801%, +10.103%]
+       Erro padrao = 2.985%
+       IC 90% media = [-3.642%, +6.179%]
+       [~] Nao significativo
+       Win/Loss/Push = 2/4/0
+       Win rate = 33.3%
+       N estimado p/ significancia: ~90
+     ROI Betslip:
+       N = 72
+       Media   = -14.518%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +87.000%]
+       Erro padrao = 10.419%
+       IC 90% media = [-31.657%, +2.621%]
+       [~] Nao significativo
+       Win/Loss/Push = 24/33/15
+       Win rate = 42.1%
+     Diff BS vs WS:
+       N = 79
+       Media   = +0.181%
+       Mediana = -0.392%
+       P25/P75 = [-2.228%, +3.450%]
+       Erro padrao = 0.545%
+       IC 90% media = [-0.716%, +1.078%]
+       [~] Nao significativo
+       Win/Loss/Push = 27/50/2
+       Win rate = 35.1%
+       N estimado p/ significancia: ~1937
+
+  === Lag > 30s (N=69) ===
+     CLV Betslip (pre-match):
+       N = 4
+       Media   = -0.286%
+       Mediana = +1.667%
+       P25/P75 = [-3.100%, +3.729%]
+       Erro padrao = 1.775%
+       IC 90% media = [-3.206%, +2.634%]
+       [~] Nao significativo
+       Win/Loss/Push = 2/2/0
+       Win rate = 50.0%
+     ROI Betslip:
+       N = 68
+       Media   = +10.782%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +95.800%]
+       Erro padrao = 11.279%
+       IC 90% media = [-7.772%, +29.337%]
+       [~] Nao significativo
+       Win/Loss/Push = 32/25/11
+       Win rate = 56.1%
+       N estimado p/ significancia: ~202
+     Diff BS vs WS:
+       N = 69
+       Media   = +1.477%
+       Mediana = +1.217%
+       P25/P75 = [-2.591%, +5.609%]
+       Erro padrao = 0.610%
+       IC 90% media = [+0.474%, +2.480%]
+       [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+       Win/Loss/Push = 36/32/1
+       Win rate = 52.9%
+
+======================================================================
+(viii) POR MODELO: API (2-4s) vs DOM (15-30s)
+======================================================================
+
+  === API (2-4s) ===
+    Total observacoes: 1069
+    Com betslip: 772
+    Com CLV (pre-match): 42
+    Com ROI: 682
+    Lag medio: 11543ms
+     CLV Bruto BS Pre-Match (API (2-4s)):
+       N = 42
+       Media   = +0.355%
+       Mediana = +0.160%
+       P25/P75 = [-2.255%, +1.934%]
+       Erro padrao = 0.548%
+       IC 90% media = [-0.545%, +1.256%]
+       [~] Nao significativo
+       Win/Loss/Push = 21/21/0
+       Win rate = 50.0%
+       N estimado p/ significancia: ~270
+     CLV Adicional BS Pre-Match (API (2-4s)):
+       N = 42
+       Media   = +0.023%
+       Mediana = -0.546%
+       P25/P75 = [-1.996%, +2.162%]
+       Erro padrao = 0.572%
+       IC 90% media = [-0.918%, +0.964%]
+       [~] Nao significativo
+       Win/Loss/Push = 19/23/0
+       Win rate = 45.2%
+       N estimado p/ significancia: ~68622
+     CLV Bruto WS Pre-Match (API (2-4s)):
+       N = 53
+       Media   = +0.836%
+       Mediana = +0.767%
+       P25/P75 = [-1.400%, +2.315%]
+       Erro padrao = 0.499%
+       IC 90% media = [+0.016%, +1.657%]
+       [OK] SIGNIFICATIVO POSITIVO (p<0.10)
+       Win/Loss/Push = 30/21/2
+       Win rate = 58.8%
+     ROI Betslip (API (2-4s)):
+       N = 682
+       Media   = -2.446%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +91.500%]
+       Erro padrao = 3.498%
+       IC 90% media = [-8.200%, +3.307%]
+       [~] Nao significativo
+       Win/Loss/Push = 293/293/96
+       Win rate = 50.0%
+     ROI Websocket (API (2-4s)):
+       N = 961
+       Media   = +0.734%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +92.100%]
+       Erro padrao = 4.209%
+       IC 90% media = [-6.190%, +7.659%]
+       [~] Nao significativo
+       Win/Loss/Push = 409/423/129
+       Win rate = 49.2%
+       N estimado p/ significancia: ~85499
+     Diff BS vs WS (API (2-4s)):
+       N = 772
+       Media   = +0.185%
+       Mediana = -0.051%
+       P25/P75 = [-0.547%, +0.897%]
+       Erro padrao = 0.123%
+       IC 90% media = [-0.018%, +0.388%]
+       [~] Nao significativo
+       Win/Loss/Push = 292/391/89
+       Win rate = 42.8%
+       N estimado p/ significancia: ~929
+     BS > WS: 292/772 (37.8%)
+     BS > WS +2%: 142/772 (18.4%)
+
+  === DOM (15-30s) ===
+    Total observacoes: 2845
+    Com betslip: 129
+    Com CLV (pre-match): 45
+    Com ROI: 105
+    Lag medio: 15170ms
+     CLV Bruto BS Pre-Match (DOM (15-30s)):
+       N = 45
+       Media   = -2.144%
+       Mediana = -1.939%
+       P25/P75 = [-4.703%, +0.000%]
+       Erro padrao = 0.630%
+       IC 90% media = [-3.181%, -1.108%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 11/33/1
+       Win rate = 25.0%
+     CLV Adicional BS Pre-Match (DOM (15-30s)):
+       N = 45
+       Media   = -3.354%
+       Mediana = -2.607%
+       P25/P75 = [-6.943%, +0.000%]
+       Erro padrao = 0.847%
+       IC 90% media = [-4.748%, -1.960%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 12/33/0
+       Win rate = 26.7%
+     CLV Bruto WS Pre-Match (DOM (15-30s)):
+       N = 983
+       Media   = +0.108%
+       Mediana = +0.000%
+       P25/P75 = [-1.015%, +1.243%]
+       Erro padrao = 0.085%
+       IC 90% media = [-0.032%, +0.248%]
+       [~] Nao significativo
+       Win/Loss/Push = 452/433/98
+       Win rate = 51.1%
+       N estimado p/ significancia: ~1651
+     ROI Betslip (DOM (15-30s)):
+       N = 105
+       Media   = +6.893%
+       Mediana = +0.000%
+       P25/P75 = [+0.000%, +0.000%]
+       Erro padrao = 6.155%
+       IC 90% media = [-3.231%, +17.018%]
+       [~] Nao significativo
+       Win/Loss/Push = 26/17/62
+       Win rate = 60.5%
+       N estimado p/ significancia: ~227
+     ROI Websocket (DOM (15-30s)):
+       N = 2263
+       Media   = -0.276%
+       Mediana = +0.000%
+       P25/P75 = [-100.000%, +93.100%]
+       Erro padrao = 2.019%
+       IC 90% media = [-3.598%, +3.046%]
+       [~] Nao significativo
+       Win/Loss/Push = 916/938/409
+       Win rate = 49.4%
+     Diff BS vs WS (DOM (15-30s)):
+       N = 129
+       Media   = -2.931%
+       Mediana = -2.773%
+       P25/P75 = [-4.948%, -1.231%]
+       Erro padrao = 0.325%
+       IC 90% media = [-3.465%, -2.396%]
+       [X] SIGNIFICATIVO NEGATIVO (p<0.10)
+       Win/Loss/Push = 11/114/4
+       Win rate = 8.8%
+     BS > WS: 11/129 (8.5%)
+     BS > WS +2%: 9/129 (7.0%)
+
+======================================================================
+DIAGNOSTICO DE QUALIDADE
+======================================================================
+
+  Betslip odds: min=1.029 med=1.940 max=23.775
+  Websocket odds: min=1.068 med=1.943 max=24.725
+  Diferenca: min=-10.0% med=-0.2% max=+10.0%
+  Diffs < -30%: 0 (0.0%)
+  Diffs > +30%: 0 (0.0%)
+
+  Jogos com resultado (gols): 3278/3993
+
+======================================================================
+FIM DA ANALISE
+======================================================================

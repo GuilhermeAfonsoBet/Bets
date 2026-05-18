@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Environment variables (NUNCA commitar!)
+.env
+
+# Logs
+logs/
+*.log
+
+# Screenshots de debug
+*.png
+
+# Modelos treinados (podem ser grandes)
+models/*.joblib
+
+# Banco de dados local
+*.db
+*.sqlite
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+
+# Coverage
+htmlcov/
+.coverage
+
+# Backups
+*.bak
+*.backup
+*.sql
+*.sql.gz
+
+# Session files
+betinasia_session.json
