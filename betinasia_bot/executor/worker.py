@@ -684,6 +684,30 @@ class ExecutorWorker:
 
         allow_live = os.getenv("EXECUTOR_ALLOW_LIVE", "0").strip() in ("1", "true", "True", "yes", "YES")
         will_place_live = bool(allow_live) and bool(req.is_live)
+        try:
+            precheck_retry_enabled = (
+                os.getenv("EXECUTOR_LIVE_PRECHECK_RETRY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+            )
+        except Exception:
+            precheck_retry_enabled = True
+        try:
+            precheck_retry_max = int(float(os.getenv("EXECUTOR_LIVE_PRECHECK_RETRY_MAX", "1") or 1))
+        except Exception:
+            precheck_retry_max = 1
+        precheck_retry_max = int(max(0, precheck_retry_max))
+        try:
+            precheck_retry_sleep_s = float(os.getenv("EXECUTOR_LIVE_PRECHECK_RETRY_SLEEP_SEC", "0.25") or 0.25)
+        except Exception:
+            precheck_retry_sleep_s = 0.25
+        try:
+            precheck_retry_restart_on_ctx = (
+                os.getenv("EXECUTOR_LIVE_PRECHECK_RETRY_RESTART_ON_CONTEXT", "1").strip().lower()
+                in ("1", "true", "yes", "y", "on")
+            )
+        except Exception:
+            precheck_retry_restart_on_ctx = True
+        precheck_retry_attempts = 0
+        precheck_retry_last_reason: Optional[str] = None
 
         try:
             cached_id = None
@@ -772,6 +796,71 @@ class ExecutorWorker:
                 policy=req.policy,
                 error=str(e),
             )
+
+        # Retry controlado para pré-checagem LIVE em falhas transitórias.
+        # Evita derrubar a conversão por erros online curtos (PMM/contexto/timeout).
+        try:
+            if bool(will_place_live) and bool(precheck_retry_enabled) and int(precheck_retry_max) > 0:
+                for _ in range(int(precheck_retry_max)):
+                    if api_result and api_result.success:
+                        break
+                    err_now = str(getattr(api_result, "error", "") or "")
+                    err_now_low = err_now.lower()
+                    retryable = (
+                        ("no pmms received" in err_now_low)
+                        or ("ws stale" in err_now_low)
+                        or ("timeout" in err_now_low)
+                        or _is_playwright_context_destroyed(err_now)
+                        or _is_playwright_target_closed(err_now)
+                        or _is_login_navigation_timeout(err_now)
+                    )
+                    if not retryable:
+                        break
+                    precheck_retry_attempts += 1
+                    precheck_retry_last_reason = err_now[:200] if err_now else "PRECHECK_RETRYABLE_ERROR"
+
+                    # Em erro de contexto fechado, preferimos reiniciar sessão antes do retry.
+                    if bool(precheck_retry_restart_on_ctx) and (
+                        _is_playwright_context_destroyed(err_now) or _is_playwright_target_closed(err_now)
+                    ):
+                        await self._restart_browser_session(reason=f"LIVE_PRECHECK_RETRY:{precheck_retry_last_reason}")
+                    elif _is_auth_error(api_result):
+                        await self._relogin()
+
+                    try:
+                        if self._betslip_cache is not None:
+                            self._betslip_cache.pop(cache_key, None)
+                    except Exception:
+                        pass
+                    try:
+                        await self._api.close_visible_betslip_ui()
+                    except Exception:
+                        pass
+                    if float(precheck_retry_sleep_s) > 0:
+                        await asyncio.sleep(float(precheck_retry_sleep_s))
+
+                    api_result = await self._api.get_betslip_odds(event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type)
+                    if _is_too_many_open(api_result):
+                        try:
+                            if self._betslip_cache is not None:
+                                self._betslip_cache.clear()
+                        except Exception:
+                            pass
+                        try:
+                            await self._api.close_visible_betslip_ui()
+                        except Exception:
+                            pass
+                        api_result = await self._api.get_betslip_odds(
+                            event_id=req.event_id, bet_type=bet_type, betslip_type=betslip_type
+                        )
+                    if self._betslip_cache is not None and api_result and api_result.success and getattr(api_result, "betslip_id", ""):
+                        self._betslip_cache[cache_key] = str(api_result.betslip_id)
+                        try:
+                            self._betslip_cache.move_to_end(cache_key)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
         timing.post_ms = int(getattr(api_result, "request_time_ms", 0) or 0)
         timing.total_ms = int(getattr(api_result, "total_time_ms", 0) or 0)
@@ -901,6 +990,12 @@ class ExecutorWorker:
                 "cap": cap_meta,
                 "bet_type": bet_type,
                 "betslip_type": betslip_type,
+                "precheck_retry": {
+                    "enabled": bool(precheck_retry_enabled and will_place_live),
+                    "max": int(precheck_retry_max),
+                    "attempts": int(precheck_retry_attempts),
+                    "last_reason": (precheck_retry_last_reason or None),
+                },
                 "slippage_telemetry": slip_tel,
                 "value_sizing": value_sizing,
             },

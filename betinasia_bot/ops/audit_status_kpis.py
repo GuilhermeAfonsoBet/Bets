@@ -147,6 +147,11 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
               COUNT(*) FILTER (
                 WHERE (hypothesis_details::jsonb ? 'telemetry')
                   AND (
+                    (
+                      (hypothesis_details::jsonb->'telemetry' ? 'betslip_call_attempts')
+                      AND COALESCE(NULLIF(hypothesis_details#>>'{telemetry,betslip_call_attempts}','')::int, 0) > 0
+                    )
+                    OR
                     ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
                     OR ((hypothesis_details::jsonb->'telemetry') ? 'back_total_ms')
                     OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_total_ms')
@@ -158,6 +163,11 @@ async def compute_audit_status_kpis(cfg: AuditStatusCfg) -> Dict[str, Any]:
               COUNT(*) FILTER (
                 WHERE (hypothesis_details::jsonb ? 'telemetry')
                   AND (
+                    (
+                      (hypothesis_details::jsonb->'telemetry' ? 'betslip_call_attempts')
+                      AND COALESCE(NULLIF(hypothesis_details#>>'{telemetry,betslip_call_attempts}','')::int, 0) > 0
+                    )
+                    OR
                     ((hypothesis_details::jsonb->'telemetry') ? 'parallel_fetch_ms')
                     OR ((hypothesis_details::jsonb->'telemetry') ? 'back_total_ms')
                     OR ((hypothesis_details::jsonb->'telemetry') ? 'lay_total_ms')
