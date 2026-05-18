@@ -239,6 +239,7 @@ class BridgeConfig:
     poll_sec: float = 2.0
     lookback_sec: int = 120
     max_per_cycle: int = 3
+    fetch_newest_first: bool = True
     mode: str = "shadow"  # shadow|live
     exec_side: ExecSide = ExecSide.BACK
     stake: float = 3.0
@@ -289,6 +290,31 @@ class BridgeConfig:
     # Isso evita que linhas antigas/sem hint (ou geradas por outros auditores) sejam consumidas
     # pelo bridge do lado errado por engano.
     strict_exec_side_hint_live: bool = True
+    # Fase 1 (fast-path): permite limitar a origem de candidatos por versão/status do audit.
+    # Útil para rodar ws_gate_back como feed de execução e manter audit API em paralelo (shadow).
+    source_audit_versions: Tuple[str, ...] = tuple()
+    source_statuses: Tuple[str, ...] = tuple()
+
+
+def _parse_csv_tokens(raw: Optional[str], *, upper: bool = False) -> Tuple[str, ...]:
+    s = str(raw or "").strip()
+    if not s:
+        return tuple()
+    out: List[str] = []
+    for part in s.replace(";", ",").split(","):
+        tok = str(part or "").strip()
+        if not tok:
+            continue
+        out.append(tok.upper() if upper else tok)
+    # dedup mantendo ordem
+    seen = set()
+    uniq: List[str] = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return tuple(uniq)
 
 
 def _wf_float(wf: Dict[str, Any], *keys: str) -> Optional[float]:
@@ -419,6 +445,27 @@ async def _ensure_seen_table(db: Database) -> None:
         await conn.execute(text(DDL_POSITIONS))
         for stmt in DDL_POSITIONS_IDX:
             await conn.execute(text(stmt))
+
+
+async def _table_columns(db: Database, table_name: str) -> set[str]:
+    q = """
+    SELECT lower(column_name) AS c
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name=:t
+    """
+    async with db.async_session() as session:
+        r = await session.execute(text(q), {"t": str(table_name)})
+        rows = r.fetchall() or []
+    out: set[str] = set()
+    for rr in rows:
+        try:
+            c = str(rr[0] or "").strip().lower()
+            if c:
+                out.add(c)
+        except Exception:
+            continue
+    return out
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -782,6 +829,7 @@ async def _fetch_candidates(
     *,
     since: datetime,
     cfg: BridgeConfig,
+    audit_columns: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     # Nota: betslip_audit_results está em models_hypothesis (tabela criada pela connect()).
     strict_hint = bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live)
@@ -825,16 +873,38 @@ async def _fetch_candidates(
       AND r.event_id IS NOT NULL AND r.event_id <> ''
       AND upper(r.market_type) = 'AH'
       AND r.hypothesis_type = :hyp
-    ORDER BY r.audited_at ASC
-    LIMIT :lim
     """
     params = {
         "since": since,
-        "lim": int(cfg.max_per_cycle),
         "action": f"{cfg.mode}:{cfg.exec_side.value}",
         "hyp": str(cfg.only_hypothesis),
         "exec_side_hint": str(cfg.exec_side.value),
     }
+    has_status_col = (audit_columns is None) or ("status" in audit_columns)
+    has_audit_version_col = (audit_columns is None) or ("audit_version" in audit_columns)
+
+    if cfg.source_statuses and has_status_col:
+        ph: List[str] = []
+        for i, st in enumerate(cfg.source_statuses):
+            k = f"src_status_{i}"
+            ph.append(f":{k}")
+            params[k] = str(st).upper()
+        q += f"\n      AND upper(COALESCE(r.status, '')) IN ({', '.join(ph)})"
+    elif cfg.source_statuses and (not has_status_col):
+        logger.warning("[bridge] BRIDGE_SOURCE_STATUSES ignorado: coluna r.status ausente em betslip_audit_results")
+
+    if cfg.source_audit_versions and has_audit_version_col:
+        ph2: List[str] = []
+        for i, ver in enumerate(cfg.source_audit_versions):
+            k = f"src_ver_{i}"
+            ph2.append(f":{k}")
+            params[k] = str(ver)
+        q += f"\n      AND COALESCE(r.audit_version, '') IN ({', '.join(ph2)})"
+    elif cfg.source_audit_versions and (not has_audit_version_col):
+        logger.warning("[bridge] BRIDGE_SOURCE_AUDIT_VERSIONS ignorado: coluna r.audit_version ausente em betslip_audit_results")
+    order_dir = "DESC" if bool(cfg.fetch_newest_first) else "ASC"
+    q += f"\n    ORDER BY r.audited_at {order_dir}\n    LIMIT :lim\n    "
+    params["lim"] = int(cfg.max_per_cycle)
     if cfg.only_prematch:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
     # Conexões DB podem cair em serviços long-running; fazemos 1 retry com reconnect.
@@ -1120,16 +1190,31 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
+        f"fetch_newest_first={int(bool(cfg.fetch_newest_first))} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
+        f"src_statuses={list(cfg.source_statuses) if cfg.source_statuses else ['*']} "
+        f"src_audit_versions={list(cfg.source_audit_versions) if cfg.source_audit_versions else ['*']} "
         f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
         f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
         f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
         f"min_limit={cfg.min_limit} enforce_wf_filters={int(bool(cfg.enforce_wf_filters))}"
     )
 
+    audit_columns: Optional[set[str]] = None
+    audit_columns_last_check = 0.0
+
     while True:
         t0 = time.time()
         try:
+
+            # Descobre colunas disponíveis no betslip_audit_results (compatibilidade de schema).
+            if (time.time() - float(audit_columns_last_check or 0.0)) >= 300.0 or not audit_columns:
+                try:
+                    audit_columns = await _table_columns(db, "betslip_audit_results")
+                    audit_columns_last_check = time.time()
+                except Exception as e:
+                    logger.warning(f"[bridge] table_columns check failed: {str(e)[:180]}")
+                    audit_columns = None
 
             # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
             try:
@@ -1241,7 +1326,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
 
             since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
             try:
-                rows = await _fetch_candidates(db, since=since, cfg=cfg)
+                rows = await _fetch_candidates(db, since=since, cfg=cfg, audit_columns=audit_columns)
             except (InterfaceError, OperationalError, DBAPIError) as e:
                 if _is_db_disconnect_error(e):
                     await _db_reconnect(db, why="fetch_candidates_disconnect")
@@ -1912,10 +1997,35 @@ def main() -> int:
     ap.add_argument("--poll-sec", type=float, default=float(os.getenv("BRIDGE_POLL_SEC", "2.0")))
     ap.add_argument("--lookback-sec", type=int, default=int(os.getenv("BRIDGE_LOOKBACK_SEC", "120")))
     ap.add_argument("--max-per-cycle", type=int, default=int(os.getenv("BRIDGE_MAX_PER_CYCLE", "3")))
+    ap.set_defaults(
+        fetch_newest_first=(os.getenv("BRIDGE_FETCH_NEWEST_FIRST", "1").strip() not in ("0", "false", "False", "no", "NO"))
+    )
+    ap.add_argument(
+        "--fetch-newest-first",
+        dest="fetch_newest_first",
+        action="store_true",
+        help="Prioriza candidatos mais recentes (ORDER BY audited_at DESC).",
+    )
+    ap.add_argument(
+        "--fetch-oldest-first",
+        dest="fetch_newest_first",
+        action="store_false",
+        help="Modo legado: prioriza candidatos mais antigos (ORDER BY audited_at ASC).",
+    )
     ap.add_argument("--unix-socket", default=os.getenv("EXECUTOR_UNIX_SOCKET", "/tmp/betinasia-exec.sock"))
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
     ap.add_argument("--prematch-only", action="store_true", default=(os.getenv("BRIDGE_PREMATCH_ONLY", "1").strip() not in ("0", "false", "False", "no", "NO")))
+    ap.add_argument(
+        "--source-audit-versions",
+        default=os.getenv("BRIDGE_SOURCE_AUDIT_VERSIONS", "").strip(),
+        help="Lista CSV de audit_version para consumir (ex.: v5.3-ws-gate-back). Vazio=sem filtro.",
+    )
+    ap.add_argument(
+        "--source-statuses",
+        default=os.getenv("BRIDGE_SOURCE_STATUSES", "").strip(),
+        help="Lista CSV de status no betslip_audit_results (ex.: OK). Vazio=sem filtro.",
+    )
     ap.add_argument("--policy-json", default=os.getenv("BRIDGE_POLICY_JSON", "").strip() or None, help="Path para WF policy exportado (JSON).")
     ap.add_argument("--policy-reload-sec", type=float, default=float(os.getenv("BRIDGE_POLICY_RELOAD_SEC", "5.0")))
     ap.add_argument(
@@ -1975,6 +2085,7 @@ def main() -> int:
         poll_sec=float(args.poll_sec),
         lookback_sec=int(args.lookback_sec),
         max_per_cycle=int(args.max_per_cycle),
+        fetch_newest_first=bool(args.fetch_newest_first),
         mode=str(args.mode),
         exec_side=ExecSide(str(args.exec_side)),
         strict_exec_side_hint_live=bool(args.strict_exec_side_hint_live),
@@ -1983,6 +2094,8 @@ def main() -> int:
         http_url=(str(args.http_url) if args.http_url else None),
         only_hypothesis=str(args.hypothesis),
         only_prematch=bool(args.prematch_only),
+        source_audit_versions=_parse_csv_tokens(args.source_audit_versions, upper=False),
+        source_statuses=_parse_csv_tokens(args.source_statuses, upper=True),
         policy_json=(str(args.policy_json) if args.policy_json else None),
         policy_reload_sec=float(args.policy_reload_sec),
         policy_use_base=bool(args.policy_use_base),
