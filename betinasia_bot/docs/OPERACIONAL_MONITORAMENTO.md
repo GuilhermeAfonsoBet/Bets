@@ -139,6 +139,8 @@ Guardrail de compatibilidade (recomendado):
 - `DAILY_WF_COMPAT_GUARD_ENABLE=1`
 - `DAILY_WF_COMPAT_FAIL_CLOSED=1`
 - `DAILY_WF_COMPAT_MIN_PRE_KEYS=1`
+- `DAILY_WF_SIDES=back`
+- `DAILY_WF_REGIMES=pre`
 
 Com isso, se o bridge estiver em `PREMATCH_ONLY=1` e a policy candidata não tiver chaves `Back_Pre_*`/`Lay_Pre_*` compatíveis com o lado operacional, o daily **não publica** a nova policy no `wf_policy_current.json` (mantém a anterior e registra o motivo no relatório).
 
