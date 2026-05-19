@@ -166,6 +166,72 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _is_truthy(x: Any) -> bool:
+    try:
+        return str(x or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
+
+
+def _policy_compatibility_check(
+    active_keys: Any,
+    *,
+    bridge_exec_side: str,
+    bridge_prematch_only: bool,
+    min_pre_keys: int,
+) -> Dict[str, Any]:
+    keys = [str(k) for k in (active_keys or []) if str(k).strip()]
+    side = str(bridge_exec_side or "back").strip().lower()
+    if side not in ("back", "lay", "both"):
+        side = "back"
+    prematch = bool(bridge_prematch_only)
+    min_need = max(1, int(min_pre_keys))
+
+    def _count(prefix: str) -> int:
+        return sum(1 for k in keys if str(k).startswith(prefix))
+
+    cnt_back_pre = _count("Back_Pre_")
+    cnt_back_in = _count("Back_In_")
+    cnt_lay_pre = _count("Lay_Pre_")
+    cnt_lay_in = _count("Lay_In_")
+
+    checks: List[Tuple[bool, str]] = []
+    if prematch:
+        if side in ("back", "both"):
+            checks.append((cnt_back_pre >= min_need, f"Back_Pre_>={min_need} (atual={cnt_back_pre})"))
+        if side in ("lay", "both"):
+            checks.append((cnt_lay_pre >= min_need, f"Lay_Pre_>={min_need} (atual={cnt_lay_pre})"))
+    else:
+        if side in ("back", "both"):
+            checks.append(((cnt_back_pre + cnt_back_in) >= 1, f"Back_(Pre/In)>=1 (atual={cnt_back_pre + cnt_back_in})"))
+        if side in ("lay", "both"):
+            checks.append(((cnt_lay_pre + cnt_lay_in) >= 1, f"Lay_(Pre/In)>=1 (atual={cnt_lay_pre + cnt_lay_in})"))
+
+    ok = bool(checks) and all(c[0] for c in checks)
+    failed = [msg for cond, msg in checks if not cond]
+    reason = "ok" if ok else ("; ".join(failed) if failed else "no_checks")
+    return {
+        "ok": bool(ok),
+        "reason": str(reason),
+        "bridge_exec_side": str(side),
+        "bridge_prematch_only": bool(prematch),
+        "min_pre_keys": int(min_need),
+        "n_active_keys": int(len(keys)),
+        "n_back_pre": int(cnt_back_pre),
+        "n_back_in": int(cnt_back_in),
+        "n_lay_pre": int(cnt_lay_pre),
+        "n_lay_in": int(cnt_lay_in),
+        "checks": [{"ok": bool(cond), "rule": str(msg)} for cond, msg in checks],
+    }
+
+
 def _parse_dt_any(s: Any) -> Optional[datetime]:
     """
     Best-effort parse para campos como 'post date' do CSV de accounting.
@@ -3414,6 +3480,11 @@ class DailyReportCfg:
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
     publish_policy_current: bool = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1").strip() in ("1", "true", "True", "yes", "YES"))
+    policy_compat_guard_enable: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_GUARD_ENABLE", "1")))
+    policy_compat_fail_closed: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_FAIL_CLOSED", "1")))
+    policy_compat_min_pre_keys: int = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", "1"), 1))
+    policy_compat_bridge_exec_side: str = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", "Back"))
+    policy_compat_prematch_only: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1"))))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
     wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
@@ -3469,6 +3540,11 @@ class DailyReportCfg:
         self.wf_policy_history_dir = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", str(self.wf_policy_history_dir)))
         self.wf_policy_history_jsonl = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", str(self.wf_policy_history_jsonl)))
         self.publish_policy_current = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1" if self.publish_policy_current else "0").strip() in ("1", "true", "True", "yes", "YES"))
+        self.policy_compat_guard_enable = _is_truthy(os.getenv("DAILY_WF_COMPAT_GUARD_ENABLE", "1" if self.policy_compat_guard_enable else "0"))
+        self.policy_compat_fail_closed = _is_truthy(os.getenv("DAILY_WF_COMPAT_FAIL_CLOSED", "1" if self.policy_compat_fail_closed else "0"))
+        self.policy_compat_min_pre_keys = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", str(self.policy_compat_min_pre_keys or 1)), 1))
+        self.policy_compat_bridge_exec_side = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", self.policy_compat_bridge_exec_side))
+        self.policy_compat_prematch_only = _is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1")))
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
@@ -3739,8 +3815,36 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             oos_run["ok"] = False
             oos_run["error"] = f"OOS_EXCEPTION: {str(e)[:200]}"
 
+    policy_publish_info: Dict[str, Any] = {
+        "enabled": bool(cfg.publish_policy_current),
+        "guard_enabled": bool(cfg.policy_compat_guard_enable),
+        "fail_closed": bool(cfg.policy_compat_fail_closed),
+        "published": False,
+        "reason": "skipped",
+        "compatibility": None,
+        "candidate_path": str(policy_hist),
+        "effective_path": str(cfg.wf_policy_current),
+    }
+    active_keys = None
+    active_keys_base = None
+    policy_wf: Optional[Dict[str, Any]] = None
+    policy_last_step: Optional[Dict[str, Any]] = None
+    candidate_active_keys = None
+
     # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
     if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        pol_candidate: Optional[Dict[str, Any]] = None
+        candidate_last: Optional[Dict[str, Any]] = None
+        try:
+            pol_candidate = json.loads(policy_hist.read_text(encoding="utf-8"))
+            csteps = pol_candidate.get("steps") if isinstance(pol_candidate, dict) else []
+            candidate_last = csteps[-1] if isinstance(csteps, list) and csteps else {}
+            if isinstance(candidate_last, dict):
+                candidate_active_keys = candidate_last.get("active_keys")
+                policy_publish_info["candidate_active_keys_n"] = int(len(list(candidate_active_keys or [])))
+        except Exception as e:
+            policy_publish_info["reason"] = f"candidate_policy_parse_failed: {str(e)[:120]}"
+
         # Preenche o snapshot canônico do dia (best-effort) apenas se ainda não existir.
         # Isso evita que re-runs manuais sobrescrevam o arquivo `wf_policy_YYYYMMDD.json`.
         try:
@@ -3750,33 +3854,62 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 tmpc.replace(policy_canon)
         except Exception:
             pass
-        if bool(cfg.publish_policy_current):
-            cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cfg.wf_policy_current.with_suffix(".tmp")
-            tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
-            tmp.replace(cfg.wf_policy_current)
 
-    active_keys = None
-    active_keys_base = None
-    policy_wf: Optional[Dict[str, Any]] = None
-    policy_last_step: Optional[Dict[str, Any]] = None
-    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        can_publish = bool(cfg.publish_policy_current)
+        if can_publish and isinstance(candidate_last, dict):
+            compat = _policy_compatibility_check(
+                candidate_last.get("active_keys"),
+                bridge_exec_side=str(cfg.policy_compat_bridge_exec_side or "Back"),
+                bridge_prematch_only=bool(cfg.policy_compat_prematch_only),
+                min_pre_keys=int(cfg.policy_compat_min_pre_keys),
+            )
+            policy_publish_info["compatibility"] = compat
+            if bool(cfg.policy_compat_guard_enable) and (not bool(compat.get("ok"))):
+                if bool(cfg.policy_compat_fail_closed):
+                    can_publish = False
+                    policy_publish_info["reason"] = f"blocked_by_compat_guard: {compat.get('reason')}"
+                else:
+                    policy_publish_info["reason"] = f"compat_guard_warn_fail_open: {compat.get('reason')}"
+
+        if can_publish and bool(cfg.publish_policy_current):
+            try:
+                cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cfg.wf_policy_current.with_suffix(".tmp")
+                tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
+                tmp.replace(cfg.wf_policy_current)
+                policy_publish_info["published"] = True
+                policy_publish_info["reason"] = "published"
+            except Exception as e:
+                policy_publish_info["published"] = False
+                policy_publish_info["reason"] = f"publish_failed: {str(e)[:120]}"
+        elif bool(cfg.publish_policy_current) and str(policy_publish_info.get("reason") or "") == "skipped":
+            policy_publish_info["reason"] = "publish_disabled_or_guard_block"
+
+        # Política efetiva para relatório: a publicada no current (quando publish foi bloqueado/falhou),
+        # senão a policy candidata recém-gerada.
+        pol_effective = pol_candidate if bool(policy_publish_info.get("published")) else _read_json(cfg.wf_policy_current)
+        if not isinstance(pol_effective, dict):
+            pol_effective = pol_candidate if isinstance(pol_candidate, dict) else None
+        if isinstance(pol_effective, dict):
+            esteps = pol_effective.get("steps") if isinstance(pol_effective, dict) else []
+            elast = esteps[-1] if isinstance(esteps, list) and esteps else {}
+            if isinstance(elast, dict):
+                active_keys = elast.get("active_keys")
+                active_keys_base = elast.get("active_keys_base")
+                policy_last_step = elast
+            if isinstance(pol_effective.get("wf"), dict):
+                policy_wf = pol_effective.get("wf")
+
         try:
-            pol = json.loads(policy_hist.read_text(encoding="utf-8"))
-            steps = pol.get("steps") if isinstance(pol, dict) else []
-            last = steps[-1] if isinstance(steps, list) and steps else {}
-            if isinstance(last, dict):
-                active_keys = last.get("active_keys")
-                active_keys_base = last.get("active_keys_base")
-                policy_last_step = last
-            if isinstance(pol, dict) and isinstance(pol.get("wf"), dict):
-                policy_wf = pol.get("wf")
             rec = {
                 "ts": ts.isoformat(),
                 "policy_path": str(policy_hist),
                 "policy_current": str(cfg.wf_policy_current),
                 "active_keys": active_keys,
                 "active_keys_base": active_keys_base,
+                "published_to_current": bool(policy_publish_info.get("published")),
+                "publish_reason": str(policy_publish_info.get("reason") or ""),
+                "candidate_active_keys": candidate_active_keys,
             }
             cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
             with cfg.wf_policy_history_jsonl.open("a", encoding="utf-8") as f:
@@ -3940,6 +4073,18 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             s0.append(f"- **OOS**: **FAILED** — `{oos_run.get('error')}`\n")
             if oos_run.get("log"):
                 s0.append(f"- Log: `{oos_run.get('log')}`\n\n")
+    else:
+        if bool(cfg.publish_policy_current):
+            if bool(policy_publish_info.get("published")):
+                s0.append(
+                    "- **Policy publish**: `OK` "
+                    f"(candidate `{policy_publish_info.get('candidate_active_keys_n', '—')}` keys → `{cfg.wf_policy_current}`).\n"
+                )
+            else:
+                s0.append(
+                    "- **Policy publish**: `BLOQUEADO` "
+                    f"(`{policy_publish_info.get('reason')}`) — mantendo policy anterior em `{cfg.wf_policy_current}`.\n"
+                )
 
     # performance “real” (accounting) quando houver
     if isinstance(acct, dict) and not acct.get("error"):
@@ -6825,6 +6970,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "pdf": str(pdf),
         "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
+        "policy_publish": dict(policy_publish_info or {}),
     }
 
     # 6) Telegram
