@@ -3544,11 +3544,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
     if str(cfg.wf_exclude_exec_buckets_lay).strip():
         args += ["--wf-exclude-exec-buckets-lay", str(cfg.wf_exclude_exec_buckets_lay).strip()]
-    # Restrição por lado (evita que o portfólio OOS selecione Back quando a operação é Lay-only).
+    # Restrição por lado/regime para alinhar policy com o modo operacional do bridge.
+    # Defaults defensivos:
+    # - sides: herda DAILY_WF_SIDES; se vazio, deriva de BRIDGE_EXEC_SIDE.
+    # - regimes: herda DAILY_WF_REGIMES; se vazio e BRIDGE_PREMATCH_ONLY=1, usa "pre".
     try:
         wf_sides = str(os.getenv("DAILY_WF_SIDES", "") or "").strip().lower()
+        if not wf_sides:
+            bside = str(os.getenv("BRIDGE_EXEC_SIDE", "Back") or "Back").strip().lower()
+            if bside in ("back", "lay", "both"):
+                wf_sides = bside
+            else:
+                wf_sides = "back"
         if wf_sides:
             args += ["--wf-sides", wf_sides]
+    except Exception:
+        pass
+    try:
+        wf_regimes = str(os.getenv("DAILY_WF_REGIMES", "") or "").strip().lower()
+        if not wf_regimes:
+            wf_regimes = "pre" if _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1")) else "both"
+        if wf_regimes:
+            args += ["--wf-regimes", wf_regimes]
     except Exception:
         pass
 
@@ -6265,6 +6282,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "DAILY_WF_TRAIN_DAYS",
         "DAILY_WF_TEST_DAYS",
         "DAILY_WF_STEP_DAYS",
+        "DAILY_WF_SIDES",
+        "DAILY_WF_REGIMES",
         "DAILY_WF_KEY_BY_LEAGUE",
         "DAILY_WF_KEY_BY_LEAGUE_SCOPE",
         "DAILY_WF_AH_MAX_ABS_LINE",
