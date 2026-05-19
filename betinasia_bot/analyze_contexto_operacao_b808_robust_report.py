@@ -874,6 +874,35 @@ async def main() -> int:
         "Use 'lay' para evitar que a carteira OOS selecione Back quando a operação ainda é Lay-only. Default: both.",
     )
     parser.add_argument(
+        "--wf-regimes",
+        choices=["both", "pre", "in"],
+        default=os.getenv("WF_REGIMES", "both").strip() or "both",
+        help="Restringe o universo do walk-forward por regime temporal. "
+        "Use 'pre' para cenários Back Pre puros, sem mistura com In. Default: both.",
+    )
+    parser.add_argument(
+        "--wf-backpre-slip-max",
+        type=float,
+        default=_safe_float(os.getenv("WF_BACKPRE_SLIP_MAX", "")),
+        help="Filtro opcional para cenário Back Pre: mantém apenas eventos com slippage <= limite. "
+        "Ex.: 0 para cenário slippage <~ 0. Desligado por padrão.",
+    )
+    parser.add_argument(
+        "--wf-backpre-slip-field",
+        choices=["slippage_pre_pct", "diff_pct"],
+        default=os.getenv("WF_BACKPRE_SLIP_FIELD", "diff_pct").strip() or "diff_pct",
+        help="Campo usado no filtro de slippage Back Pre: "
+        "`slippage_pre_pct` (quando disponível em hypothesis_details) ou `diff_pct` (proxy sempre disponível). "
+        "Default: diff_pct.",
+    )
+    parser.add_argument(
+        "--wf-backpre-fast-max-lag-ms",
+        type=float,
+        default=_safe_float(os.getenv("WF_BACKPRE_FAST_MAX_LAG_MS", "")),
+        help="Filtro opcional para cenário Back Pre Fast: mantém apenas eventos com lag_total_ms <= limite. "
+        "Ex.: 5000 para ~5s. Desligado por padrão.",
+    )
+    parser.add_argument(
         "--wf-liquidity-mode",
         choices=["none", "gate_p50", "gate_p75", "gate_min"],
         default=os.getenv("WF_LIQUIDITY_MODE", "none").strip() or "none",
@@ -5116,6 +5145,19 @@ async def main() -> int:
                 wf_sides = "both"
             allow_back = wf_sides in ("both", "back")
             allow_lay = wf_sides in ("both", "lay")
+            wf_regimes = str(getattr(args, "wf_regimes", "both") or "both").strip().lower()
+            if wf_regimes not in ("both", "pre", "in"):
+                wf_regimes = "both"
+            allow_pre = wf_regimes in ("both", "pre")
+            allow_in = wf_regimes in ("both", "in")
+            wf_backpre_slip_max = _safe_float(getattr(args, "wf_backpre_slip_max", None))
+            wf_backpre_slip_field = str(getattr(args, "wf_backpre_slip_field", "diff_pct") or "diff_pct").strip().lower()
+            if wf_backpre_slip_field not in ("slippage_pre_pct", "diff_pct"):
+                wf_backpre_slip_field = "diff_pct"
+            wf_backpre_fast_max_lag_ms = _safe_float(getattr(args, "wf_backpre_fast_max_lag_ms", None))
+
+            def _regime_allowed(is_live_eff: bool) -> bool:
+                return bool(allow_in if bool(is_live_eff) else allow_pre)
 
             # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
             def _is_live_eff(d: dict, *, ts: Optional[datetime] = None) -> bool:
@@ -5149,6 +5191,19 @@ async def main() -> int:
                     if not isinstance(ts, datetime):
                         continue
                     is_live_eff = _is_live_eff(d0, ts=ts)
+                    if not _regime_allowed(bool(is_live_eff)):
+                        continue
+                    h = d0.get("hypothesis_details") or {}
+                    slip_pre = (
+                        _safe_float(_get_path(h, ["value_sizing", "slippage_pre_pct"]))
+                        or _safe_float(_get_path(h, ["finance", "value_sizing", "slippage_pre_pct"]))
+                        or _safe_float(_get_path(h, ["slippage_pre_pct"]))
+                    )
+                    pre_submit_ms = (
+                        _safe_float(_get_path(h, ["value_sizing", "pre_submit_ms"]))
+                        or _safe_float(_get_path(h, ["finance", "value_sizing", "pre_submit_ms"]))
+                        or _safe_float(_get_path(h, ["pre_submit_ms"]))
+                    )
                     ws0 = _safe_float(d0.get("ws_odd"))
                     if ws0 is None or ws0 <= 0:
                         continue
@@ -5170,6 +5225,18 @@ async def main() -> int:
                     diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
                     if diff is None:
                         continue
+                    # Cenário opcional Back Pre Fast/Slippage:
+                    # - aplica apenas em eventos Pre
+                    # - slippage por `slippage_pre_pct` (quando disponível) ou proxy `diff_pct`
+                    if not bool(is_live_eff):
+                        if wf_backpre_slip_max is not None:
+                            slip_ref = (slip_pre if wf_backpre_slip_field == "slippage_pre_pct" else _safe_float(diff))
+                            if slip_ref is None or float(slip_ref) > float(wf_backpre_slip_max):
+                                continue
+                        if wf_backpre_fast_max_lag_ms is not None:
+                            lag_ms = _safe_float(d0.get("lag_total_ms"))
+                            if lag_ms is None or float(lag_ms) > float(wf_backpre_fast_max_lag_ms):
+                                continue
                     # filtro de qualidade (mesmo range do BS confiável)
                     if not (-10.0 <= float(diff) <= 10.0):
                         continue
@@ -5208,6 +5275,8 @@ async def main() -> int:
                             "entry_odd": float(entry),
                             "entry_source": src,
                             "diff_pct": float(diff),
+                            "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+                            "pre_submit_ms": (float(pre_submit_ms) if pre_submit_ms is not None else None),
                         }
                     )
 
@@ -6768,6 +6837,11 @@ async def main() -> int:
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
+                                "sides": str(getattr(args, "wf_sides", "both") or "both"),
+                                "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
+                                "backpre_slip_max": _safe_float(getattr(args, "wf_backpre_slip_max", None)),
+                                "backpre_slip_field": str(getattr(args, "wf_backpre_slip_field", "diff_pct") or "diff_pct"),
+                                "backpre_fast_max_lag_ms": _safe_float(getattr(args, "wf_backpre_fast_max_lag_ms", None)),
                                 "key_by_league": bool(getattr(args, "wf_key_by_league", False)),
                                 "key_by_league_scope": str(getattr(args, "wf_key_by_league_scope", "pre") or "pre"),
                                 "liquidity_mode": str(getattr(args, "wf_liquidity_mode", "none") or "none"),
@@ -6882,7 +6956,10 @@ async def main() -> int:
                                 f"- **Filtros OOS**: AH_max_abs_line=`{_fmt_num(getattr(args,'wf_ah_max_abs_line',0.0),2)}`, "
                                 f"AH_scope=`{getattr(args,'wf_ah_scope','all')}`; "
                                 f"exclude_exec_buckets_back=`{getattr(args,'wf_exclude_exec_buckets_back','')}`; "
-                                f"exclude_exec_buckets_lay=`{getattr(args,'wf_exclude_exec_buckets_lay','')}`\n",
+                                f"exclude_exec_buckets_lay=`{getattr(args,'wf_exclude_exec_buckets_lay','')}`; "
+                                f"backpre_slip_max=`{_fmt_num(getattr(args,'wf_backpre_slip_max',None),2)}` "
+                                f"(field=`{getattr(args,'wf_backpre_slip_field','diff_pct')}`); "
+                                f"backpre_fast_max_lag_ms=`{_fmt_num(getattr(args,'wf_backpre_fast_max_lag_ms',None),0)}`\n",
                                 f"- **Sizing**: pre=`{getattr(args,'wf_scheme_pre','')}`, in=`{getattr(args,'wf_scheme_in','')}`, "
                                 f"flat_back=`{_fmt_num(getattr(args,'wf_flat_stake_back',1.0),2)}`, flat_lay=`{_fmt_num(getattr(args,'wf_flat_liab_lay',1.0),2)}`; "
                                 f"kelly_bankroll=`{_fmt_num(getattr(args,'kelly_bankroll',None),2)}`\n",

@@ -2966,6 +2966,9 @@ class DailyReportCfg:
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
+    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "").strip()
+    wf_backpre_slip_field: str = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct").strip()
+    wf_backpre_fast_max_lag_ms: str = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", "").strip()
     # Sizing no WF (útil para simular in-match governado por budget/caps, sem trocar policy do robô)
     wf_scheme_pre: str = os.getenv("DAILY_WF_SCHEME_PRE", "").strip()
     wf_scheme_in: str = os.getenv("DAILY_WF_SCHEME_IN", "").strip()
@@ -3005,6 +3008,9 @@ class DailyReportCfg:
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
+        self.wf_backpre_slip_max = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.wf_backpre_slip_max).strip()
+        self.wf_backpre_slip_field = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.wf_backpre_slip_field).strip()
+        self.wf_backpre_fast_max_lag_ms = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", self.wf_backpre_fast_max_lag_ms).strip()
         self.wf_scheme_pre = os.getenv("DAILY_WF_SCHEME_PRE", self.wf_scheme_pre).strip()
         self.wf_scheme_in = os.getenv("DAILY_WF_SCHEME_IN", self.wf_scheme_in).strip()
         self.wf_flat_stake_back = os.getenv("DAILY_WF_FLAT_STAKE_BACK", self.wf_flat_stake_back).strip()
@@ -3210,6 +3216,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             wf_regimes = "pre" if _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1")) else "both"
         if wf_regimes:
             args += ["--wf-regimes", wf_regimes]
+    except Exception:
+        pass
+    try:
+        if str(cfg.wf_backpre_slip_max).strip():
+            args += ["--wf-backpre-slip-max", str(cfg.wf_backpre_slip_max).strip()]
+        if str(cfg.wf_backpre_slip_field).strip():
+            args += ["--wf-backpre-slip-field", str(cfg.wf_backpre_slip_field).strip()]
+        if str(cfg.wf_backpre_fast_max_lag_ms).strip():
+            args += ["--wf-backpre-fast-max-lag-ms", str(cfg.wf_backpre_fast_max_lag_ms).strip()]
     except Exception:
         pass
 
@@ -5820,6 +5835,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "DAILY_WF_STEP_DAYS",
         "DAILY_WF_SIDES",
         "DAILY_WF_REGIMES",
+        "DAILY_WF_BACKPRE_SLIP_MAX",
+        "DAILY_WF_BACKPRE_SLIP_FIELD",
+        "DAILY_WF_BACKPRE_FAST_MAX_LAG_MS",
         "DAILY_WF_KEY_BY_LEAGUE",
         "DAILY_WF_KEY_BY_LEAGUE_SCOPE",
         "DAILY_WF_AH_MAX_ABS_LINE",
