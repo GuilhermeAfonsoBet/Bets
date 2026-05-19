@@ -877,6 +877,13 @@ async def main() -> int:
         "Use 'lay' para evitar que a carteira OOS selecione Back quando a operação ainda é Lay-only. Default: both.",
     )
     parser.add_argument(
+        "--wf-regimes",
+        choices=["both", "pre", "in"],
+        default=os.getenv("WF_REGIMES", "both").strip() or "both",
+        help="Restringe o universo do walk-forward por regime temporal. "
+        "Use 'pre' para cenários Back Pre puros, sem mistura com In. Default: both.",
+    )
+    parser.add_argument(
         "--wf-liquidity-mode",
         choices=["none", "gate_p50", "gate_p75", "gate_min"],
         default=os.getenv("WF_LIQUIDITY_MODE", "none").strip() or "none",
@@ -5127,6 +5134,14 @@ async def main() -> int:
                 wf_sides = "both"
             allow_back = wf_sides in ("both", "back")
             allow_lay = wf_sides in ("both", "lay")
+            wf_regimes = str(getattr(args, "wf_regimes", "both") or "both").strip().lower()
+            if wf_regimes not in ("both", "pre", "in"):
+                wf_regimes = "both"
+            allow_pre = wf_regimes in ("both", "pre")
+            allow_in = wf_regimes in ("both", "in")
+
+            def _regime_allowed(is_live_eff: bool) -> bool:
+                return bool(allow_in if bool(is_live_eff) else allow_pre)
 
             # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
             def _is_live_eff(d: dict, *, ts: Optional[datetime] = None) -> bool:
@@ -5160,6 +5175,8 @@ async def main() -> int:
                     if not isinstance(ts, datetime):
                         continue
                     is_live_eff = _is_live_eff(d0, ts=ts)
+                    if not _regime_allowed(bool(is_live_eff)):
+                        continue
                     ws0 = _safe_float(d0.get("ws_odd"))
                     if ws0 is None or ws0 <= 0:
                         continue
@@ -5257,6 +5274,8 @@ async def main() -> int:
                     if float(diff) > float(lay_cut):
                         continue
                     is_live_eff = _is_live_eff(d0, ts=ts)
+                    if not _regime_allowed(bool(is_live_eff)):
+                        continue
                     combo_events.append(
                         {
                             "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
@@ -6779,6 +6798,8 @@ async def main() -> int:
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
+                                "sides": str(getattr(args, "wf_sides", "both") or "both"),
+                                "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
                                 "key_by_league": bool(getattr(args, "wf_key_by_league", False)),
                                 "key_by_league_scope": str(getattr(args, "wf_key_by_league_scope", "pre") or "pre"),
                                 "liquidity_mode": str(getattr(args, "wf_liquidity_mode", "none") or "none"),
@@ -6889,7 +6910,8 @@ async def main() -> int:
                                 f"start_utc=`{start_lbl}`, end_utc=`{end_lbl}`\n",
                                 f"- **WF**: train_mode=`{wf_train_mode}`, train_days=`{wf_train}`, test_days=`{wf_test}`, step_days=`{wf_step}`; "
                                 f"min_matches=`{wf_min_m}`; key_by_league=`{bool(getattr(args,'wf_key_by_league',False))}` "
-                                f"(scope=`{getattr(args,'wf_key_by_league_scope','pre')}`)\n",
+                                f"(scope=`{getattr(args,'wf_key_by_league_scope','pre')}`); "
+                                f"sides=`{getattr(args,'wf_sides','both')}`; regimes=`{getattr(args,'wf_regimes','both')}`\n",
                                 f"- **Filtros OOS**: AH_max_abs_line=`{_fmt_num(getattr(args,'wf_ah_max_abs_line',0.0),2)}`, "
                                 f"AH_scope=`{getattr(args,'wf_ah_scope','all')}`; "
                                 f"exclude_exec_buckets_back=`{getattr(args,'wf_exclude_exec_buckets_back','')}`; "
