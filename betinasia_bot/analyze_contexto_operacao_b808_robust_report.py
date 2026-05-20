@@ -562,6 +562,11 @@ def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optio
     return roi_ws, roi_bs
 
 
+def _is_match_finished_status(status: Any) -> bool:
+    s = str(status or "").strip().lower()
+    return s in {"finished", "ended", "closed", "settled", "full_time", "fulltime", "ft"}
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hypothesis-type", default="H3B", help="Hypothesis type da auditoria (default: H3B)")
@@ -650,6 +655,13 @@ async def main() -> int:
         help="Mensagem do commit (opcional). Se omitida, usa uma mensagem padrão.",
     )
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
+    parser.add_argument(
+        "--roi-require-finished",
+        type=int,
+        default=int(os.getenv("ROI_REQUIRE_FINISHED", "1")),
+        help="Se 1 (default), só calcula ROI quando match_status indica jogo finalizado. "
+        "Use 0 para permitir ROI em jogos não-finalizados (não recomendado).",
+    )
     # Sizing / oportunidade (Kelly + capacidade)
     parser.add_argument(
         "--kelly-fractions",
@@ -1236,14 +1248,19 @@ async def main() -> int:
                 d["lag_overhead_ms"] = None
 
             # ROI
-            roi_ws, roi_bs = compute_roi_pct(
-                line=str(d["line"]),
-                side=str(d["side"]),
-                ws_odd=_safe_float(d["ws_odd"]),
-                bs_odd=_safe_float(d["bs_odd"]),
-                hs=d["home_score"],
-                aws=d["away_score"],
-            )
+            roi_require_finished = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished = _is_match_finished_status(d.get("match_status"))
+            if roi_require_finished and (not is_finished):
+                roi_ws, roi_bs = None, None
+            else:
+                roi_ws, roi_bs = compute_roi_pct(
+                    line=str(d["line"]),
+                    side=str(d["side"]),
+                    ws_odd=_safe_float(d["ws_odd"]),
+                    bs_odd=_safe_float(d["bs_odd"]),
+                    hs=d["home_score"],
+                    aws=d["away_score"],
+                )
             d["roi_ws"] = roi_ws
             d["roi_bs"] = roi_bs
 
@@ -3538,7 +3555,13 @@ async def main() -> int:
             if ws0 is not None and float(ws0) > 0 and entry_odd is not None and float(entry_odd) > 0:
                 diff_entry = (float(entry_odd) - float(ws0)) / float(ws0) * 100.0
             # ROI por ponto (se houver placar)
-            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi_require_finished_local = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished_local = _is_match_finished_status(d.get("match_status"))
+            mult = (
+                _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if (not roi_require_finished_local or is_finished_local)
+                else None
+            )
             roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
             roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
@@ -3597,7 +3620,13 @@ async def main() -> int:
                         p_end = p_end0
             except Exception:
                 p_end = plast
-            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi_require_finished_local = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished_local = _is_match_finished_status(d.get("match_status"))
+            mult = (
+                _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if (not roi_require_finished_local or is_finished_local)
+                else None
+            )
             roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
             roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
@@ -5281,14 +5310,16 @@ async def main() -> int:
                     if float(diff) < float(back_cut):
                         continue
                     # ROI no ponto de entrada (stake=1)
-                    _, roi_entry = compute_roi_pct(
-                        line=str(d0.get("line", "")),
-                        side=str(d0.get("side", "")),
-                        ws_odd=None,
-                        bs_odd=float(entry),
-                        hs=d0.get("home_score"),
-                        aws=d0.get("away_score"),
-                    )
+                    roi_entry = None
+                    if (not bool(int(getattr(args, "roi_require_finished", 1)))) or _is_match_finished_status(d0.get("match_status")):
+                        _, roi_entry = compute_roi_pct(
+                            line=str(d0.get("line", "")),
+                            side=str(d0.get("side", "")),
+                            ws_odd=None,
+                            bs_odd=float(entry),
+                            hs=d0.get("home_score"),
+                            aws=d0.get("away_score"),
+                        )
                     # CLV pre-match
                     clv_entry = None
                     if not is_live_eff:
@@ -6914,6 +6945,7 @@ async def main() -> int:
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
                                 "pre_activation_mode": str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv"),
                                 "roi_min_activate": float(getattr(args, "wf_roi_min_activate", 0.0) or 0.0),
+                                "roi_require_finished": bool(int(getattr(args, "roi_require_finished", 1))),
                                 "sides": str(getattr(args, "wf_sides", "both") or "both"),
                                 "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
                                 "backpre_slip_max": _safe_float(getattr(args, "wf_backpre_slip_max", None)),

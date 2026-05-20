@@ -143,6 +143,7 @@ Guardrail de compatibilidade (recomendado):
 - `DAILY_WF_REGIMES=pre`
 - `DAILY_WF_PRE_ACTIVATION_MODE=roi_clv` (padrão) ou `roi_only` (sem gate de CLV no pre-match)
 - `DAILY_WF_ROI_MIN_ACTIVATE=0` (padrão). Ex.: `2` para exigir `ROI > 2%` na ativação.
+- `ROI_REQUIRE_FINISHED=1` e `OOS_ADHERENCE_ROI_REQUIRE_FINISHED=1` para calcular ROI/placar apenas com `match_status=finished` (evita superestimação por jogos não liquidados).
 - (opcional, cenário Back Pre Fast/Slippage) `DAILY_WF_BACKPRE_SLIP_MAX=0`, `DAILY_WF_BACKPRE_SLIP_FIELD=diff_pct`, `DAILY_WF_BACKPRE_FAST_MAX_LAG_MS=5000`
 
 Com isso, se o bridge estiver em `PREMATCH_ONLY=1` e a policy candidata não tiver chaves `Back_Pre_*`/`Lay_Pre_*` compatíveis com o lado operacional, o daily **não publica** a nova policy no `wf_policy_current.json` (mantém a anterior e registra o motivo no relatório).
