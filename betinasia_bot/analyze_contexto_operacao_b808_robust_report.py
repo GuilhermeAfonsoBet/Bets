@@ -880,7 +880,7 @@ async def main() -> int:
         "--wf-roi-min-activate",
         type=float,
         default=float(os.getenv("WF_ROI_MIN_ACTIVATE", "0")),
-        help="ROI mínimo (%) para ativar combinações no WF (default 0). "
+        help="ROI mínimo (%%) para ativar combinações no WF (default 0). "
         "Ex.: 2 para exigir ROI>2%% em vez de ROI>0.",
     )
     parser.add_argument(
