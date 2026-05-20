@@ -857,6 +857,14 @@ async def main() -> int:
         help="Mínimo de jogos por combinação para ser elegível (default 20). Use 0 para desabilitar o mínimo.",
     )
     parser.add_argument(
+        "--wf-pre-activation-mode",
+        choices=["roi_clv", "roi_only"],
+        default=os.getenv("WF_PRE_ACTIVATION_MODE", "roi_clv").strip() or "roi_clv",
+        help="Regra de ativação para combinações pre-match no WF: "
+        "'roi_clv' mantém o gate atual (ROI + CLV quando ROI não-significativo); "
+        "'roi_only' ativa apenas por ROI (sem gate de CLV). Default: roi_clv.",
+    )
+    parser.add_argument(
         "--wf-key-by-league",
         action="store_true",
         default=(os.getenv("WF_KEY_BY_LEAGUE", "0").strip() in ("1", "true", "True", "yes", "YES")),
@@ -4969,6 +4977,10 @@ async def main() -> int:
             "os lucros/prejuízos por linha não são somáveis. Para não sobrepor: use `--wf-step-days` igual a `--wf-test-days`.\n\n"
             "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
         )
+        lines.append(
+            f"- **Pre activation mode**: `{str(getattr(args,'wf_pre_activation_mode','roi_clv') or 'roi_clv')}` "
+            "(`roi_clv` = ROI+CLV no pre; `roi_only` = somente ROI no pre).\n\n"
+        )
 
         if not bool(getattr(args, "walkforward", False)):
             lines.append(
@@ -4984,6 +4996,9 @@ async def main() -> int:
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
             if wf_train_mode not in ("rolling", "expanding"):
                 wf_train_mode = "rolling"
+            wf_pre_activation_mode = str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv").strip().lower()
+            if wf_pre_activation_mode not in ("roi_clv", "roi_only"):
+                wf_pre_activation_mode = "roi_clv"
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
             wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
@@ -6066,15 +6081,20 @@ async def main() -> int:
                             elif roi_sig_pos:
                                 ok_sel = True
                                 reason = "BackPre: ROI sig>0"
-                            elif roi_pos and ((not clv_avail) or clv_pos):
-                                ok_sel = True
-                                reason = "BackPre: ROI>0 (NS) AND (CLV ausente OU CLV>0)"
                             else:
-                                ok_sel = False
-                                reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                if wf_pre_activation_mode == "roi_only":
+                                    ok_sel = bool(roi_pos)
+                                    reason = f"BackPre[ROI_ONLY]: ROI>0={roi_pos}"
+                                elif roi_pos and ((not clv_avail) or clv_pos):
+                                    ok_sel = True
+                                    reason = "BackPre: ROI>0 (NS) AND (CLV ausente OU CLV>0)"
+                                else:
+                                    ok_sel = False
+                                    reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos} (CLV ausente={not clv_avail})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6130,15 +6150,20 @@ async def main() -> int:
                             elif roi_sig_pos:
                                 ok_sel = True
                                 reason = "LayPre: ROI sig>0"
-                            elif roi_pos and ((not clv_avail) or clv_pos):
-                                ok_sel = True
-                                reason = "LayPre: ROI>0 (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
                             else:
-                                ok_sel = False
-                                reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                if wf_pre_activation_mode == "roi_only":
+                                    ok_sel = bool(roi_pos)
+                                    reason = f"LayPre[ROI_ONLY]: ROI>0={roi_pos}"
+                                elif roi_pos and ((not clv_avail) or clv_pos):
+                                    ok_sel = True
+                                    reason = "LayPre: ROI>0 (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
+                                else:
+                                    ok_sel = False
+                                    reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6850,6 +6875,7 @@ async def main() -> int:
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
+                                "pre_activation_mode": str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv"),
                                 "sides": str(getattr(args, "wf_sides", "both") or "both"),
                                 "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
                                 "backpre_slip_max": _safe_float(getattr(args, "wf_backpre_slip_max", None)),

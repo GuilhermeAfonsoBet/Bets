@@ -3499,6 +3499,7 @@ class DailyReportCfg:
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
     wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
     wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
+    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_clv").strip()
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
@@ -3551,6 +3552,7 @@ class DailyReportCfg:
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
+        self.wf_pre_activation_mode = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", self.wf_pre_activation_mode).strip()
         self.wf_backpre_slip_max = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.wf_backpre_slip_max).strip()
         self.wf_backpre_slip_field = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.wf_backpre_slip_field).strip()
         self.wf_backpre_fast_max_lag_ms = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", self.wf_backpre_fast_max_lag_ms).strip()
@@ -3759,6 +3761,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             args += ["--wf-liquidity-scope", str(cfg.wf_liquidity_scope).strip()]
     if str(cfg.wf_min_matches).strip():
         args += ["--wf-min-matches", str(cfg.wf_min_matches).strip()]
+    if str(cfg.wf_pre_activation_mode).strip():
+        args += ["--wf-pre-activation-mode", str(cfg.wf_pre_activation_mode).strip()]
     if bool(cfg.wf_shrinkage):
         args += ["--wf-shrinkage"]
     if str(cfg.wf_exclude_exec_buckets_back).strip():
