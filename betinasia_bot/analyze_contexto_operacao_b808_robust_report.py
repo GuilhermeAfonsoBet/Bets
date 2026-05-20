@@ -865,6 +865,13 @@ async def main() -> int:
         "'roi_only' ativa apenas por ROI (sem gate de CLV). Default: roi_clv.",
     )
     parser.add_argument(
+        "--wf-roi-min-activate",
+        type=float,
+        default=float(os.getenv("WF_ROI_MIN_ACTIVATE", "0")),
+        help="ROI mínimo (%) para ativar combinações no WF (default 0). "
+        "Ex.: 2 para exigir ROI>2%% em vez de ROI>0.",
+    )
+    parser.add_argument(
         "--wf-key-by-league",
         action="store_true",
         default=(os.getenv("WF_KEY_BY_LEAGUE", "0").strip() in ("1", "true", "True", "yes", "YES")),
@@ -4981,6 +4988,9 @@ async def main() -> int:
             f"- **Pre activation mode**: `{str(getattr(args,'wf_pre_activation_mode','roi_clv') or 'roi_clv')}` "
             "(`roi_clv` = ROI+CLV no pre; `roi_only` = somente ROI no pre).\n\n"
         )
+        lines.append(
+            f"- **ROI mínimo de ativação**: `ROI > {float(getattr(args,'wf_roi_min_activate',0.0) or 0.0):.2f}%`.\n\n"
+        )
 
         if not bool(getattr(args, "walkforward", False)):
             lines.append(
@@ -4999,6 +5009,7 @@ async def main() -> int:
             wf_pre_activation_mode = str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv").strip().lower()
             if wf_pre_activation_mode not in ("roi_clv", "roi_only"):
                 wf_pre_activation_mode = "roi_clv"
+            wf_roi_min_activate = float(_safe_float(getattr(args, "wf_roi_min_activate", 0.0)) or 0.0)
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
             wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
@@ -6062,7 +6073,7 @@ async def main() -> int:
                             roi_sh = _safe_float((shrink_map or {}).get(str(k)))
                             if roi_sh is not None:
                                 roi_mean_eff = float(roi_sh)
-                        roi_pos = bool(roi_mean_eff is not None and float(roi_mean_eff) > 0)
+                        roi_above_min = bool(roi_mean_eff is not None and float(roi_mean_eff) > float(wf_roi_min_activate))
                         roi_sig_pos = _ci_sig_pos(roi_ci)
                         roi_sig_neg = _ci_sig_neg(roi_ci)
                         eligible = bool(len(bym_roi) >= wf_min_m)
@@ -6079,22 +6090,30 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "BackPre: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "BackPre: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"BackPre: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"BackPre: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
                                 if wf_pre_activation_mode == "roi_only":
-                                    ok_sel = bool(roi_pos)
-                                    reason = f"BackPre[ROI_ONLY]: ROI>0={roi_pos}"
-                                elif roi_pos and ((not clv_avail) or clv_pos):
+                                    ok_sel = bool(roi_above_min)
+                                    reason = f"BackPre[ROI_ONLY]: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                elif roi_above_min and ((not clv_avail) or clv_pos):
                                     ok_sel = True
-                                    reason = "BackPre: ROI>0 (NS) AND (CLV ausente OU CLV>0)"
+                                    reason = f"BackPre: ROI>{wf_roi_min_activate:.2f} (NS) AND (CLV ausente OU CLV>0)"
                                 else:
                                     ok_sel = False
-                                    reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    reason = (
+                                        f"BackPre: ROI>{wf_roi_min_activate:.2f}={roi_above_min}, "
+                                        f"CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    )
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6117,14 +6136,19 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "BackIn: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "BackIn: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"BackIn: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"BackIn: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = bool(roi_pos)
-                                reason = f"BackIn: ROI>0={roi_pos}"
+                                ok_sel = bool(roi_above_min)
+                                reason = f"BackIn: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
@@ -6148,22 +6172,30 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "LayPre: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "LayPre: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"LayPre: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"LayPre: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
                                 if wf_pre_activation_mode == "roi_only":
-                                    ok_sel = bool(roi_pos)
-                                    reason = f"LayPre[ROI_ONLY]: ROI>0={roi_pos}"
-                                elif roi_pos and ((not clv_avail) or clv_pos):
+                                    ok_sel = bool(roi_above_min)
+                                    reason = f"LayPre[ROI_ONLY]: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                elif roi_above_min and ((not clv_avail) or clv_pos):
                                     ok_sel = True
-                                    reason = "LayPre: ROI>0 (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
+                                    reason = f"LayPre: ROI>{wf_roi_min_activate:.2f} (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
                                 else:
                                     ok_sel = False
-                                    reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    reason = (
+                                        f"LayPre: ROI>{wf_roi_min_activate:.2f}={roi_above_min}, "
+                                        f"CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    )
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
                                 "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6186,14 +6218,19 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "In: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "In: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"In: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"In: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = bool(roi_pos)
-                                reason = f"In: ROI>0={roi_pos}"
+                                ok_sel = bool(roi_above_min)
+                                reason = f"In: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
@@ -6876,6 +6913,7 @@ async def main() -> int:
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
                                 "pre_activation_mode": str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv"),
+                                "roi_min_activate": float(getattr(args, "wf_roi_min_activate", 0.0) or 0.0),
                                 "sides": str(getattr(args, "wf_sides", "both") or "both"),
                                 "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
                                 "backpre_slip_max": _safe_float(getattr(args, "wf_backpre_slip_max", None)),
