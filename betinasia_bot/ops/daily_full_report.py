@@ -166,13 +166,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return int(default)
-
-
 def _is_truthy(x: Any) -> bool:
     try:
         return str(x or "").strip().lower() in ("1", "true", "yes", "y", "on")
