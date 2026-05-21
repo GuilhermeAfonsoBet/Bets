@@ -662,13 +662,19 @@ def _order_tail_risk_by_bucket(rows: List[Dict[str, Any]], *, top_n: int = 6) ->
     return out
 
 
-def _safe_int(x: Any) -> Optional[int]:
+def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
+    """
+    Conversão resiliente para int.
+
+    - Sem default explícito: mantém retorno Optional[int] (None em falha).
+    - Com default explícito: retorna o fallback informado em falha/None.
+    """
     try:
         if x is None:
-            return None
+            return default
         return int(str(x).strip())
     except Exception:
-        return None
+        return default
 
 
 def _extract_order_id_from_raw(raw: Any) -> Optional[str]:
