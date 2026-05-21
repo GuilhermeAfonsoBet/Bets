@@ -102,16 +102,51 @@ Relatório diário completo (OOS + execução + accounting + PDF + Telegram):
 python3 -m ops.daily_full_report
 ```
 
+Relatório diário DT (segunda trilha, com recorte DT/down):
+
+```bash
+python3 -m ops.daily_dt_report
+```
+
+Governança de policy (H3B como fonte única):
+- `DAILY_WF_PUBLISH_CURRENT=1` no daily H3B (publica `logs/wf_policy_current.json`)
+- `DAILY_DT_WF_PUBLISH_CURRENT=0` no daily DT (não sobrescreve policy global)
+- Assim o DT usa a policy vigente para análise operacional, sem alterar a carteira ativa.
+
 Saídas importantes do daily:
 - `logs/daily_reports/YYYYMMDD/report_daily.pdf`: relatório completo (inclui seção 99)
+- `logs/daily_reports_dt/YYYYMMDD/report_daily.pdf`: relatório completo da trilha DT
 - `logs/wf_policy_current.json`: policy “corrente” (export do walk-forward, usado pelo bridge)
 - `logs/policy_history/wf_policy_YYYYMMDD.json`: histórico diário do export
 - `logs/daily_reports/YYYYMMDD/oos_adherence.json`: aderência (portfolio por dia × execução × ROI por placar)
+
+Agendamento diário DT (systemd):
+
+```bash
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-daily-dt-report.service')" /etc/systemd/system/
+sudo cp -v "$(git ls-files | grep -m1 'betinasia-daily-dt-report.timer')" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now betinasia-daily-dt-report.timer
+sudo systemctl status --no-pager -n 80 betinasia-daily-dt-report.service
+```
 
 ### Policy OOS ativa (mecânica de atualização)
 O `ops.daily_full_report` roda o walk-forward e faz:
 - export diário da policy (JSON) em `logs/policy_history/`
 - atualização **atômica** do “ponteiro” `logs/wf_policy_current.json`
+
+Guardrail de compatibilidade (recomendado):
+- `DAILY_WF_COMPAT_GUARD_ENABLE=1`
+- `DAILY_WF_COMPAT_FAIL_CLOSED=1`
+- `DAILY_WF_COMPAT_MIN_PRE_KEYS=1`
+- `DAILY_WF_SIDES=back`
+- `DAILY_WF_REGIMES=pre`
+- `DAILY_WF_PRE_ACTIVATION_MODE=roi_clv` (padrão) ou `roi_only` (sem gate de CLV no pre-match)
+- `DAILY_WF_ROI_MIN_ACTIVATE=0` (padrão). Ex.: `2` para exigir `ROI > 2%` na ativação.
+- `ROI_REQUIRE_FINISHED=1` e `OOS_ADHERENCE_ROI_REQUIRE_FINISHED=1` para calcular ROI/placar apenas com `match_status=finished` (evita superestimação por jogos não liquidados).
+- (opcional, cenário Back Pre Fast/Slippage) `DAILY_WF_BACKPRE_SLIP_MAX=0`, `DAILY_WF_BACKPRE_SLIP_FIELD=diff_pct`, `DAILY_WF_BACKPRE_FAST_MAX_LAG_MS=5000`
+
+Com isso, se o bridge estiver em `PREMATCH_ONLY=1` e a policy candidata não tiver chaves `Back_Pre_*`/`Lay_Pre_*` compatíveis com o lado operacional, o daily **não publica** a nova policy no `wf_policy_current.json` (mantém a anterior e registra o motivo no relatório).
 
 O bridge (`ops/executor_bridge_audit.py`) aplica essa policy quando você setar:
 - `BRIDGE_POLICY_JSON=logs/wf_policy_current.json`
@@ -171,9 +206,20 @@ SELECT
 ## 2) Monitor automático (timer)
 
 O monitor executa a cada ~2 minutos e envia alerta no Telegram quando houver WARN/FAIL.
+Além disso, o monitor atual valida:
+- `executor /health` (ready/workers)
+- estagnação de `betslip_audit_results` no DB (opcional, com limiar)
+- fluxo audit -> bridge (`eligible`, `seen`, `accepted`) para detectar travamento funcional
+- composição de motivos do bridge (ex.: `not_active`, `wf_ah_max_abs_line`) para distinguir bloqueio de política vs. falha técnica
+- degradação de latência do executor:
+  - por threshold absoluto (p50/p90 de `call_to_done_ms`, `post_ms`, `queue_delay_ms`)
+  - por degradação relativa (`call_to_done_ms` recente vs baseline histórico no tail do JSONL)
+  - com modo de **amostra baixa** (alerta WARN mesmo com poucos `LIVE_OK/DRY_OK` quando latência já está alta)
 
 > Nota: o `ops.health_monitor` usa **exit codes** (0=PASS, 1=WARN, 2=FAIL).  
 > Nos units `betinasia-ops-monitor.service` e `betinasia-ops-autopilot.service` nós já incluímos `SuccessExitStatus=1 2` para o systemd **não** marcar o unit como "failed" em WARN/FAIL (o que é esperado e não significa que o timer quebrou).
+>  
+> Para evitar quebra por drift de argumentos entre unit e script, o monitor aceita `--telegram-source` e, por padrão, ignora argumentos desconhecidos (`OPS_MONITOR_STRICT_ARGS=0`).
 
 ### Instalar systemd unit + timer
 ```bash
@@ -191,12 +237,21 @@ systemctl list-timers --all | grep -i betinasia-ops-monitor || true
 
 ### Rodar manualmente
 ```bash
-PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --telegram
+PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --telegram --telegram-source manual
 ```
 
 Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
+- `OPS_MONITOR_STRICT_ARGS` (default `0`)
+- `OPS_EXECUTOR_HEALTH_*`
+- `OPS_EXECUTOR_LAT_*` (thresholds absolutos de latência)
+- `OPS_EXECUTOR_LAT_LOW_SAMPLE_*` (alerta de latência alta com poucos OKs)
+- `OPS_EXECUTOR_LAT_SINGLE_EVENT_*` (detecção de outlier extremo com 1-4 OKs)
+- `OPS_EXECUTOR_LAT_DEGRADE_*` (degradação relativa recente vs baseline)
+- `OPS_LATENCY_DEGRADE_REFRESH_*` (refresh controlado em degradação persistente de latência)
+- `OPS_AUDIT_DB_STALE_FAIL_*`
+- `OPS_BRIDGE_FLOW_*`, `OPS_BRIDGE_THROUGHPUT_*`
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.
@@ -220,6 +275,16 @@ O auto-pilot roda a cada ~2 minutos e:
 - **só reinicia** serviços quando houver **FAIL por 2 execuções seguidas** (default)
 - aplica **cooldown** e **rate limit** para evitar flapping
 
+> O Telegram é apenas **notificação**. O fluxo de reação (restart/pause) roda sem intervenção humana
+> quando `betinasia-ops-autopilot.timer` está ativo e os thresholds estão configurados.
+>
+> Em operação Back-only, configure `BRIDGE_LAY_SERVICE=0` no `.env` para não gerar FAIL por service
+> propositalmente inativo.
+>
+> Para reduzir ruído quando a policy bloqueia tudo (`bridge_accepted=0`), use:
+> - `OPS_EXECUTOR_IDLE_EXPECTED_WHEN_ZERO_ACCEPTED=1`
+> - `OPS_EXECUTOR_IDLE_WARN_ON_NO_NONHEARTBEAT=1` (ou `0` para não alertar WARN nesse caso)
+
 ### Instalar
 ```bash
 AUTO_SVC="$(git ls-files | grep -m1 'betinasia-ops-autopilot.service')"
@@ -237,6 +302,8 @@ systemctl list-timers --all | grep -i betinasia-ops-autopilot || true
 - `OPS_RESTART_COOLDOWN_SEC=1800`  (30min)
 - `OPS_MAX_RESTARTS_PER_HOUR=2`
 - `OPS_AUTOPILOT_STATE_FILE=logs/ops_autopilot_state.json`
+- `OPS_LATENCY_FAIL_PAUSE_BRIDGES=0/1` (opcional)
+- `OPS_BRIDGE_FLOW_FAIL_ON_ZERO=1` (recomendado para detectar bridge “up” mas sem consumo)
 
 ### Importante: sudo sem prompt (para o timer conseguir reiniciar)
 O restart usa `sudo systemctl restart ...`. Configure uma regra NOPASSWD (exemplo):

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run BetinAsia DT report daily 19:10 BRT (22:10 UTC)
+
+[Timer]
+OnCalendar=*-*-* 22:10:00 UTC
+Persistent=true
+RandomizedDelaySec=180
+Unit=betinasia-daily-dt-report.service
+
+[Install]
+WantedBy=timers.target
+

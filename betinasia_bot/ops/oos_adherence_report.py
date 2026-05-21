@@ -141,6 +141,11 @@ def _mult_back_from_scores(line: Any, side: str, hs: Any, aws: Any) -> Optional[
     return -1.0
 
 
+def _is_match_finished_status(status: Any) -> bool:
+    s = str(status or "").strip().lower()
+    return s in {"finished", "ended", "closed", "settled", "full_time", "fulltime", "ft"}
+
+
 def _roi_back_pct(odd: float, mult: float) -> float:
     if mult > 0:
         return (odd - 1.0) * mult * 100.0
@@ -872,6 +877,7 @@ async def run_report(
     include_today: bool,
     no_per_day: bool = False,
     slip_cf_start_day: Optional[str] = None,
+    roi_require_finished: bool = True,
     out_json: Optional[Path] = None,
 ) -> Dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
@@ -1091,6 +1097,8 @@ async def run_report(
             # Caso contrário, vira "what-if" e tende a ficar sistematicamente acima/abaixo do accounting.
             if not is_success:
                 continue
+            if bool(roi_require_finished) and (not _is_match_finished_status(a.get("match_status"))):
+                continue
             try:
                 _ah_track("cov_placar", line=str(a.get("line") or e.line or ""), regime=("In" if bool(e.is_live) else "Pre"))
             except Exception:
@@ -1240,6 +1248,7 @@ async def run_report(
             "tz": tz_name,
             "policy_json": str(policy_json),
             "executor_jsonl": str(executor_jsonl),
+            "roi_require_finished": bool(roi_require_finished),
             "range": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat(), "days": int(days), "include_today": bool(include_today)},
             "slippage_range": {
                 "start_day": slip_start_day.isoformat(),
@@ -1505,6 +1514,8 @@ async def run_report(
                 continue
             a = audit_map.get(int(e.audit_id)) if e.audit_id is not None else None
             if not a:
+                continue
+            if bool(roi_require_finished) and (not _is_match_finished_status(a.get("match_status"))):
                 continue
             try:
                 _ah_track("cov_placar", line=str(a.get("line") or e.line or ""), regime=("In" if bool(e.is_live) else "Pre"))
@@ -1907,6 +1918,7 @@ async def run_report(
         "tz": tz_name,
         "policy_json": str(policy_json),
         "executor_jsonl": str(executor_jsonl),
+        "roi_require_finished": bool(roi_require_finished),
         "range": {
             "start_day": start_day.isoformat(),
             "end_day": end_day.isoformat(),
@@ -1995,6 +2007,12 @@ def main() -> int:
     ap.add_argument("--include-today", action="store_true", default=(os.getenv("OOS_ADHERENCE_INCLUDE_TODAY", "1").strip() not in ("0", "false", "False", "no", "NO")))
     ap.add_argument("--no-per-day", action="store_true", default=(os.getenv("OOS_ADHERENCE_NO_PER_DAY", "0").strip() in ("1", "true", "True", "yes", "YES")))
     ap.add_argument(
+        "--roi-require-finished",
+        type=int,
+        default=int(os.getenv("OOS_ADHERENCE_ROI_REQUIRE_FINISHED", "1")),
+        help="Se 1 (default), calcula ROI/placar apenas para matches finalizados (match_status=finished/closed/etc).",
+    )
+    ap.add_argument(
         "--slippage-cf-start-day",
         default=os.getenv("OOS_ADHERENCE_SLIP_CF_START_DAY", "").strip() or None,
         help="(opcional) Restringe o contrafactual de slippage (placar) para execuções a partir deste dia local (YYYY-MM-DD).",
@@ -2020,6 +2038,7 @@ def main() -> int:
             include_today=bool(args.include_today),
             no_per_day=bool(args.no_per_day),
             slip_cf_start_day=str(args.slippage_cf_start_day).strip() if args.slippage_cf_start_day else None,
+            roi_require_finished=bool(int(getattr(args, "roi_require_finished", 1))),
             out_json=outp,
         )
     )

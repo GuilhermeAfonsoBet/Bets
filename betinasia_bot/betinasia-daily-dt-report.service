@@ -1,0 +1,25 @@
+[Unit]
+Description=BetinAsia Daily DT Report (OOS + execution + accounting + PDF + Telegram)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PYTHONUNBUFFERED=1"
+Environment="DISPLAY=:99"
+Environment="DAILY_DT_OOS_HYPOTHESIS_TYPE=DT"
+Environment="DAILY_DT_OOS_DIRECTION=down"
+Environment="DAILY_DT_OOS_VERSIONS=v5.3-ws-gate-back"
+Environment="DAILY_DT_REPORT_OUT_DIR=logs/daily_reports_dt"
+Environment="DAILY_DT_WF_PUBLISH_CURRENT=0"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs/daily_reports_dt
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python -m ops.daily_dt_report; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec /home/betbot/Bets/venv/bin/python -m ops.daily_dt_report; else exec /usr/bin/python3 -m ops.daily_dt_report; fi'
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/daily_dt_report.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/daily_dt_report_error.log
+
