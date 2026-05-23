@@ -127,6 +127,9 @@ Para reduzir risco de “accepted=0” por lock/dedupe antigo:
 - `BRIDGE_SINGLETON_KILL_COMPETITORS=1`  
   No startup, encerra processos concorrentes do mesmo modo/lado encontrados em `/proc`
   (self-healing para órfãos após deploy/restart).
+- `BRIDGE_SINGLETON_ASSUME_UNKNOWN_MODE_COMPETITOR=1` e `...SIDE...=1`  
+  Quando um processo órfão não tem `BRIDGE_MODE/BRIDGE_EXEC_SIDE` no ambiente
+  (run manual), ele também é tratado como concorrente e encerrado.
 - `BRIDGE_SEEN_KEY_GC_SEC` + `BRIDGE_SEEN_KEY_TTL_SEC`  
   Limpam reservas órfãs (sem `execution_id`) antigas.
 - `BRIDGE_SEEN_KEY_HARD_TTL_SEC`  

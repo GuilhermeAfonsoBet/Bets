@@ -91,9 +91,29 @@ def _same_bridge_process(pid: int, *, mode: str, exec_side: ExecSide) -> bool:
         return False
     p_side = (_proc_env_value(pid, "BRIDGE_EXEC_SIDE") or "").strip().lower()
     p_mode = (_proc_env_value(pid, "BRIDGE_MODE") or "").strip().lower()
-    if not p_side or not p_mode:
-        return False
-    return (p_side == str(exec_side.value).strip().lower()) and (p_mode == str(mode).strip().lower())
+    own_side = str(exec_side.value).strip().lower()
+    own_mode = str(mode).strip().lower()
+
+    # Alguns órfãos podem ter subido manualmente sem EnvironmentFile (sem BRIDGE_* no /proc/environ).
+    # Para não manter o lock "zumbi", tratamos valores ausentes como compatíveis por default.
+    assume_unknown_mode = str(os.getenv("BRIDGE_SINGLETON_ASSUME_UNKNOWN_MODE_COMPETITOR", "1") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    assume_unknown_side = str(os.getenv("BRIDGE_SINGLETON_ASSUME_UNKNOWN_SIDE_COMPETITOR", "1") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+
+    mode_ok = (p_mode == own_mode) if p_mode else bool(assume_unknown_mode)
+    side_ok = (p_side == own_side) if p_side else bool(assume_unknown_side)
+    return bool(mode_ok and side_ok)
 
 
 def _kill_competing_bridge_processes(*, mode: str, exec_side: ExecSide) -> None:
