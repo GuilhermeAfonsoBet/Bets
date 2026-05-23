@@ -222,6 +222,12 @@ PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --tele
 Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
+- `OPS_PIPELINE_MIN_BEST_ODDS_FOR_ZERO_AUDIT` (default 1000)
+- `OPS_PIPELINE_ZERO_AUDIT_FAIL` (default 1)
+
+Essas duas últimas ajudam a detectar “travamento funcional” do audit/bridge:
+se o collector segue produzindo (`best_odds_n` alto) mas `audits_n=0` na janela do monitor,
+o health_monitor sobe WARN/FAIL e envia Telegram.
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.

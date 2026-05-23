@@ -443,6 +443,24 @@ async def run_checks(
 
     results.append(CheckResult("PASS", f"DB: h3b_temporal_reversal_events (n={h3b_n} desde {since_minutes}m)"))
 
+    # Guardrail de pipeline: se collector segue produzindo volume, mas auditoria zera,
+    # tratamos como possível travamento funcional do audit/bridge (mesmo com serviço "ativo").
+    try:
+        min_best_for_zero_audit = _safe_int(os.getenv("OPS_PIPELINE_MIN_BEST_ODDS_FOR_ZERO_AUDIT", "1000"), 1000)
+        zero_audit_fail = _is_truthy(os.getenv("OPS_PIPELINE_ZERO_AUDIT_FAIL", "1"))
+        if int(best_n) >= int(max(1, min_best_for_zero_audit)) and int(audits_n) == 0:
+            lvl = "FAIL" if bool(zero_audit_fail) else "WARN"
+            results.append(
+                CheckResult(
+                    lvl,
+                    f"pipeline: collector ativo sem auditoria (best_odds_n={best_n}, audits_n={audits_n} em {since_minutes}m) "
+                    f"(possível travamento do audit/bridge)",
+                )
+            )
+            exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+    except Exception:
+        pass
+
     # 4) Audit API friction / possible block (Telegram alert)
     try:
         total_n = int(fr.get("total_n") or 0)
