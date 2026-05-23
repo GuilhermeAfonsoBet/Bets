@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import json
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -56,6 +57,84 @@ def _acquire_singleton_lock(path: str) -> Optional[Any]:
             pass
         logger.warning(f"[bridge] singleton lock unavailable path={path} err={str(e)[:180]}")
         return None
+
+
+def _proc_env_value(pid: int, key: str) -> Optional[str]:
+    try:
+        raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+        for item in raw.split(b"\x00"):
+            if not item or b"=" not in item:
+                continue
+            k, v = item.split(b"=", 1)
+            if k.decode("utf-8", errors="ignore") == key:
+                return v.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    return None
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        if not raw:
+            return ""
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def _same_bridge_process(pid: int, *, mode: str, exec_side: ExecSide) -> bool:
+    cmd = _proc_cmdline(pid)
+    if not cmd:
+        return False
+    if ("ops.executor_bridge_audit" not in cmd) and ("executor_bridge_audit.py" not in cmd):
+        return False
+    p_side = (_proc_env_value(pid, "BRIDGE_EXEC_SIDE") or "").strip().lower()
+    p_mode = (_proc_env_value(pid, "BRIDGE_MODE") or "").strip().lower()
+    if not p_side or not p_mode:
+        return False
+    return (p_side == str(exec_side.value).strip().lower()) and (p_mode == str(mode).strip().lower())
+
+
+def _kill_competing_bridge_processes(*, mode: str, exec_side: ExecSide) -> None:
+    if str(os.getenv("BRIDGE_SINGLETON_KILL_COMPETITORS", "1") or "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ):
+        return
+    me = int(os.getpid())
+    competitors: List[int] = []
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == me:
+                continue
+            if _same_bridge_process(pid, mode=str(mode), exec_side=exec_side):
+                competitors.append(pid)
+    except Exception:
+        competitors = []
+    if not competitors:
+        return
+
+    logger.warning(f"[bridge] found competing same-side bridge pids={competitors}; terminating")
+    for pid in competitors:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    time.sleep(0.6)
+    for pid in competitors:
+        try:
+            # se ainda existir, força kill
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _safe_float_money(x: Any) -> Optional[float]:
@@ -1125,6 +1204,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     if singleton_lock_fp is None:
         logger.error(f"[bridge] lock já em uso; não inicia segunda instância path={lock_path}")
         return 0
+
+    # Self-healing operacional: encerra instâncias órfãs concorrentes do mesmo modo/lado.
+    _kill_competing_bridge_processes(mode=cfg.mode, exec_side=cfg.exec_side)
 
     db = Database()
     await db.connect()

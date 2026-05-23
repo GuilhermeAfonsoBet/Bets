@@ -124,6 +124,9 @@ Para reduzir risco de “accepted=0” por lock/dedupe antigo:
 - `BRIDGE_SINGLETON_LOCK_PATH`  
   Garante **uma única instância** do `ops.executor_bridge_audit` por modo/lado no host.
   Evita concorrência acidental (service + processo órfão/manual).
+- `BRIDGE_SINGLETON_KILL_COMPETITORS=1`  
+  No startup, encerra processos concorrentes do mesmo modo/lado encontrados em `/proc`
+  (self-healing para órfãos após deploy/restart).
 - `BRIDGE_SEEN_KEY_GC_SEC` + `BRIDGE_SEEN_KEY_TTL_SEC`  
   Limpam reservas órfãs (sem `execution_id`) antigas.
 - `BRIDGE_SEEN_KEY_HARD_TTL_SEC`  
