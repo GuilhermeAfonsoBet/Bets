@@ -26,6 +26,23 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _git_head_short(repo_root: Path) -> Optional[str]:
+    try:
+        p = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=False,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            return None
+        out = (p.stdout or "").strip()
+        return out or None
+    except Exception:
+        return None
+
+
 def _load_env_file(path: Path) -> None:
     """
     Carrega variáveis de um arquivo .env simples (KEY=VALUE), sem sobrescrever env já definido.
@@ -2771,10 +2788,11 @@ class DailyReportCfg:
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
+    # Default operacional estável (evita OOS hiper-curto por omissão).
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
-    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
-    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "2")
-    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
+    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "14")
+    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "7")
+    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "7")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
     # Estatística exploratória no OOS (deve ficar OFF no daily 19h)
@@ -5914,7 +5932,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 extra.append(add_txt)
     except Exception:
         pass
-    combined_core = "".join(s0) + "".join(s1) + insample_wrapped
+    repo_root = Path(__file__).resolve().parent.parent
+    git_head = _git_head_short(repo_root)
+    report_header = (
+        "# Daily Report BetinAsia\n\n"
+        f"- Dia do relatório (UTC): `{day}`\n"
+        f"- Gerado em (UTC): `{ts.isoformat()}`\n"
+        f"- Código daily_full_report: `git:{git_head or 'unknown'}`\n"
+        f"- WF (cfg): mode=`{cfg.wf_train_mode}`, train_days=`{cfg.wf_train_days}`, test_days=`{cfg.wf_test_days}`, step_days=`{cfg.wf_step_days}`\n\n"
+    )
+    combined_core = report_header + "".join(s0) + "".join(s1) + insample_wrapped
     combined_md.write_text(combined_core + "".join(extra) + oos_annex, encoding="utf-8")
 
     # 5) PDF
