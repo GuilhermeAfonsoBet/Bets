@@ -1372,9 +1372,11 @@ class ExecutorWorker:
         # Novo modo (recomendado): Back Pre fast => HI, demais Back => LO
         # envs:
         # - EXECUTOR_BACKPRE_FAST_STAKE_ENABLE
+        # - EXECUTOR_BACKPRE_FAST_STAKE_ENFORCE (default=1; fail-safe contra stake vindo do bridge/policy)
         # - EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS
         # - EXECUTOR_BACKPRE_FAST_STAKE_HI / _LO
         sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
+        sizing_enforce = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENFORCE", "1")
         pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
         stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 12.0))
         stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
@@ -1494,24 +1496,28 @@ class ExecutorWorker:
                 }
             )
 
-            if sizing_enabled and req.exec_side == ExecSide.BACK:
+            apply_back_sizing = bool(req.exec_side == ExecSide.BACK) and bool(sizing_enabled or sizing_enforce)
+            if apply_back_sizing:
                 # regra solicitada:
                 # - pre & pre_submit_ms<=5s => 12
                 # - senão => 1.50
                 is_pre = not bool(market_is_live)
                 ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))
                 is_pre_fast = bool(is_pre and ok_time)
+                stake_prev = float(stake)
                 stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
                 vs.update(
                     {
                         "enabled": True,
                         "eligible": bool(is_pre_fast),
+                        "enforced": bool(sizing_enforce),
                         "rule": "stake_pre_fast_if(market=pre && pre_submit_ms<=max) else stake_back_default",
                         "params": {
                             "max_pre_submit_ms": float(pre_fast_max_ms),
                             "stake_pre_fast": float(stake_pre_fast),
                             "stake_back_default": float(stake_back_default),
                         },
+                        "stake_prev": float(stake_prev),
                         "stake_chosen": float(stake),
                     }
                 )
