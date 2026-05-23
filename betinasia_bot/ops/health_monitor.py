@@ -351,6 +351,8 @@ async def _db_audit_gate_back_stats(db: Database, since: datetime, *, audit_vers
           count(*) FILTER (WHERE upper(status)='GATE_NOT_ELIGIBLE')::bigint AS not_eligible_n,
           count(*) FILTER (WHERE upper(status) IN ('GATE_WS_MISSING','GATE_WS_POINT_MISSING','GATE_STALE'))::bigint AS ws_or_stale_n,
           count(*) FILTER (WHERE is_valid_opportunity=TRUE)::bigint AS valid_n,
+          count(*) FILTER (WHERE is_valid_opportunity=TRUE AND (is_live IS NULL OR is_live=FALSE))::bigint AS valid_pre_n,
+          count(*) FILTER (WHERE is_valid_opportunity=TRUE AND is_live=TRUE)::bigint AS valid_live_n,
           avg(NULLIF((hypothesis_details::jsonb->'telemetry'->>'gate_rise_ratio_obs'), '')::double precision) AS rise_ratio_obs_avg
         FROM betslip_audit_results
         WHERE audited_at >= :since
@@ -562,6 +564,8 @@ async def run_checks(
         gt = gate_stats if isinstance(gate_stats, dict) else {}
         g_total = int(gt.get("total_n") or 0)
         g_valid = int(gt.get("valid_n") or 0)
+        g_valid_pre = int(gt.get("valid_pre_n") or 0)
+        g_valid_live = int(gt.get("valid_live_n") or 0)
         g_ok = int(gt.get("ok_n") or 0)
         g_not = int(gt.get("not_eligible_n") or 0)
         g_ws = int(gt.get("ws_or_stale_n") or 0)
@@ -584,9 +588,32 @@ async def run_checks(
             results.append(
                 CheckResult(
                     "PASS",
-                    f"audit-gate-back: fluxo ok total={g_total} valid={g_valid} not_eligible={g_not} ws_or_stale={g_ws}",
+                    f"audit-gate-back: fluxo ok total={g_total} valid={g_valid} (pre={g_valid_pre}, live={g_valid_live}) not_eligible={g_not} ws_or_stale={g_ws}",
                 )
             )
+
+        # Alerta de desalinhamento operacional: bridge pre-only + valid apenas em LIVE.
+        bridge_prematch_only = _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1"))
+        misalign_min_total = _safe_int(os.getenv("OPS_PREMATCH_MISALIGN_MIN_AUDITS", "40"), 40)
+        misalign_level = str(os.getenv("OPS_PREMATCH_MISALIGN_LEVEL", "warn") or "warn").strip().lower()
+        if misalign_level not in ("off", "warn", "fail"):
+            misalign_level = "warn"
+        if (
+            bridge_prematch_only
+            and misalign_level != "off"
+            and g_total >= int(max(1, misalign_min_total))
+            and g_valid_live > 0
+            and g_valid_pre == 0
+        ):
+            level = "FAIL" if misalign_level == "fail" else "WARN"
+            results.append(
+                CheckResult(
+                    level,
+                    f"prematch-misalignment: bridge está PREMATCH_ONLY=1, mas valid_pre=0 e valid_live={g_valid_live} "
+                    f"(total_audits={g_total} em {since_minutes}m). Execução ficará zerada por desenho.",
+                )
+            )
+            exit_code = max(exit_code, 2 if level == "FAIL" else 1)
     except Exception:
         pass
 
