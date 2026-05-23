@@ -224,10 +224,17 @@ Variáveis úteis (no `.env`):
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
 - `OPS_PIPELINE_MIN_BEST_ODDS_FOR_ZERO_AUDIT` (default 1000)
 - `OPS_PIPELINE_ZERO_AUDIT_FAIL` (default 1)
+- `OPS_AUDIT_GATE_BACK_VERSION` (default `v5.3-ws-gate-back`)
+- `OPS_AUDIT_ZERO_VALID_MIN_AUDITS` (default 40)
+- `OPS_AUDIT_ZERO_VALID_LEVEL` (`off|warn|fail`, default `warn`)
 
 Essas duas últimas ajudam a detectar “travamento funcional” do audit/bridge:
 se o collector segue produzindo (`best_odds_n` alto) mas `audits_n=0` na janela do monitor,
 o health_monitor sobe WARN/FAIL e envia Telegram.
+
+As três variáveis `OPS_AUDIT_*` detectam um cenário diferente:
+auditoria rodando, porém sem elegibilidade (`valid=0`) por janela longa
+(ex.: só `GATE_NOT_ELIGIBLE`). Isso evita confundir “sem setup” com “travado”.
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.
