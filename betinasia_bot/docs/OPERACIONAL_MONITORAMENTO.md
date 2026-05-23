@@ -118,6 +118,25 @@ O bridge (`ops/executor_bridge_audit.py`) aplica essa policy quando você setar:
 - `BRIDGE_POLICY_RELOAD_SEC=5` (recarrega automaticamente quando o arquivo muda)
 - `BRIDGE_POLICY_USE_BASE=1` (opcional: ignora sufixo de liga, usa `active_keys_base`)
 
+### Anti-trava operacional do bridge (recomendado)
+Para reduzir risco de “accepted=0” por lock/dedupe antigo:
+
+- `BRIDGE_SINGLETON_LOCK_PATH`  
+  Garante **uma única instância** do `ops.executor_bridge_audit` por modo/lado no host.
+  Evita concorrência acidental (service + processo órfão/manual).
+- `BRIDGE_SEEN_KEY_GC_SEC` + `BRIDGE_SEEN_KEY_TTL_SEC`  
+  Limpam reservas órfãs (sem `execution_id`) antigas.
+- `BRIDGE_SEEN_KEY_HARD_TTL_SEC`  
+  Limpa chaves de dedupe muito antigas, evitando `dup_key` indefinido por histórico velho.
+
+Defaults operacionais sugeridos:
+
+```env
+BRIDGE_SEEN_KEY_GC_SEC=300
+BRIDGE_SEEN_KEY_TTL_SEC=3600
+BRIDGE_SEEN_KEY_HARD_TTL_SEC=86400
+```
+
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
 

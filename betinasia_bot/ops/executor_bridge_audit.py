@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import sys
@@ -21,6 +22,40 @@ sys.path.insert(0, ".")
 from storage.database import Database
 from executor.client import submit_execution
 from executor.contracts import ExecSide, ExecutionRequest, MarketType
+
+
+def _singleton_lock_path(mode: str, exec_side: ExecSide) -> str:
+    default = f"/tmp/betinasia-bridge-{str(mode).lower()}-{str(exec_side.value).lower()}.lock"
+    return str(os.getenv("BRIDGE_SINGLETON_LOCK_PATH", "").strip() or default)
+
+
+def _acquire_singleton_lock(path: str) -> Optional[Any]:
+    fp = None
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fp = p.open("a+", encoding="utf-8")
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fp.seek(0)
+        fp.truncate(0)
+        fp.write(f"pid={os.getpid()} ts_utc={datetime.now(timezone.utc).isoformat()}\n")
+        fp.flush()
+        return fp
+    except BlockingIOError:
+        try:
+            if fp is not None:
+                fp.close()
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        try:
+            if fp is not None:
+                fp.close()
+        except Exception:
+            pass
+        logger.warning(f"[bridge] singleton lock unavailable path={path} err={str(e)[:180]}")
+        return None
 
 
 def _safe_float_money(x: Any) -> Optional[float]:
@@ -1084,6 +1119,13 @@ async def _insert_position(
 
 
 async def run_bridge(cfg: BridgeConfig) -> int:
+    # Proteção operacional: evita duas instâncias concorrentes do mesmo bridge (ex.: serviço + processo órfão).
+    lock_path = _singleton_lock_path(cfg.mode, cfg.exec_side)
+    singleton_lock_fp = _acquire_singleton_lock(lock_path)
+    if singleton_lock_fp is None:
+        logger.error(f"[bridge] lock já em uso; não inicia segunda instância path={lock_path}")
+        return 0
+
     db = Database()
     await db.connect()
     await _ensure_seen_table(db)
@@ -1131,7 +1173,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         t0 = time.time()
         try:
 
-            # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
+            # GC periódico do dedupe operacional:
+            # 1) limpa reservas órfãs sem execution_id (falhas transitórias / crashes)
+            # 2) limpa chaves muito antigas (hard TTL) para evitar bloqueio indefinido por `dup_key`
             try:
                 gc_every = float(os.getenv("BRIDGE_SEEN_KEY_GC_SEC", "300") or 300.0)
             except Exception:
@@ -1141,18 +1185,47 @@ async def run_bridge(cfg: BridgeConfig) -> int:
             except Exception:
                 ttl_sec = 3600.0
             try:
-                if gc_every > 0 and ttl_sec > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
+                hard_ttl_sec = float(os.getenv("BRIDGE_SEEN_KEY_HARD_TTL_SEC", "86400") or 86400.0)
+            except Exception:
+                hard_ttl_sec = 86400.0
+            try:
+                if gc_every > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
                     seen_gc_last_check = time.time()
-                    qgc = """
+                    qgc_pending = """
                     DELETE FROM executor_bridge_seen_keys
                     WHERE src_table='betslip_audit_results'
                       AND action=:action
                       AND execution_id IS NULL
                       AND created_at < (now() - (:ttl_sec::double precision * interval '1 second'))
                     """
+                    qgc_hard = """
+                    DELETE FROM executor_bridge_seen_keys
+                    WHERE src_table='betslip_audit_results'
+                      AND action=:action
+                      AND created_at < (now() - (:hard_ttl_sec::double precision * interval '1 second'))
+                    """
                     async with db.async_session() as session:
-                        await session.execute(text(qgc), {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)})
+                        deleted_pending = 0
+                        deleted_hard = 0
+                        if ttl_sec > 0:
+                            r1 = await session.execute(
+                                text(qgc_pending),
+                                {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)},
+                            )
+                            deleted_pending = int(r1.rowcount or 0)
+                        if hard_ttl_sec > 0:
+                            r2 = await session.execute(
+                                text(qgc_hard),
+                                {"action": f"{cfg.mode}:{cfg.exec_side.value}", "hard_ttl_sec": float(hard_ttl_sec)},
+                            )
+                            deleted_hard = int(r2.rowcount or 0)
                         await session.commit()
+                    if deleted_pending > 0 or deleted_hard > 0:
+                        logger.info(
+                            f"[bridge] dedupe_gc action={cfg.mode}:{cfg.exec_side.value} "
+                            f"deleted_pending={deleted_pending} deleted_hard={deleted_hard} "
+                            f"ttl_sec={ttl_sec:.0f} hard_ttl_sec={hard_ttl_sec:.0f}"
+                        )
             except (InterfaceError, OperationalError, DBAPIError) as e:
                 if _is_db_disconnect_error(e):
                     await _db_reconnect(db, why="seen_key_gc_disconnect")
