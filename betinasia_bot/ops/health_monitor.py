@@ -594,6 +594,18 @@ async def run_checks(
 
         # Alerta de desalinhamento operacional: bridge pre-only + valid apenas em LIVE.
         bridge_prematch_only = _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1"))
+        bridge_prematch_fallback = _is_truthy(os.getenv("BRIDGE_PREMATCH_FALLBACK_ENABLE", "0"))
+        fb_window_min = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_WINDOW_MIN", "60"), 60)
+        fb_min_total = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_TOTAL_AUDITS", "40"), 40)
+        fb_min_live = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_LIVE_VALID", "1"), 1)
+        if bridge_prematch_only:
+            results.append(
+                CheckResult(
+                    "PASS",
+                    f"bridge-regime: PREMATCH_ONLY=1 fallback_live={int(bridge_prematch_fallback)} "
+                    f"(window={fb_window_min}m min_total={fb_min_total} min_live={fb_min_live})",
+                )
+            )
         misalign_min_total = _safe_int(os.getenv("OPS_PREMATCH_MISALIGN_MIN_AUDITS", "40"), 40)
         misalign_level = str(os.getenv("OPS_PREMATCH_MISALIGN_LEVEL", "warn") or "warn").strip().lower()
         if misalign_level not in ("off", "warn", "fail"):
@@ -606,11 +618,21 @@ async def run_checks(
             and g_valid_pre == 0
         ):
             level = "FAIL" if misalign_level == "fail" else "WARN"
+            if bridge_prematch_fallback:
+                msg = (
+                    f"prematch-misalignment: valid_pre=0 e valid_live={g_valid_live} com PREMATCH_ONLY=1 "
+                    f"(total_audits={g_total} em {since_minutes}m). Fallback LIVE está habilitado; "
+                    f"se execução seguir zerada, investigar filtros WF/limit/stake no bridge."
+                )
+            else:
+                msg = (
+                    f"prematch-misalignment: bridge está PREMATCH_ONLY=1, mas valid_pre=0 e valid_live={g_valid_live} "
+                    f"(total_audits={g_total} em {since_minutes}m). Execução ficará zerada por desenho."
+                )
             results.append(
                 CheckResult(
                     level,
-                    f"prematch-misalignment: bridge está PREMATCH_ONLY=1, mas valid_pre=0 e valid_live={g_valid_live} "
-                    f"(total_audits={g_total} em {since_minutes}m). Execução ficará zerada por desenho.",
+                    msg,
                 )
             )
             exit_code = max(exit_code, 2 if level == "FAIL" else 1)

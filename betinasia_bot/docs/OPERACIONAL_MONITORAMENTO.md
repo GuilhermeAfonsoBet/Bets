@@ -229,6 +229,10 @@ Variáveis úteis (no `.env`):
 - `OPS_AUDIT_ZERO_VALID_LEVEL` (`off|warn|fail`, default `warn`)
 - `OPS_PREMATCH_MISALIGN_MIN_AUDITS` (default 40)
 - `OPS_PREMATCH_MISALIGN_LEVEL` (`off|warn|fail`, default `warn`)
+- `BRIDGE_PREMATCH_FALLBACK_ENABLE` (default `0`)
+- `BRIDGE_PREMATCH_FALLBACK_WINDOW_MIN` (default `60`)
+- `BRIDGE_PREMATCH_FALLBACK_MIN_TOTAL_AUDITS` (default `40`)
+- `BRIDGE_PREMATCH_FALLBACK_MIN_LIVE_VALID` (default `1`)
 
 Essas duas últimas ajudam a detectar “travamento funcional” do audit/bridge:
 se o collector segue produzindo (`best_odds_n` alto) mas `audits_n=0` na janela do monitor,
@@ -241,6 +245,21 @@ auditoria rodando, porém sem elegibilidade (`valid=0`) por janela longa
 As variáveis `OPS_PREMATCH_*` detectam desalinhamento de regime:
 `BRIDGE_PREMATCH_ONLY=1` com `valid_live>0` e `valid_pre=0` na janela.
 Nesse caso a execução fica zerada por desenho (não é crash), e o monitor alerta.
+
+### Opções operacionais para PREMATCH_ONLY (A e B)
+
+Quando o bridge está em `BRIDGE_PREMATCH_ONLY=1`, há dois modos de operar:
+
+- **Opção A (estrita PRE, sem fallback)**  
+  - `BRIDGE_PREMATCH_ONLY=1`
+  - `BRIDGE_PREMATCH_FALLBACK_ENABLE=0`  
+  O monitor passa a imprimir o regime ativo (`bridge-regime`) e alerta desalinhamento quando houver `valid_live>0` e `valid_pre=0`.
+
+- **Opção B (fallback LIVE controlado)**  
+  - `BRIDGE_PREMATCH_ONLY=1`
+  - `BRIDGE_PREMATCH_FALLBACK_ENABLE=1`  
+  O bridge ativa LIVE automaticamente quando, na janela configurada, `valid_pre=0` e `valid_live` atingir o mínimo.  
+  Quando `valid_pre` volta, o fallback desliga sozinho e o bridge retorna ao comportamento PRE-only.
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.
