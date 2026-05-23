@@ -26,23 +26,6 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _git_head_short(repo_root: Path) -> Optional[str]:
-    try:
-        p = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            check=False,
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-        )
-        if p.returncode != 0:
-            return None
-        out = (p.stdout or "").strip()
-        return out or None
-    except Exception:
-        return None
-
-
 def _load_env_file(path: Path) -> None:
     """
     Carrega variáveis de um arquivo .env simples (KEY=VALUE), sem sobrescrever env já definido.
@@ -570,6 +553,14 @@ def _stake_bucket(stake: Any) -> str:
     return "other"
 
 
+def _in_range(x: Any, lo: float, hi: float) -> bool:
+    try:
+        v = float(x)
+        return float(lo) <= v <= float(hi)
+    except Exception:
+        return False
+
+
 def _slip_bucket_3(slip_pct: Any) -> str:
     s = _safe_float_or_none(slip_pct)
     if s is None:
@@ -846,6 +837,8 @@ def _append_backpre_fast_slow_sections(
     # Se vazio, usa tudo (comportamento antigo).
     thesis_start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
     stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0) or 12.0
+    thesis_hi_min = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MIN", "5.0") or 5.0) or 5.0
+    thesis_hi_max = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "14.0") or 14.0) or 14.0
 
     # rows com accounting (pnl) + stake (exposure)
     groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
@@ -911,9 +904,11 @@ def _append_backpre_fast_slow_sections(
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
             elif int(pre_submit_ms) <= int(thr_ms):
                 groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake=HI (pós-início)
-                if _approx_eq(exp, float(stake_hi), eps=0.02):
-                    groups_thesis[f"Back Pre fast (stake≈{_fmt_num(stake_hi,2)}; pre_submit_ms<= {thr_ms}ms)"].append(row)
+                # tese = fast + stake em faixa HI (pós-início)
+                if _in_range(exp, float(thesis_hi_min), float(thesis_hi_max)):
+                    groups_thesis[
+                        f"Back Pre fast (stake em [{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
+                    ].append(row)
             else:
                 groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
 
@@ -923,7 +918,10 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     # A) Performance da tese (stake=HI) com métricas “liquidadas”
     # -------------------------
-    out_lines.append("**Tese: Back Pre fast (pós-início; stake=HI) — performance (accounting; order_id)**\n\n")
+    out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
+    out_lines.append(
+        f"- Critério de elegibilidade HI (relatório): stake em `[{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]`.\n\n"
+    )
     if thesis_start_day:
         out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
@@ -955,6 +953,27 @@ def _append_backpre_fast_slow_sections(
     out_lines.append("\n")
     if open_order_ids is None:
         out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
+
+    # Performance auxiliar: fast com stake < limiar HI_min (impacto prático de latência/degradação)
+    low_rows: List[Dict[str, Any]] = []
+    fast_key = f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"
+    for r in (groups_all.get(fast_key) or []):
+        exp = _safe_float_or_none(r.get("exposure"))
+        if exp is not None and exp < float(thesis_hi_min):
+            low_rows.append(r)
+    out_lines.append("**Back Pre fast (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
+    out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
+    out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
+    settled_rows, open_rows = _split_settled(low_rows)
+    label_low = f"Back Pre fast (stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
+    if settled_rows is None or open_rows is None:
+        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
+    else:
+        summ_set = _summarize_rows_pnl_exp(settled_rows)
+        out_lines.append(
+            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+        )
+    out_lines.append("\n")
 
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
@@ -2788,11 +2807,10 @@ class DailyReportCfg:
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
-    # Default operacional estável (evita OOS hiper-curto por omissão).
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
-    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "14")
-    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "7")
-    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "7")
+    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
+    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "2")
+    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
     # Estatística exploratória no OOS (deve ficar OFF no daily 19h)
@@ -5932,14 +5950,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 extra.append(add_txt)
     except Exception:
         pass
-    repo_root = Path(__file__).resolve().parent.parent
-    git_head = _git_head_short(repo_root)
+    # Cabeçalho com o dia relativo ao report para facilitar leitura/auditoria entre dias.
     report_header = (
         "# Daily Report BetinAsia\n\n"
         f"- Dia do relatório (UTC): `{day}`\n"
-        f"- Gerado em (UTC): `{ts.isoformat()}`\n"
-        f"- Código daily_full_report: `git:{git_head or 'unknown'}`\n"
-        f"- WF (cfg): mode=`{cfg.wf_train_mode}`, train_days=`{cfg.wf_train_days}`, test_days=`{cfg.wf_test_days}`, step_days=`{cfg.wf_step_days}`\n\n"
+        f"- Gerado em (UTC): `{ts.isoformat()}`\n\n"
     )
     combined_core = report_header + "".join(s0) + "".join(s1) + insample_wrapped
     combined_md.write_text(combined_core + "".join(extra) + oos_annex, encoding="utf-8")
