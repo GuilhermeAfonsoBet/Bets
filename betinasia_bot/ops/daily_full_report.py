@@ -6,11 +6,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 import statistics
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -214,6 +215,10 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
           a.event_id,
           a.is_live,
           a.audited_at,
+          a.hypothesis_detected_at,
+          a.lag_detection_to_click_ms,
+          a.lag_click_to_betslip_ms,
+          a.audit_total_duration_ms,
           m.kickoff_time
         FROM betslip_audit_results a
         LEFT JOIN matches m ON m.external_id = a.event_id
@@ -444,6 +449,149 @@ def _summarize_event_pnls(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         out["stake_conc_max_share"] = (float(max(abs(x) for x in stakes)) / abs_st_sum) if abs_st_sum > 0 else None
     except Exception:
         out["stake_conc_max_share"] = None
+    return out
+
+
+def _event_tail_risk_metrics(ev_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Métricas simples de risco de cauda por jogo (event_id), usando P&L agregado por jogo.
+    Retorna:
+      - p5_pnl_per_game: percentil 5% do P&L por jogo
+      - cvar5_pnl_per_game: média dos piores 5% jogos (ES/CVaR proxy)
+      - worst_game_pnl: pior jogo
+    """
+    out: Dict[str, Any] = {
+        "games_n": 0,
+        "p5_pnl_per_game": None,
+        "cvar5_pnl_per_game": None,
+        "worst_game_pnl": None,
+    }
+    try:
+        pnls = [float(v.get("pnl_sum") or 0.0) for v in (ev_map or {}).values() if isinstance(v, dict)]
+    except Exception:
+        pnls = []
+    if not pnls:
+        return out
+    xs = sorted(pnls)
+    n = len(xs)
+    out["games_n"] = int(n)
+    try:
+        q_idx = int(max(0, min(n - 1, math.floor((n - 1) * 0.05))))
+        qv = float(xs[q_idx])
+        out["p5_pnl_per_game"] = qv
+        tail = [x for x in xs if x <= qv]
+        if not tail:
+            tail = [xs[0]]
+        out["cvar5_pnl_per_game"] = float(sum(tail) / float(len(tail)))
+        out["worst_game_pnl"] = float(xs[0])
+    except Exception:
+        pass
+    return out
+
+
+def _top_event_exposures(ev_map: Dict[str, Dict[str, Any]], *, top_n: int = 5) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    rows: List[Tuple[str, float, float, str]] = []
+    for ev_id, rec in (ev_map or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            st = float(rec.get("stake_est_sum") or 0.0)
+            pnl = float(rec.get("pnl_sum") or 0.0)
+        except Exception:
+            continue
+        ev_name = str(rec.get("event_name") or "").strip()
+        rows.append((str(ev_id), st, pnl, ev_name))
+    rows.sort(key=lambda x: abs(float(x[1])), reverse=True)
+    total_abs = float(sum(abs(float(x[1])) for x in rows)) if rows else 0.0
+    for ev_id, st, pnl, ev_name in rows[: max(1, int(top_n))]:
+        share = (abs(float(st)) / total_abs * 100.0) if total_abs > 0 else None
+        out.append(
+            {
+                "event_id": ev_id,
+                "event_name": ev_name,
+                "stake_est_sum": float(st),
+                "pnl_sum": float(pnl),
+                "share_pct": share,
+            }
+        )
+    return out
+
+
+def _order_tail_risk_by_bucket(rows: List[Dict[str, Any]], *, top_n: int = 6) -> Dict[str, Any]:
+    """
+    Risco de cauda por bucket operacional (lado×regime), usando ordens com accounting.
+    rows: itens com {side, regime, pnl, exposure}.
+    """
+    out: Dict[str, Any] = {"by_bucket": [], "top_event_exposure": []}
+    if not rows:
+        return out
+
+    by: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        side = str(r.get("side") or "NA")
+        regime = str(r.get("regime") or "NA")
+        key = f"{side}_{regime}"
+        by[key].append(r)
+
+    # métrica por bucket (ordens)
+    metrics: List[Dict[str, Any]] = []
+    for key, sub in by.items():
+        pnls: List[float] = []
+        exps: List[float] = []
+        for r in sub:
+            try:
+                pnl = float(r.get("pnl") or 0.0)
+                exp = float(r.get("exposure") or 0.0)
+            except Exception:
+                continue
+            pnls.append(pnl)
+            exps.append(exp)
+        if not pnls:
+            continue
+        xs = sorted(pnls)
+        n = len(xs)
+        q_idx = int(max(0, min(n - 1, math.floor((n - 1) * 0.05))))
+        qv = float(xs[q_idx])
+        tail = [x for x in xs if x <= qv] or [xs[0]]
+        cvar5 = float(sum(tail) / float(len(tail)))
+        worst = float(xs[0])
+        exp_sum = float(sum(exps)) if exps else 0.0
+        metrics.append(
+            {
+                "bucket": key,
+                "n_orders": int(n),
+                "exp_sum": exp_sum,
+                "p5": qv,
+                "cvar5": cvar5,
+                "worst": worst,
+            }
+        )
+    metrics.sort(key=lambda d: float(d.get("cvar5") or 0.0))
+    out["by_bucket"] = metrics
+
+    # top jogos por exposição, por bucket (proxy de concentração em score-state)
+    top_rows: List[Dict[str, Any]] = []
+    for key, sub in by.items():
+        ev_agg: Dict[str, Dict[str, Any]] = {}
+        for r in sub:
+            ev_id = str(r.get("event_id") or "").strip()
+            if not ev_id:
+                continue
+            try:
+                st = float(r.get("exposure") or 0.0)
+                pnl = float(r.get("pnl") or 0.0)
+            except Exception:
+                continue
+            blk = ev_agg.setdefault(ev_id, {"event_id": ev_id, "stake_est_sum": 0.0, "pnl_sum": 0.0, "event_name": str(r.get("event_name") or "")})
+            blk["stake_est_sum"] = float(blk.get("stake_est_sum") or 0.0) + float(st)
+            blk["pnl_sum"] = float(blk.get("pnl_sum") or 0.0) + float(pnl)
+        tops = _top_event_exposures(ev_agg, top_n=max(1, int(top_n)))
+        for t in tops:
+            top_rows.append({"bucket": key, **t})
+    out["top_event_exposure"] = top_rows
     return out
 
 
@@ -1030,30 +1178,42 @@ def _append_backpre_fast_slow_sections(
     out_lines.append("\n")
 
     # Robustez: delta fast-slow
+    out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
     try:
         fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
         slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
-        if len(fast) >= min_n and len(slow) >= min_n:
+        fast_roi = [float(r.get("roi")) for r in fast if r.get("roi") is not None]
+        slow_roi = [float(r.get("roi")) for r in slow if r.get("roi") is not None]
+        out_lines.append(f"- Amostra líquida: fast=`{len(fast_roi)}` | slow=`{len(slow_roi)}` | min_n=`{min_n}`.\n")
+        if len(fast_roi) >= min_n and len(slow_roi) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
             rnd = random.Random(123)
             deltas: List[float] = []
-            nf = len(fast)
-            ns = len(slow)
+            nf = len(fast_roi)
+            ns = len(slow_roi)
             for _ in range(int(max(300, n_boot))):
                 mf = 0.0
                 ms = 0.0
                 for _j in range(nf):
-                    mf += float(fast[rnd.randrange(0, nf)].get("roi"))
+                    mf += float(fast_roi[rnd.randrange(0, nf)])
                 for _j in range(ns):
-                    ms += float(slow[rnd.randrange(0, ns)].get("roi"))
+                    ms += float(slow_roi[rnd.randrange(0, ns)])
                 deltas.append((mf / float(nf)) - (ms / float(ns)))
             deltas.sort()
-            lo = deltas[int(round(0.05 * (len(deltas) - 1)))]
-            hi = deltas[int(round(0.95 * (len(deltas) - 1)))]
-            out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
-            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo)} .. {_fmt_pct(hi)}` (min_n={min_n}).\n\n")
-    except Exception:
-        pass
+            lo90 = deltas[int(round(0.05 * (len(deltas) - 1)))]
+            hi90 = deltas[int(round(0.95 * (len(deltas) - 1)))]
+            lo95 = deltas[int(round(0.025 * (len(deltas) - 1)))]
+            hi95 = deltas[int(round(0.975 * (len(deltas) - 1)))]
+            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo90)} .. {_fmt_pct(hi90)}`.\n")
+            out_lines.append(f"- Delta (fast − slow) IC95 bootstrap: `{_fmt_pct(lo95)} .. {_fmt_pct(hi95)}`.\n\n")
+        else:
+            out_lines.append(
+                f"- _N insuficiente para inferência bootstrap (fast={len(fast_roi)}, slow={len(slow_roi)}, min_n={min_n})._\n\n"
+            )
+    except Exception as e:
+        out_lines.append(
+            f"- _Erro ao montar seção fast vs slow: `{type(e).__name__}: {str(e)[:180]}`._\n\n"
+        )
 
 
 def _acct_amount_by_order_day_from_balance_csv(
@@ -2495,6 +2655,297 @@ def _filter_executor_jsonl_lines_window(lines: list[str], *, since_utc: datetime
     return out
 
 
+def _executor_post_accept_failures_24h(lines_24h: list[str]) -> Dict[str, Any]:
+    """
+    Diagnóstico pós-accepted no executor (janela 24h, a partir do JSONL):
+    - accepted: `result.status in {LIVE_OK, API_FAILED, NO_SESSION, RATE_LIMIT, CAP_BLOCKED}`
+      (i.e., requisições que passaram da etapa de enfileiramento e geraram resultado de execução)
+    - separa por fase:
+      - precheck_fail: erro antes do place_order (sinalizado por LIVE_PRECHECK_FAILED)
+      - place_fail: erro no place_order (LIVE_PLACE_FAILED)
+    """
+    out: Dict[str, Any] = {
+        "accepted_n": 0,
+        "live_ok_n": 0,
+        "accepted_fail_n": 0,
+        "precheck_fail_n": 0,
+        "place_fail_n": 0,
+        "api_failed_n": 0,
+        "no_session_n": 0,
+        "rate_limit_n": 0,
+        "cap_blocked_n": 0,
+        "no_pmms_n": 0,
+        "ctx_destroyed_n": 0,
+        "auth_401_n": 0,
+        "ws_stale_n": 0,
+        "precheck_pmm_wait_ms_p50": None,
+        "precheck_pmm_wait_ms_p90": None,
+        "precheck_ws_age_ms_p50": None,
+        "precheck_ws_age_ms_p90": None,
+        "top_errors": [],
+    }
+    try:
+        accepted_status = {"LIVE_OK", "API_FAILED", "NO_SESSION", "RATE_LIMIT", "CAP_BLOCKED"}
+        err_counts: Dict[str, int] = defaultdict(int)
+        pmm_wait_vals: list[float] = []
+        ws_age_vals: list[float] = []
+
+        for ln in lines_24h or []:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+            if not isinstance(res, dict):
+                continue
+            st = str(res.get("status") or "").upper().strip()
+            if st == "HEARTBEAT" or st not in accepted_status:
+                continue
+
+            out["accepted_n"] = int(out["accepted_n"]) + 1
+            if st == "LIVE_OK":
+                out["live_ok_n"] = int(out["live_ok_n"]) + 1
+                continue
+
+            out["accepted_fail_n"] = int(out["accepted_fail_n"]) + 1
+            if st == "API_FAILED":
+                out["api_failed_n"] = int(out["api_failed_n"]) + 1
+            elif st == "NO_SESSION":
+                out["no_session_n"] = int(out["no_session_n"]) + 1
+            elif st == "RATE_LIMIT":
+                out["rate_limit_n"] = int(out["rate_limit_n"]) + 1
+            elif st == "CAP_BLOCKED":
+                out["cap_blocked_n"] = int(out["cap_blocked_n"]) + 1
+
+            err = str(res.get("error") or "").strip()
+            err_low = err.lower()
+            if err:
+                err_counts[err[:180]] += 1
+
+            raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+            if "live_precheck_failed" in err_low:
+                out["precheck_fail_n"] = int(out["precheck_fail_n"]) + 1
+                try:
+                    t = raw.get("timing_breakdown") if isinstance(raw.get("timing_breakdown"), dict) else {}
+                    pmmw = _safe_float(t.get("pmm_wait_ms"))
+                    if pmmw is not None:
+                        pmm_wait_vals.append(float(pmmw))
+                except Exception:
+                    pass
+                try:
+                    ws_age = _safe_float(raw.get("ws_age_ms"))
+                    if ws_age is not None:
+                        ws_age_vals.append(float(ws_age))
+                except Exception:
+                    pass
+            if "live_place_failed" in err_low:
+                out["place_fail_n"] = int(out["place_fail_n"]) + 1
+
+            if "no pmms received" in err_low:
+                out["no_pmms_n"] = int(out["no_pmms_n"]) + 1
+            if ("execution context was destroyed" in err_low) or ("target closed" in err_low):
+                out["ctx_destroyed_n"] = int(out["ctx_destroyed_n"]) + 1
+            if ("http_401" in err_low) or ("auth_error" in err_low) or ("no_root_session_cookie" in err_low):
+                out["auth_401_n"] = int(out["auth_401_n"]) + 1
+            if "ws_age_ms=" in err_low or "ws stale" in err_low:
+                out["ws_stale_n"] = int(out["ws_stale_n"]) + 1
+
+        # percentis simples (numpy-free)
+        def _pct(xs: list[float], p: float) -> Optional[float]:
+            if not xs:
+                return None
+            ys = sorted(float(x) for x in xs)
+            if len(ys) == 1:
+                return float(ys[0])
+            k = int(round((len(ys) - 1) * float(p)))
+            k = max(0, min(len(ys) - 1, k))
+            return float(ys[k])
+
+        out["precheck_pmm_wait_ms_p50"] = _pct(pmm_wait_vals, 0.50)
+        out["precheck_pmm_wait_ms_p90"] = _pct(pmm_wait_vals, 0.90)
+        out["precheck_ws_age_ms_p50"] = _pct(ws_age_vals, 0.50)
+        out["precheck_ws_age_ms_p90"] = _pct(ws_age_vals, 0.90)
+
+        tops = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        out["top_errors"] = [{"error": k, "n": int(v)} for k, v in tops]
+    except Exception:
+        return out
+    return out
+
+
+def _extract_audit_ids_from_exec_lines(lines: list[str]) -> list[int]:
+    out: set[int] = set()
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is not None and int(aid) > 0:
+            out.add(int(aid))
+    return sorted(out)
+
+
+def _ms_stats(xs: list[float]) -> Dict[str, Any]:
+    if not xs:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+    ys = sorted(float(x) for x in xs if x is not None)
+    if not ys:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+
+    def _q(p: float) -> Optional[float]:
+        if not ys:
+            return None
+        if len(ys) == 1:
+            return float(ys[0])
+        k = int(round((len(ys) - 1) * float(p)))
+        k = max(0, min(len(ys) - 1, k))
+        return float(ys[k])
+
+    return {
+        "n": int(len(ys)),
+        "p50": _q(0.50),
+        "p90": _q(0.90),
+        "p99": _q(0.99),
+        "mean": float(sum(ys) / float(len(ys))),
+    }
+
+
+def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Latência ponta a ponta em 24h:
+      WS detectado (hypothesis_detected_at) -> executor finished_at.
+
+    Breakdown principal:
+      1) detect_to_submit_ms   : detect -> request.created_at (bridge submit)
+      2) audit_total_ms        : detect -> fim do audit (quando disponível no DB)
+      3) bridge_wait_ms        : (detect->submit) - audit_total_ms
+      4) executor_submit_to_done_ms : submit -> finished_at (call_to_done efetivo)
+      5) e2e_total_ms          : detect -> finished_at
+    """
+    out: Dict[str, Any] = {
+        "n_jsonl_24h": int(len(lines_24h or [])),
+        "n_with_audit_id": 0,
+        "n_with_detected_at": 0,
+        "n_e2e_all": 0,
+        "n_e2e_success": 0,
+        "ok_statuses": ["LIVE_OK", "DRY_OK"],
+        "all": {},
+        "success": {},
+    }
+    metrics_all: Dict[str, list[float]] = defaultdict(list)
+    metrics_ok: Dict[str, list[float]] = defaultdict(list)
+    ok_status = {"LIVE_OK", "DRY_OK"}
+
+    for ln in lines_24h or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        if not isinstance(res, dict):
+            continue
+        st = str(res.get("status") or "").upper().strip()
+        if st == "HEARTBEAT":
+            continue
+
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is None or int(aid) <= 0:
+            continue
+        out["n_with_audit_id"] = int(out["n_with_audit_id"]) + 1
+
+        a = audit_by_id.get(int(aid)) if isinstance(audit_by_id, dict) else None
+        if not isinstance(a, dict):
+            continue
+
+        det = _parse_iso_dt_best(a.get("hypothesis_detected_at"))
+        if not isinstance(det, datetime):
+            continue
+        out["n_with_detected_at"] = int(out["n_with_detected_at"]) + 1
+
+        req_created = _parse_iso_dt_best(req.get("created_at") or res.get("created_at"))
+        fin = _parse_iso_dt_best(res.get("finished_at") or res.get("created_at"))
+        if not isinstance(req_created, datetime) or not isinstance(fin, datetime):
+            continue
+        if fin < det:
+            continue
+
+        detect_to_submit_ms = max(0.0, (req_created - det).total_seconds() * 1000.0)
+        submit_to_done_ms = _safe_float(
+            ((res.get("timing") or {}).get("call_to_done_ms"))
+            if isinstance(res.get("timing"), dict)
+            else None
+        )
+        if submit_to_done_ms is None:
+            submit_to_done_ms = max(0.0, (fin - req_created).total_seconds() * 1000.0)
+        e2e_total_ms = max(0.0, (fin - det).total_seconds() * 1000.0)
+
+        audit_total_ms = _safe_float(a.get("audit_total_duration_ms"))
+        audit_det_click_ms = _safe_float(a.get("lag_detection_to_click_ms"))
+        audit_click_bs_ms = _safe_float(a.get("lag_click_to_betslip_ms"))
+        bridge_wait_ms = (
+            max(0.0, float(detect_to_submit_ms) - float(audit_total_ms))
+            if audit_total_ms is not None
+            else None
+        )
+
+        t = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+        queue_delay_ms = _safe_float(t.get("queue_delay_ms")) if isinstance(t, dict) else None
+        post_ms = _safe_float(t.get("post_ms")) if isinstance(t, dict) else None
+        total_api_ms = _safe_float(t.get("total_ms")) if isinstance(t, dict) else None
+
+        vals = {
+            "e2e_total_ms": e2e_total_ms,
+            "detect_to_submit_ms": detect_to_submit_ms,
+            "audit_total_ms": audit_total_ms,
+            "audit_detect_to_click_ms": audit_det_click_ms,
+            "audit_click_to_betslip_ms": audit_click_bs_ms,
+            "bridge_wait_ms": bridge_wait_ms,
+            "executor_submit_to_done_ms": submit_to_done_ms,
+            "executor_queue_delay_ms": queue_delay_ms,
+            "executor_post_ms": post_ms,
+            "executor_total_api_ms": total_api_ms,
+        }
+        out["n_e2e_all"] = int(out["n_e2e_all"]) + 1
+        for k, v in vals.items():
+            if v is not None:
+                metrics_all[k].append(float(v))
+        if st in ok_status:
+            out["n_e2e_success"] = int(out["n_e2e_success"]) + 1
+            for k, v in vals.items():
+                if v is not None:
+                    metrics_ok[k].append(float(v))
+
+    keys = [
+        "e2e_total_ms",
+        "detect_to_submit_ms",
+        "audit_total_ms",
+        "audit_detect_to_click_ms",
+        "audit_click_to_betslip_ms",
+        "bridge_wait_ms",
+        "executor_submit_to_done_ms",
+        "executor_queue_delay_ms",
+        "executor_post_ms",
+        "executor_total_api_ms",
+    ]
+    out["all"] = {k: _ms_stats(metrics_all.get(k, [])) for k in keys}
+    out["success"] = {k: _ms_stats(metrics_ok.get(k, [])) for k in keys}
+    return out
+
+
 def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
@@ -2781,13 +3232,35 @@ def _fmt_status(ok: Optional[bool]) -> str:
     return "OK" if ok else "FAIL"
 
 
-def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
+def _telegram_send_document(
+    token: str,
+    chat_id: str,
+    *,
+    file_path: Path,
+    caption: str,
+) -> Tuple[bool, Optional[int], str]:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
-    with file_path.open("rb") as f:
-        files = {"document": (file_path.name, f, "application/pdf")}
-        data = {"chat_id": chat_id, "caption": caption[:900]}
-        r = requests.post(url, data=data, files=files, timeout=60)
-        return bool(r.ok)
+    try:
+        with file_path.open("rb") as f:
+            files = {"document": (file_path.name, f, "application/pdf")}
+            data = {"chat_id": chat_id, "caption": caption[:900]}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            if r.ok:
+                return True, int(r.status_code), ""
+            return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
+
+
+def _telegram_send_message(token: str, chat_id: str, text_msg: str) -> Tuple[bool, Optional[int], str]:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": str(text_msg)[:3900]}, timeout=30)
+        if r.ok:
+            return True, int(r.status_code), ""
+        return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
 
 
 @dataclass
@@ -2934,6 +3407,32 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         exec_lines_24h = []
     kpi_ok_24h = compute_kpis_from_lines(exec_lines_24h, path=str(cfg.executor_jsonl), only_status=["LIVE_OK", "DRY_OK"])
     (day_dir / "execution_kpis_ok_24h.json").write_text(json.dumps(kpi_ok_24h, ensure_ascii=False, indent=2), encoding="utf-8")
+    exec_post_24h = _executor_post_accept_failures_24h(exec_lines_24h)
+    (day_dir / "execution_post_accept_24h.json").write_text(
+        json.dumps(exec_post_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    exec_e2e_24h: Dict[str, Any] = {"error": None}
+    try:
+        audit_ids_24h = _extract_audit_ids_from_exec_lines(exec_lines_24h)
+        if audit_ids_24h:
+            from storage.database import Database  # local import para manter daily operável sem DB
+
+            db = Database()
+            await db.connect()
+            try:
+                audit_by_id_24h = await _fetch_audit_rows_for_ids_daily(db, audit_ids_24h)
+            finally:
+                await db.close()
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, audit_by_id_24h)
+            exec_e2e_24h["audit_ids_24h"] = int(len(audit_ids_24h))
+            exec_e2e_24h["audit_rows_found_24h"] = int(len(audit_by_id_24h))
+        else:
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, {})
+    except Exception as e:
+        exec_e2e_24h = {"error": str(e)[:240], "n_jsonl_24h": int(len(exec_lines_24h or []))}
+    (day_dir / "execution_latency_e2e_24h.json").write_text(
+        json.dumps(exec_e2e_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # atividade recente (ajuda a diagnosticar "hoje não teve aposta" sem depender do DB)
     exec_activity: Dict[str, Any] = {"last_live_ok_ts": None, "live_ok_1h": 0, "live_ok_6h": 0, "live_ok_24h": 0}
@@ -3441,6 +3940,86 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if int(exec_activity.get("live_ok_6h") or 0) == 0:
             s0.append("- Se isso persistir com auditoria OK no DB, suspeite de sessão/PMM/timeout ou bridge travado (ver checklist abaixo).\n")
         s0.append("\n")
+    except Exception:
+        pass
+
+    # diagnóstico explícito pós-accepted (executor): separa pré-place vs place
+    try:
+        pa = exec_post_24h if isinstance(exec_post_24h, dict) else {}
+        acc_n = int(pa.get("accepted_n") or 0)
+        if acc_n > 0:
+            ok_n = int(pa.get("live_ok_n") or 0)
+            fail_n = int(pa.get("accepted_fail_n") or 0)
+            s0.append("**Falhas pós-accepted (executor, 24h)**\n\n")
+            s0.append("| Métrica | Valor |\n|---|---:|\n")
+            s0.append(f"| accepted | {acc_n} |\n")
+            s0.append(f"| LIVE_OK | {ok_n} ({_fmt_num((100.0*ok_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| accepted sem LIVE_OK | {fail_n} ({_fmt_num((100.0*fail_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| precheck fail (`LIVE_PRECHECK_FAILED`) | {int(pa.get('precheck_fail_n') or 0)} |\n")
+            s0.append(f"| place fail (`LIVE_PLACE_FAILED`) | {int(pa.get('place_fail_n') or 0)} |\n")
+            s0.append(f"| API_FAILED | {int(pa.get('api_failed_n') or 0)} |\n")
+            s0.append(f"| NO_SESSION | {int(pa.get('no_session_n') or 0)} |\n")
+            s0.append(f"| RATE_LIMIT | {int(pa.get('rate_limit_n') or 0)} |\n")
+            s0.append(f"| CAP_BLOCKED | {int(pa.get('cap_blocked_n') or 0)} |\n")
+            s0.append(f"| No PMMs received | {int(pa.get('no_pmms_n') or 0)} |\n")
+            s0.append(f"| Execution context destroyed/target closed | {int(pa.get('ctx_destroyed_n') or 0)} |\n")
+            s0.append(f"| Auth 401 / NO_ROOT_SESSION_COOKIE | {int(pa.get('auth_401_n') or 0)} |\n")
+            s0.append(
+                f"| p50/p90 `pmm_wait_ms` (precheck fail) | {_fmt_num(pa.get('precheck_pmm_wait_ms_p50'),0)} / {_fmt_num(pa.get('precheck_pmm_wait_ms_p90'),0)} |\n"
+            )
+            s0.append(
+                f"| p50/p90 `ws_age_ms` (precheck fail) | {_fmt_num(pa.get('precheck_ws_age_ms_p50'),0)} / {_fmt_num(pa.get('precheck_ws_age_ms_p90'),0)} |\n"
+            )
+            s0.append("\n")
+            tops = pa.get("top_errors") if isinstance(pa.get("top_errors"), list) else []
+            if tops:
+                s0.append("- Top erros pós-accepted:\n")
+                for it in tops[:6]:
+                    if not isinstance(it, dict):
+                        continue
+                    err = str(it.get("error") or "").strip()
+                    n = int(it.get("n") or 0)
+                    if err:
+                        err = (err[:180] + "…") if len(err) > 180 else err
+                        s0.append(f"  - ×{n}: `{err}`\n")
+                s0.append("\n")
+    except Exception:
+        pass
+
+    # Latência ponta a ponta (WS detectado -> executor_done) já no bloco inicial.
+    try:
+        e2e = exec_e2e_24h if isinstance(exec_e2e_24h, dict) else {}
+        grp_ok = e2e.get("success") if isinstance(e2e.get("success"), dict) else {}
+        n_ok = int(e2e.get("n_e2e_success") or 0)
+        n_all = int(e2e.get("n_e2e_all") or 0)
+        n_aid = int(e2e.get("n_with_audit_id") or 0)
+        n_det = int(e2e.get("n_with_detected_at") or 0)
+        if n_all > 0:
+            s0.append("**Latência ponta a ponta (24h; WS → executor_done)**\n\n")
+            s0.append(
+                f"- Cobertura: `n_jsonl_24h={int(e2e.get('n_jsonl_24h') or 0)}`, "
+                f"`com_audit_id={n_aid}`, `com_hypothesis_detected_at={n_det}`, "
+                f"`e2e_all={n_all}`, `e2e_success={n_ok}`.\n"
+            )
+            s0.append("| Etapa | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|\n")
+            rows = [
+                ("e2e_total", "e2e_total_ms"),
+                ("detect_to_submit", "detect_to_submit_ms"),
+                ("audit_total", "audit_total_ms"),
+                ("audit_detect_to_click", "audit_detect_to_click_ms"),
+                ("audit_click_to_betslip", "audit_click_to_betslip_ms"),
+                ("bridge_wait", "bridge_wait_ms"),
+                ("executor_submit_to_done", "executor_submit_to_done_ms"),
+                ("executor_queue_delay", "executor_queue_delay_ms"),
+                ("executor_post", "executor_post_ms"),
+                ("executor_total_api", "executor_total_api_ms"),
+            ]
+            for label, key in rows:
+                a = grp_ok.get(key) if isinstance(grp_ok.get(key), dict) else {}
+                s0.append(
+                    f"| {label} | {_fmt_num(a.get('p50'),0)} | {_fmt_num(a.get('p90'),0)} | {_fmt_num(a.get('p99'),0)} | {_fmt_num(a.get('mean'),0)} |\n"
+                )
+            s0.append("\n")
     except Exception:
         pass
 
@@ -4380,7 +4959,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Slippage × ROI (accounting; por order_id): compara com "Slippage × ROI" via placar (subamostra coberta).
+        # Slippage × ROI (accounting; por order_id): janela móvel + acumulada (pós-início).
         try:
             if acct_pnl_by_oid_total and exec_by_oid_back:
                 rows_all: list[dict] = []
@@ -4389,19 +4968,38 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 rows_all_post: list[dict] = []
                 rows_pre_post: list[dict] = []
                 rows_in_post: list[dict] = []
+                rows_all_since_post: list[dict] = []
+                rows_pre_since_post: list[dict] = []
+                rows_in_since_post: list[dict] = []
                 post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
+                win_min = None
+                win_max = None
+                win_days = None
+                try:
+                    if days_utc_exec:
+                        d0 = sorted(list(days_utc_exec))
+                        if d0:
+                            win_min = d0[0]
+                            win_max = d0[-1]
+                            try:
+                                win_days = (datetime.fromisoformat(win_max).date() - datetime.fromisoformat(win_min).date()).days + 1
+                            except Exception:
+                                win_days = len(d0)
+                except Exception:
+                    win_min = None
+                    win_max = None
+                    win_days = None
                 for oid, em in (exec_by_oid_back or {}).items():
                     if not isinstance(em, dict):
                         continue
                     created = em.get("created_at")
                     if not isinstance(created, datetime):
                         continue
-                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
-                        continue
                     pnl = acct_pnl_by_oid_total.get(str(oid))
                     if pnl is None:
                         continue
                     row = {"pnl": float(pnl), "exposure": em.get("exposure"), "slip_raw_pct": em.get("slip_raw_pct")}
+                    created_day = str(created.date().isoformat())
                     rows_all.append(row)
                     # classifica Pre/In via audit quando possível
                     try:
@@ -4411,11 +5009,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     except Exception:
                         is_in = False
                     (rows_in if is_in else rows_pre).append(row)
+                    # janela móvel (days_utc_exec)
+                    if (not days_utc_exec) or (created_day in days_utc_exec):
+                        rows_all_post.append(row)
+                        (rows_in_post if is_in else rows_pre_post).append(row)
                     # corte pós-início (por created_at UTC)
                     try:
-                        if post_start and str(created.date().isoformat()) >= post_start:
-                            rows_all_post.append(row)
-                            (rows_in_post if is_in else rows_pre_post).append(row)
+                        if post_start and created_day >= post_start:
+                            rows_all_since_post.append(row)
+                            (rows_in_since_post if is_in else rows_pre_since_post).append(row)
                     except Exception:
                         pass
 
@@ -4432,13 +5034,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         )
                     s1.append("\n")
 
-                _render(rows_all, title="Slippage × ROI (accounting; order_id) — Back (janela Execução)")
-                _render(rows_pre, title="Slippage × ROI (accounting; order_id) — Back Pre (janela Execução)")
-                _render(rows_in, title="Slippage × ROI (accounting; order_id) — Back In (janela Execução)")
-                if rows_all_post:
-                    _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (pós-início >= {post_start})")
-                    _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (pós-início >= {post_start})")
-                    _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (pós-início >= {post_start})")
+                # Janela móvel explícita
+                win_lbl = f"{win_min}..{win_max}" if (win_min and win_max) else "janela móvel"
+                if win_days is not None and win_days > 0:
+                    win_lbl = f"{win_lbl} ({int(win_days)} dias)"
+                _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (janela móvel: {win_lbl})")
+                _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (janela móvel: {win_lbl})")
+                _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (janela móvel: {win_lbl})")
+
+                # Acumulado fixo desde post_start (independente da janela móvel)
+                if rows_all_since_post:
+                    _render(rows_all_since_post, title=f"Slippage × ROI (accounting; order_id) — Back (acumulado pós-início >= {post_start})")
+                    _render(rows_pre_since_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (acumulado pós-início >= {post_start})")
+                    _render(rows_in_since_post, title=f"Slippage × ROI (accounting; order_id) — Back In (acumulado pós-início >= {post_start})")
         except Exception:
             pass
 
@@ -4900,6 +5508,35 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         f"{_fmt_num(summ.get('stake_est_sum'),2)} | {_fmt_pct((float(summ.get('stake_conc_max_share'))*100.0) if summ.get('stake_conc_max_share') is not None else None,2)} |\n"
                     )
                 s1.append("\n")
+                s1.append("**Risco de cauda por jogo (event_id; accounting)**\n\n")
+                s1.append(
+                    "| Dia | #jogos | P5 P&L/jogo | CVaR5 P&L/jogo (média piores 5%) | Pior jogo |\n"
+                )
+                s1.append("|---|---:|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    tail = _event_tail_risk_metrics(ev_map)
+                    s1.append(
+                        f"| {dayk} | {int(tail.get('games_n') or 0)} | {_fmt_num(tail.get('p5_pnl_per_game'),2)} | {_fmt_num(tail.get('cvar5_pnl_per_game'),2)} | {_fmt_num(tail.get('worst_game_pnl'),2)} |\n"
+                    )
+                s1.append("\n")
+                s1.append("**Top jogos por exposição (proxy) — concentração operacional**\n\n")
+                s1.append("| Dia | event_id | event_name | Exposição proxy (∑-amount) | Share da exposição do dia | P&L por jogo |\n")
+                s1.append("|---|---|---|---:|---:|---:|\n")
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ev_map = by_day_event.get(dayk) if isinstance(by_day_event.get(dayk), dict) else {}
+                    tops = _top_event_exposures(ev_map, top_n=5)
+                    for t in tops:
+                        s1.append(
+                            f"| {dayk} | {t.get('event_id')} | {str(t.get('event_name') or '')[:48]} | {_fmt_num(t.get('stake_est_sum'),2)} | {_fmt_pct(t.get('share_pct'),2)} | {_fmt_num(t.get('pnl_sum'),2)} |\n"
+                        )
+                s1.append("\n")
             except Exception:
                 pass
 
@@ -4989,6 +5626,60 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"{_fmt_num(plp,2)} | {_fmt_pct(r_lp)} | {_fmt_num(pli,2)} | {_fmt_pct(r_li)} |\n"
                 )
             s1.append("\n")
+            # Risco de cauda por bucket operacional (ordens com accounting)
+            try:
+                recs: List[Dict[str, Any]] = []
+                for it in adh_day.get("per_day") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    dayk = str(it.get("day") or "")
+                    ex = it.get("execution") if isinstance(it.get("execution"), dict) else {}
+                    bt = ex.get("pnl_placar_by_type") if isinstance(ex.get("pnl_placar_by_type"), dict) else {}
+                    # usamos o bloco por tipo para construir uma proxy de ordens por bucket
+                    # (cada linha do bucket agrega ordens cobertas).
+                    for k, side, regime in (
+                        ("Back_Pre", "Back", "Pre"),
+                        ("Back_In", "Back", "In"),
+                        ("Lay_Pre", "Lay", "Pre"),
+                        ("Lay_In", "Lay", "In"),
+                    ):
+                        d = bt.get(k) if isinstance(bt.get(k), dict) else {}
+                        if not d:
+                            continue
+                        pnl = _safe_float(d.get("pnl"))
+                        exp = _safe_float(d.get("exposure"))
+                        n = _safe_int(d.get("n"))
+                        if pnl is None or exp is None or n is None or int(n) <= 0:
+                            continue
+                        # replica n registros sintéticos para permitir quantis/cauda por bucket;
+                        # cada item recebe média por ordem (aproximação operacional).
+                        pnlo = float(pnl) / float(max(1, int(n)))
+                        expo = float(exp) / float(max(1, int(n)))
+                        for _ in range(int(max(1, int(n)))):
+                            recs.append(
+                                {
+                                    "day": dayk,
+                                    "side": side,
+                                    "regime": regime,
+                                    "pnl": pnlo,
+                                    "exposure": expo,
+                                }
+                            )
+                tail_bucket = _order_tail_risk_by_bucket(recs, top_n=5)
+                byb = tail_bucket.get("by_bucket") if isinstance(tail_bucket.get("by_bucket"), list) else []
+                if byb:
+                    s1.append("**Risco de cauda por bucket operacional (proxy por ordem coberta)**\n\n")
+                    s1.append("| Bucket | n_ordens | Exposição (∑) | P5 P&L/ordem | CVaR5 P&L/ordem | Pior ordem |\n")
+                    s1.append("|---|---:|---:|---:|---:|---:|\n")
+                    for r in byb:
+                        if not isinstance(r, dict):
+                            continue
+                        s1.append(
+                            f"| {r.get('bucket')} | {int(r.get('n_orders') or 0)} | {_fmt_num(r.get('exp_sum'),2)} | {_fmt_num(r.get('p5'),2)} | {_fmt_num(r.get('cvar5'),2)} | {_fmt_num(r.get('worst'),2)} |\n"
+                        )
+                    s1.append("\n")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -5418,7 +6109,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(_timing_table("Latência (últimas 24h; somente LIVE_OK/DRY_OK) — ms", timing_ok24))
     except Exception:
         pass
-
     slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
     extra.append(
@@ -5968,6 +6658,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "ts": ts.isoformat(),
         "day_dir": str(day_dir),
         "pdf": str(pdf),
+        "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
     }
 
@@ -5976,10 +6667,48 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if token and chat_id and pdf.exists():
-            ok = _telegram_send_document(token, chat_id, file_path=pdf, caption=f"Relatório diário BetinAsia ({day})")
+            retries = max(1, int(float(os.getenv("DAILY_TELEGRAM_RETRIES", "2") or 2)))
+            retry_sleep_sec = max(0.0, float(os.getenv("DAILY_TELEGRAM_RETRY_SLEEP_SEC", "3.0") or 3.0))
+
+            ok = False
+            last_status: Optional[int] = None
+            last_err = ""
+            for i in range(retries):
+                ok, st, err = _telegram_send_document(
+                    token,
+                    chat_id,
+                    file_path=pdf,
+                    caption=f"Relatório diário BetinAsia ({day})",
+                )
+                last_status = st
+                last_err = err
+                if ok:
+                    break
+                if i < (retries - 1) and retry_sleep_sec > 0:
+                    time.sleep(retry_sleep_sec)
+
             out["telegram_sent"] = bool(ok)
+            out["telegram_attempts"] = int(retries)
+            out["telegram_http_status"] = int(last_status) if last_status is not None else None
+            out["telegram_error"] = str(last_err or "")[:500] if not ok else ""
+
+            if not ok:
+                logger.warning(
+                    "Daily report Telegram send failed: "
+                    f"status={last_status} err={str(last_err or '')[:220]} pdf={pdf} size_mb={out.get('pdf_size_mb')}"
+                )
+                # fallback: tenta ao menos avisar no chat que o envio do PDF falhou.
+                _telegram_send_message(
+                    token,
+                    chat_id,
+                    (
+                        f"[daily_full_report] Falha ao enviar PDF ({day}). "
+                        f"status={last_status or '-'} err={str(last_err or '')[:220]}"
+                    ),
+                )
         else:
             out["telegram_sent"] = False
+            out["telegram_error"] = "missing_token_or_chat_or_pdf"
 
     return out
 
