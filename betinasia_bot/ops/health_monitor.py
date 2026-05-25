@@ -337,6 +337,36 @@ async def _db_audit_friction(db: Database, since: datetime) -> Dict[str, Any]:
         return dict(row._mapping) if row else {}
 
 
+async def _db_audit_gate_back_stats(db: Database, since: datetime, *, audit_version: str) -> Dict[str, Any]:
+    """
+    Estatísticas operacionais do pipeline ws_gate_back para distinguir:
+    - travamento funcional (audits=0)
+    - auditoria ativa, porém sem elegibilidade (valid=0, geralmente GATE_NOT_ELIGIBLE)
+    """
+    q = text(
+        """
+        SELECT
+          count(*)::bigint AS total_n,
+          count(*) FILTER (WHERE upper(status)='OK')::bigint AS ok_n,
+          count(*) FILTER (WHERE upper(status)='GATE_NOT_ELIGIBLE')::bigint AS not_eligible_n,
+          count(*) FILTER (WHERE upper(status) IN ('GATE_WS_MISSING','GATE_WS_POINT_MISSING','GATE_STALE'))::bigint AS ws_or_stale_n,
+          count(*) FILTER (WHERE is_valid_opportunity=TRUE)::bigint AS valid_n,
+          count(*) FILTER (WHERE is_valid_opportunity=TRUE AND (is_live IS NULL OR is_live=FALSE))::bigint AS valid_pre_n,
+          count(*) FILTER (WHERE is_valid_opportunity=TRUE AND is_live=TRUE)::bigint AS valid_live_n,
+          avg(NULLIF((hypothesis_details::jsonb->'telemetry'->>'gate_rise_ratio_obs'), '')::double precision) AS rise_ratio_obs_avg
+        FROM betslip_audit_results
+        WHERE audited_at >= :since
+          AND hypothesis_type = 'H3B'
+          AND upper(market_type) = 'AH'
+          AND COALESCE(audit_version, '') = :audit_version
+        """
+    )
+    async with db.async_session() as session:
+        r = await session.execute(q, {"since": since, "audit_version": str(audit_version)})
+        row = r.fetchone()
+        return dict(row._mapping) if row else {}
+
+
 async def run_checks(
     *,
     since_minutes: int,
@@ -403,6 +433,7 @@ async def run_checks(
     _check_telemetry("audit-api", audit_telemetry)
 
     # 3) DB freshness
+    gate_stats: Dict[str, Any] = {}
     db = Database()
     await db.connect()
     try:
@@ -412,6 +443,8 @@ async def run_checks(
         fric_min = max(1, min(int(since_minutes), int(fric_min)))
         fric_since = now - timedelta(minutes=int(fric_min))
         fr = await _db_audit_friction(db, fric_since)
+        gate_ver = str(os.getenv("OPS_AUDIT_GATE_BACK_VERSION", "v5.3-ws-gate-back") or "v5.3-ws-gate-back").strip()
+        gate_stats = await _db_audit_gate_back_stats(db, since, audit_version=gate_ver)
     finally:
         await db.close()
 
@@ -442,6 +475,24 @@ async def run_checks(
         exit_code = max(exit_code, 1)
 
     results.append(CheckResult("PASS", f"DB: h3b_temporal_reversal_events (n={h3b_n} desde {since_minutes}m)"))
+
+    # Guardrail de pipeline: se collector segue produzindo volume, mas auditoria zera,
+    # tratamos como possível travamento funcional do audit/bridge (mesmo com serviço "ativo").
+    try:
+        min_best_for_zero_audit = _safe_int(os.getenv("OPS_PIPELINE_MIN_BEST_ODDS_FOR_ZERO_AUDIT", "1000"), 1000)
+        zero_audit_fail = _is_truthy(os.getenv("OPS_PIPELINE_ZERO_AUDIT_FAIL", "1"))
+        if int(best_n) >= int(max(1, min_best_for_zero_audit)) and int(audits_n) == 0:
+            lvl = "FAIL" if bool(zero_audit_fail) else "WARN"
+            results.append(
+                CheckResult(
+                    lvl,
+                    f"pipeline: collector ativo sem auditoria (best_odds_n={best_n}, audits_n={audits_n} em {since_minutes}m) "
+                    f"(possível travamento do audit/bridge)",
+                )
+            )
+            exit_code = max(exit_code, 2 if lvl == "FAIL" else 1)
+    except Exception:
+        pass
 
     # 4) Audit API friction / possible block (Telegram alert)
     try:
@@ -506,6 +557,86 @@ async def run_checks(
             )
     except Exception:
         # Nunca deixa o monitor quebrar por esse check
+        pass
+
+    # 4b) Audit gate-back sem elegibilidade por longo período (não é "travado", mas é importante alertar)
+    try:
+        gt = gate_stats if isinstance(gate_stats, dict) else {}
+        g_total = int(gt.get("total_n") or 0)
+        g_valid = int(gt.get("valid_n") or 0)
+        g_valid_pre = int(gt.get("valid_pre_n") or 0)
+        g_valid_live = int(gt.get("valid_live_n") or 0)
+        g_ok = int(gt.get("ok_n") or 0)
+        g_not = int(gt.get("not_eligible_n") or 0)
+        g_ws = int(gt.get("ws_or_stale_n") or 0)
+        g_ratio_avg = _safe_float(gt.get("rise_ratio_obs_avg"))
+        min_total = _safe_int(os.getenv("OPS_AUDIT_ZERO_VALID_MIN_AUDITS", "40"), 40)
+        lvl = str(os.getenv("OPS_AUDIT_ZERO_VALID_LEVEL", "warn") or "warn").strip().lower()
+        if lvl not in ("off", "warn", "fail"):
+            lvl = "warn"
+        if g_total >= int(max(1, min_total)) and g_valid == 0 and lvl != "off":
+            level = "FAIL" if lvl == "fail" else "WARN"
+            msg = (
+                f"audit-gate-back: sem oportunidades válidas na janela ({since_minutes}m) "
+                f"total={g_total} ok={g_ok} not_eligible={g_not} ws_or_stale={g_ws}"
+            )
+            if g_ratio_avg is not None:
+                msg += f" rise_ratio_obs_avg={g_ratio_avg:.4f}"
+            results.append(CheckResult(level, msg))
+            exit_code = max(exit_code, 2 if level == "FAIL" else 1)
+        elif g_total > 0:
+            results.append(
+                CheckResult(
+                    "PASS",
+                    f"audit-gate-back: fluxo ok total={g_total} valid={g_valid} (pre={g_valid_pre}, live={g_valid_live}) not_eligible={g_not} ws_or_stale={g_ws}",
+                )
+            )
+
+        # Alerta de desalinhamento operacional: bridge pre-only + valid apenas em LIVE.
+        bridge_prematch_only = _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1"))
+        bridge_prematch_fallback = _is_truthy(os.getenv("BRIDGE_PREMATCH_FALLBACK_ENABLE", "0"))
+        fb_window_min = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_WINDOW_MIN", "60"), 60)
+        fb_min_total = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_TOTAL_AUDITS", "40"), 40)
+        fb_min_live = _safe_int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_LIVE_VALID", "1"), 1)
+        if bridge_prematch_only:
+            results.append(
+                CheckResult(
+                    "PASS",
+                    f"bridge-regime: PREMATCH_ONLY=1 fallback_live={int(bridge_prematch_fallback)} "
+                    f"(window={fb_window_min}m min_total={fb_min_total} min_live={fb_min_live})",
+                )
+            )
+        misalign_min_total = _safe_int(os.getenv("OPS_PREMATCH_MISALIGN_MIN_AUDITS", "40"), 40)
+        misalign_level = str(os.getenv("OPS_PREMATCH_MISALIGN_LEVEL", "warn") or "warn").strip().lower()
+        if misalign_level not in ("off", "warn", "fail"):
+            misalign_level = "warn"
+        if (
+            bridge_prematch_only
+            and misalign_level != "off"
+            and g_total >= int(max(1, misalign_min_total))
+            and g_valid_live > 0
+            and g_valid_pre == 0
+        ):
+            level = "FAIL" if misalign_level == "fail" else "WARN"
+            if bridge_prematch_fallback:
+                msg = (
+                    f"prematch-misalignment: valid_pre=0 e valid_live={g_valid_live} com PREMATCH_ONLY=1 "
+                    f"(total_audits={g_total} em {since_minutes}m). Fallback LIVE está habilitado; "
+                    f"se execução seguir zerada, investigar filtros WF/limit/stake no bridge."
+                )
+            else:
+                msg = (
+                    f"prematch-misalignment: bridge está PREMATCH_ONLY=1, mas valid_pre=0 e valid_live={g_valid_live} "
+                    f"(total_audits={g_total} em {since_minutes}m). Execução ficará zerada por desenho."
+                )
+            results.append(
+                CheckResult(
+                    level,
+                    msg,
+                )
+            )
+            exit_code = max(exit_code, 2 if level == "FAIL" else 1)
+    except Exception:
         pass
 
     # 5) Executor activity/health (via JSONL)

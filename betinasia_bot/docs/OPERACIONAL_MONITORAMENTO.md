@@ -113,10 +113,45 @@ O `ops.daily_full_report` roda o walk-forward e faz:
 - export diário da policy (JSON) em `logs/policy_history/`
 - atualização **atômica** do “ponteiro” `logs/wf_policy_current.json`
 
+Guardrail de compatibilidade (recomendado):
+- `DAILY_WF_COMPAT_GUARD_ENABLE=1`
+- `DAILY_WF_COMPAT_FAIL_CLOSED=1`
+- `DAILY_WF_COMPAT_MIN_PRE_KEYS=1`
+- `DAILY_WF_SIDES=back`
+- `DAILY_WF_REGIMES=pre`
+- `DAILY_WF_PRE_ACTIVATION_MODE=roi_clv` (padrão) ou `roi_only` (sem gate de CLV no pre-match)
+- (opcional, cenário Back Pre Fast/Slippage) `DAILY_WF_BACKPRE_SLIP_MAX=0`, `DAILY_WF_BACKPRE_SLIP_FIELD=diff_pct`, `DAILY_WF_BACKPRE_FAST_MAX_LAG_MS=5000`
+
+Com isso, se o bridge estiver em `PREMATCH_ONLY=1` e a policy candidata não tiver chaves `Back_Pre_*`/`Lay_Pre_*` compatíveis com o lado operacional, o daily **não publica** a nova policy no `wf_policy_current.json` (mantém a anterior e registra o motivo no relatório).
 O bridge (`ops/executor_bridge_audit.py`) aplica essa policy quando você setar:
 - `BRIDGE_POLICY_JSON=logs/wf_policy_current.json`
 - `BRIDGE_POLICY_RELOAD_SEC=5` (recarrega automaticamente quando o arquivo muda)
 - `BRIDGE_POLICY_USE_BASE=1` (opcional: ignora sufixo de liga, usa `active_keys_base`)
+
+### Anti-trava operacional do bridge (recomendado)
+Para reduzir risco de “accepted=0” por lock/dedupe antigo:
+
+- `BRIDGE_SINGLETON_LOCK_PATH`  
+  Garante **uma única instância** do `ops.executor_bridge_audit` por modo/lado no host.
+  Evita concorrência acidental (service + processo órfão/manual).
+- `BRIDGE_SINGLETON_KILL_COMPETITORS=1`  
+  No startup, encerra processos concorrentes do mesmo modo/lado encontrados em `/proc`
+  (self-healing para órfãos após deploy/restart).
+- `BRIDGE_SINGLETON_ASSUME_UNKNOWN_MODE_COMPETITOR=1` e `...SIDE...=1`  
+  Quando um processo órfão não tem `BRIDGE_MODE/BRIDGE_EXEC_SIDE` no ambiente
+  (run manual), ele também é tratado como concorrente e encerrado.
+- `BRIDGE_SEEN_KEY_GC_SEC` + `BRIDGE_SEEN_KEY_TTL_SEC`  
+  Limpam reservas órfãs (sem `execution_id`) antigas.
+- `BRIDGE_SEEN_KEY_HARD_TTL_SEC`  
+  Limpa chaves de dedupe muito antigas, evitando `dup_key` indefinido por histórico velho.
+
+Defaults operacionais sugeridos:
+
+```env
+BRIDGE_SEEN_KEY_GC_SEC=300
+BRIDGE_SEEN_KEY_TTL_SEC=3600
+BRIDGE_SEEN_KEY_HARD_TTL_SEC=86400
+```
 
 ### Importante (systemd): `.env` vs overrides (`service.d/`)
 Se você ajustou variáveis no `.env` (ex.: `AUDIT_EXECUTOR_WORKERS=4`) e **não refletiu** no serviço, cheque se existe algum **drop-in** em `/etc/systemd/system/<service>.service.d/*.conf` sobrescrevendo `Environment=`. Esses overrides **têm precedência** sobre o `EnvironmentFile=...`.
@@ -197,6 +232,44 @@ PYTHONPATH=betinasia_bot python3 -m ops.health_monitor --since-minutes 30 --tele
 Variáveis úteis (no `.env`):
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `OPS_TELEMETRY_MAX_AGE_SEC` (default 600)
+- `OPS_PIPELINE_MIN_BEST_ODDS_FOR_ZERO_AUDIT` (default 1000)
+- `OPS_PIPELINE_ZERO_AUDIT_FAIL` (default 1)
+- `OPS_AUDIT_GATE_BACK_VERSION` (default `v5.3-ws-gate-back`)
+- `OPS_AUDIT_ZERO_VALID_MIN_AUDITS` (default 40)
+- `OPS_AUDIT_ZERO_VALID_LEVEL` (`off|warn|fail`, default `warn`)
+- `OPS_PREMATCH_MISALIGN_MIN_AUDITS` (default 40)
+- `OPS_PREMATCH_MISALIGN_LEVEL` (`off|warn|fail`, default `warn`)
+- `BRIDGE_PREMATCH_FALLBACK_ENABLE` (default `0`)
+- `BRIDGE_PREMATCH_FALLBACK_WINDOW_MIN` (default `60`)
+- `BRIDGE_PREMATCH_FALLBACK_MIN_TOTAL_AUDITS` (default `40`)
+- `BRIDGE_PREMATCH_FALLBACK_MIN_LIVE_VALID` (default `1`)
+
+Essas duas últimas ajudam a detectar “travamento funcional” do audit/bridge:
+se o collector segue produzindo (`best_odds_n` alto) mas `audits_n=0` na janela do monitor,
+o health_monitor sobe WARN/FAIL e envia Telegram.
+
+As três variáveis `OPS_AUDIT_*` detectam um cenário diferente:
+auditoria rodando, porém sem elegibilidade (`valid=0`) por janela longa
+(ex.: só `GATE_NOT_ELIGIBLE`). Isso evita confundir “sem setup” com “travado”.
+
+As variáveis `OPS_PREMATCH_*` detectam desalinhamento de regime:
+`BRIDGE_PREMATCH_ONLY=1` com `valid_live>0` e `valid_pre=0` na janela.
+Nesse caso a execução fica zerada por desenho (não é crash), e o monitor alerta.
+
+### Opções operacionais para PREMATCH_ONLY (A e B)
+
+Quando o bridge está em `BRIDGE_PREMATCH_ONLY=1`, há dois modos de operar:
+
+- **Opção A (estrita PRE, sem fallback)**  
+  - `BRIDGE_PREMATCH_ONLY=1`
+  - `BRIDGE_PREMATCH_FALLBACK_ENABLE=0`  
+  O monitor passa a imprimir o regime ativo (`bridge-regime`) e alerta desalinhamento quando houver `valid_live>0` e `valid_pre=0`.
+
+- **Opção B (fallback LIVE controlado)**  
+  - `BRIDGE_PREMATCH_ONLY=1`
+  - `BRIDGE_PREMATCH_FALLBACK_ENABLE=1`  
+  O bridge ativa LIVE automaticamente quando, na janela configurada, `valid_pre=0` e `valid_live` atingir o mínimo.  
+  Quando `valid_pre` volta, o fallback desliga sozinho e o bridge retorna ao comportamento PRE-only.
 
 ### Telegram (como “cadastrar” corretamente)
 Não é pelo telefone. Você precisa do **chat_id** do seu Telegram para o seu bot.

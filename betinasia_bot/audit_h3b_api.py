@@ -67,6 +67,8 @@ class H3bApiAudit:
         gate_open_window_sec: int = 300,
         gate_open_max: int = 3,
         gate_max_late_sec: float = 2.5,
+        gate_back_prefetch_betslip: Optional[bool] = None,
+        gate_back_prefetch_settle_timeout_sec: Optional[float] = None,
         gate_lay_refresh: bool = False,
         gate_lay_refresh_times_sec: Optional[List[float]] = None,
         api_sides: str = "both",
@@ -162,6 +164,29 @@ class H3bApiAudit:
         self.gate_open_window_sec = max(30, int(gate_open_window_sec))
         self.gate_open_max = max(0, int(gate_open_max))
         self.gate_max_late_sec = max(0.0, float(gate_max_late_sec))
+        if gate_back_prefetch_betslip is None:
+            gate_back_prefetch_betslip = self._parse_env_bool("GATE_BACK_PREFETCH_BETSLIP", "1")
+        if gate_back_prefetch_settle_timeout_sec is None:
+            gate_back_prefetch_settle_timeout_sec = self._parse_env_float(
+                "GATE_BACK_PREFETCH_SETTLE_TIMEOUT_SEC", 0.25
+            )
+        self.gate_back_prefetch_betslip = bool(gate_back_prefetch_betslip)
+        self.gate_back_prefetch_settle_timeout_sec = max(0.0, float(gate_back_prefetch_settle_timeout_sec))
+        self.gate_back_enforce_rise_filter = self._parse_env_bool("GATE_BACK_ENFORCE_RISE_FILTER", "0")
+        default_gate_back_offsets = sorted({0.0, float(self.gate_rise_offset_sec), 10.0})
+        self.gate_back_measure_offsets_sec = self._parse_offsets(
+            os.getenv("GATE_BACK_MEASURE_OFFSETS_SEC", "0,5,10"),
+            default=default_gate_back_offsets,
+        )
+        self.gate_back_async_measure_workers = max(
+            1,
+            int(self._parse_env_float("AUDIT_GATE_BACK_ASYNC_MEASURE_WORKERS", 1.0)),
+        )
+        self.gate_back_forced_temporal_workers = False
+        if self.mode in ("ws_gate_back", "gate_back") and self.temporal_workers <= 0:
+            # Sem workers temporais não conseguimos medir t+5/t+10 em paralelo.
+            self.temporal_workers = int(self.gate_back_async_measure_workers)
+            self.gate_back_forced_temporal_workers = True
         self.gate_open_lock = asyncio.Lock()
         self.gate_open_times = deque()
         self.gate_lay_refresh = bool(gate_lay_refresh)
@@ -489,6 +514,12 @@ class H3bApiAudit:
             return float(default)
 
     @staticmethod
+    def _parse_env_bool(name: str, default: str = "0") -> bool:
+        raw = os.getenv(name, default)
+        val = str(raw or "").strip().lower()
+        return val in ("1", "true", "yes", "on")
+
+    @staticmethod
     def _avg(values: List[float]) -> float:
         return (sum(values) / len(values)) if values else 0.0
 
@@ -632,10 +663,19 @@ class H3bApiAudit:
                 f"max_late={self.gate_max_late_sec:.1f}s | lay_refresh={self.gate_lay_refresh}"
             )
         if self.mode in ("ws_gate_back", "gate_back"):
+            max_late_str = "off" if float(self.gate_max_late_sec) <= 0 else f"{self.gate_max_late_sec:.1f}s"
             logger.info(
                 f"gate_back: offset={self.gate_rise_offset_sec:.1f}s ratio={self.gate_rise_ratio:.3f} | "
-                f"max_late={self.gate_max_late_sec:.1f}s"
+                f"rise_filter_enabled={int(bool(self.gate_back_enforce_rise_filter))} "
+                f"measure_offsets={self.gate_back_measure_offsets_sec} | "
+                f"max_late={max_late_str} | prefetch_betslip={int(bool(self.gate_back_prefetch_betslip))} "
+                f"settle_timeout={self.gate_back_prefetch_settle_timeout_sec:.2f}s"
             )
+            if self.gate_back_forced_temporal_workers:
+                logger.info(
+                    "gate_back: AUDIT_TEMPORAL_WORKERS<=0 detectado; "
+                    f"forcando temporal_workers={self.temporal_workers} para amostragem assíncrona."
+                )
         logger.info("=" * 60)
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'running', False))
@@ -1150,6 +1190,7 @@ class H3bApiAudit:
                         'ws_state_key': ws_refs.get('ws_state_key'),
                         'ws_side': ws_refs.get('ws_side'),
                         'offsets_sec': ws_refs.get('offsets_sec'),
+                        'origin_ts': ws_refs.get('origin_ts'),
                         'telemetry_base': dict(telemetry),
                         'queued_at': time.time(),
                     }
@@ -1351,6 +1392,7 @@ class H3bApiAudit:
         ws_state_key: Tuple[str, str, str, str],
         ws_side: str,
         offsets_sec: List[float],
+        origin_ts: Optional[float] = None,
     ) -> Tuple[List[dict], Dict[str, Any]]:
         """
         Coleta série de odds via WS em offsets específicos.
@@ -1361,20 +1403,29 @@ class H3bApiAudit:
         if not offsets:
             offsets = [0.0]
 
-        t_start = time.time()
+        collect_start = time.time()
+        base_ts = float(collect_start)
+        if origin_ts is not None:
+            try:
+                base_ts = float(origin_ts)
+            except Exception:
+                base_ts = float(collect_start)
         series: List[dict] = []
         points_meta: List[dict] = []
         wait_ms = 0
 
         for target in offsets:
-            elapsed = time.time() - t_start
-            wait = float(target) - float(elapsed)
+            if origin_ts is not None:
+                wait = (float(base_ts) + float(target)) - float(time.time())
+            else:
+                elapsed = time.time() - collect_start
+                wait = float(target) - float(elapsed)
             if wait > 0:
                 await asyncio.sleep(wait)
                 wait_ms += int(wait * 1000)
             snap = self._ws_get_snapshot(ws_state_key)
             now_ts = time.time()
-            actual = round(now_ts - t_start, 3)
+            actual = round(now_ts - float(base_ts), 3)
 
             side_odd = self._ws_get_side_odd(ws_state_key, ws_side)
             point = {
@@ -1395,10 +1446,12 @@ class H3bApiAudit:
             points_meta.append({"t_target_s": float(target), "t_actual_s": float(actual), "ws_ok": bool(side_odd)})
 
         telemetry_patch = {
-            "ws_series_total_ms": int((time.time() - t_start) * 1000),
+            "ws_series_total_ms": int((time.time() - collect_start) * 1000),
             "ws_series_wait_ms": int(wait_ms),
             "ws_series_points": points_meta,
             "ws_series_deferred": False,
+            "ws_series_origin_ts": float(base_ts),
+            "ws_series_start_lag_ms": int(max(0.0, (collect_start - float(base_ts)) * 1000)),
         }
         return series, telemetry_patch
 
@@ -1457,16 +1510,28 @@ class H3bApiAudit:
                     ws_state_key = job.get("ws_state_key")
                     ws_side = str(job.get("ws_side") or "")
                     offsets = job.get("offsets_sec") or self.ws_sample_offsets_sec
+                    origin_ts = job.get("origin_ts")
+                    origin_ts_safe = None
+                    if origin_ts is not None:
+                        try:
+                            origin_ts_safe = float(origin_ts)
+                        except Exception:
+                            origin_ts_safe = None
                     ws_series, telemetry_patch = await self._collect_ws_series(
                         ws_state_key=tuple(ws_state_key) if isinstance(ws_state_key, (list, tuple)) else ws_state_key,
                         ws_side=ws_side,
                         offsets_sec=[float(x) for x in offsets],
+                        origin_ts=origin_ts_safe,
                     )
                     telemetry_final = dict(job.get("telemetry_base") or {})
                     telemetry_final.update(telemetry_patch)
                     telemetry_final["temporal_worker_id"] = worker_id
                     telemetry_final["temporal_async_latency_ms"] = int((time.time() - job.get("queued_at", time.time())) * 1000)
-                    meta = {"offsets_sec": [float(x) for x in offsets], "ws_side": ws_side}
+                    meta = {
+                        "offsets_sec": [float(x) for x in offsets],
+                        "ws_side": ws_side,
+                        "origin_ts": origin_ts_safe,
+                    }
                     await self._patch_ws_series_result(
                         record_id=int(job.get("record_id") or 0),
                         ws_series=ws_series,
@@ -1923,6 +1988,7 @@ class H3bApiAudit:
                 ws_state_key=ws_state_key,
                 ws_side=str(h3b.get("side") or ""),
                 offsets_sec=offsets,
+                origin_ts=float(detected_at),
             )
             telemetry.update(telemetry_patch)
             base["ws_series"] = ws_series
@@ -1932,6 +1998,7 @@ class H3bApiAudit:
                 "ws_state_key": ws_state_key,
                 "ws_side": str(h3b.get("side") or ""),
                 "offsets_sec": offsets,
+                "origin_ts": float(detected_at),
             }
 
         end_to_end_ms = int((time.time() - detected_at) * 1000)
@@ -2102,6 +2169,7 @@ class H3bApiAudit:
                     "ws_side": ws_side,
                     # garante que inclui offset do gate e os offsets padrões
                     "offsets_sec": sorted({0.0, float(self.gate_drop_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+                    "origin_ts": float(detected_at),
                 }
                 telemetry["ws_series_deferred"] = True
             base.update({
@@ -2274,6 +2342,7 @@ class H3bApiAudit:
                 "ws_state_key": ws_state_key,
                 "ws_side": ws_side,
                 "offsets_sec": sorted({0.0, float(self.gate_drop_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+                "origin_ts": float(detected_at),
             }
             telemetry["ws_series_deferred"] = True
 
@@ -2497,10 +2566,10 @@ class H3bApiAudit:
 
     async def _execute_ws_gate_back(self, h3b: dict, *, defer_temporal: bool = True) -> dict:
         """
-        Gate Back (H3B UP + alta em 5s):
-          - mede WS(t0) e WS(t+offset) no timestamp alvo (detected_at + offset)
-          - se WS(t+offset) >= gate_rise_ratio * WS(t0): marca como oportunidade executável (Back)
-          - NÃO abre betslip (executor fará isso no momento da execução)
+        Gate Back (H3B UP):
+          - padrão atual: NÃO bloqueia por % de subida; aprova no T+0 e mede WS(t0,t+5,t+10) em paralelo
+          - modo legado opcional (GATE_BACK_ENFORCE_RISE_FILTER=1): aplica WS(t+offset) >= gate_rise_ratio * WS(t0)
+          - pode pre-abrir betslip BACK em paralelo no modo legado
         """
         self.gate_back_seen += 1
         detected_at = h3b['detected_at']
@@ -2546,6 +2615,96 @@ class H3bApiAudit:
                 ws0 = float(h3b.get("websocket_odd"))
         except Exception:
             ws0 = None
+
+        # Novo padrão operacional: não bloquear o pipeline pelo gate de crescimento.
+        # Mantemos a medição WS(t0, t+5, t+10) em paralelo para análise estatística posterior.
+        measure_offsets = sorted(
+            {
+                0.0,
+                float(self.gate_rise_offset_sec),
+                *[float(x) for x in (self.gate_back_measure_offsets_sec or [])],
+            }
+        )
+        telemetry["gate_back_rise_filter_enabled"] = bool(self.gate_back_enforce_rise_filter)
+        telemetry["gate_back_measure_offsets_sec"] = list(measure_offsets)
+        telemetry["gate_ws_t0"] = ws0
+
+        if not bool(self.gate_back_enforce_rise_filter):
+            telemetry["gate_back_prefetch_bypassed"] = True
+            if not ws_state_key or not ws_side:
+                self.gate_back_ws_missing += 1
+                telemetry["gate_eligible"] = False
+                base.update({
+                    'success': True,
+                    'status': 'GATE_WS_MISSING',
+                    'bs_odd': None,
+                    'bs_limit': 0,
+                    'num_bk': 0,
+                    'diff_pct': None,
+                    'error': 'WS_STATE_KEY_OR_SIDE_MISSING',
+                    'total_ms': int((time.time() - detected_at) * 1000),
+                    'telemetry': telemetry,
+                    'is_valid_opportunity': False,
+                })
+                return base
+
+            if not ws0:
+                self.gate_back_ws_missing += 1
+                telemetry["gate_eligible"] = False
+                base.update({
+                    'success': True,
+                    'status': 'GATE_WS_POINT_MISSING',
+                    'bs_odd': None,
+                    'bs_limit': 0,
+                    'num_bk': 0,
+                    'diff_pct': None,
+                    'error': 'WS_T0_MISSING',
+                    'total_ms': int((time.time() - detected_at) * 1000),
+                    'telemetry': telemetry,
+                    'is_valid_opportunity': False,
+                })
+                return base
+
+            base['ws_gate_series'] = [
+                {
+                    "t_target_s": 0.0,
+                    "t_actual_s": max(0.0, float(time.time() - float(detected_at))),
+                    "ts": float(time.time()),
+                    "ws_side": ws_side,
+                    "ws_odd": ws0,
+                }
+            ]
+            if defer_temporal:
+                base["_ws_series_refs"] = {
+                    "ws_state_key": ws_state_key,
+                    "ws_side": ws_side,
+                    "offsets_sec": list(measure_offsets),
+                    "origin_ts": float(detected_at),
+                }
+                telemetry["ws_series_deferred"] = True
+            else:
+                telemetry["ws_series_deferred"] = False
+                telemetry["ws_series_warning"] = "temporal_workers_disabled"
+
+            self.gate_back_eligible += 1
+            telemetry["gate_eligible"] = True
+            end_to_end_ms = int((time.time() - detected_at) * 1000)
+            telemetry['execution_ms'] = int((time.time() - execution_start) * 1000)
+            telemetry['end_to_end_ms'] = end_to_end_ms
+            telemetry['pipeline_overhead_ms'] = max(0, end_to_end_ms - telemetry.get('queue_wait_ms', 0))
+            base.update({
+                'success': True,
+                'status': 'OK',
+                'bs_odd': None,
+                'bs_limit': 0,
+                'num_bk': 0,
+                'diff_pct': None,
+                'error': '',
+                'total_ms': end_to_end_ms,
+                'telemetry': telemetry,
+                'is_valid_opportunity': True,
+            })
+            return base
 
         # WS(t+offset) no timestamp alvo (detected_at + offset)
         target_abs_ts = float(detected_at) + float(self.gate_rise_offset_sec)
@@ -2634,7 +2793,8 @@ class H3bApiAudit:
                 base["_ws_series_refs"] = {
                     "ws_state_key": ws_state_key,
                     "ws_side": ws_side,
-                    "offsets_sec": sorted({0.0, float(self.gate_rise_offset_sec), *[float(x) for x in (self.ws_sample_offsets_sec or [])]}),
+                    "offsets_sec": list(measure_offsets),
+                    "origin_ts": float(detected_at),
                 }
                 telemetry["ws_series_deferred"] = True
             base.update({

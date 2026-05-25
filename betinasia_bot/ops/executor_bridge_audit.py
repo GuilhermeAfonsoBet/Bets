@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -21,6 +23,138 @@ sys.path.insert(0, ".")
 from storage.database import Database
 from executor.client import submit_execution
 from executor.contracts import ExecSide, ExecutionRequest, MarketType
+
+
+def _singleton_lock_path(mode: str, exec_side: ExecSide) -> str:
+    default = f"/tmp/betinasia-bridge-{str(mode).lower()}-{str(exec_side.value).lower()}.lock"
+    return str(os.getenv("BRIDGE_SINGLETON_LOCK_PATH", "").strip() or default)
+
+
+def _acquire_singleton_lock(path: str) -> Optional[Any]:
+    fp = None
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fp = p.open("a+", encoding="utf-8")
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fp.seek(0)
+        fp.truncate(0)
+        fp.write(f"pid={os.getpid()} ts_utc={datetime.now(timezone.utc).isoformat()}\n")
+        fp.flush()
+        return fp
+    except BlockingIOError:
+        try:
+            if fp is not None:
+                fp.close()
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        try:
+            if fp is not None:
+                fp.close()
+        except Exception:
+            pass
+        logger.warning(f"[bridge] singleton lock unavailable path={path} err={str(e)[:180]}")
+        return None
+
+
+def _proc_env_value(pid: int, key: str) -> Optional[str]:
+    try:
+        raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+        for item in raw.split(b"\x00"):
+            if not item or b"=" not in item:
+                continue
+            k, v = item.split(b"=", 1)
+            if k.decode("utf-8", errors="ignore") == key:
+                return v.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    return None
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        if not raw:
+            return ""
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def _same_bridge_process(pid: int, *, mode: str, exec_side: ExecSide) -> bool:
+    cmd = _proc_cmdline(pid)
+    if not cmd:
+        return False
+    if ("ops.executor_bridge_audit" not in cmd) and ("executor_bridge_audit.py" not in cmd):
+        return False
+    p_side = (_proc_env_value(pid, "BRIDGE_EXEC_SIDE") or "").strip().lower()
+    p_mode = (_proc_env_value(pid, "BRIDGE_MODE") or "").strip().lower()
+    own_side = str(exec_side.value).strip().lower()
+    own_mode = str(mode).strip().lower()
+
+    # Alguns órfãos podem ter subido manualmente sem EnvironmentFile (sem BRIDGE_* no /proc/environ).
+    # Para não manter o lock "zumbi", tratamos valores ausentes como compatíveis por default.
+    assume_unknown_mode = str(os.getenv("BRIDGE_SINGLETON_ASSUME_UNKNOWN_MODE_COMPETITOR", "1") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    assume_unknown_side = str(os.getenv("BRIDGE_SINGLETON_ASSUME_UNKNOWN_SIDE_COMPETITOR", "1") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+
+    mode_ok = (p_mode == own_mode) if p_mode else bool(assume_unknown_mode)
+    side_ok = (p_side == own_side) if p_side else bool(assume_unknown_side)
+    return bool(mode_ok and side_ok)
+
+
+def _kill_competing_bridge_processes(*, mode: str, exec_side: ExecSide) -> None:
+    if str(os.getenv("BRIDGE_SINGLETON_KILL_COMPETITORS", "1") or "1").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ):
+        return
+    me = int(os.getpid())
+    competitors: List[int] = []
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == me:
+                continue
+            if _same_bridge_process(pid, mode=str(mode), exec_side=exec_side):
+                competitors.append(pid)
+    except Exception:
+        competitors = []
+    if not competitors:
+        return
+
+    logger.warning(f"[bridge] found competing same-side bridge pids={competitors}; terminating")
+    for pid in competitors:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    time.sleep(0.6)
+    for pid in competitors:
+        try:
+            # se ainda existir, força kill
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _safe_float_money(x: Any) -> Optional[float]:
@@ -246,6 +380,13 @@ class BridgeConfig:
     http_url: Optional[str] = None
     only_hypothesis: str = "H3B"
     only_prematch: bool = True
+    # Fallback controlado: se PRE estiver zerado e LIVE válido surgir, permite consumir LIVE temporariamente.
+    prematch_fallback_enable: bool = False
+    prematch_fallback_window_min: int = 60
+    prematch_fallback_min_total_audits: int = 40
+    prematch_fallback_min_live_valid: int = 1
+    prematch_fallback_audit_version: str = ""
+    prematch_fallback_log_cooldown_sec: float = 120.0
     # Policy OOS (export do report walk-forward)
     policy_json: Optional[str] = None
     policy_reload_sec: float = 5.0
@@ -777,11 +918,62 @@ def _combo_key_from_row(row: Dict[str, Any], cfg: BridgeConfig, policy: Dict[str
     return comb
 
 
+async def _audit_validity_snapshot(
+    db: Database,
+    *,
+    since: datetime,
+    cfg: BridgeConfig,
+) -> Dict[str, int]:
+    q = """
+    SELECT
+      COUNT(*)::int AS audits_total,
+      COUNT(*) FILTER (WHERE r.is_valid_opportunity = TRUE)::int AS valid_total,
+      COUNT(*) FILTER (
+        WHERE r.is_valid_opportunity = TRUE
+          AND (r.is_live IS NULL OR r.is_live = FALSE)
+      )::int AS valid_pre,
+      COUNT(*) FILTER (
+        WHERE r.is_valid_opportunity = TRUE
+          AND r.is_live = TRUE
+      )::int AS valid_live
+    FROM betslip_audit_results r
+    WHERE r.audited_at >= :since
+      AND upper(r.market_type) = 'AH'
+      AND r.hypothesis_type = :hyp
+      AND (
+        :audit_version = ''
+        OR COALESCE(r.audit_version, '') = :audit_version
+      )
+      AND (
+        r.hypothesis_details IS NULL
+        OR COALESCE((r.hypothesis_details::jsonb->>'exec_side_hint'), '') = ''
+        OR lower(r.hypothesis_details::jsonb->>'exec_side_hint') = lower(:exec_side_hint)
+      )
+    """
+    params = {
+        "since": since,
+        "hyp": str(cfg.only_hypothesis),
+        "audit_version": str(cfg.prematch_fallback_audit_version or ""),
+        "exec_side_hint": str(cfg.exec_side.value),
+    }
+    async with db.async_session() as session:
+        r = await session.execute(text(q), params)
+        row = r.first()
+    m = dict(row._mapping) if row else {}
+    return {
+        "audits_total": int(m.get("audits_total") or 0),
+        "valid_total": int(m.get("valid_total") or 0),
+        "valid_pre": int(m.get("valid_pre") or 0),
+        "valid_live": int(m.get("valid_live") or 0),
+    }
+
+
 async def _fetch_candidates(
     db: Database,
     *,
     since: datetime,
     cfg: BridgeConfig,
+    only_prematch: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     # Nota: betslip_audit_results está em models_hypothesis (tabela criada pela connect()).
     strict_hint = bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live)
@@ -835,7 +1027,8 @@ async def _fetch_candidates(
         "hyp": str(cfg.only_hypothesis),
         "exec_side_hint": str(cfg.exec_side.value),
     }
-    if cfg.only_prematch:
+    prematch_only = cfg.only_prematch if only_prematch is None else bool(only_prematch)
+    if prematch_only:
         q = q.replace("AND r.hypothesis_type = :hyp", "AND r.hypothesis_type = :hyp AND (r.is_live IS NULL OR r.is_live = FALSE)")
     # Conexões DB podem cair em serviços long-running; fazemos 1 retry com reconnect.
     for attempt in (1, 2):
@@ -1084,6 +1277,16 @@ async def _insert_position(
 
 
 async def run_bridge(cfg: BridgeConfig) -> int:
+    # Proteção operacional: evita duas instâncias concorrentes do mesmo bridge (ex.: serviço + processo órfão).
+    lock_path = _singleton_lock_path(cfg.mode, cfg.exec_side)
+    singleton_lock_fp = _acquire_singleton_lock(lock_path)
+    if singleton_lock_fp is None:
+        logger.error(f"[bridge] lock já em uso; não inicia segunda instância path={lock_path}")
+        return 0
+
+    # Self-healing operacional: encerra instâncias órfãs concorrentes do mesmo modo/lado.
+    _kill_competing_bridge_processes(mode=cfg.mode, exec_side=cfg.exec_side)
+
     db = Database()
     await db.connect()
     await _ensure_seen_table(db)
@@ -1116,11 +1319,14 @@ async def run_bridge(cfg: BridgeConfig) -> int:
     tg_last_alert_ts = 0.0
     tg_token = str(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
     tg_chat = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+    prematch_fallback_active_last = False
+    prematch_fallback_last_log = 0.0
 
     logger.info(
         f"[bridge] started mode={cfg.mode} exec_side={cfg.exec_side.value} "
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
+        f"prematch_fallback={int(bool(cfg.prematch_fallback_enable))} "
         f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
         f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
         f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
@@ -1131,7 +1337,9 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         t0 = time.time()
         try:
 
-            # GC periódico das chaves reservadas sem execution_id (falhas transitórias / crashes)
+            # GC periódico do dedupe operacional:
+            # 1) limpa reservas órfãs sem execution_id (falhas transitórias / crashes)
+            # 2) limpa chaves muito antigas (hard TTL) para evitar bloqueio indefinido por `dup_key`
             try:
                 gc_every = float(os.getenv("BRIDGE_SEEN_KEY_GC_SEC", "300") or 300.0)
             except Exception:
@@ -1141,18 +1349,47 @@ async def run_bridge(cfg: BridgeConfig) -> int:
             except Exception:
                 ttl_sec = 3600.0
             try:
-                if gc_every > 0 and ttl_sec > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
+                hard_ttl_sec = float(os.getenv("BRIDGE_SEEN_KEY_HARD_TTL_SEC", "86400") or 86400.0)
+            except Exception:
+                hard_ttl_sec = 86400.0
+            try:
+                if gc_every > 0 and (time.time() - float(seen_gc_last_check)) >= float(gc_every):
                     seen_gc_last_check = time.time()
-                    qgc = """
+                    qgc_pending = """
                     DELETE FROM executor_bridge_seen_keys
                     WHERE src_table='betslip_audit_results'
                       AND action=:action
                       AND execution_id IS NULL
                       AND created_at < (now() - (:ttl_sec::double precision * interval '1 second'))
                     """
+                    qgc_hard = """
+                    DELETE FROM executor_bridge_seen_keys
+                    WHERE src_table='betslip_audit_results'
+                      AND action=:action
+                      AND created_at < (now() - (:hard_ttl_sec::double precision * interval '1 second'))
+                    """
                     async with db.async_session() as session:
-                        await session.execute(text(qgc), {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)})
+                        deleted_pending = 0
+                        deleted_hard = 0
+                        if ttl_sec > 0:
+                            r1 = await session.execute(
+                                text(qgc_pending),
+                                {"action": f"{cfg.mode}:{cfg.exec_side.value}", "ttl_sec": float(ttl_sec)},
+                            )
+                            deleted_pending = int(r1.rowcount or 0)
+                        if hard_ttl_sec > 0:
+                            r2 = await session.execute(
+                                text(qgc_hard),
+                                {"action": f"{cfg.mode}:{cfg.exec_side.value}", "hard_ttl_sec": float(hard_ttl_sec)},
+                            )
+                            deleted_hard = int(r2.rowcount or 0)
                         await session.commit()
+                    if deleted_pending > 0 or deleted_hard > 0:
+                        logger.info(
+                            f"[bridge] dedupe_gc action={cfg.mode}:{cfg.exec_side.value} "
+                            f"deleted_pending={deleted_pending} deleted_hard={deleted_hard} "
+                            f"ttl_sec={ttl_sec:.0f} hard_ttl_sec={hard_ttl_sec:.0f}"
+                        )
             except (InterfaceError, OperationalError, DBAPIError) as e:
                 if _is_db_disconnect_error(e):
                     await _db_reconnect(db, why="seen_key_gc_disconnect")
@@ -1239,9 +1476,55 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                 except Exception as e:
                     logger.warning(f"[bridge] risk_params reload failed: {e}")
 
+            effective_only_prematch = bool(cfg.only_prematch)
+            prematch_fallback_snapshot: Optional[Dict[str, int]] = None
+            if cfg.only_prematch and cfg.prematch_fallback_enable:
+                now_ts = time.time()
+                fb_minutes = max(1, int(cfg.prematch_fallback_window_min))
+                fb_since = _utcnow() - timedelta(minutes=fb_minutes)
+                try:
+                    snap = await _audit_validity_snapshot(db, since=fb_since, cfg=cfg)
+                    prematch_fallback_snapshot = snap
+                    audits_total = int(snap.get("audits_total") or 0)
+                    valid_pre = int(snap.get("valid_pre") or 0)
+                    valid_live = int(snap.get("valid_live") or 0)
+                    should_fallback = (
+                        audits_total >= int(cfg.prematch_fallback_min_total_audits)
+                        and valid_pre <= 0
+                        and valid_live >= int(cfg.prematch_fallback_min_live_valid)
+                    )
+                    effective_only_prematch = not should_fallback
+                    if should_fallback:
+                        cooldown = max(10.0, float(cfg.prematch_fallback_log_cooldown_sec))
+                        if (not prematch_fallback_active_last) or ((now_ts - prematch_fallback_last_log) >= cooldown):
+                            logger.warning(
+                                f"[bridge] prematch_fallback LIVE ON "
+                                f"window_min={fb_minutes} audits={audits_total} valid_pre={valid_pre} valid_live={valid_live} "
+                                f"min_audits={cfg.prematch_fallback_min_total_audits} min_live={cfg.prematch_fallback_min_live_valid} "
+                                f"audit_version={(cfg.prematch_fallback_audit_version or '*')}"
+                            )
+                            prematch_fallback_last_log = now_ts
+                    elif prematch_fallback_active_last:
+                        logger.info(
+                            f"[bridge] prematch_fallback LIVE OFF window_min={fb_minutes} "
+                            f"audits={audits_total} valid_pre={valid_pre} valid_live={valid_live}"
+                        )
+                    prematch_fallback_active_last = bool(should_fallback)
+                except (InterfaceError, OperationalError, DBAPIError) as e:
+                    if _is_db_disconnect_error(e):
+                        await _db_reconnect(db, why="prematch_fallback_snapshot_disconnect")
+                        await asyncio.sleep(float(os.getenv("BRIDGE_DB_BACKOFF_SEC", "0.8") or 0.8))
+                except Exception as e:
+                    logger.warning(f"[bridge] prematch_fallback snapshot failed: {str(e)[:200]}")
+
             since = _utcnow() - timedelta(seconds=int(cfg.lookback_sec))
             try:
-                rows = await _fetch_candidates(db, since=since, cfg=cfg)
+                rows = await _fetch_candidates(
+                    db,
+                    since=since,
+                    cfg=cfg,
+                    only_prematch=effective_only_prematch,
+                )
             except (InterfaceError, OperationalError, DBAPIError) as e:
                 if _is_db_disconnect_error(e):
                     await _db_reconnect(db, why="fetch_candidates_disconnect")
@@ -1515,6 +1798,18 @@ async def run_bridge(cfg: BridgeConfig) -> int:
 
                 req = _build_request(row, cfg)
                 try:
+                    if cfg.only_prematch and (not effective_only_prematch):
+                        req.meta["prematch_fallback"] = {
+                            "active": True,
+                            "window_min": int(cfg.prematch_fallback_window_min),
+                            "min_total_audits": int(cfg.prematch_fallback_min_total_audits),
+                            "min_live_valid": int(cfg.prematch_fallback_min_live_valid),
+                            "audit_version": (str(cfg.prematch_fallback_audit_version or "") or None),
+                            "snapshot": (prematch_fallback_snapshot or {}),
+                        }
+                except Exception:
+                    pass
+                try:
                     # adiciona snapshot simples para auditoria, sem inflar DB
                     if "bal_eff" in locals() and bal_eff is not None:
                         req.meta.setdefault("balance", {})
@@ -1577,7 +1872,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                             hyp=str(cfg.only_hypothesis),
                             exec_side=cfg.exec_side,
                             lookback_h=float(_rp_float(risk_params, "signals_lookback_h") or cfg.signals_lookback_h),
-                            prematch_only=bool(cfg.only_prematch),
+                            prematch_only=bool(effective_only_prematch),
                             strict_hint=bool(cfg.mode == "live") and bool(cfg.strict_exec_side_hint_live),
                         )
                         bud_match = float(bud_base)
@@ -1916,6 +2211,41 @@ def main() -> int:
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
     ap.add_argument("--prematch-only", action="store_true", default=(os.getenv("BRIDGE_PREMATCH_ONLY", "1").strip() not in ("0", "false", "False", "no", "NO")))
+    ap.add_argument(
+        "--prematch-fallback-enable",
+        action="store_true",
+        default=(os.getenv("BRIDGE_PREMATCH_FALLBACK_ENABLE", "0").strip() in ("1", "true", "True", "yes", "YES")),
+        help="Se true, quando valid_pre=0 e valid_live>0 na janela, libera ingestão LIVE temporária mesmo com PREMATCH_ONLY=1.",
+    )
+    ap.add_argument(
+        "--prematch-fallback-window-min",
+        type=int,
+        default=int(os.getenv("BRIDGE_PREMATCH_FALLBACK_WINDOW_MIN", "60")),
+        help="Janela (min) usada para medir valid_pre/valid_live no fallback.",
+    )
+    ap.add_argument(
+        "--prematch-fallback-min-total-audits",
+        type=int,
+        default=int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_TOTAL_AUDITS", "40")),
+        help="Só ativa fallback se total de audits na janela atingir este mínimo.",
+    )
+    ap.add_argument(
+        "--prematch-fallback-min-live-valid",
+        type=int,
+        default=int(os.getenv("BRIDGE_PREMATCH_FALLBACK_MIN_LIVE_VALID", "1")),
+        help="Mínimo de valid_live na janela para ativar fallback.",
+    )
+    ap.add_argument(
+        "--prematch-fallback-audit-version",
+        default=os.getenv("BRIDGE_PREMATCH_FALLBACK_AUDIT_VERSION", "").strip(),
+        help="Se informado, restringe snapshot do fallback a esta audit_version.",
+    )
+    ap.add_argument(
+        "--prematch-fallback-log-cooldown-sec",
+        type=float,
+        default=float(os.getenv("BRIDGE_PREMATCH_FALLBACK_LOG_COOLDOWN_SEC", "120")),
+        help="Cooldown de logs ON do fallback para evitar spam.",
+    )
     ap.add_argument("--policy-json", default=os.getenv("BRIDGE_POLICY_JSON", "").strip() or None, help="Path para WF policy exportado (JSON).")
     ap.add_argument("--policy-reload-sec", type=float, default=float(os.getenv("BRIDGE_POLICY_RELOAD_SEC", "5.0")))
     ap.add_argument(
@@ -1983,6 +2313,12 @@ def main() -> int:
         http_url=(str(args.http_url) if args.http_url else None),
         only_hypothesis=str(args.hypothesis),
         only_prematch=bool(args.prematch_only),
+        prematch_fallback_enable=bool(args.prematch_fallback_enable),
+        prematch_fallback_window_min=int(args.prematch_fallback_window_min),
+        prematch_fallback_min_total_audits=int(args.prematch_fallback_min_total_audits),
+        prematch_fallback_min_live_valid=int(args.prematch_fallback_min_live_valid),
+        prematch_fallback_audit_version=str(args.prematch_fallback_audit_version or ""),
+        prematch_fallback_log_cooldown_sec=float(args.prematch_fallback_log_cooldown_sec),
         policy_json=(str(args.policy_json) if args.policy_json else None),
         policy_reload_sec=float(args.policy_reload_sec),
         policy_use_base=bool(args.policy_use_base),
