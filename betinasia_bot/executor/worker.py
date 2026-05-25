@@ -1343,7 +1343,7 @@ class ExecutorWorker:
 
         # ------------------------------------------------------------
         # Stake sizing (Back Pre/In) — operacionalização:
-        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 12)
+        # - Back Pre com pre_submit_ms <= 5s => stake_hi_pre_fast (default 20)
         # - demais BACK (Back Pre lento + Back In) => stake_back_default (default 1.5)
         # Obs: medimos pre_submit_ms imediatamente antes do place_order().
         # ------------------------------------------------------------
@@ -1378,7 +1378,7 @@ class ExecutorWorker:
         sizing_enabled = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENABLE", "0") or _env_bool("EXECUTOR_BACK_STAKE_SIZING_ENABLE", "0")
         sizing_enforce = _env_bool("EXECUTOR_BACKPRE_FAST_STAKE_ENFORCE", "1")
         pre_fast_max_ms = _env_float("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", 5000.0)
-        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 12.0))
+        stake_pre_fast = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_HI", _env_float("EXECUTOR_BACKPRE_FAST_STAKE", 20.0))
         stake_back_default = _env_float("EXECUTOR_BACKPRE_FAST_STAKE_LO", _env_float("EXECUTOR_BACK_STAKE_DEFAULT", 1.5))
 
         # persistir métricas no JSONL para auditoria/analytics (vamos preencher os tempos
@@ -1410,7 +1410,7 @@ class ExecutorWorker:
         if stake is None:
             # Default live stake (global). Se sizing estiver habilitado, vamos sobrescrever abaixo
             # (antes de aplicar max_stake).
-            stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "3.0"))
+            stake = float(os.getenv("EXECUTOR_LIVE_STAKE", "1.5"))
 
         # Gate de slippage (opcional): bloqueia LIVE se odds piorarem além do limiar.
         # Caso de uso: in-match, bloquear se odds piorarem além do limiar (Lay: odds sobem; Back: odds caem).
@@ -1499,7 +1499,7 @@ class ExecutorWorker:
             apply_back_sizing = bool(req.exec_side == ExecSide.BACK) and bool(sizing_enabled or sizing_enforce)
             if apply_back_sizing:
                 # regra solicitada:
-                # - pre & pre_submit_ms<=5s => 12
+                # - pre & pre_submit_ms<=5s => 20
                 # - senão => 1.50
                 is_pre = not bool(market_is_live)
                 ok_time = (pre_ms is not None) and (float(pre_ms) <= float(pre_fast_max_ms))

@@ -1123,14 +1123,29 @@ def _append_backpre_fast_slow_sections(
         )
     out_lines.append("\n")
 
+    stake_hi_cfg = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI"))
+    if stake_hi_cfg is None:
+        stake_hi_cfg = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE"))
+    if stake_hi_cfg is None:
+        stake_hi_cfg = 20.0
+    stake_lo_cfg = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_LO"))
+    if stake_lo_cfg is None:
+        stake_lo_cfg = _safe_float_or_none(os.getenv("EXECUTOR_BACK_STAKE_DEFAULT"))
+    if stake_lo_cfg is None:
+        stake_lo_cfg = 1.5
+
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
-        c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
+        c: Dict[str, int] = {"hi": 0, "lo": 0, "other": 0}
         for r in rows or []:
-            sb = str(r.get("stake_bucket") or "")
-            if sb == "12":
-                c["12"] += 1
-            elif sb == "1.5":
-                c["1.5"] += 1
+            sb = r.get("stake_bucket")
+            val = _safe_float_or_none(sb)
+            if val is None:
+                c["other"] += 1
+                continue
+            if abs(float(val) - float(stake_hi_cfg)) <= 1e-6:
+                c["hi"] += 1
+            elif abs(float(val) - float(stake_lo_cfg)) <= 1e-6:
+                c["lo"] += 1
             else:
                 c["other"] += 1
         return c
@@ -1139,8 +1154,10 @@ def _append_backpre_fast_slow_sections(
     # B) Compliance: fast/slow/NA (todos stakes) + contagem por stake bucket
     # -------------------------
     out_lines.append("**Tese Back Pre fast — compliance (pós-início; distribuição de stake e pre_submit_ms)**\n\n")
+    stake_hi_lbl = _fmt_num(stake_hi_cfg, 2)
+    stake_lo_lbl = _fmt_num(stake_lo_cfg, 2)
     out_lines.append(
-        "| Grupo | n_ordens | stake=12 | stake=1.5 | stake=other/NA |\n"
+        f"| Grupo | n_ordens | stake={stake_hi_lbl} | stake={stake_lo_lbl} | stake=other/NA |\n"
     )
     out_lines.append("|---|---:|---:|---:|---:|\n")
     order_diag = [
@@ -1154,7 +1171,7 @@ def _append_backpre_fast_slow_sections(
         if not rows:
             continue
         stc = _cnt_stake(rows)
-        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n")
+        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('hi') or 0)} | {int(stc.get('lo') or 0)} | {int(stc.get('other') or 0)} |\n")
     out_lines.append("\n")
 
     # Slippage_pre_pct por grupo (3 buckets)

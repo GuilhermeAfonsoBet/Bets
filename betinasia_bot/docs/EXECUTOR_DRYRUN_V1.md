@@ -37,8 +37,8 @@ Variáveis úteis:
 ```bash
 export EXECUTOR_ALLOW_LIVE=1
 export EXECUTOR_LIVE_CCY=USD
-export EXECUTOR_LIVE_STAKE=3.0
-export EXECUTOR_LIVE_MAX_STAKE=3.0
+export EXECUTOR_LIVE_STAKE=1.5
+export EXECUTOR_LIVE_MAX_STAKE=20.0
 ```
 
 ## Modo ultra-rápido (recomendado para aproximar do real)
