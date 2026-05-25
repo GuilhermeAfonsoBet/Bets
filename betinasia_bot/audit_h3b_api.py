@@ -67,6 +67,8 @@ class H3bApiAudit:
         gate_open_window_sec: int = 300,
         gate_open_max: int = 3,
         gate_max_late_sec: float = 2.5,
+        gate_back_prefetch_betslip: Optional[bool] = None,
+        gate_back_prefetch_settle_timeout_sec: Optional[float] = None,
         gate_lay_refresh: bool = False,
         gate_lay_refresh_times_sec: Optional[List[float]] = None,
         api_sides: str = "both",
@@ -162,6 +164,12 @@ class H3bApiAudit:
         self.gate_open_window_sec = max(30, int(gate_open_window_sec))
         self.gate_open_max = max(0, int(gate_open_max))
         self.gate_max_late_sec = max(0.0, float(gate_max_late_sec))
+        if gate_back_prefetch_betslip is None:
+            gate_back_prefetch_betslip = self._parse_env_bool("GATE_BACK_PREFETCH_BETSLIP", "1")
+        if gate_back_prefetch_settle_timeout_sec is None:
+            gate_back_prefetch_settle_timeout_sec = self._parse_env_float(
+                "GATE_BACK_PREFETCH_SETTLE_TIMEOUT_SEC", 0.25
+            )
         self.gate_back_prefetch_betslip = bool(gate_back_prefetch_betslip)
         self.gate_back_prefetch_settle_timeout_sec = max(0.0, float(gate_back_prefetch_settle_timeout_sec))
         self.gate_back_enforce_rise_filter = self._parse_env_bool("GATE_BACK_ENFORCE_RISE_FILTER", "0")
