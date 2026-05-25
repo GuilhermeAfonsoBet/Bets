@@ -506,6 +506,12 @@ class H3bApiAudit:
             return float(default)
 
     @staticmethod
+    def _parse_env_bool(name: str, default: str = "0") -> bool:
+        raw = os.getenv(name, default)
+        val = str(raw or "").strip().lower()
+        return val in ("1", "true", "yes", "on")
+
+    @staticmethod
     def _avg(values: List[float]) -> float:
         return (sum(values) / len(values)) if values else 0.0
 
