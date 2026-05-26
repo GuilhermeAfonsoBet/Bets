@@ -4,7 +4,7 @@
 Gera relatório estatístico ROBUSTO (cluster por jogo) no estilo do:
   docs/analise_h3b_resultados_v4_somente.md
 
-Foco: H3B (reversal_direction), comparando modelos por audit_version.
+Foco: hipótese configurável (ex.: H3B/DT + reversal_direction), comparando modelos por audit_version.
 
 Robustez adicionada:
 - métricas reportadas com N_eventos e N_jogos
@@ -417,6 +417,7 @@ def exec_time_bucket(ms: Optional[float]) -> str:
 
 async def fetch_h3b_audit_rows(
     db: Database,
+    hypothesis_type: str,
     direction: str,
     versions: List[str],
     lookback_days: Optional[int] = None,
@@ -424,7 +425,7 @@ async def fetch_h3b_audit_rows(
 ) -> List[Tuple[Any, ...]]:
     """
     Traz a base principal:
-    - betslip_audit_results (H3B, direction) + match (kickoff passado)
+    - betslip_audit_results (hypothesis_type, direction) + match (kickoff passado)
     - closing_odd por best_odds_history (último antes do kickoff, linha+lado)
     """
     # OBS importante de performance:
@@ -469,7 +470,7 @@ async def fetch_h3b_audit_rows(
                 m.status AS match_status
             FROM betslip_audit_results a
             JOIN matches m ON m.external_id = a.event_id
-            WHERE a.hypothesis_type = 'H3B'
+            WHERE a.hypothesis_type = :hypothesis_type
               AND a.reversal_direction = :direction
               AND m.kickoff_time < :end_utc
               AND a.audit_version = ANY(:versions)
@@ -488,6 +489,7 @@ async def fetch_h3b_audit_rows(
         res = await session.execute(
             q,
             {
+                "hypothesis_type": str(hypothesis_type or "H3B"),
                 "direction": direction,
                 "versions": versions,
                 "lookback_days": lookback_days,
@@ -560,9 +562,15 @@ def compute_roi_pct(line: str, side: str, ws_odd: Optional[float], bs_odd: Optio
     return roi_ws, roi_bs
 
 
+def _is_match_finished_status(status: Any) -> bool:
+    s = str(status or "").strip().lower()
+    return s in {"finished", "ended", "closed", "settled", "full_time", "fulltime", "ft"}
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção H3B (default: up)")
+    parser.add_argument("--hypothesis-type", default="H3B", help="Hypothesis type da auditoria (default: H3B)")
+    parser.add_argument("--direction", default="up", choices=["up", "down"], help="Direção da hipótese (default: up)")
     parser.add_argument(
         "--versions",
         default="v4.0-api,v5.2-api-back,v5.1-ws-gate-lay",
@@ -647,6 +655,13 @@ async def main() -> int:
         help="Mensagem do commit (opcional). Se omitida, usa uma mensagem padrão.",
     )
     parser.add_argument("--seed", type=int, default=1337, help="Seed do bootstrap")
+    parser.add_argument(
+        "--roi-require-finished",
+        type=int,
+        default=int(os.getenv("ROI_REQUIRE_FINISHED", "1")),
+        help="Se 1 (default), só calcula ROI quando match_status indica jogo finalizado. "
+        "Use 0 para permitir ROI em jogos não-finalizados (não recomendado).",
+    )
     # Sizing / oportunidade (Kelly + capacidade)
     parser.add_argument(
         "--kelly-fractions",
@@ -854,6 +869,21 @@ async def main() -> int:
         help="Mínimo de jogos por combinação para ser elegível (default 20). Use 0 para desabilitar o mínimo.",
     )
     parser.add_argument(
+        "--wf-pre-activation-mode",
+        choices=["roi_clv", "roi_only"],
+        default=os.getenv("WF_PRE_ACTIVATION_MODE", "roi_clv").strip() or "roi_clv",
+        help="Regra de ativação para combinações pre-match no WF: "
+        "'roi_clv' mantém o gate atual (ROI + CLV quando ROI não-significativo); "
+        "'roi_only' ativa apenas por ROI (sem gate de CLV). Default: roi_clv.",
+    )
+    parser.add_argument(
+        "--wf-roi-min-activate",
+        type=float,
+        default=float(os.getenv("WF_ROI_MIN_ACTIVATE", "0")),
+        help="ROI mínimo (%%) para ativar combinações no WF (default 0). "
+        "Ex.: 2 para exigir ROI>2%% em vez de ROI>0.",
+    )
+    parser.add_argument(
         "--wf-key-by-league",
         action="store_true",
         default=(os.getenv("WF_KEY_BY_LEAGUE", "0").strip() in ("1", "true", "True", "yes", "YES")),
@@ -872,6 +902,35 @@ async def main() -> int:
         default=os.getenv("WF_SIDES", "both").strip() or "both",
         help="Restringe o universo do walk-forward por lado. "
         "Use 'lay' para evitar que a carteira OOS selecione Back quando a operação ainda é Lay-only. Default: both.",
+    )
+    parser.add_argument(
+        "--wf-regimes",
+        choices=["both", "pre", "in"],
+        default=os.getenv("WF_REGIMES", "both").strip() or "both",
+        help="Restringe o universo do walk-forward por regime temporal. "
+        "Use 'pre' para cenários Back Pre puros, sem mistura com In. Default: both.",
+    )
+    parser.add_argument(
+        "--wf-backpre-slip-max",
+        type=float,
+        default=_safe_float(os.getenv("WF_BACKPRE_SLIP_MAX", "")),
+        help="Filtro opcional para cenário Back Pre: mantém apenas eventos com slippage <= limite. "
+        "Ex.: 0 para cenário slippage <~ 0. Desligado por padrão.",
+    )
+    parser.add_argument(
+        "--wf-backpre-slip-field",
+        choices=["slippage_pre_pct", "diff_pct"],
+        default=os.getenv("WF_BACKPRE_SLIP_FIELD", "diff_pct").strip() or "diff_pct",
+        help="Campo usado no filtro de slippage Back Pre: "
+        "`slippage_pre_pct` (quando disponível em hypothesis_details) ou `diff_pct` (proxy sempre disponível). "
+        "Default: diff_pct.",
+    )
+    parser.add_argument(
+        "--wf-backpre-fast-max-lag-ms",
+        type=float,
+        default=_safe_float(os.getenv("WF_BACKPRE_FAST_MAX_LAG_MS", "")),
+        help="Filtro opcional para cenário Back Pre Fast: mantém apenas eventos com lag_total_ms <= limite. "
+        "Ex.: 5000 para ~5s. Desligado por padrão.",
     )
     parser.add_argument(
         "--wf-liquidity-mode",
@@ -1100,13 +1159,15 @@ async def main() -> int:
         end_lbl = end_utc.isoformat().replace("+00:00", "Z")
         start_lbl = (start_utc.isoformat().replace("+00:00", "Z") if isinstance(start_utc, datetime) else None)
         print(
-            f"[INFO] Carregando dados H3B (direction={args.direction}, versions={versions}, "
+            f"[INFO] Carregando dados {str(args.hypothesis_type).upper()} "
+            f"(direction={args.direction}, versions={versions}, "
             f"lookback_days={args.lookback_days}, start_utc={start_lbl}, end_utc={end_lbl})...",
             flush=True,
         )
         t0 = time.perf_counter()
         rows = await fetch_h3b_audit_rows(
             db,
+            hypothesis_type=str(args.hypothesis_type or "H3B"),
             direction=str(args.direction),
             versions=versions,
             lookback_days=args.lookback_days,
@@ -1187,14 +1248,19 @@ async def main() -> int:
                 d["lag_overhead_ms"] = None
 
             # ROI
-            roi_ws, roi_bs = compute_roi_pct(
-                line=str(d["line"]),
-                side=str(d["side"]),
-                ws_odd=_safe_float(d["ws_odd"]),
-                bs_odd=_safe_float(d["bs_odd"]),
-                hs=d["home_score"],
-                aws=d["away_score"],
-            )
+            roi_require_finished = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished = _is_match_finished_status(d.get("match_status"))
+            if roi_require_finished and (not is_finished):
+                roi_ws, roi_bs = None, None
+            else:
+                roi_ws, roi_bs = compute_roi_pct(
+                    line=str(d["line"]),
+                    side=str(d["side"]),
+                    ws_odd=_safe_float(d["ws_odd"]),
+                    bs_odd=_safe_float(d["bs_odd"]),
+                    hs=d["home_score"],
+                    aws=d["away_score"],
+                )
             d["roi_ws"] = roi_ws
             d["roi_bs"] = roi_bs
 
@@ -1536,14 +1602,20 @@ async def main() -> int:
             title += f" — Regime(s): {args.exec_bucket}"
         lines.append(f"# {title}\n")
         lines.append(f"**Data da execução:** {now_utc}  \n")
-        lines.append("**Escopo:** H3B (auditoria), com comparação por `audit_version` e inferência robusta por jogo (cluster bootstrap).  \n")
+        hyp_lbl = str(args.hypothesis_type or "H3B").upper()
+        lines.append(
+            f"**Escopo:** {hyp_lbl} (auditoria), com comparação por `audit_version` e "
+            "inferência robusta por jogo (cluster bootstrap).  \n"
+        )
         lines.append("**Nota:** a robustez aqui significa que intervalos de confiança consideram correlação intra-jogo (múltiplas auditorias por partida).\n")
         lines.append("---\n")
 
         # 1) Contexto
         lines.append("## 1) Contexto do corte (b808)\n")
         lines.append("| Indicador | Valor |\n|---|---:|\n")
-        lines.append(f"| Auditorias H3B `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n")
+        lines.append(
+            f"| Auditorias {hyp_lbl} `{args.direction.upper()}` (match + kickoff passado) | {len(all_data)} |\n"
+        )
         lines.append(f"| Betslip bruto | {len(with_bs_raw)} |\n")
         lines.append(f"| Betslip confiável (diff -10% a +10%) | {len(with_bs)} |\n")
         lines.append(f"| Descartados no filtro de qualidade | {len(with_bs_raw) - len(with_bs)} |\n")
@@ -3483,7 +3555,13 @@ async def main() -> int:
             if ws0 is not None and float(ws0) > 0 and entry_odd is not None and float(entry_odd) > 0:
                 diff_entry = (float(entry_odd) - float(ws0)) / float(ws0) * 100.0
             # ROI por ponto (se houver placar)
-            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi_require_finished_local = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished_local = _is_match_finished_status(d.get("match_status"))
+            mult = (
+                _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if (not roi_require_finished_local or is_finished_local)
+                else None
+            )
             roi0 = _roi_back_pct(p0["odd"], mult) if mult is not None else None
             roipeak = _roi_back_pct(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_back_pct(plast["odd"], mult) if mult is not None else None
@@ -3542,7 +3620,13 @@ async def main() -> int:
                         p_end = p_end0
             except Exception:
                 p_end = plast
-            mult = _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+            roi_require_finished_local = bool(int(getattr(args, "roi_require_finished", 1)))
+            is_finished_local = _is_match_finished_status(d.get("match_status"))
+            mult = (
+                _outcome_mult(str(d.get("line", "")), str(d.get("side", "")), d.get("home_score"), d.get("away_score"))
+                if (not roi_require_finished_local or is_finished_local)
+                else None
+            )
             roi0 = _roi_lay_pct_per_liability(p0["odd"], mult) if mult is not None else None
             roival = _roi_lay_pct_per_liability(a["odd_ext"], mult) if mult is not None else None
             roilast = _roi_lay_pct_per_liability(plast["odd"], mult) if mult is not None else None
@@ -4929,6 +5013,13 @@ async def main() -> int:
             "os lucros/prejuízos por linha não são somáveis. Para não sobrepor: use `--wf-step-days` igual a `--wf-test-days`.\n\n"
             "Isso aproxima o fluxo operacional que você descreveu (seleciona no passo atual e mede no(s) próximo(s) dia(s)).\n\n"
         )
+        lines.append(
+            f"- **Pre activation mode**: `{str(getattr(args,'wf_pre_activation_mode','roi_clv') or 'roi_clv')}` "
+            "(`roi_clv` = ROI+CLV no pre; `roi_only` = somente ROI no pre).\n\n"
+        )
+        lines.append(
+            f"- **ROI mínimo de ativação**: `ROI > {float(getattr(args,'wf_roi_min_activate',0.0) or 0.0):.2f}%`.\n\n"
+        )
 
         if not bool(getattr(args, "walkforward", False)):
             lines.append(
@@ -4944,6 +5035,10 @@ async def main() -> int:
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
             if wf_train_mode not in ("rolling", "expanding"):
                 wf_train_mode = "rolling"
+            wf_pre_activation_mode = str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv").strip().lower()
+            if wf_pre_activation_mode not in ("roi_clv", "roi_only"):
+                wf_pre_activation_mode = "roi_clv"
+            wf_roi_min_activate = float(_safe_float(getattr(args, "wf_roi_min_activate", 0.0)) or 0.0)
             wf_scheme_pre = str(getattr(args, "wf_scheme_pre", "KELLY_0.25") or "KELLY_0.25").strip()
             wf_scheme_in = str(getattr(args, "wf_scheme_in", "FLAT") or "FLAT").strip()
             wf_expand = bool(getattr(args, "wf_expand_missing_roi", True))
@@ -5116,6 +5211,19 @@ async def main() -> int:
                 wf_sides = "both"
             allow_back = wf_sides in ("both", "back")
             allow_lay = wf_sides in ("both", "lay")
+            wf_regimes = str(getattr(args, "wf_regimes", "both") or "both").strip().lower()
+            if wf_regimes not in ("both", "pre", "in"):
+                wf_regimes = "both"
+            allow_pre = wf_regimes in ("both", "pre")
+            allow_in = wf_regimes in ("both", "in")
+            wf_backpre_slip_max = _safe_float(getattr(args, "wf_backpre_slip_max", None))
+            wf_backpre_slip_field = str(getattr(args, "wf_backpre_slip_field", "diff_pct") or "diff_pct").strip().lower()
+            if wf_backpre_slip_field not in ("slippage_pre_pct", "diff_pct"):
+                wf_backpre_slip_field = "diff_pct"
+            wf_backpre_fast_max_lag_ms = _safe_float(getattr(args, "wf_backpre_fast_max_lag_ms", None))
+
+            def _regime_allowed(is_live_eff: bool) -> bool:
+                return bool(allow_in if bool(is_live_eff) else allow_pre)
 
             # --- Back: inclui v4.0-api (BS real) e v5.0-ws-only (proxy WS@t+offset) ---
             def _is_live_eff(d: dict, *, ts: Optional[datetime] = None) -> bool:
@@ -5149,6 +5257,19 @@ async def main() -> int:
                     if not isinstance(ts, datetime):
                         continue
                     is_live_eff = _is_live_eff(d0, ts=ts)
+                    if not _regime_allowed(bool(is_live_eff)):
+                        continue
+                    h = d0.get("hypothesis_details") or {}
+                    slip_pre = (
+                        _safe_float(_get_path(h, ["value_sizing", "slippage_pre_pct"]))
+                        or _safe_float(_get_path(h, ["finance", "value_sizing", "slippage_pre_pct"]))
+                        or _safe_float(_get_path(h, ["slippage_pre_pct"]))
+                    )
+                    pre_submit_ms = (
+                        _safe_float(_get_path(h, ["value_sizing", "pre_submit_ms"]))
+                        or _safe_float(_get_path(h, ["finance", "value_sizing", "pre_submit_ms"]))
+                        or _safe_float(_get_path(h, ["pre_submit_ms"]))
+                    )
                     ws0 = _safe_float(d0.get("ws_odd"))
                     if ws0 is None or ws0 <= 0:
                         continue
@@ -5170,6 +5291,18 @@ async def main() -> int:
                     diff = ((float(entry) - float(ws0)) / float(ws0)) * 100.0 if ws0 else None
                     if diff is None:
                         continue
+                    # Cenário opcional Back Pre Fast/Slippage:
+                    # - aplica apenas em eventos Pre
+                    # - slippage por `slippage_pre_pct` (quando disponível) ou proxy `diff_pct`
+                    if not bool(is_live_eff):
+                        if wf_backpre_slip_max is not None:
+                            slip_ref = (slip_pre if wf_backpre_slip_field == "slippage_pre_pct" else _safe_float(diff))
+                            if slip_ref is None or float(slip_ref) > float(wf_backpre_slip_max):
+                                continue
+                        if wf_backpre_fast_max_lag_ms is not None:
+                            lag_ms = _safe_float(d0.get("lag_total_ms"))
+                            if lag_ms is None or float(lag_ms) > float(wf_backpre_fast_max_lag_ms):
+                                continue
                     # filtro de qualidade (mesmo range do BS confiável)
                     if not (-10.0 <= float(diff) <= 10.0):
                         continue
@@ -5177,14 +5310,16 @@ async def main() -> int:
                     if float(diff) < float(back_cut):
                         continue
                     # ROI no ponto de entrada (stake=1)
-                    _, roi_entry = compute_roi_pct(
-                        line=str(d0.get("line", "")),
-                        side=str(d0.get("side", "")),
-                        ws_odd=None,
-                        bs_odd=float(entry),
-                        hs=d0.get("home_score"),
-                        aws=d0.get("away_score"),
-                    )
+                    roi_entry = None
+                    if (not bool(int(getattr(args, "roi_require_finished", 1)))) or _is_match_finished_status(d0.get("match_status")):
+                        _, roi_entry = compute_roi_pct(
+                            line=str(d0.get("line", "")),
+                            side=str(d0.get("side", "")),
+                            ws_odd=None,
+                            bs_odd=float(entry),
+                            hs=d0.get("home_score"),
+                            aws=d0.get("away_score"),
+                        )
                     # CLV pre-match
                     clv_entry = None
                     if not is_live_eff:
@@ -5208,6 +5343,8 @@ async def main() -> int:
                             "entry_odd": float(entry),
                             "entry_source": src,
                             "diff_pct": float(diff),
+                            "slippage_pre_pct": (float(slip_pre) if slip_pre is not None else None),
+                            "pre_submit_ms": (float(pre_submit_ms) if pre_submit_ms is not None else None),
                         }
                     )
 
@@ -5246,6 +5383,8 @@ async def main() -> int:
                     if float(diff) > float(lay_cut):
                         continue
                     is_live_eff = _is_live_eff(d0, ts=ts)
+                    if not _regime_allowed(bool(is_live_eff)):
+                        continue
                     combo_events.append(
                         {
                             "day": ts.astimezone(timezone.utc).strftime("%Y-%m-%d"),
@@ -5965,7 +6104,7 @@ async def main() -> int:
                             roi_sh = _safe_float((shrink_map or {}).get(str(k)))
                             if roi_sh is not None:
                                 roi_mean_eff = float(roi_sh)
-                        roi_pos = bool(roi_mean_eff is not None and float(roi_mean_eff) > 0)
+                        roi_above_min = bool(roi_mean_eff is not None and float(roi_mean_eff) > float(wf_roi_min_activate))
                         roi_sig_pos = _ci_sig_pos(roi_ci)
                         roi_sig_neg = _ci_sig_neg(roi_ci)
                         eligible = bool(len(bym_roi) >= wf_min_m)
@@ -5982,17 +6121,30 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "BackPre: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "BackPre: ROI sig>0"
-                            elif roi_pos and ((not clv_avail) or clv_pos):
-                                ok_sel = True
-                                reason = "BackPre: ROI>0 (NS) AND (CLV ausente OU CLV>0)"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"BackPre: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"BackPre: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = False
-                                reason = f"BackPre: ROI>0={roi_pos}, CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                if wf_pre_activation_mode == "roi_only":
+                                    ok_sel = bool(roi_above_min)
+                                    reason = f"BackPre[ROI_ONLY]: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                elif roi_above_min and ((not clv_avail) or clv_pos):
+                                    ok_sel = True
+                                    reason = f"BackPre: ROI>{wf_roi_min_activate:.2f} (NS) AND (CLV ausente OU CLV>0)"
+                                else:
+                                    ok_sel = False
+                                    reason = (
+                                        f"BackPre: ROI>{wf_roi_min_activate:.2f}={roi_above_min}, "
+                                        f"CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    )
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6015,14 +6167,19 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "BackIn: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "BackIn: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"BackIn: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"BackIn: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = bool(roi_pos)
-                                reason = f"BackIn: ROI>0={roi_pos}"
+                                ok_sel = bool(roi_above_min)
+                                reason = f"BackIn: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
@@ -6046,17 +6203,30 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "LayPre: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "LayPre: ROI sig>0"
-                            elif roi_pos and ((not clv_avail) or clv_pos):
-                                ok_sel = True
-                                reason = "LayPre: ROI>0 (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"LayPre: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"LayPre: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = False
-                                reason = f"LayPre: ROI>0={roi_pos}, CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                if wf_pre_activation_mode == "roi_only":
+                                    ok_sel = bool(roi_above_min)
+                                    reason = f"LayPre[ROI_ONLY]: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                elif roi_above_min and ((not clv_avail) or clv_pos):
+                                    ok_sel = True
+                                    reason = f"LayPre: ROI>{wf_roi_min_activate:.2f} (NS) AND (CLV_CONV ausente OU CLV_CONV>0)"
+                                else:
+                                    ok_sel = False
+                                    reason = (
+                                        f"LayPre: ROI>{wf_roi_min_activate:.2f}={roi_above_min}, "
+                                        f"CLV_CONV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                    )
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_clv": len(bym_clv),
                                 "clv_q10": _q(bym_clv, 0.10) if bym_clv else None,
@@ -6079,14 +6249,19 @@ async def main() -> int:
                                 ok_sel = False
                                 reason = "In: ROI sig<0 (bloqueia)"
                             elif roi_sig_pos:
-                                ok_sel = True
-                                reason = "In: ROI sig>0"
+                                ok_sel = bool(roi_above_min)
+                                reason = (
+                                    f"In: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                    if ok_sel
+                                    else f"In: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                                )
                             else:
-                                ok_sel = bool(roi_pos)
-                                reason = f"In: ROI>0={roi_pos}"
+                                ok_sel = bool(roi_above_min)
+                                reason = f"In: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
                             diag[k] = {
                                 "ok": ok_sel,
                                 "reason": reason,
+                                "roi_min_activate": wf_roi_min_activate,
                                 "train_matches_total": len({e['match_id'] for e in sub}),
                                 "train_matches_roi": len(bym_roi),
                                 "roi_mean": roi_mean,
@@ -6768,6 +6943,14 @@ async def main() -> int:
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
                                 "min_matches": int(getattr(args, "wf_min_matches", 0)),
+                                "pre_activation_mode": str(getattr(args, "wf_pre_activation_mode", "roi_clv") or "roi_clv"),
+                                "roi_min_activate": float(getattr(args, "wf_roi_min_activate", 0.0) or 0.0),
+                                "roi_require_finished": bool(int(getattr(args, "roi_require_finished", 1))),
+                                "sides": str(getattr(args, "wf_sides", "both") or "both"),
+                                "regimes": str(getattr(args, "wf_regimes", "both") or "both"),
+                                "backpre_slip_max": _safe_float(getattr(args, "wf_backpre_slip_max", None)),
+                                "backpre_slip_field": str(getattr(args, "wf_backpre_slip_field", "diff_pct") or "diff_pct"),
+                                "backpre_fast_max_lag_ms": _safe_float(getattr(args, "wf_backpre_fast_max_lag_ms", None)),
                                 "key_by_league": bool(getattr(args, "wf_key_by_league", False)),
                                 "key_by_league_scope": str(getattr(args, "wf_key_by_league_scope", "pre") or "pre"),
                                 "liquidity_mode": str(getattr(args, "wf_liquidity_mode", "none") or "none"),
@@ -6878,11 +7061,15 @@ async def main() -> int:
                                 f"start_utc=`{start_lbl}`, end_utc=`{end_lbl}`\n",
                                 f"- **WF**: train_mode=`{wf_train_mode}`, train_days=`{wf_train}`, test_days=`{wf_test}`, step_days=`{wf_step}`; "
                                 f"min_matches=`{wf_min_m}`; key_by_league=`{bool(getattr(args,'wf_key_by_league',False))}` "
-                                f"(scope=`{getattr(args,'wf_key_by_league_scope','pre')}`)\n",
+                                f"(scope=`{getattr(args,'wf_key_by_league_scope','pre')}`); "
+                                f"sides=`{getattr(args,'wf_sides','both')}`; regimes=`{getattr(args,'wf_regimes','both')}`\n",
                                 f"- **Filtros OOS**: AH_max_abs_line=`{_fmt_num(getattr(args,'wf_ah_max_abs_line',0.0),2)}`, "
                                 f"AH_scope=`{getattr(args,'wf_ah_scope','all')}`; "
                                 f"exclude_exec_buckets_back=`{getattr(args,'wf_exclude_exec_buckets_back','')}`; "
-                                f"exclude_exec_buckets_lay=`{getattr(args,'wf_exclude_exec_buckets_lay','')}`\n",
+                                f"exclude_exec_buckets_lay=`{getattr(args,'wf_exclude_exec_buckets_lay','')}`; "
+                                f"backpre_slip_max=`{_fmt_num(getattr(args,'wf_backpre_slip_max',None),2)}` "
+                                f"(field=`{getattr(args,'wf_backpre_slip_field','diff_pct')}`); "
+                                f"backpre_fast_max_lag_ms=`{_fmt_num(getattr(args,'wf_backpre_fast_max_lag_ms',None),0)}`\n",
                                 f"- **Sizing**: pre=`{getattr(args,'wf_scheme_pre','')}`, in=`{getattr(args,'wf_scheme_in','')}`, "
                                 f"flat_back=`{_fmt_num(getattr(args,'wf_flat_stake_back',1.0),2)}`, flat_lay=`{_fmt_num(getattr(args,'wf_flat_liab_lay',1.0),2)}`; "
                                 f"kelly_bankroll=`{_fmt_num(getattr(args,'kelly_bankroll',None),2)}`\n",
