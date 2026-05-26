@@ -232,6 +232,90 @@ def _policy_compatibility_check(
     }
 
 
+def _policy_wf_guard_check(
+    policy_wf: Any,
+    *,
+    required_fields: List[str],
+    expected_train_mode: str,
+    min_train_days: int,
+    min_test_days: int,
+    min_step_days: int,
+    expected_sides: str,
+    expected_regimes: str,
+    expected_pre_activation_mode: str,
+    expected_backpre_slip_field: str,
+    expected_backpre_slip_max: Optional[float],
+) -> Dict[str, Any]:
+    wf = policy_wf if isinstance(policy_wf, dict) else {}
+    checks: List[Tuple[bool, str]] = []
+
+    req = [str(x).strip() for x in (required_fields or []) if str(x).strip()]
+    for field in req:
+        val = wf.get(field)
+        ok = not (val is None or (isinstance(val, str) and (not str(val).strip())))
+        checks.append((ok, f"{field} presente (atual={val!r})"))
+
+    def _cmp_str(field: str, expected: str) -> None:
+        exp = str(expected or "").strip().lower()
+        if not exp:
+            return
+        act = str(wf.get(field) or "").strip().lower()
+        checks.append((act == exp, f"{field}={exp} (atual={wf.get(field)!r})"))
+
+    _cmp_str("train_mode", expected_train_mode)
+    _cmp_str("sides", expected_sides)
+    _cmp_str("regimes", expected_regimes)
+    _cmp_str("pre_activation_mode", expected_pre_activation_mode)
+    _cmp_str("backpre_slip_field", expected_backpre_slip_field)
+
+    tr = _safe_float(wf.get("train_days"))
+    te = _safe_float(wf.get("test_days"))
+    st = _safe_float(wf.get("step_days"))
+    if int(min_train_days or 0) > 0:
+        checks.append((tr is not None and float(tr) >= float(min_train_days), f"train_days>={int(min_train_days)} (atual={wf.get('train_days')!r})"))
+    if int(min_test_days or 0) > 0:
+        checks.append((te is not None and float(te) >= float(min_test_days), f"test_days>={int(min_test_days)} (atual={wf.get('test_days')!r})"))
+    if int(min_step_days or 0) > 0:
+        checks.append((st is not None and float(st) >= float(min_step_days), f"step_days>={int(min_step_days)} (atual={wf.get('step_days')!r})"))
+
+    if expected_backpre_slip_max is not None:
+        got_slip = _safe_float(wf.get("backpre_slip_max"))
+        ok_slip = (got_slip is not None) and (abs(float(got_slip) - float(expected_backpre_slip_max)) <= 1e-9)
+        checks.append((ok_slip, f"backpre_slip_max={float(expected_backpre_slip_max):g} (atual={wf.get('backpre_slip_max')!r})"))
+
+    ok = bool(checks) and all(c[0] for c in checks)
+    failed = [msg for cond, msg in checks if not cond]
+    reason = "ok" if ok else ("; ".join(failed[:6]) if failed else "wf_guard_no_checks")
+    return {
+        "ok": bool(ok),
+        "reason": str(reason),
+        "required_fields": list(req),
+        "expected": {
+            "train_mode": str(expected_train_mode or ""),
+            "min_train_days": int(min_train_days or 0),
+            "min_test_days": int(min_test_days or 0),
+            "min_step_days": int(min_step_days or 0),
+            "sides": str(expected_sides or ""),
+            "regimes": str(expected_regimes or ""),
+            "pre_activation_mode": str(expected_pre_activation_mode or ""),
+            "backpre_slip_field": str(expected_backpre_slip_field or ""),
+            "backpre_slip_max": expected_backpre_slip_max,
+        },
+        "actual": {
+            "train_mode": wf.get("train_mode"),
+            "train_days": wf.get("train_days"),
+            "test_days": wf.get("test_days"),
+            "step_days": wf.get("step_days"),
+            "sides": wf.get("sides"),
+            "regimes": wf.get("regimes"),
+            "pre_activation_mode": wf.get("pre_activation_mode"),
+            "backpre_slip_field": wf.get("backpre_slip_field"),
+            "backpre_slip_max": wf.get("backpre_slip_max"),
+        },
+        "checks": [{"ok": bool(cond), "rule": str(msg)} for cond, msg in checks],
+    }
+
+
 def _parse_dt_any(s: Any) -> Optional[datetime]:
     """
     Best-effort parse para campos como 'post date' do CSV de accounting.
@@ -3491,6 +3575,31 @@ class DailyReportCfg:
     policy_compat_min_pre_keys: int = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", "1"), 1))
     policy_compat_bridge_exec_side: str = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", "Back"))
     policy_compat_prematch_only: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1"))))
+    # Guard extra para evitar regressões silenciosas de versão/parametrização WF.
+    policy_wf_guard_enable: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1")))
+    policy_wf_guard_fail_closed: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1")))
+    policy_wf_guard_required_fields: str = os.getenv(
+        "DAILY_WF_GUARD_REQUIRED_FIELDS",
+        "train_mode,train_days,test_days,step_days,sides,regimes,pre_activation_mode,backpre_slip_max,backpre_slip_field",
+    ).strip()
+    policy_wf_guard_expected_train_mode: str = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", "expanding")).strip()
+    policy_wf_guard_min_train_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", "30"), 30))
+    policy_wf_guard_min_test_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", "7"), 7))
+    policy_wf_guard_min_step_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", "7"), 7))
+    policy_wf_guard_expected_sides: str = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", "back")).strip()
+    policy_wf_guard_expected_regimes: str = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", "pre")).strip()
+    policy_wf_guard_expected_pre_activation_mode: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
+        os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_only"),
+    ).strip()
+    policy_wf_guard_expected_backpre_slip_field: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
+        os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct"),
+    ).strip()
+    policy_wf_guard_expected_backpre_slip_max: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
+        os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0"),
+    ).strip()
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
     wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
@@ -3556,6 +3665,27 @@ class DailyReportCfg:
         self.policy_compat_min_pre_keys = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", str(self.policy_compat_min_pre_keys or 1)), 1))
         self.policy_compat_bridge_exec_side = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", self.policy_compat_bridge_exec_side))
         self.policy_compat_prematch_only = _is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1")))
+        self.policy_wf_guard_enable = _is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1" if self.policy_wf_guard_enable else "0"))
+        self.policy_wf_guard_fail_closed = _is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1" if self.policy_wf_guard_fail_closed else "0"))
+        self.policy_wf_guard_required_fields = os.getenv("DAILY_WF_GUARD_REQUIRED_FIELDS", self.policy_wf_guard_required_fields).strip()
+        self.policy_wf_guard_expected_train_mode = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", self.policy_wf_guard_expected_train_mode)).strip()
+        self.policy_wf_guard_min_train_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", str(self.policy_wf_guard_min_train_days or 0)), self.policy_wf_guard_min_train_days))
+        self.policy_wf_guard_min_test_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", str(self.policy_wf_guard_min_test_days or 0)), self.policy_wf_guard_min_test_days))
+        self.policy_wf_guard_min_step_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", str(self.policy_wf_guard_min_step_days or 0)), self.policy_wf_guard_min_step_days))
+        self.policy_wf_guard_expected_sides = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", self.policy_wf_guard_expected_sides)).strip()
+        self.policy_wf_guard_expected_regimes = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", self.policy_wf_guard_expected_regimes)).strip()
+        self.policy_wf_guard_expected_pre_activation_mode = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
+            os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", self.policy_wf_guard_expected_pre_activation_mode),
+        ).strip()
+        self.policy_wf_guard_expected_backpre_slip_field = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
+            os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.policy_wf_guard_expected_backpre_slip_field),
+        ).strip()
+        self.policy_wf_guard_expected_backpre_slip_max = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
+            os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.policy_wf_guard_expected_backpre_slip_max),
+        ).strip()
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
@@ -3865,9 +3995,12 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "enabled": bool(cfg.publish_policy_current),
         "guard_enabled": bool(cfg.policy_compat_guard_enable),
         "fail_closed": bool(cfg.policy_compat_fail_closed),
+        "wf_guard_enabled": bool(cfg.policy_wf_guard_enable),
+        "wf_guard_fail_closed": bool(cfg.policy_wf_guard_fail_closed),
         "published": False,
         "reason": "skipped",
         "compatibility": None,
+        "wf_guard": None,
         "candidate_path": str(policy_hist),
         "effective_path": str(cfg.wf_policy_current),
     }
@@ -3881,9 +4014,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
         pol_candidate: Optional[Dict[str, Any]] = None
         candidate_last: Optional[Dict[str, Any]] = None
+        candidate_wf: Optional[Dict[str, Any]] = None
         try:
             pol_candidate = json.loads(policy_hist.read_text(encoding="utf-8"))
             csteps = pol_candidate.get("steps") if isinstance(pol_candidate, dict) else []
+            candidate_wf = pol_candidate.get("wf") if (isinstance(pol_candidate, dict) and isinstance(pol_candidate.get("wf"), dict)) else {}
             candidate_last = csteps[-1] if isinstance(csteps, list) and csteps else {}
             if isinstance(candidate_last, dict):
                 candidate_active_keys = candidate_last.get("active_keys")
@@ -3902,6 +4037,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             pass
 
         can_publish = bool(cfg.publish_policy_current)
+        def _append_reason(msg: str) -> None:
+            cur = str(policy_publish_info.get("reason") or "")
+            if not cur or cur == "skipped":
+                policy_publish_info["reason"] = str(msg)
+            else:
+                policy_publish_info["reason"] = f"{cur} | {msg}"
+
         if can_publish and isinstance(candidate_last, dict):
             compat = _policy_compatibility_check(
                 candidate_last.get("active_keys"),
@@ -3913,9 +4055,32 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             if bool(cfg.policy_compat_guard_enable) and (not bool(compat.get("ok"))):
                 if bool(cfg.policy_compat_fail_closed):
                     can_publish = False
-                    policy_publish_info["reason"] = f"blocked_by_compat_guard: {compat.get('reason')}"
+                    _append_reason(f"blocked_by_compat_guard: {compat.get('reason')}")
                 else:
-                    policy_publish_info["reason"] = f"compat_guard_warn_fail_open: {compat.get('reason')}"
+                    _append_reason(f"compat_guard_warn_fail_open: {compat.get('reason')}")
+
+        if isinstance(candidate_wf, dict):
+            req_fields = [x.strip() for x in str(cfg.policy_wf_guard_required_fields or "").split(",") if x.strip()]
+            wf_guard = _policy_wf_guard_check(
+                candidate_wf,
+                required_fields=req_fields,
+                expected_train_mode=str(cfg.policy_wf_guard_expected_train_mode or ""),
+                min_train_days=int(cfg.policy_wf_guard_min_train_days or 0),
+                min_test_days=int(cfg.policy_wf_guard_min_test_days or 0),
+                min_step_days=int(cfg.policy_wf_guard_min_step_days or 0),
+                expected_sides=str(cfg.policy_wf_guard_expected_sides or ""),
+                expected_regimes=str(cfg.policy_wf_guard_expected_regimes or ""),
+                expected_pre_activation_mode=str(cfg.policy_wf_guard_expected_pre_activation_mode or ""),
+                expected_backpre_slip_field=str(cfg.policy_wf_guard_expected_backpre_slip_field or ""),
+                expected_backpre_slip_max=_safe_float(cfg.policy_wf_guard_expected_backpre_slip_max),
+            )
+            policy_publish_info["wf_guard"] = wf_guard
+            if bool(cfg.policy_wf_guard_enable) and (not bool(wf_guard.get("ok"))):
+                if bool(cfg.policy_wf_guard_fail_closed):
+                    can_publish = False
+                    _append_reason(f"blocked_by_wf_guard: {wf_guard.get('reason')}")
+                else:
+                    _append_reason(f"wf_guard_warn_fail_open: {wf_guard.get('reason')}")
 
         if can_publish and bool(cfg.publish_policy_current):
             try:
@@ -3955,6 +4120,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "active_keys_base": active_keys_base,
                 "published_to_current": bool(policy_publish_info.get("published")),
                 "publish_reason": str(policy_publish_info.get("reason") or ""),
+                "wf_guard_ok": bool(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("ok")),
+                "wf_guard_reason": str(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("reason") or ""),
                 "candidate_active_keys": candidate_active_keys,
             }
             cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -4131,6 +4298,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     "- **Policy publish**: `BLOQUEADO` "
                     f"(`{policy_publish_info.get('reason')}`) — mantendo policy anterior em `{cfg.wf_policy_current}`.\n"
                 )
+            try:
+                wf_guard = policy_publish_info.get("wf_guard") if isinstance(policy_publish_info, dict) else None
+                if isinstance(wf_guard, dict):
+                    s0.append(
+                        f"- **WF guard (versão/parâmetros)**: "
+                        f"`{'OK' if bool(wf_guard.get('ok')) else 'FAIL'}` "
+                        f"(`{wf_guard.get('reason')}`).\n"
+                    )
+            except Exception:
+                pass
 
     # performance “real” (accounting) quando houver
     if isinstance(acct, dict) and not acct.get("error"):
