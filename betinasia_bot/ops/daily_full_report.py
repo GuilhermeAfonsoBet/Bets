@@ -4039,56 +4039,80 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     return ""
                 return ""
 
+            def _tail_text(txt: str, max_chars: int = 320) -> str:
+                try:
+                    t = str(txt or "").strip()
+                    if not t:
+                        return ""
+                    if len(t) <= int(max_chars):
+                        return t
+                    return t[-int(max_chars):]
+                except Exception:
+                    return ""
+
             proc = _run_oos(args)
             oos_run["returncode"] = int(proc.returncode)
             log_text = _format_oos_log(proc, args)
-            if proc.returncode != 0:
-                oos_run["ok"] = False
-                oos_run["error"] = f"OOS_FAILED: returncode={proc.returncode}"
-            else:
-                # Se o analyzer retornou 0 mas não exportou candidate, tenta 1 rerun com lookback maior.
-                if not policy_hist.exists():
-                    lb_curr = _safe_int(cfg.lookback_days, None)
-                    wf_train_i = max(1, int(_safe_int(cfg.wf_train_days, 30) or 30))
-                    wf_test_i = max(1, int(_safe_int(cfg.wf_test_days, 7) or 7))
-                    wf_step_i = max(1, int(_safe_int(cfg.wf_step_days, 7) or 7))
-                    # margem para dias sem amostra (buracos operacionais)
-                    lb_needed = max(int(wf_train_i + wf_test_i + wf_step_i), int(wf_train_i + wf_test_i + 14), 60)
-                    lb_base = int(lb_curr or 0)
-                    lb_retry = int(max(lb_needed, lb_base))
-                    oos_run["candidate_missing_after_first_run"] = True
-                    oos_run["lookback_days_first"] = lb_base if lb_base > 0 else None
-                    oos_run["lookback_days_retry"] = lb_retry
+            lb_curr = _safe_int(cfg.lookback_days, None)
+            wf_train_i = max(1, int(_safe_int(cfg.wf_train_days, 30) or 30))
+            wf_test_i = max(1, int(_safe_int(cfg.wf_test_days, 7) or 7))
+            wf_step_i = max(1, int(_safe_int(cfg.wf_step_days, 7) or 7))
+            # margem para dias sem amostra (buracos operacionais)
+            lb_needed = max(int(wf_train_i + wf_test_i + wf_step_i), int(wf_train_i + wf_test_i + 14), 60)
+            lb_base = int(lb_curr or 0)
+            lb_retry = int(max(lb_needed, lb_base))
+            oos_run["lookback_days_first"] = lb_base if lb_base > 0 else None
+            oos_run["lookback_days_retry"] = lb_retry
 
-                    if lb_retry > lb_base:
-                        args_retry = _replace_cli_arg(args, "--lookback-days", str(lb_retry))
-                        proc2 = _run_oos(args_retry)
-                        oos_run["commands"] = [str(x) for x in oos_run.get("commands") or []] + [" ".join([str(x) for x in args_retry])]
-                        oos_run["retry_returncode"] = int(proc2.returncode)
-                        log_text = (
-                            log_text
-                            + "\n\n\n========== RETRY: EXPANDED LOOKBACK ==========\n\n"
-                            + _format_oos_log(proc2, args_retry)
-                        )
-                        if proc2.returncode != 0:
-                            oos_run["ok"] = False
-                            oos_run["error"] = f"OOS_RETRY_FAILED: returncode={proc2.returncode}"
-                        elif not policy_hist.exists():
-                            hint = _short_window_hint((proc2.stdout or "") + "\n" + (proc2.stderr or ""))
-                            oos_run["ok"] = False
-                            oos_run["error"] = (
-                                f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
-                                + (f", hint={hint}" if hint else "")
-                            )
-                        else:
-                            oos_run["command"] = " ".join([str(x) for x in args_retry])
-                    else:
-                        hint = _short_window_hint((proc.stdout or "") + "\n" + (proc.stderr or ""))
-                        oos_run["ok"] = False
-                        oos_run["error"] = (
-                            f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
-                            + (f", hint={hint}" if hint else "")
-                        )
+            need_retry_for_failure = bool(proc.returncode != 0 and lb_retry > lb_base)
+            need_retry_for_missing_candidate = bool(proc.returncode == 0 and (not policy_hist.exists()) and lb_retry > lb_base)
+
+            if need_retry_for_failure or need_retry_for_missing_candidate:
+                args_retry = _replace_cli_arg(args, "--lookback-days", str(lb_retry))
+                proc2 = _run_oos(args_retry)
+                oos_run["commands"] = [str(x) for x in oos_run.get("commands") or []] + [" ".join([str(x) for x in args_retry])]
+                oos_run["retry_returncode"] = int(proc2.returncode)
+                log_text = (
+                    log_text
+                    + "\n\n\n========== RETRY: EXPANDED LOOKBACK ==========\n\n"
+                    + _format_oos_log(proc2, args_retry)
+                )
+                oos_run["command"] = " ".join([str(x) for x in args_retry])
+
+                if proc2.returncode != 0:
+                    oos_run["ok"] = False
+                    detail = _tail_text(proc2.stderr or proc2.stdout or "")
+                    oos_run["error_detail"] = detail
+                    oos_run["error"] = (
+                        f"OOS_RETRY_FAILED: returncode={proc2.returncode}"
+                        + (f", detail={detail}" if detail else "")
+                    )
+                elif not policy_hist.exists():
+                    hint = _short_window_hint((proc2.stdout or "") + "\n" + (proc2.stderr or ""))
+                    oos_run["ok"] = False
+                    oos_run["error"] = (
+                        f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
+                        + (f", hint={hint}" if hint else "")
+                    )
+                else:
+                    oos_run["ok"] = True
+                    oos_run["returncode"] = int(proc2.returncode)
+                    oos_run["error"] = None
+                    if need_retry_for_missing_candidate:
+                        oos_run["candidate_missing_after_first_run"] = True
+            else:
+                if proc.returncode != 0:
+                    oos_run["ok"] = False
+                    detail = _tail_text(proc.stderr or proc.stdout or "")
+                    oos_run["error_detail"] = detail
+                    oos_run["error"] = f"OOS_FAILED: returncode={proc.returncode}" + (f", detail={detail}" if detail else "")
+                elif not policy_hist.exists():
+                    hint = _short_window_hint((proc.stdout or "") + "\n" + (proc.stderr or ""))
+                    oos_run["ok"] = False
+                    oos_run["error"] = (
+                        f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
+                        + (f", hint={hint}" if hint else "")
+                    )
 
             # sempre grava log (stdout+stderr) para debug no VPS
             try:
