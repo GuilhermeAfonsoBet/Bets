@@ -3563,7 +3563,7 @@ class DailyReportCfg:
     hypothesis_type: str = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", "H3B")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
-    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
+    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "35")
     no_auto_exclude_days: bool = (os.getenv("DAILY_NO_AUTO_EXCLUDE_DAYS", "0").strip() in ("1", "true", "True", "yes", "YES"))
     report_mode: str = os.getenv("DAILY_REPORT_MODE", "oos_first")
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
@@ -3600,26 +3600,29 @@ class DailyReportCfg:
         "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
         os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0"),
     ).strip()
+    # Hard-fail opcional para impedir "silent stale policy" quando OOS não roda.
+    policy_require_oos_success: bool = (_is_truthy(os.getenv("DAILY_WF_REQUIRE_OOS_SUCCESS", "1")))
+    policy_require_candidate: bool = (_is_truthy(os.getenv("DAILY_WF_REQUIRE_CANDIDATE", "1")))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
-    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
-    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "2")
-    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
+    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "30")
+    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "7")
+    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "7")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
     # Estatística exploratória no OOS (deve ficar OFF no daily 19h)
     wf_experimental_stats: bool = (os.getenv("DAILY_WF_EXPERIMENTAL_STATS", "0").strip() in ("1", "true", "True", "yes", "YES"))
-    wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "2.0")
+    wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "")
     wf_ah_scope: str = os.getenv("DAILY_WF_AH_SCOPE", "pre")
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
     wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
     wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
-    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_clv").strip()
+    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_only").strip()
     wf_roi_min_activate: str = os.getenv("DAILY_WF_ROI_MIN_ACTIVATE", "0").strip()
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
-    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "").strip()
+    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0").strip()
     wf_backpre_slip_field: str = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct").strip()
     wf_backpre_fast_max_lag_ms: str = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", "").strip()
     # Sizing no WF (útil para simular in-match governado por budget/caps, sem trocar policy do robô)
@@ -3686,6 +3689,12 @@ class DailyReportCfg:
             "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
             os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.policy_wf_guard_expected_backpre_slip_max),
         ).strip()
+        self.policy_require_oos_success = _is_truthy(
+            os.getenv("DAILY_WF_REQUIRE_OOS_SUCCESS", "1" if self.policy_require_oos_success else "0")
+        )
+        self.policy_require_candidate = _is_truthy(
+            os.getenv("DAILY_WF_REQUIRE_CANDIDATE", "1" if self.policy_require_candidate else "0")
+        )
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
@@ -3971,7 +3980,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if bool(cfg.wf_sweep_grid_in):
             args += ["--wf-sweep-grid-in"]
 
-    oos_run = {"skipped": False, "ok": True, "returncode": 0, "error": None, "log": str(day_dir / "oos_run.log")}
+    oos_run = {
+        "skipped": False,
+        "ok": True,
+        "returncode": 0,
+        "error": None,
+        "log": str(day_dir / "oos_run.log"),
+        "command": " ".join([str(x) for x in args]),
+        "candidate_path": str(policy_hist),
+    }
     if cfg.skip_oos:
         oos_run = {"skipped": True, "ok": False, "returncode": None, "error": "OOS_SKIPPED (DAILY_SKIP_OOS=1)", "log": None}
     else:
@@ -3997,12 +4014,16 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "fail_closed": bool(cfg.policy_compat_fail_closed),
         "wf_guard_enabled": bool(cfg.policy_wf_guard_enable),
         "wf_guard_fail_closed": bool(cfg.policy_wf_guard_fail_closed),
+        "require_oos_success": bool(cfg.policy_require_oos_success),
+        "require_candidate": bool(cfg.policy_require_candidate),
         "published": False,
         "reason": "skipped",
         "compatibility": None,
         "wf_guard": None,
         "candidate_path": str(policy_hist),
         "effective_path": str(cfg.wf_policy_current),
+        "oos": dict(oos_run or {}),
+        "fatal": False,
     }
     active_keys = None
     active_keys_base = None
@@ -4010,8 +4031,31 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     policy_last_step: Optional[Dict[str, Any]] = None
     candidate_active_keys = None
 
+    oos_ok_for_publish = (not cfg.skip_oos) and bool(oos_run.get("ok"))
+    candidate_exists = bool(policy_hist.exists())
+    policy_publish_info["oos"] = {
+        "skipped": bool(cfg.skip_oos),
+        "ok": bool(oos_run.get("ok")),
+        "returncode": oos_run.get("returncode"),
+        "error": oos_run.get("error"),
+        "log": oos_run.get("log"),
+    }
+    policy_publish_info["candidate_exists"] = bool(candidate_exists)
+    if bool(cfg.publish_policy_current):
+        if bool(cfg.skip_oos):
+            policy_publish_info["reason"] = "blocked_oos_skipped"
+        elif not bool(oos_run.get("ok")):
+            policy_publish_info["reason"] = f"blocked_oos_failed: {str(oos_run.get('error') or 'unknown')[:160]}"
+        elif not bool(candidate_exists):
+            policy_publish_info["reason"] = f"blocked_candidate_missing: {policy_hist}"
+
+        if bool(cfg.policy_require_oos_success) and (not bool(oos_ok_for_publish)):
+            policy_publish_info["fatal"] = True
+        if bool(cfg.policy_require_candidate) and (not bool(candidate_exists)):
+            policy_publish_info["fatal"] = True
+
     # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
-    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+    if bool(oos_ok_for_publish) and bool(candidate_exists):
         pol_candidate: Optional[Dict[str, Any]] = None
         candidate_last: Optional[Dict[str, Any]] = None
         candidate_wf: Optional[Dict[str, Any]] = None
@@ -7199,6 +7243,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
         "policy_publish": dict(policy_publish_info or {}),
+        "oos_run": dict(oos_run or {}),
+        "fatal": bool((policy_publish_info or {}).get("fatal")),
     }
 
     # 6) Telegram
@@ -7268,6 +7314,9 @@ def main() -> int:
 
     out = asyncio.run(run_daily_full(cfg))
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    if bool((out or {}).get("fatal")):
+        logger.error("Daily report finalizou com FATAL (policy publish precondition não atendida).")
+        return 2
     return 0
 
 
