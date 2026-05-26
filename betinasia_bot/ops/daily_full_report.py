@@ -6,11 +6,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 import statistics
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -165,6 +166,156 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _is_truthy(x: Any) -> bool:
+    try:
+        return str(x or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
+
+
+def _policy_compatibility_check(
+    active_keys: Any,
+    *,
+    bridge_exec_side: str,
+    bridge_prematch_only: bool,
+    min_pre_keys: int,
+) -> Dict[str, Any]:
+    keys = [str(k) for k in (active_keys or []) if str(k).strip()]
+    side = str(bridge_exec_side or "back").strip().lower()
+    if side not in ("back", "lay", "both"):
+        side = "back"
+    prematch = bool(bridge_prematch_only)
+    min_need = max(1, int(min_pre_keys))
+
+    def _count(prefix: str) -> int:
+        return sum(1 for k in keys if str(k).startswith(prefix))
+
+    cnt_back_pre = _count("Back_Pre_")
+    cnt_back_in = _count("Back_In_")
+    cnt_lay_pre = _count("Lay_Pre_")
+    cnt_lay_in = _count("Lay_In_")
+
+    checks: List[Tuple[bool, str]] = []
+    if prematch:
+        if side in ("back", "both"):
+            checks.append((cnt_back_pre >= min_need, f"Back_Pre_>={min_need} (atual={cnt_back_pre})"))
+        if side in ("lay", "both"):
+            checks.append((cnt_lay_pre >= min_need, f"Lay_Pre_>={min_need} (atual={cnt_lay_pre})"))
+    else:
+        if side in ("back", "both"):
+            checks.append(((cnt_back_pre + cnt_back_in) >= 1, f"Back_(Pre/In)>=1 (atual={cnt_back_pre + cnt_back_in})"))
+        if side in ("lay", "both"):
+            checks.append(((cnt_lay_pre + cnt_lay_in) >= 1, f"Lay_(Pre/In)>=1 (atual={cnt_lay_pre + cnt_lay_in})"))
+
+    ok = bool(checks) and all(c[0] for c in checks)
+    failed = [msg for cond, msg in checks if not cond]
+    reason = "ok" if ok else ("; ".join(failed) if failed else "no_checks")
+    return {
+        "ok": bool(ok),
+        "reason": str(reason),
+        "bridge_exec_side": str(side),
+        "bridge_prematch_only": bool(prematch),
+        "min_pre_keys": int(min_need),
+        "n_active_keys": int(len(keys)),
+        "n_back_pre": int(cnt_back_pre),
+        "n_back_in": int(cnt_back_in),
+        "n_lay_pre": int(cnt_lay_pre),
+        "n_lay_in": int(cnt_lay_in),
+        "checks": [{"ok": bool(cond), "rule": str(msg)} for cond, msg in checks],
+    }
+
+
+def _policy_wf_guard_check(
+    policy_wf: Any,
+    *,
+    required_fields: List[str],
+    expected_train_mode: str,
+    min_train_days: int,
+    min_test_days: int,
+    min_step_days: int,
+    expected_sides: str,
+    expected_regimes: str,
+    expected_pre_activation_mode: str,
+    expected_backpre_slip_field: str,
+    expected_backpre_slip_max: Optional[float],
+) -> Dict[str, Any]:
+    wf = policy_wf if isinstance(policy_wf, dict) else {}
+    checks: List[Tuple[bool, str]] = []
+
+    req = [str(x).strip() for x in (required_fields or []) if str(x).strip()]
+    for field in req:
+        val = wf.get(field)
+        ok = not (val is None or (isinstance(val, str) and (not str(val).strip())))
+        checks.append((ok, f"{field} presente (atual={val!r})"))
+
+    def _cmp_str(field: str, expected: str) -> None:
+        exp = str(expected or "").strip().lower()
+        if not exp:
+            return
+        act = str(wf.get(field) or "").strip().lower()
+        checks.append((act == exp, f"{field}={exp} (atual={wf.get(field)!r})"))
+
+    _cmp_str("train_mode", expected_train_mode)
+    _cmp_str("sides", expected_sides)
+    _cmp_str("regimes", expected_regimes)
+    _cmp_str("pre_activation_mode", expected_pre_activation_mode)
+    _cmp_str("backpre_slip_field", expected_backpre_slip_field)
+
+    tr = _safe_float(wf.get("train_days"))
+    te = _safe_float(wf.get("test_days"))
+    st = _safe_float(wf.get("step_days"))
+    if int(min_train_days or 0) > 0:
+        checks.append((tr is not None and float(tr) >= float(min_train_days), f"train_days>={int(min_train_days)} (atual={wf.get('train_days')!r})"))
+    if int(min_test_days or 0) > 0:
+        checks.append((te is not None and float(te) >= float(min_test_days), f"test_days>={int(min_test_days)} (atual={wf.get('test_days')!r})"))
+    if int(min_step_days or 0) > 0:
+        checks.append((st is not None and float(st) >= float(min_step_days), f"step_days>={int(min_step_days)} (atual={wf.get('step_days')!r})"))
+
+    if expected_backpre_slip_max is not None:
+        got_slip = _safe_float(wf.get("backpre_slip_max"))
+        ok_slip = (got_slip is not None) and (abs(float(got_slip) - float(expected_backpre_slip_max)) <= 1e-9)
+        checks.append((ok_slip, f"backpre_slip_max={float(expected_backpre_slip_max):g} (atual={wf.get('backpre_slip_max')!r})"))
+
+    ok = bool(checks) and all(c[0] for c in checks)
+    failed = [msg for cond, msg in checks if not cond]
+    reason = "ok" if ok else ("; ".join(failed[:6]) if failed else "wf_guard_no_checks")
+    return {
+        "ok": bool(ok),
+        "reason": str(reason),
+        "required_fields": list(req),
+        "expected": {
+            "train_mode": str(expected_train_mode or ""),
+            "min_train_days": int(min_train_days or 0),
+            "min_test_days": int(min_test_days or 0),
+            "min_step_days": int(min_step_days or 0),
+            "sides": str(expected_sides or ""),
+            "regimes": str(expected_regimes or ""),
+            "pre_activation_mode": str(expected_pre_activation_mode or ""),
+            "backpre_slip_field": str(expected_backpre_slip_field or ""),
+            "backpre_slip_max": expected_backpre_slip_max,
+        },
+        "actual": {
+            "train_mode": wf.get("train_mode"),
+            "train_days": wf.get("train_days"),
+            "test_days": wf.get("test_days"),
+            "step_days": wf.get("step_days"),
+            "sides": wf.get("sides"),
+            "regimes": wf.get("regimes"),
+            "pre_activation_mode": wf.get("pre_activation_mode"),
+            "backpre_slip_field": wf.get("backpre_slip_field"),
+            "backpre_slip_max": wf.get("backpre_slip_max"),
+        },
+        "checks": [{"ok": bool(cond), "rule": str(msg)} for cond, msg in checks],
+    }
+
+
 def _parse_dt_any(s: Any) -> Optional[datetime]:
     """
     Best-effort parse para campos como 'post date' do CSV de accounting.
@@ -214,6 +365,11 @@ async def _fetch_audit_rows_for_ids_daily(db, ids: list[int]) -> Dict[int, Dict[
           a.event_id,
           a.is_live,
           a.audited_at,
+          a.hypothesis_detected_at,
+          a.lag_detection_to_click_ms,
+          a.lag_click_to_betslip_ms,
+          a.audit_total_duration_ms,
+          a.hypothesis_details,
           m.kickoff_time
         FROM betslip_audit_results a
         LEFT JOIN matches m ON m.external_id = a.event_id
@@ -590,13 +746,19 @@ def _order_tail_risk_by_bucket(rows: List[Dict[str, Any]], *, top_n: int = 6) ->
     return out
 
 
-def _safe_int(x: Any) -> Optional[int]:
+def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
+    """
+    Conversão resiliente para int.
+
+    - Sem default explícito: mantém retorno Optional[int] (None em falha).
+    - Com default explícito: retorna o fallback informado em falha/None.
+    """
     try:
         if x is None:
-            return None
+            return default
         return int(str(x).strip())
     except Exception:
-        return None
+        return default
 
 
 def _extract_order_id_from_raw(raw: Any) -> Optional[str]:
@@ -680,19 +842,22 @@ def _approx_eq(a: Any, b: float, *, eps: float = 1e-6) -> bool:
         return False
 
 
-def _stake_bucket(stake: Any) -> str:
+def _stake_bucket(stake: Any, *, hi_min: float, lo_ref: float = 1.5) -> str:
     """
     Bucket simples para acompanhamento operacional do sizing:
-    - "12" para stake≈12
-    - "1.5" para stake≈1.5
+    - "HI" para stake > hi_min
+    - "LO" para stake≈lo_ref
     - "other" para valores diferentes/ausentes
     """
-    if _approx_eq(stake, 12.0, eps=0.02):
-        return "12"
-    if _approx_eq(stake, 1.5, eps=0.02):
-        return "1.5"
     if stake is None:
         return "NA"
+    try:
+        if float(stake) > float(hi_min):
+            return "HI"
+    except Exception:
+        return "NA"
+    if _approx_eq(stake, float(lo_ref), eps=0.02):
+        return "LO"
     return "other"
 
 
@@ -955,7 +1120,7 @@ def _append_backpre_fast_slow_sections(
     open_order_ids: Optional[set[str]] = None,
 ) -> None:
     """
-    Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake 12 vs 1.5):
+    Seções para acompanhar a tese Back Pre fast (pre_submit_ms<=5s) e o sizing (stake HI vs LO):
     - contagem por grupo e por stake_bucket
     - P&L/ROIw (accounting ledger por order_id)
     - slippage_pre_pct por grupo
@@ -964,9 +1129,13 @@ def _append_backpre_fast_slow_sections(
     if not exec_by_oid_back:
         return
     try:
-        thr_ms = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
+        thr_ms_post = int(float(os.getenv("EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS", "5000") or 5000))
     except Exception:
-        thr_ms = 5000
+        thr_ms_post = 5000
+    try:
+        thr_ms_old = int(float(os.getenv("DAILY_BACKPRE_FAST_OLD_MAX_PRE_SUBMIT_MS", "6000") or 6000))
+    except Exception:
+        thr_ms_old = 6000
     try:
         n_boot = int(float(os.getenv("DAILY_BACKPRE_FAST_BOOTSTRAP_N", "2000") or 2000))
     except Exception:
@@ -979,27 +1148,66 @@ def _append_backpre_fast_slow_sections(
     # “início operacional” da tese (quando stake=HI foi habilitado em produção).
     # Se vazio, usa tudo (comportamento antigo).
     thesis_start_day = str(os.getenv("DAILY_BACKPRE_FAST_THESIS_START_DAY", "") or "").strip()
-    stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "12") or 12.0) or 12.0
+    stake_hi = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_HI", "20") or 20.0) or 20.0
+    stake_lo = _safe_float_or_none(os.getenv("EXECUTOR_BACKPRE_FAST_STAKE_LO", "1.5") or 1.5) or 1.5
     thesis_hi_min = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MIN", "5.0") or 5.0) or 5.0
-    thesis_hi_max = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "14.0") or 14.0) or 14.0
+    thesis_hi_max_raw = str(os.getenv("DAILY_BACKPRE_FAST_HI_MAX", "") or "").strip()
+    thesis_hi_max = _safe_float_or_none(thesis_hi_max_raw) if thesis_hi_max_raw else None
+    if thesis_hi_max is not None and float(thesis_hi_max) <= float(thesis_hi_min):
+        thesis_hi_max = None
+    old_hi_min = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_OLD_HI_MIN", "5.0") or 5.0) or 5.0
+    old_hi_max = _safe_float_or_none(os.getenv("DAILY_BACKPRE_FAST_OLD_HI_MAX", "14.0") or 14.0) or 14.0
+    if float(old_hi_max) < float(old_hi_min):
+        old_hi_max = float(old_hi_min)
+    has_transition = bool(thesis_start_day)
+    try:
+        old_period_end = (
+            (date.fromisoformat(thesis_start_day) - timedelta(days=1)).isoformat() if has_transition else None
+        )
+    except Exception:
+        old_period_end = None
+    old_period_label = (f"até {old_period_end}" if old_period_end else f"< {thesis_start_day}") if has_transition else ""
+    post_period_label = f"desde {thesis_start_day}" if has_transition else "janela analisada"
+    old_hi_label = f"stake em [{_fmt_num(old_hi_min,2)}, {_fmt_num(old_hi_max,2)}]"
+    post_hi_label = (
+        f"stake > {_fmt_num(thesis_hi_min,2)}"
+        if thesis_hi_max is None
+        else f"stake em ({_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]"
+    )
+    fast_dyn_key = "Back Pre fast (critério dinâmico por período)"
+    slow_dyn_key = "Back Pre slow (critério dinâmico por período)"
+    if has_transition:
+        fast_old_diag_key = f"Back Pre fast ({old_period_label}; pre_submit_ms<= {thr_ms_old}ms)"
+        fast_post_diag_key = f"Back Pre fast ({post_period_label}; pre_submit_ms<= {thr_ms_post}ms)"
+        slow_old_diag_key = f"Back Pre slow ({old_period_label}; pre_submit_ms> {thr_ms_old}ms)"
+        slow_post_diag_key = f"Back Pre slow ({post_period_label}; pre_submit_ms> {thr_ms_post}ms)"
+        thesis_old_key = f"Back Pre fast ({old_period_label}; {old_hi_label}; pre_submit_ms<= {thr_ms_old}ms)"
+    else:
+        fast_old_diag_key = None
+        fast_post_diag_key = f"Back Pre fast (pre_submit_ms<= {thr_ms_post}ms)"
+        slow_old_diag_key = None
+        slow_post_diag_key = f"Back Pre slow (pre_submit_ms> {thr_ms_post}ms)"
+        thesis_old_key = None
+    thesis_post_key = f"Back Pre fast ({post_period_label}; {post_hi_label}; pre_submit_ms<= {thr_ms_post}ms)"
+    aux_low_old_key = (
+        f"Back Pre slow ({old_period_label}; stake < {_fmt_num(old_hi_min,2)}; pre_submit_ms> {thr_ms_old}ms)"
+        if has_transition
+        else None
+    )
+    aux_low_post_key = (
+        f"Back Pre slow ({post_period_label}; stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms> {thr_ms_post}ms)"
+    )
 
     # rows com accounting (pnl) + stake (exposure)
     groups_all: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # diagnóstico (todos stakes)
-    groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake=HI)
+    groups_thesis: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # tese (fast + stake HI)
+    groups_aux_low: Dict[str, List[Dict[str, Any]]] = defaultdict(list)  # slow + stake abaixo do limiar
     for oid, em in (exec_by_oid_back or {}).items():
         if not isinstance(em, dict):
             continue
         created = em.get("created_at")
         if not isinstance(created, datetime):
             continue
-        # filtro de janela (>= start_day)
-        if thesis_start_day:
-            try:
-                if str(created.date().isoformat()) < thesis_start_day:
-                    continue
-            except Exception:
-                pass
-
         exp = _safe_float_or_none(em.get("exposure"))
         if exp is None or exp <= 0:
             continue
@@ -1026,7 +1234,35 @@ def _append_backpre_fast_slow_sections(
 
         pre_submit_ms = _safe_int_or_none(em.get("pre_submit_ms"))
         slip_pre = _safe_float_or_none(em.get("slippage_pre_pct"))
-        stake_b = _stake_bucket(exp)
+        created_day = str(created.date().isoformat())
+        is_post = bool(has_transition and created_day >= thesis_start_day)
+        if is_post:
+            fast_thr = int(thr_ms_post)
+            hi_min = float(thesis_hi_min)
+            hi_max = (float(thesis_hi_max) if thesis_hi_max is not None else None)
+            hi_inclusive_min = False
+            fast_reg_key = fast_post_diag_key
+            slow_reg_key = slow_post_diag_key
+            thesis_key = thesis_post_key
+            low_key = aux_low_post_key
+        else:
+            fast_thr = int(thr_ms_old)
+            hi_min = float(old_hi_min)
+            hi_max = float(old_hi_max)
+            hi_inclusive_min = True
+            fast_reg_key = fast_old_diag_key
+            slow_reg_key = slow_old_diag_key
+            thesis_key = thesis_old_key
+            low_key = aux_low_old_key
+        is_hi = ((float(exp) >= hi_min) if hi_inclusive_min else (float(exp) > hi_min)) and (
+            hi_max is None or float(exp) <= float(hi_max)
+        )
+        if is_hi:
+            stake_b = "HI"
+        elif _approx_eq(exp, float(stake_lo), eps=0.02):
+            stake_b = "LO"
+        else:
+            stake_b = "other"
         roi_i = float(pnl) / float(exp) * 100.0
         row = {
             "order_id": str(oid),
@@ -1036,7 +1272,7 @@ def _append_backpre_fast_slow_sections(
             "stake_bucket": stake_b,
             "pre_submit_ms": pre_submit_ms,
             "slippage_pre_pct": slip_pre,
-            "created_day": str(created.date().isoformat()),
+            "created_day": created_day,
         }
 
         if bool(is_in):
@@ -1045,15 +1281,18 @@ def _append_backpre_fast_slow_sections(
             # Pre
             if pre_submit_ms is None:
                 groups_all["Back Pre (pre_submit_ms NA)"].append(row)
-            elif int(pre_submit_ms) <= int(thr_ms):
-                groups_all[f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"].append(row)
-                # tese = fast + stake em faixa HI (pós-início)
-                if _in_range(exp, float(thesis_hi_min), float(thesis_hi_max)):
-                    groups_thesis[
-                        f"Back Pre fast (stake em [{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]; pre_submit_ms<= {thr_ms}ms)"
-                    ].append(row)
+            elif int(pre_submit_ms) <= int(fast_thr):
+                groups_all[fast_dyn_key].append(row)
+                if fast_reg_key:
+                    groups_all[fast_reg_key].append(row)
+                if is_hi and thesis_key:
+                    groups_thesis[thesis_key].append(row)
             else:
-                groups_all[f"Back Pre slow (pre_submit_ms> {thr_ms}ms)"].append(row)
+                groups_all[slow_dyn_key].append(row)
+                if slow_reg_key:
+                    groups_all[slow_reg_key].append(row)
+                if low_key and float(exp) < float(thesis_hi_min if is_post else old_hi_min):
+                    groups_aux_low[low_key].append(row)
 
     if not groups_all and not groups_thesis:
         return
@@ -1062,11 +1301,17 @@ def _append_backpre_fast_slow_sections(
     # A) Performance da tese (stake=HI) com métricas “liquidadas”
     # -------------------------
     out_lines.append("**Tese: Back Pre fast (pós-início; elegível HI) — performance (accounting; order_id)**\n\n")
-    out_lines.append(
-        f"- Critério de elegibilidade HI (relatório): stake em `[{_fmt_num(thesis_hi_min,2)}, {_fmt_num(thesis_hi_max,2)}]`.\n\n"
-    )
-    if thesis_start_day:
-        out_lines.append(f"- Recorte: `created_at_utc >= {thesis_start_day}`.\n\n")
+    if has_transition:
+        out_lines.append(
+            f"- Critério antigo (`{old_period_label}`): `{old_hi_label}` e `pre_submit_ms<= {int(thr_ms_old)}ms`.\n"
+            f"- Critério atual (`{post_period_label}`): `{post_hi_label}` e `pre_submit_ms<= {int(thr_ms_post)}ms`.\n"
+            f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
+        )
+    else:
+        out_lines.append(
+            f"- Critério aplicado: `{post_hi_label}` e `pre_submit_ms<= {int(thr_ms_post)}ms`.\n"
+            f"- Stake HI configurado no executor (`EXECUTOR_BACKPRE_FAST_STAKE_HI`): `{_fmt_num(stake_hi,2)}`.\n\n"
+        )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
 
@@ -1084,7 +1329,12 @@ def _append_backpre_fast_slow_sections(
                 settled.append(r)
         return settled, open_rows
 
-    for g, rows in sorted((groups_thesis or {}).items(), key=lambda kv: kv[0]):
+    thesis_order: List[str] = []
+    if thesis_old_key:
+        thesis_order.append(thesis_old_key)
+    thesis_order.append(thesis_post_key)
+    for g in sorted((groups_thesis or {}).keys(), key=lambda x: (thesis_order.index(x) if x in thesis_order else 999, x)):
+        rows = groups_thesis.get(g) or []
         settled_rows, open_rows = _split_settled(rows)
         if settled_rows is None or open_rows is None:
             out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
@@ -1097,35 +1347,43 @@ def _append_backpre_fast_slow_sections(
     if open_order_ids is None:
         out_lines.append("_Nota: `n_liquidadas`/`ROIw_liquidado` requer `open_stakes.csv` (accounting). Sem isso, este bloco fica como `—`._\n\n")
 
-    # Performance auxiliar: fast com stake < limiar HI_min (impacto prático de latência/degradação)
-    low_rows: List[Dict[str, Any]] = []
-    fast_key = f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)"
-    for r in (groups_all.get(fast_key) or []):
-        exp = _safe_float_or_none(r.get("exposure"))
-        if exp is not None and exp < float(thesis_hi_min):
-            low_rows.append(r)
-    out_lines.append("**Back Pre fast (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
+    # Performance auxiliar: slow/fallback abaixo do limiar HI (ex.: latência acima do limiar do período)
+    out_lines.append("**Back Pre slow (pós-início; stake < limiar HI) — performance auxiliar (accounting; order_id)**\n\n")
+    if has_transition:
+        out_lines.append(
+            f"- Critério antigo (`{old_period_label}`): `pre_submit_ms> {int(thr_ms_old)}ms` e `stake < {_fmt_num(old_hi_min,2)}`.\n"
+            f"- Critério atual (`{post_period_label}`): `pre_submit_ms> {int(thr_ms_post)}ms` e `stake < {_fmt_num(thesis_hi_min,2)}`.\n\n"
+        )
+    else:
+        out_lines.append(
+            f"- Critério aplicado: `pre_submit_ms> {int(thr_ms_post)}ms` e `stake < {_fmt_num(thesis_hi_min,2)}`.\n\n"
+        )
     out_lines.append("| Grupo | n_ordens | n_liquidadas | n_abertas | Stake_liquidado (∑) | P&L_liquidado (∑acct) | ROIw_liquidado |\n")
     out_lines.append("|---|---:|---:|---:|---:|---:|---:|\n")
-    settled_rows, open_rows = _split_settled(low_rows)
-    label_low = f"Back Pre fast (stake < {_fmt_num(thesis_hi_min,2)}; pre_submit_ms<= {thr_ms}ms)"
-    if settled_rows is None or open_rows is None:
-        out_lines.append(f"| {label_low} | {len(low_rows)} | — | — | — | — | — |\n")
-    else:
-        summ_set = _summarize_rows_pnl_exp(settled_rows)
-        out_lines.append(
-            f"| {label_low} | {len(low_rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
-        )
+    aux_order: List[str] = []
+    if aux_low_old_key:
+        aux_order.append(aux_low_old_key)
+    aux_order.append(aux_low_post_key)
+    for g in sorted((groups_aux_low or {}).keys(), key=lambda x: (aux_order.index(x) if x in aux_order else 999, x)):
+        rows = groups_aux_low.get(g) or []
+        settled_rows, open_rows = _split_settled(rows)
+        if settled_rows is None or open_rows is None:
+            out_lines.append(f"| {g} | {len(rows)} | — | — | — | — | — |\n")
+        else:
+            summ_set = _summarize_rows_pnl_exp(settled_rows)
+            out_lines.append(
+                f"| {g} | {len(rows)} | {len(settled_rows)} | {len(open_rows)} | {_fmt_num(summ_set.get('exposure_sum'),2)} | {_fmt_num(summ_set.get('pnl_sum'),2)} | {_fmt_pct(summ_set.get('roi_weighted'))} |\n"
+            )
     out_lines.append("\n")
 
     def _cnt_stake(rows: List[Dict[str, Any]]) -> Dict[str, int]:
-        c: Dict[str, int] = {"12": 0, "1.5": 0, "other": 0}
+        c: Dict[str, int] = {"HI": 0, "LO": 0, "other": 0}
         for r in rows or []:
             sb = str(r.get("stake_bucket") or "")
-            if sb == "12":
-                c["12"] += 1
-            elif sb == "1.5":
-                c["1.5"] += 1
+            if sb == "HI":
+                c["HI"] += 1
+            elif sb == "LO":
+                c["LO"] += 1
             else:
                 c["other"] += 1
         return c
@@ -1135,21 +1393,25 @@ def _append_backpre_fast_slow_sections(
     # -------------------------
     out_lines.append("**Tese Back Pre fast — compliance (pós-início; distribuição de stake e pre_submit_ms)**\n\n")
     out_lines.append(
-        "| Grupo | n_ordens | stake=12 | stake=1.5 | stake=other/NA |\n"
+        f"| Grupo | n_ordens | stake=HI (critério por período) | stake≈{_fmt_num(stake_lo,2)} | stake=other/NA |\n"
     )
     out_lines.append("|---|---:|---:|---:|---:|\n")
-    order_diag = [
-        f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)",
-        f"Back Pre slow (pre_submit_ms> {thr_ms}ms)",
-        "Back Pre (pre_submit_ms NA)",
-        "Back In",
-    ]
+    order_diag = [fast_dyn_key, slow_dyn_key]
+    if fast_old_diag_key:
+        order_diag.append(fast_old_diag_key)
+    if fast_post_diag_key:
+        order_diag.append(fast_post_diag_key)
+    if slow_old_diag_key:
+        order_diag.append(slow_old_diag_key)
+    if slow_post_diag_key:
+        order_diag.append(slow_post_diag_key)
+    order_diag.extend(["Back Pre (pre_submit_ms NA)", "Back In"])
     for g in order_diag:
         rows = groups_all.get(g) or []
         if not rows:
             continue
         stc = _cnt_stake(rows)
-        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('12') or 0)} | {int(stc.get('1.5') or 0)} | {int(stc.get('other') or 0)} |\n")
+        out_lines.append(f"| {g} | {len(rows)} | {int(stc.get('HI') or 0)} | {int(stc.get('LO') or 0)} | {int(stc.get('other') or 0)} |\n")
     out_lines.append("\n")
 
     # Slippage_pre_pct por grupo (3 buckets)
@@ -1173,30 +1435,45 @@ def _append_backpre_fast_slow_sections(
     out_lines.append("\n")
 
     # Robustez: delta fast-slow
+    out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
     try:
-        fast = groups_all.get(f"Back Pre fast (pre_submit_ms<= {thr_ms}ms)") or []
-        slow = groups_all.get(f"Back Pre slow (pre_submit_ms> {thr_ms}ms)") or []
-        if len(fast) >= min_n and len(slow) >= min_n:
+        fast = groups_all.get(fast_dyn_key) or []
+        slow = groups_all.get(slow_dyn_key) or []
+        fast_roi = [float(r.get("roi")) for r in fast if r.get("roi") is not None]
+        slow_roi = [float(r.get("roi")) for r in slow if r.get("roi") is not None]
+        out_lines.append(
+            f"- Critério dinâmico por período (pré: `<= {int(thr_ms_old)}ms`; pós: `<= {int(thr_ms_post)}ms`).\n"
+        )
+        out_lines.append(f"- Amostra líquida: fast=`{len(fast_roi)}` | slow=`{len(slow_roi)}` | min_n=`{min_n}`.\n")
+        if len(fast_roi) >= min_n and len(slow_roi) >= min_n:
             # delta por bootstrap: resample separadamente e computa mean(fast)-mean(slow)
             rnd = random.Random(123)
             deltas: List[float] = []
-            nf = len(fast)
-            ns = len(slow)
+            nf = len(fast_roi)
+            ns = len(slow_roi)
             for _ in range(int(max(300, n_boot))):
                 mf = 0.0
                 ms = 0.0
                 for _j in range(nf):
-                    mf += float(fast[rnd.randrange(0, nf)].get("roi"))
+                    mf += float(fast_roi[rnd.randrange(0, nf)])
                 for _j in range(ns):
-                    ms += float(slow[rnd.randrange(0, ns)].get("roi"))
+                    ms += float(slow_roi[rnd.randrange(0, ns)])
                 deltas.append((mf / float(nf)) - (ms / float(ns)))
             deltas.sort()
-            lo = deltas[int(round(0.05 * (len(deltas) - 1)))]
-            hi = deltas[int(round(0.95 * (len(deltas) - 1)))]
-            out_lines.append("**Tese: Back Pre fast vs slow — diferença de ROI mean (por ordem)**\n\n")
-            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo)} .. {_fmt_pct(hi)}` (min_n={min_n}).\n\n")
-    except Exception:
-        pass
+            lo90 = deltas[int(round(0.05 * (len(deltas) - 1)))]
+            hi90 = deltas[int(round(0.95 * (len(deltas) - 1)))]
+            lo95 = deltas[int(round(0.025 * (len(deltas) - 1)))]
+            hi95 = deltas[int(round(0.975 * (len(deltas) - 1)))]
+            out_lines.append(f"- Delta (fast − slow) IC90 bootstrap: `{_fmt_pct(lo90)} .. {_fmt_pct(hi90)}`.\n")
+            out_lines.append(f"- Delta (fast − slow) IC95 bootstrap: `{_fmt_pct(lo95)} .. {_fmt_pct(hi95)}`.\n\n")
+        else:
+            out_lines.append(
+                f"- _N insuficiente para inferência bootstrap (fast={len(fast_roi)}, slow={len(slow_roi)}, min_n={min_n})._\n\n"
+            )
+    except Exception as e:
+        out_lines.append(
+            f"- _Erro ao montar seção fast vs slow: `{type(e).__name__}: {str(e)[:180]}`._\n\n"
+        )
 
 
 def _acct_amount_by_order_day_from_balance_csv(
@@ -2638,6 +2915,326 @@ def _filter_executor_jsonl_lines_window(lines: list[str], *, since_utc: datetime
     return out
 
 
+def _executor_post_accept_failures_24h(lines_24h: list[str]) -> Dict[str, Any]:
+    """
+    Diagnóstico pós-accepted no executor (janela 24h, a partir do JSONL):
+    - accepted: `result.status in {LIVE_OK, API_FAILED, NO_SESSION, RATE_LIMIT, CAP_BLOCKED}`
+      (i.e., requisições que passaram da etapa de enfileiramento e geraram resultado de execução)
+    - separa por fase:
+      - precheck_fail: erro antes do place_order (sinalizado por LIVE_PRECHECK_FAILED)
+      - place_fail: erro no place_order (LIVE_PLACE_FAILED)
+    """
+    out: Dict[str, Any] = {
+        "accepted_n": 0,
+        "live_ok_n": 0,
+        "accepted_fail_n": 0,
+        "precheck_fail_n": 0,
+        "place_fail_n": 0,
+        "api_failed_n": 0,
+        "no_session_n": 0,
+        "rate_limit_n": 0,
+        "cap_blocked_n": 0,
+        "no_pmms_n": 0,
+        "ctx_destroyed_n": 0,
+        "auth_401_n": 0,
+        "ws_stale_n": 0,
+        "precheck_pmm_wait_ms_p50": None,
+        "precheck_pmm_wait_ms_p90": None,
+        "precheck_ws_age_ms_p50": None,
+        "precheck_ws_age_ms_p90": None,
+        "top_errors": [],
+    }
+    try:
+        accepted_status = {"LIVE_OK", "API_FAILED", "NO_SESSION", "RATE_LIMIT", "CAP_BLOCKED"}
+        err_counts: Dict[str, int] = defaultdict(int)
+        pmm_wait_vals: list[float] = []
+        ws_age_vals: list[float] = []
+
+        for ln in lines_24h or []:
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+            if not isinstance(res, dict):
+                continue
+            st = str(res.get("status") or "").upper().strip()
+            if st == "HEARTBEAT" or st not in accepted_status:
+                continue
+
+            out["accepted_n"] = int(out["accepted_n"]) + 1
+            if st == "LIVE_OK":
+                out["live_ok_n"] = int(out["live_ok_n"]) + 1
+                continue
+
+            out["accepted_fail_n"] = int(out["accepted_fail_n"]) + 1
+            if st == "API_FAILED":
+                out["api_failed_n"] = int(out["api_failed_n"]) + 1
+            elif st == "NO_SESSION":
+                out["no_session_n"] = int(out["no_session_n"]) + 1
+            elif st == "RATE_LIMIT":
+                out["rate_limit_n"] = int(out["rate_limit_n"]) + 1
+            elif st == "CAP_BLOCKED":
+                out["cap_blocked_n"] = int(out["cap_blocked_n"]) + 1
+
+            err = str(res.get("error") or "").strip()
+            err_low = err.lower()
+            if err:
+                err_counts[err[:180]] += 1
+
+            raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+            if "live_precheck_failed" in err_low:
+                out["precheck_fail_n"] = int(out["precheck_fail_n"]) + 1
+                try:
+                    t = raw.get("timing_breakdown") if isinstance(raw.get("timing_breakdown"), dict) else {}
+                    pmmw = _safe_float(t.get("pmm_wait_ms"))
+                    if pmmw is not None:
+                        pmm_wait_vals.append(float(pmmw))
+                except Exception:
+                    pass
+                try:
+                    ws_age = _safe_float(raw.get("ws_age_ms"))
+                    if ws_age is not None:
+                        ws_age_vals.append(float(ws_age))
+                except Exception:
+                    pass
+            if "live_place_failed" in err_low:
+                out["place_fail_n"] = int(out["place_fail_n"]) + 1
+
+            if "no pmms received" in err_low:
+                out["no_pmms_n"] = int(out["no_pmms_n"]) + 1
+            if ("execution context was destroyed" in err_low) or ("target closed" in err_low):
+                out["ctx_destroyed_n"] = int(out["ctx_destroyed_n"]) + 1
+            if ("http_401" in err_low) or ("auth_error" in err_low) or ("no_root_session_cookie" in err_low):
+                out["auth_401_n"] = int(out["auth_401_n"]) + 1
+            if "ws_age_ms=" in err_low or "ws stale" in err_low:
+                out["ws_stale_n"] = int(out["ws_stale_n"]) + 1
+
+        # percentis simples (numpy-free)
+        def _pct(xs: list[float], p: float) -> Optional[float]:
+            if not xs:
+                return None
+            ys = sorted(float(x) for x in xs)
+            if len(ys) == 1:
+                return float(ys[0])
+            k = int(round((len(ys) - 1) * float(p)))
+            k = max(0, min(len(ys) - 1, k))
+            return float(ys[k])
+
+        out["precheck_pmm_wait_ms_p50"] = _pct(pmm_wait_vals, 0.50)
+        out["precheck_pmm_wait_ms_p90"] = _pct(pmm_wait_vals, 0.90)
+        out["precheck_ws_age_ms_p50"] = _pct(ws_age_vals, 0.50)
+        out["precheck_ws_age_ms_p90"] = _pct(ws_age_vals, 0.90)
+
+        tops = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        out["top_errors"] = [{"error": k, "n": int(v)} for k, v in tops]
+    except Exception:
+        return out
+    return out
+
+
+def _extract_audit_ids_from_exec_lines(lines: list[str]) -> list[int]:
+    out: set[int] = set()
+    for ln in lines or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is not None and int(aid) > 0:
+            out.add(int(aid))
+    return sorted(out)
+
+
+def _ms_stats(xs: list[float]) -> Dict[str, Any]:
+    if not xs:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+    ys = sorted(float(x) for x in xs if x is not None)
+    if not ys:
+        return {"n": 0, "p50": None, "p90": None, "p99": None, "mean": None}
+
+    def _q(p: float) -> Optional[float]:
+        if not ys:
+            return None
+        if len(ys) == 1:
+            return float(ys[0])
+        k = int(round((len(ys) - 1) * float(p)))
+        k = max(0, min(len(ys) - 1, k))
+        return float(ys[k])
+
+    return {
+        "n": int(len(ys)),
+        "p50": _q(0.50),
+        "p90": _q(0.90),
+        "p99": _q(0.99),
+        "mean": float(sum(ys) / float(len(ys))),
+    }
+
+
+def _executor_e2e_latency_24h(lines_24h: list[str], audit_by_id: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Latência ponta a ponta em 24h:
+      WS detectado (hypothesis_detected_at) -> executor finished_at.
+
+    Breakdown principal:
+      1) detect_to_submit_ms   : detect -> request.created_at (bridge submit)
+      2) audit_total_ms        : detect -> fim do audit (quando disponível no DB)
+      3) bridge_wait_ms        : (detect->submit) - audit_total_ms
+      4) executor_submit_to_done_ms : submit -> finished_at (call_to_done efetivo)
+      5) e2e_total_ms          : detect -> finished_at
+    """
+    out: Dict[str, Any] = {
+        "n_jsonl_24h": int(len(lines_24h or [])),
+        "n_with_audit_id": 0,
+        "n_with_detected_at": 0,
+        "n_e2e_all": 0,
+        "n_e2e_success": 0,
+        "ok_statuses": ["LIVE_OK", "DRY_OK"],
+        "all": {},
+        "success": {},
+    }
+    metrics_all: Dict[str, list[float]] = defaultdict(list)
+    metrics_ok: Dict[str, list[float]] = defaultdict(list)
+    ok_status = {"LIVE_OK", "DRY_OK"}
+
+    def _audit_telemetry(row: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            raw = row.get("hypothesis_details")
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, dict):
+                return {}
+            t = raw.get("telemetry")
+            return t if isinstance(t, dict) else {}
+        except Exception:
+            return {}
+
+    for ln in lines_24h or []:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+        res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+        if not isinstance(res, dict):
+            continue
+        st = str(res.get("status") or "").upper().strip()
+        if st == "HEARTBEAT":
+            continue
+
+        aid = _safe_int_or_none(
+            res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        )
+        if aid is None or int(aid) <= 0:
+            continue
+        out["n_with_audit_id"] = int(out["n_with_audit_id"]) + 1
+
+        a = audit_by_id.get(int(aid)) if isinstance(audit_by_id, dict) else None
+        if not isinstance(a, dict):
+            continue
+
+        det = _parse_iso_dt_best(a.get("hypothesis_detected_at"))
+        if not isinstance(det, datetime):
+            continue
+        out["n_with_detected_at"] = int(out["n_with_detected_at"]) + 1
+
+        req_created = _parse_iso_dt_best(req.get("created_at") or res.get("created_at"))
+        fin = _parse_iso_dt_best(res.get("finished_at") or res.get("created_at"))
+        if not isinstance(req_created, datetime) or not isinstance(fin, datetime):
+            continue
+        if fin < det:
+            continue
+
+        detect_to_submit_ms = max(0.0, (req_created - det).total_seconds() * 1000.0)
+        submit_to_done_ms = _safe_float(
+            ((res.get("timing") or {}).get("call_to_done_ms"))
+            if isinstance(res.get("timing"), dict)
+            else None
+        )
+        if submit_to_done_ms is None:
+            submit_to_done_ms = max(0.0, (fin - req_created).total_seconds() * 1000.0)
+        e2e_total_ms = max(0.0, (fin - det).total_seconds() * 1000.0)
+
+        audit_total_ms = _safe_float(a.get("audit_total_duration_ms"))
+        audit_det_click_ms = _safe_float(a.get("lag_detection_to_click_ms"))
+        audit_click_bs_ms = _safe_float(a.get("lag_click_to_betslip_ms"))
+        tele = _audit_telemetry(a)
+        gate_wait_s = _safe_float(tele.get("gate_wait_s"))
+        gate_wait_ms = (float(gate_wait_s) * 1000.0) if gate_wait_s is not None else None
+        bridge_wait_ms = (
+            max(0.0, float(detect_to_submit_ms) - float(audit_total_ms))
+            if audit_total_ms is not None
+            else None
+        )
+
+        t = res.get("timing") if isinstance(res.get("timing"), dict) else {}
+        queue_delay_ms = _safe_float(t.get("queue_delay_ms")) if isinstance(t, dict) else None
+        post_ms = _safe_float(t.get("post_ms")) if isinstance(t, dict) else None
+        total_api_ms = _safe_float(t.get("total_ms")) if isinstance(t, dict) else None
+
+        vals = {
+            "e2e_total_ms": e2e_total_ms,
+            "detect_to_submit_ms": detect_to_submit_ms,
+            "audit_total_ms": audit_total_ms,
+            "audit_detect_to_click_ms": audit_det_click_ms,
+            "audit_click_to_betslip_ms": audit_click_bs_ms,
+            "audit_queue_wait_ms": _safe_float(tele.get("queue_wait_ms")),
+            "audit_parallel_fetch_ms": _safe_float(tele.get("parallel_fetch_ms")),
+            "audit_temporal_total_ms": _safe_float(tele.get("temporal_total_ms")),
+            "audit_execution_ms": _safe_float(tele.get("execution_ms")),
+            "audit_pipeline_overhead_ms": _safe_float(tele.get("pipeline_overhead_ms")),
+            "audit_db_save_ms": _safe_float(tele.get("db_save_ms")),
+            "audit_gate_wait_ms": gate_wait_ms,
+            "bridge_wait_ms": bridge_wait_ms,
+            "executor_submit_to_done_ms": submit_to_done_ms,
+            "executor_queue_delay_ms": queue_delay_ms,
+            "executor_post_ms": post_ms,
+            "executor_total_api_ms": total_api_ms,
+        }
+        out["n_e2e_all"] = int(out["n_e2e_all"]) + 1
+        for k, v in vals.items():
+            if v is not None:
+                metrics_all[k].append(float(v))
+        if st in ok_status:
+            out["n_e2e_success"] = int(out["n_e2e_success"]) + 1
+            for k, v in vals.items():
+                if v is not None:
+                    metrics_ok[k].append(float(v))
+
+    keys = [
+        "e2e_total_ms",
+        "detect_to_submit_ms",
+        "audit_total_ms",
+        "audit_detect_to_click_ms",
+        "audit_click_to_betslip_ms",
+        "audit_queue_wait_ms",
+        "audit_parallel_fetch_ms",
+        "audit_temporal_total_ms",
+        "audit_execution_ms",
+        "audit_pipeline_overhead_ms",
+        "audit_db_save_ms",
+        "audit_gate_wait_ms",
+        "bridge_wait_ms",
+        "executor_submit_to_done_ms",
+        "executor_queue_delay_ms",
+        "executor_post_ms",
+        "executor_total_api_ms",
+    ]
+    out["all"] = {k: _ms_stats(metrics_all.get(k, [])) for k in keys}
+    out["success"] = {k: _ms_stats(metrics_ok.get(k, [])) for k in keys}
+    return out
+
+
 def _executor_gaps_summary_window(lines: list[str], *, since_utc: datetime, until_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Mesmo sumário de gaps, mas focado em uma janela (ex.: últimas 24h).
@@ -2924,13 +3521,35 @@ def _fmt_status(ok: Optional[bool]) -> str:
     return "OK" if ok else "FAIL"
 
 
-def _telegram_send_document(token: str, chat_id: str, *, file_path: Path, caption: str) -> bool:
+def _telegram_send_document(
+    token: str,
+    chat_id: str,
+    *,
+    file_path: Path,
+    caption: str,
+) -> Tuple[bool, Optional[int], str]:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
-    with file_path.open("rb") as f:
-        files = {"document": (file_path.name, f, "application/pdf")}
-        data = {"chat_id": chat_id, "caption": caption[:900]}
-        r = requests.post(url, data=data, files=files, timeout=60)
-        return bool(r.ok)
+    try:
+        with file_path.open("rb") as f:
+            files = {"document": (file_path.name, f, "application/pdf")}
+            data = {"chat_id": chat_id, "caption": caption[:900]}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            if r.ok:
+                return True, int(r.status_code), ""
+            return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
+
+
+def _telegram_send_message(token: str, chat_id: str, text_msg: str) -> Tuple[bool, Optional[int], str]:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": str(text_msg)[:3900]}, timeout=30)
+        if r.ok:
+            return True, int(r.status_code), ""
+        return False, int(r.status_code), str(r.text or "")[:500]
+    except Exception as e:
+        return False, None, str(e)[:240]
 
 
 @dataclass
@@ -2941,6 +3560,7 @@ class DailyReportCfg:
     # Default atualizado: inclui Back API moderno (v5.2) e mantém Lay gate (v5.1).
     # Isso evita OOS truncar (ex.: parar em 03/04) quando as versões antigas não têm histórico recente.
     versions: str = os.getenv("DAILY_OOS_VERSIONS", "v4.0-api,v5.2-api-back,v5.1-ws-gate-lay")
+    hypothesis_type: str = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", "H3B")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
     lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
@@ -2949,6 +3569,37 @@ class DailyReportCfg:
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
     wf_policy_history_dir: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", "logs/policy_history"))
     wf_policy_history_jsonl: Path = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", "logs/wf_policy_history.jsonl"))
+    publish_policy_current: bool = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1").strip() in ("1", "true", "True", "yes", "YES"))
+    policy_compat_guard_enable: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_GUARD_ENABLE", "1")))
+    policy_compat_fail_closed: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_FAIL_CLOSED", "1")))
+    policy_compat_min_pre_keys: int = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", "1"), 1))
+    policy_compat_bridge_exec_side: str = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", "Back"))
+    policy_compat_prematch_only: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1"))))
+    # Guard extra para evitar regressões silenciosas de versão/parametrização WF.
+    policy_wf_guard_enable: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1")))
+    policy_wf_guard_fail_closed: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1")))
+    policy_wf_guard_required_fields: str = os.getenv(
+        "DAILY_WF_GUARD_REQUIRED_FIELDS",
+        "train_mode,train_days,test_days,step_days,sides,regimes,pre_activation_mode,backpre_slip_max,backpre_slip_field",
+    ).strip()
+    policy_wf_guard_expected_train_mode: str = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", "expanding")).strip()
+    policy_wf_guard_min_train_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", "30"), 30))
+    policy_wf_guard_min_test_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", "7"), 7))
+    policy_wf_guard_min_step_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", "7"), 7))
+    policy_wf_guard_expected_sides: str = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", "back")).strip()
+    policy_wf_guard_expected_regimes: str = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", "pre")).strip()
+    policy_wf_guard_expected_pre_activation_mode: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
+        os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_only"),
+    ).strip()
+    policy_wf_guard_expected_backpre_slip_field: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
+        os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct"),
+    ).strip()
+    policy_wf_guard_expected_backpre_slip_max: str = os.getenv(
+        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
+        os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0"),
+    ).strip()
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
     wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
@@ -2963,9 +3614,14 @@ class DailyReportCfg:
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
     wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
     wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
+    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_clv").strip()
+    wf_roi_min_activate: str = os.getenv("DAILY_WF_ROI_MIN_ACTIVATE", "0").strip()
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
+    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "").strip()
+    wf_backpre_slip_field: str = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct").strip()
+    wf_backpre_fast_max_lag_ms: str = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", "").strip()
     # Sizing no WF (útil para simular in-match governado por budget/caps, sem trocar policy do robô)
     wf_scheme_pre: str = os.getenv("DAILY_WF_SCHEME_PRE", "").strip()
     wf_scheme_in: str = os.getenv("DAILY_WF_SCHEME_IN", "").strip()
@@ -2996,15 +3652,48 @@ class DailyReportCfg:
     def __post_init__(self) -> None:
         # Releitura de env em runtime (importante quando rodando manualmente e carregando .env em main()).
         self.versions = os.getenv("DAILY_OOS_VERSIONS", self.versions)
+        self.hypothesis_type = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", self.hypothesis_type)
         self.direction = os.getenv("DAILY_OOS_DIRECTION", self.direction)
         self.lookback_days = os.getenv("DAILY_OOS_LOOKBACK_DAYS", self.lookback_days)
         self.report_mode = os.getenv("DAILY_REPORT_MODE", self.report_mode)
         self.wf_policy_current = Path(os.getenv("DAILY_WF_POLICY_CURRENT", str(self.wf_policy_current)))
         self.wf_policy_history_dir = Path(os.getenv("DAILY_WF_POLICY_HISTORY_DIR", str(self.wf_policy_history_dir)))
         self.wf_policy_history_jsonl = Path(os.getenv("DAILY_WF_POLICY_HISTORY_JSONL", str(self.wf_policy_history_jsonl)))
+        self.publish_policy_current = (os.getenv("DAILY_WF_PUBLISH_CURRENT", "1" if self.publish_policy_current else "0").strip() in ("1", "true", "True", "yes", "YES"))
+        self.policy_compat_guard_enable = _is_truthy(os.getenv("DAILY_WF_COMPAT_GUARD_ENABLE", "1" if self.policy_compat_guard_enable else "0"))
+        self.policy_compat_fail_closed = _is_truthy(os.getenv("DAILY_WF_COMPAT_FAIL_CLOSED", "1" if self.policy_compat_fail_closed else "0"))
+        self.policy_compat_min_pre_keys = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", str(self.policy_compat_min_pre_keys or 1)), 1))
+        self.policy_compat_bridge_exec_side = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", self.policy_compat_bridge_exec_side))
+        self.policy_compat_prematch_only = _is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1")))
+        self.policy_wf_guard_enable = _is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1" if self.policy_wf_guard_enable else "0"))
+        self.policy_wf_guard_fail_closed = _is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1" if self.policy_wf_guard_fail_closed else "0"))
+        self.policy_wf_guard_required_fields = os.getenv("DAILY_WF_GUARD_REQUIRED_FIELDS", self.policy_wf_guard_required_fields).strip()
+        self.policy_wf_guard_expected_train_mode = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", self.policy_wf_guard_expected_train_mode)).strip()
+        self.policy_wf_guard_min_train_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", str(self.policy_wf_guard_min_train_days or 0)), self.policy_wf_guard_min_train_days))
+        self.policy_wf_guard_min_test_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", str(self.policy_wf_guard_min_test_days or 0)), self.policy_wf_guard_min_test_days))
+        self.policy_wf_guard_min_step_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", str(self.policy_wf_guard_min_step_days or 0)), self.policy_wf_guard_min_step_days))
+        self.policy_wf_guard_expected_sides = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", self.policy_wf_guard_expected_sides)).strip()
+        self.policy_wf_guard_expected_regimes = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", self.policy_wf_guard_expected_regimes)).strip()
+        self.policy_wf_guard_expected_pre_activation_mode = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
+            os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", self.policy_wf_guard_expected_pre_activation_mode),
+        ).strip()
+        self.policy_wf_guard_expected_backpre_slip_field = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
+            os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.policy_wf_guard_expected_backpre_slip_field),
+        ).strip()
+        self.policy_wf_guard_expected_backpre_slip_max = os.getenv(
+            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
+            os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.policy_wf_guard_expected_backpre_slip_max),
+        ).strip()
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
+        self.wf_pre_activation_mode = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", self.wf_pre_activation_mode).strip()
+        self.wf_roi_min_activate = os.getenv("DAILY_WF_ROI_MIN_ACTIVATE", self.wf_roi_min_activate).strip()
+        self.wf_backpre_slip_max = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.wf_backpre_slip_max).strip()
+        self.wf_backpre_slip_field = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.wf_backpre_slip_field).strip()
+        self.wf_backpre_fast_max_lag_ms = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", self.wf_backpre_fast_max_lag_ms).strip()
         self.wf_scheme_pre = os.getenv("DAILY_WF_SCHEME_PRE", self.wf_scheme_pre).strip()
         self.wf_scheme_in = os.getenv("DAILY_WF_SCHEME_IN", self.wf_scheme_in).strip()
         self.wf_flat_stake_back = os.getenv("DAILY_WF_FLAT_STAKE_BACK", self.wf_flat_stake_back).strip()
@@ -3077,6 +3766,32 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         exec_lines_24h = []
     kpi_ok_24h = compute_kpis_from_lines(exec_lines_24h, path=str(cfg.executor_jsonl), only_status=["LIVE_OK", "DRY_OK"])
     (day_dir / "execution_kpis_ok_24h.json").write_text(json.dumps(kpi_ok_24h, ensure_ascii=False, indent=2), encoding="utf-8")
+    exec_post_24h = _executor_post_accept_failures_24h(exec_lines_24h)
+    (day_dir / "execution_post_accept_24h.json").write_text(
+        json.dumps(exec_post_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    exec_e2e_24h: Dict[str, Any] = {"error": None}
+    try:
+        audit_ids_24h = _extract_audit_ids_from_exec_lines(exec_lines_24h)
+        if audit_ids_24h:
+            from storage.database import Database  # local import para manter daily operável sem DB
+
+            db = Database()
+            await db.connect()
+            try:
+                audit_by_id_24h = await _fetch_audit_rows_for_ids_daily(db, audit_ids_24h)
+            finally:
+                await db.close()
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, audit_by_id_24h)
+            exec_e2e_24h["audit_ids_24h"] = int(len(audit_ids_24h))
+            exec_e2e_24h["audit_rows_found_24h"] = int(len(audit_by_id_24h))
+        else:
+            exec_e2e_24h = _executor_e2e_latency_24h(exec_lines_24h, {})
+    except Exception as e:
+        exec_e2e_24h = {"error": str(e)[:240], "n_jsonl_24h": int(len(exec_lines_24h or []))}
+    (day_dir / "execution_latency_e2e_24h.json").write_text(
+        json.dumps(exec_e2e_24h, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # atividade recente (ajuda a diagnosticar "hoje não teve aposta" sem depender do DB)
     exec_activity: Dict[str, Any] = {"last_live_ok_ts": None, "live_ok_1h": 0, "live_ok_6h": 0, "live_ok_24h": 0}
@@ -3136,6 +3851,8 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     args = [
         sys.executable,
         str(Path(__file__).resolve().parent.parent / "analyze_contexto_operacao_b808_robust_report.py"),
+        "--hypothesis-type",
+        str(cfg.hypothesis_type),
         "--direction",
         str(cfg.direction),
         "--versions",
@@ -3182,17 +3899,47 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             args += ["--wf-liquidity-scope", str(cfg.wf_liquidity_scope).strip()]
     if str(cfg.wf_min_matches).strip():
         args += ["--wf-min-matches", str(cfg.wf_min_matches).strip()]
+    if str(cfg.wf_pre_activation_mode).strip():
+        args += ["--wf-pre-activation-mode", str(cfg.wf_pre_activation_mode).strip()]
+    if str(cfg.wf_roi_min_activate).strip():
+        args += ["--wf-roi-min-activate", str(cfg.wf_roi_min_activate).strip()]
     if bool(cfg.wf_shrinkage):
         args += ["--wf-shrinkage"]
     if str(cfg.wf_exclude_exec_buckets_back).strip():
         args += ["--wf-exclude-exec-buckets-back", str(cfg.wf_exclude_exec_buckets_back).strip()]
     if str(cfg.wf_exclude_exec_buckets_lay).strip():
         args += ["--wf-exclude-exec-buckets-lay", str(cfg.wf_exclude_exec_buckets_lay).strip()]
-    # Restrição por lado (evita que o portfólio OOS selecione Back quando a operação é Lay-only).
+    # Restrição por lado/regime para alinhar policy com o modo operacional do bridge.
+    # Defaults defensivos:
+    # - sides: herda DAILY_WF_SIDES; se vazio, deriva de BRIDGE_EXEC_SIDE.
+    # - regimes: herda DAILY_WF_REGIMES; se vazio e BRIDGE_PREMATCH_ONLY=1, usa "pre".
     try:
         wf_sides = str(os.getenv("DAILY_WF_SIDES", "") or "").strip().lower()
+        if not wf_sides:
+            bside = str(os.getenv("BRIDGE_EXEC_SIDE", "Back") or "Back").strip().lower()
+            if bside in ("back", "lay", "both"):
+                wf_sides = bside
+            else:
+                wf_sides = "back"
         if wf_sides:
             args += ["--wf-sides", wf_sides]
+    except Exception:
+        pass
+    try:
+        wf_regimes = str(os.getenv("DAILY_WF_REGIMES", "") or "").strip().lower()
+        if not wf_regimes:
+            wf_regimes = "pre" if _is_truthy(os.getenv("BRIDGE_PREMATCH_ONLY", "1")) else "both"
+        if wf_regimes:
+            args += ["--wf-regimes", wf_regimes]
+    except Exception:
+        pass
+    try:
+        if str(cfg.wf_backpre_slip_max).strip():
+            args += ["--wf-backpre-slip-max", str(cfg.wf_backpre_slip_max).strip()]
+        if str(cfg.wf_backpre_slip_field).strip():
+            args += ["--wf-backpre-slip-field", str(cfg.wf_backpre_slip_field).strip()]
+        if str(cfg.wf_backpre_fast_max_lag_ms).strip():
+            args += ["--wf-backpre-fast-max-lag-ms", str(cfg.wf_backpre_fast_max_lag_ms).strip()]
     except Exception:
         pass
 
@@ -3244,8 +3991,41 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             oos_run["ok"] = False
             oos_run["error"] = f"OOS_EXCEPTION: {str(e)[:200]}"
 
+    policy_publish_info: Dict[str, Any] = {
+        "enabled": bool(cfg.publish_policy_current),
+        "guard_enabled": bool(cfg.policy_compat_guard_enable),
+        "fail_closed": bool(cfg.policy_compat_fail_closed),
+        "wf_guard_enabled": bool(cfg.policy_wf_guard_enable),
+        "wf_guard_fail_closed": bool(cfg.policy_wf_guard_fail_closed),
+        "published": False,
+        "reason": "skipped",
+        "compatibility": None,
+        "wf_guard": None,
+        "candidate_path": str(policy_hist),
+        "effective_path": str(cfg.wf_policy_current),
+    }
+    active_keys = None
+    active_keys_base = None
+    policy_wf: Optional[Dict[str, Any]] = None
+    policy_last_step: Optional[Dict[str, Any]] = None
+    candidate_active_keys = None
+
     # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
     if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        pol_candidate: Optional[Dict[str, Any]] = None
+        candidate_last: Optional[Dict[str, Any]] = None
+        candidate_wf: Optional[Dict[str, Any]] = None
+        try:
+            pol_candidate = json.loads(policy_hist.read_text(encoding="utf-8"))
+            csteps = pol_candidate.get("steps") if isinstance(pol_candidate, dict) else []
+            candidate_wf = pol_candidate.get("wf") if (isinstance(pol_candidate, dict) and isinstance(pol_candidate.get("wf"), dict)) else {}
+            candidate_last = csteps[-1] if isinstance(csteps, list) and csteps else {}
+            if isinstance(candidate_last, dict):
+                candidate_active_keys = candidate_last.get("active_keys")
+                policy_publish_info["candidate_active_keys_n"] = int(len(list(candidate_active_keys or [])))
+        except Exception as e:
+            policy_publish_info["reason"] = f"candidate_policy_parse_failed: {str(e)[:120]}"
+
         # Preenche o snapshot canônico do dia (best-effort) apenas se ainda não existir.
         # Isso evita que re-runs manuais sobrescrevam o arquivo `wf_policy_YYYYMMDD.json`.
         try:
@@ -3255,32 +4035,94 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 tmpc.replace(policy_canon)
         except Exception:
             pass
-        cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cfg.wf_policy_current.with_suffix(".tmp")
-        tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
-        tmp.replace(cfg.wf_policy_current)
 
-    active_keys = None
-    active_keys_base = None
-    policy_wf: Optional[Dict[str, Any]] = None
-    policy_last_step: Optional[Dict[str, Any]] = None
-    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
+        can_publish = bool(cfg.publish_policy_current)
+        def _append_reason(msg: str) -> None:
+            cur = str(policy_publish_info.get("reason") or "")
+            if not cur or cur == "skipped":
+                policy_publish_info["reason"] = str(msg)
+            else:
+                policy_publish_info["reason"] = f"{cur} | {msg}"
+
+        if can_publish and isinstance(candidate_last, dict):
+            compat = _policy_compatibility_check(
+                candidate_last.get("active_keys"),
+                bridge_exec_side=str(cfg.policy_compat_bridge_exec_side or "Back"),
+                bridge_prematch_only=bool(cfg.policy_compat_prematch_only),
+                min_pre_keys=int(cfg.policy_compat_min_pre_keys),
+            )
+            policy_publish_info["compatibility"] = compat
+            if bool(cfg.policy_compat_guard_enable) and (not bool(compat.get("ok"))):
+                if bool(cfg.policy_compat_fail_closed):
+                    can_publish = False
+                    _append_reason(f"blocked_by_compat_guard: {compat.get('reason')}")
+                else:
+                    _append_reason(f"compat_guard_warn_fail_open: {compat.get('reason')}")
+
+        if isinstance(candidate_wf, dict):
+            req_fields = [x.strip() for x in str(cfg.policy_wf_guard_required_fields or "").split(",") if x.strip()]
+            wf_guard = _policy_wf_guard_check(
+                candidate_wf,
+                required_fields=req_fields,
+                expected_train_mode=str(cfg.policy_wf_guard_expected_train_mode or ""),
+                min_train_days=int(cfg.policy_wf_guard_min_train_days or 0),
+                min_test_days=int(cfg.policy_wf_guard_min_test_days or 0),
+                min_step_days=int(cfg.policy_wf_guard_min_step_days or 0),
+                expected_sides=str(cfg.policy_wf_guard_expected_sides or ""),
+                expected_regimes=str(cfg.policy_wf_guard_expected_regimes or ""),
+                expected_pre_activation_mode=str(cfg.policy_wf_guard_expected_pre_activation_mode or ""),
+                expected_backpre_slip_field=str(cfg.policy_wf_guard_expected_backpre_slip_field or ""),
+                expected_backpre_slip_max=_safe_float(cfg.policy_wf_guard_expected_backpre_slip_max),
+            )
+            policy_publish_info["wf_guard"] = wf_guard
+            if bool(cfg.policy_wf_guard_enable) and (not bool(wf_guard.get("ok"))):
+                if bool(cfg.policy_wf_guard_fail_closed):
+                    can_publish = False
+                    _append_reason(f"blocked_by_wf_guard: {wf_guard.get('reason')}")
+                else:
+                    _append_reason(f"wf_guard_warn_fail_open: {wf_guard.get('reason')}")
+
+        if can_publish and bool(cfg.publish_policy_current):
+            try:
+                cfg.wf_policy_current.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cfg.wf_policy_current.with_suffix(".tmp")
+                tmp.write_text(policy_hist.read_text(encoding="utf-8"), encoding="utf-8")
+                tmp.replace(cfg.wf_policy_current)
+                policy_publish_info["published"] = True
+                policy_publish_info["reason"] = "published"
+            except Exception as e:
+                policy_publish_info["published"] = False
+                policy_publish_info["reason"] = f"publish_failed: {str(e)[:120]}"
+        elif bool(cfg.publish_policy_current) and str(policy_publish_info.get("reason") or "") == "skipped":
+            policy_publish_info["reason"] = "publish_disabled_or_guard_block"
+
+        # Política efetiva para relatório: a publicada no current (quando publish foi bloqueado/falhou),
+        # senão a policy candidata recém-gerada.
+        pol_effective = pol_candidate if bool(policy_publish_info.get("published")) else _read_json(cfg.wf_policy_current)
+        if not isinstance(pol_effective, dict):
+            pol_effective = pol_candidate if isinstance(pol_candidate, dict) else None
+        if isinstance(pol_effective, dict):
+            esteps = pol_effective.get("steps") if isinstance(pol_effective, dict) else []
+            elast = esteps[-1] if isinstance(esteps, list) and esteps else {}
+            if isinstance(elast, dict):
+                active_keys = elast.get("active_keys")
+                active_keys_base = elast.get("active_keys_base")
+                policy_last_step = elast
+            if isinstance(pol_effective.get("wf"), dict):
+                policy_wf = pol_effective.get("wf")
+
         try:
-            pol = json.loads(policy_hist.read_text(encoding="utf-8"))
-            steps = pol.get("steps") if isinstance(pol, dict) else []
-            last = steps[-1] if isinstance(steps, list) and steps else {}
-            if isinstance(last, dict):
-                active_keys = last.get("active_keys")
-                active_keys_base = last.get("active_keys_base")
-                policy_last_step = last
-            if isinstance(pol, dict) and isinstance(pol.get("wf"), dict):
-                policy_wf = pol.get("wf")
             rec = {
                 "ts": ts.isoformat(),
                 "policy_path": str(policy_hist),
                 "policy_current": str(cfg.wf_policy_current),
                 "active_keys": active_keys,
                 "active_keys_base": active_keys_base,
+                "published_to_current": bool(policy_publish_info.get("published")),
+                "publish_reason": str(policy_publish_info.get("reason") or ""),
+                "wf_guard_ok": bool(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("ok")),
+                "wf_guard_reason": str(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("reason") or ""),
+                "candidate_active_keys": candidate_active_keys,
             }
             cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
             with cfg.wf_policy_history_jsonl.open("a", encoding="utf-8") as f:
@@ -3444,6 +4286,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             s0.append(f"- **OOS**: **FAILED** — `{oos_run.get('error')}`\n")
             if oos_run.get("log"):
                 s0.append(f"- Log: `{oos_run.get('log')}`\n\n")
+    else:
+        if bool(cfg.publish_policy_current):
+            if bool(policy_publish_info.get("published")):
+                s0.append(
+                    "- **Policy publish**: `OK` "
+                    f"(candidate `{policy_publish_info.get('candidate_active_keys_n', '—')}` keys → `{cfg.wf_policy_current}`).\n"
+                )
+            else:
+                s0.append(
+                    "- **Policy publish**: `BLOQUEADO` "
+                    f"(`{policy_publish_info.get('reason')}`) — mantendo policy anterior em `{cfg.wf_policy_current}`.\n"
+                )
+            try:
+                wf_guard = policy_publish_info.get("wf_guard") if isinstance(policy_publish_info, dict) else None
+                if isinstance(wf_guard, dict):
+                    s0.append(
+                        f"- **WF guard (versão/parâmetros)**: "
+                        f"`{'OK' if bool(wf_guard.get('ok')) else 'FAIL'}` "
+                        f"(`{wf_guard.get('reason')}`).\n"
+                    )
+            except Exception:
+                pass
 
     # performance “real” (accounting) quando houver
     if isinstance(acct, dict) and not acct.get("error"):
@@ -3584,6 +4448,93 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if int(exec_activity.get("live_ok_6h") or 0) == 0:
             s0.append("- Se isso persistir com auditoria OK no DB, suspeite de sessão/PMM/timeout ou bridge travado (ver checklist abaixo).\n")
         s0.append("\n")
+    except Exception:
+        pass
+
+    # diagnóstico explícito pós-accepted (executor): separa pré-place vs place
+    try:
+        pa = exec_post_24h if isinstance(exec_post_24h, dict) else {}
+        acc_n = int(pa.get("accepted_n") or 0)
+        if acc_n > 0:
+            ok_n = int(pa.get("live_ok_n") or 0)
+            fail_n = int(pa.get("accepted_fail_n") or 0)
+            s0.append("**Falhas pós-accepted (executor, 24h)**\n\n")
+            s0.append("| Métrica | Valor |\n|---|---:|\n")
+            s0.append(f"| accepted | {acc_n} |\n")
+            s0.append(f"| LIVE_OK | {ok_n} ({_fmt_num((100.0*ok_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| accepted sem LIVE_OK | {fail_n} ({_fmt_num((100.0*fail_n/acc_n) if acc_n else None,1)}%) |\n")
+            s0.append(f"| precheck fail (`LIVE_PRECHECK_FAILED`) | {int(pa.get('precheck_fail_n') or 0)} |\n")
+            s0.append(f"| place fail (`LIVE_PLACE_FAILED`) | {int(pa.get('place_fail_n') or 0)} |\n")
+            s0.append(f"| API_FAILED | {int(pa.get('api_failed_n') or 0)} |\n")
+            s0.append(f"| NO_SESSION | {int(pa.get('no_session_n') or 0)} |\n")
+            s0.append(f"| RATE_LIMIT | {int(pa.get('rate_limit_n') or 0)} |\n")
+            s0.append(f"| CAP_BLOCKED | {int(pa.get('cap_blocked_n') or 0)} |\n")
+            s0.append(f"| No PMMs received | {int(pa.get('no_pmms_n') or 0)} |\n")
+            s0.append(f"| Execution context destroyed/target closed | {int(pa.get('ctx_destroyed_n') or 0)} |\n")
+            s0.append(f"| Auth 401 / NO_ROOT_SESSION_COOKIE | {int(pa.get('auth_401_n') or 0)} |\n")
+            s0.append(
+                f"| p50/p90 `pmm_wait_ms` (precheck fail) | {_fmt_num(pa.get('precheck_pmm_wait_ms_p50'),0)} / {_fmt_num(pa.get('precheck_pmm_wait_ms_p90'),0)} |\n"
+            )
+            s0.append(
+                f"| p50/p90 `ws_age_ms` (precheck fail) | {_fmt_num(pa.get('precheck_ws_age_ms_p50'),0)} / {_fmt_num(pa.get('precheck_ws_age_ms_p90'),0)} |\n"
+            )
+            s0.append("\n")
+            tops = pa.get("top_errors") if isinstance(pa.get("top_errors"), list) else []
+            if tops:
+                s0.append("- Top erros pós-accepted:\n")
+                for it in tops[:6]:
+                    if not isinstance(it, dict):
+                        continue
+                    err = str(it.get("error") or "").strip()
+                    n = int(it.get("n") or 0)
+                    if err:
+                        err = (err[:180] + "…") if len(err) > 180 else err
+                        s0.append(f"  - ×{n}: `{err}`\n")
+                s0.append("\n")
+    except Exception:
+        pass
+
+    # Latência ponta a ponta (WS detectado -> executor_done) já no bloco inicial.
+    try:
+        e2e = exec_e2e_24h if isinstance(exec_e2e_24h, dict) else {}
+        grp_ok = e2e.get("success") if isinstance(e2e.get("success"), dict) else {}
+        n_ok = int(e2e.get("n_e2e_success") or 0)
+        n_all = int(e2e.get("n_e2e_all") or 0)
+        n_aid = int(e2e.get("n_with_audit_id") or 0)
+        n_det = int(e2e.get("n_with_detected_at") or 0)
+        if n_all > 0:
+            s0.append("**Latência ponta a ponta (24h; WS → executor_done)**\n\n")
+            s0.append(
+                f"- Cobertura: `n_jsonl_24h={int(e2e.get('n_jsonl_24h') or 0)}`, "
+                f"`com_audit_id={n_aid}`, `com_hypothesis_detected_at={n_det}`, "
+                f"`e2e_all={n_all}`, `e2e_success={n_ok}`.\n"
+            )
+            s0.append("| Etapa | p50 | p90 | p99 | mean |\n|---|---:|---:|---:|---:|\n")
+            rows = [
+                ("e2e_total", "e2e_total_ms"),
+                ("detect_to_submit", "detect_to_submit_ms"),
+                ("audit_total", "audit_total_ms"),
+                ("audit_detect_to_click", "audit_detect_to_click_ms"),
+                ("audit_click_to_betslip", "audit_click_to_betslip_ms"),
+                ("audit_queue_wait", "audit_queue_wait_ms"),
+                ("audit_parallel_fetch", "audit_parallel_fetch_ms"),
+                ("audit_temporal_total", "audit_temporal_total_ms"),
+                ("audit_execution", "audit_execution_ms"),
+                ("audit_pipeline_overhead", "audit_pipeline_overhead_ms"),
+                ("audit_db_save", "audit_db_save_ms"),
+                ("audit_gate_wait", "audit_gate_wait_ms"),
+                ("bridge_wait", "bridge_wait_ms"),
+                ("executor_submit_to_done", "executor_submit_to_done_ms"),
+                ("executor_queue_delay", "executor_queue_delay_ms"),
+                ("executor_post", "executor_post_ms"),
+                ("executor_total_api", "executor_total_api_ms"),
+            ]
+            for label, key in rows:
+                a = grp_ok.get(key) if isinstance(grp_ok.get(key), dict) else {}
+                s0.append(
+                    f"| {label} | {_fmt_num(a.get('p50'),0)} | {_fmt_num(a.get('p90'),0)} | {_fmt_num(a.get('p99'),0)} | {_fmt_num(a.get('mean'),0)} |\n"
+                )
+            s0.append("\n")
     except Exception:
         pass
 
@@ -4523,7 +5474,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Slippage × ROI (accounting; por order_id): compara com "Slippage × ROI" via placar (subamostra coberta).
+        # Slippage × ROI (accounting; por order_id): janela móvel + acumulada (pós-início).
         try:
             if acct_pnl_by_oid_total and exec_by_oid_back:
                 rows_all: list[dict] = []
@@ -4532,19 +5483,38 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 rows_all_post: list[dict] = []
                 rows_pre_post: list[dict] = []
                 rows_in_post: list[dict] = []
+                rows_all_since_post: list[dict] = []
+                rows_pre_since_post: list[dict] = []
+                rows_in_since_post: list[dict] = []
                 post_start = str(os.getenv("DAILY_SLIPPAGE_POST_START_DAY", "2026-04-04") or "").strip()
+                win_min = None
+                win_max = None
+                win_days = None
+                try:
+                    if days_utc_exec:
+                        d0 = sorted(list(days_utc_exec))
+                        if d0:
+                            win_min = d0[0]
+                            win_max = d0[-1]
+                            try:
+                                win_days = (datetime.fromisoformat(win_max).date() - datetime.fromisoformat(win_min).date()).days + 1
+                            except Exception:
+                                win_days = len(d0)
+                except Exception:
+                    win_min = None
+                    win_max = None
+                    win_days = None
                 for oid, em in (exec_by_oid_back or {}).items():
                     if not isinstance(em, dict):
                         continue
                     created = em.get("created_at")
                     if not isinstance(created, datetime):
                         continue
-                    if days_utc_exec and str(created.date().isoformat()) not in days_utc_exec:
-                        continue
                     pnl = acct_pnl_by_oid_total.get(str(oid))
                     if pnl is None:
                         continue
                     row = {"pnl": float(pnl), "exposure": em.get("exposure"), "slip_raw_pct": em.get("slip_raw_pct")}
+                    created_day = str(created.date().isoformat())
                     rows_all.append(row)
                     # classifica Pre/In via audit quando possível
                     try:
@@ -4554,11 +5524,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     except Exception:
                         is_in = False
                     (rows_in if is_in else rows_pre).append(row)
+                    # janela móvel (days_utc_exec)
+                    if (not days_utc_exec) or (created_day in days_utc_exec):
+                        rows_all_post.append(row)
+                        (rows_in_post if is_in else rows_pre_post).append(row)
                     # corte pós-início (por created_at UTC)
                     try:
-                        if post_start and str(created.date().isoformat()) >= post_start:
-                            rows_all_post.append(row)
-                            (rows_in_post if is_in else rows_pre_post).append(row)
+                        if post_start and created_day >= post_start:
+                            rows_all_since_post.append(row)
+                            (rows_in_since_post if is_in else rows_pre_since_post).append(row)
                     except Exception:
                         pass
 
@@ -4575,13 +5549,19 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                         )
                     s1.append("\n")
 
-                _render(rows_all, title="Slippage × ROI (accounting; order_id) — Back (janela Execução)")
-                _render(rows_pre, title="Slippage × ROI (accounting; order_id) — Back Pre (janela Execução)")
-                _render(rows_in, title="Slippage × ROI (accounting; order_id) — Back In (janela Execução)")
-                if rows_all_post:
-                    _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (pós-início >= {post_start})")
-                    _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (pós-início >= {post_start})")
-                    _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (pós-início >= {post_start})")
+                # Janela móvel explícita
+                win_lbl = f"{win_min}..{win_max}" if (win_min and win_max) else "janela móvel"
+                if win_days is not None and win_days > 0:
+                    win_lbl = f"{win_lbl} ({int(win_days)} dias)"
+                _render(rows_all_post, title=f"Slippage × ROI (accounting; order_id) — Back (janela móvel: {win_lbl})")
+                _render(rows_pre_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (janela móvel: {win_lbl})")
+                _render(rows_in_post, title=f"Slippage × ROI (accounting; order_id) — Back In (janela móvel: {win_lbl})")
+
+                # Acumulado fixo desde post_start (independente da janela móvel)
+                if rows_all_since_post:
+                    _render(rows_all_since_post, title=f"Slippage × ROI (accounting; order_id) — Back (acumulado pós-início >= {post_start})")
+                    _render(rows_pre_since_post, title=f"Slippage × ROI (accounting; order_id) — Back Pre (acumulado pós-início >= {post_start})")
+                    _render(rows_in_since_post, title=f"Slippage × ROI (accounting; order_id) — Back In (acumulado pós-início >= {post_start})")
         except Exception:
             pass
 
@@ -4894,6 +5874,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     # Versão 1c: somente Back Pre (exclui Back In)
                     try:
                         s1.append("**Contrafactual (accounting ledger; por order_id): filtros operacionais (Back Pre somente)**\n\n")
+                        s1.append(
+                            "_Nota: `Base P&L` usa todas as ordens Back Pre com `order_id` no ledger daquele dia. "
+                            "O filtro contrafactual usa `slippage_raw_pct` (pós-execução, `odd_final` vs `odd_at_decision`). "
+                            "Se o gate operacional `slippage_raw_pct<=+2%` já estiver efetivamente aplicado no runtime, `Base` e `Após slippage<=+2%` "
+                            "tendem a coincidir; divergências sugerem ordens fora do gate e/ou diferença entre métricas de slippage usadas no runtime vs relatório._"
+                            "\n\n"
+                        )
                         s1.append(
                             "| Dia (post date UTC) | Base P&L (acct) | Base ROIw | Após slippage_raw_pct<=+2%: P&L | ROIw | Após lat<=6s: P&L | ROIw | Após ambos: P&L | ROIw | Cobertura (orders Back Pre com acct no dia) |\n"
                         )
@@ -5644,7 +6631,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(_timing_table("Latência (últimas 24h; somente LIVE_OK/DRY_OK) — ms", timing_ok24))
     except Exception:
         pass
-
     slip_ok = (kpi_ok.get("slippage") or {}) if isinstance(kpi_ok, dict) else {}
     extra.append("**Slippage (somente LIVE_OK/DRY_OK, quando houver odd_at_decision)**\n\n")
     extra.append(
@@ -5698,8 +6684,10 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             "- No operacional (shadow/live), o tamanho enviado pelo bridge é **FLAT** via `BRIDGE_STAKE`.\n"
             "- Em **Back**: stake padrão = `BRIDGE_STAKE`.\n"
             "  - **Exceção (sizing no executor)**: se `EXECUTOR_BACKPRE_FAST_STAKE_ENABLE=1`, o executor pode sobrescrever stake em Back:\n"
-            "    - Back **Pre** com `pre_submit_ms <= EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS` ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_HI` (ex.: 12)\n"
-            "    - demais Back ⇒ `EXECUTOR_BACKPRE_FAST_STAKE_LO` (ex.: 1.50)\n"
+            "    - `slippage_pre_pct < EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_NEG` (ex.: 40)\n"
+            "    - `EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT <= slippage_pre_pct <= EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_MID` (ex.: 20)\n"
+            "    - `slippage_pre_pct > EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT` ⇒ `EXECUTOR_BACK_STAKE_SLIP_POS` (default pode ser 20)\n"
+            "    - opcional: gate de latência com `EXECUTOR_BACK_LATENCY_GATE_ENABLE=1` e `EXECUTOR_BACK_LATENCY_GATE_MAX_SEC`.\n"
             "- Em **Lay**: o executor recebe stake, mas o risco relevante é a **liability**, aproximadamente `liability ≈ stake × (odd - 1)`.\n"
             "- Importante: o Kelly/caps que aparece no relatório OOS é **simulação/diagnóstico** do walk-forward; ele não está sendo aplicado no executor/bridge neste momento.\n\n"
         )
@@ -5727,6 +6715,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "EXECUTOR_QUEUE_MAX",
         "EXECUTOR_CAP_WINDOW_SEC",
         "EXECUTOR_CAP_MAX",
+        "EXECUTOR_BACKPRE_FAST_STAKE_ENABLE",
+        "EXECUTOR_BACK_STAKE_SIZING_ENABLE",
+        "EXECUTOR_BACK_STAKE_SLIP_NEG_LIMIT_PCT",
+        "EXECUTOR_BACK_STAKE_SLIP_POS_LIMIT_PCT",
+        "EXECUTOR_BACK_STAKE_SLIP_NEG",
+        "EXECUTOR_BACK_STAKE_SLIP_MID",
+        "EXECUTOR_BACK_STAKE_SLIP_POS",
+        "EXECUTOR_BACK_LATENCY_GATE_ENABLE",
+        "EXECUTOR_BACK_LATENCY_GATE_MAX_SEC",
         "EXECUTOR_FAST_PMM",
         "EXECUTOR_PMM_TIMEOUT_SEC",
         "EXECUTOR_PMM_MIN_WAIT_SEC",
@@ -5736,7 +6733,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         extra.append(f"| {k} | `{_env(k)}` |\n")
     extra.append("\n")
 
-    extra.append("**Audit H3B**\n\n")
+    extra.append(f"**Audit {str(cfg.hypothesis_type).upper()}**\n\n")
     extra.append("| chave | valor |\n|---|---|\n")
     for k in [
         "AUDIT_MODE",
@@ -5801,6 +6798,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "DAILY_WF_TRAIN_DAYS",
         "DAILY_WF_TEST_DAYS",
         "DAILY_WF_STEP_DAYS",
+        "DAILY_WF_SIDES",
+        "DAILY_WF_REGIMES",
+        "DAILY_WF_BACKPRE_SLIP_MAX",
+        "DAILY_WF_BACKPRE_SLIP_FIELD",
+        "DAILY_WF_BACKPRE_FAST_MAX_LAG_MS",
         "DAILY_WF_KEY_BY_LEAGUE",
         "DAILY_WF_KEY_BY_LEAGUE_SCOPE",
         "DAILY_WF_AH_MAX_ABS_LINE",
@@ -6194,7 +7196,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "ts": ts.isoformat(),
         "day_dir": str(day_dir),
         "pdf": str(pdf),
+        "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
+        "policy_publish": dict(policy_publish_info or {}),
     }
 
     # 6) Telegram
@@ -6202,10 +7206,48 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if token and chat_id and pdf.exists():
-            ok = _telegram_send_document(token, chat_id, file_path=pdf, caption=f"Relatório diário BetinAsia ({day})")
+            retries = max(1, int(float(os.getenv("DAILY_TELEGRAM_RETRIES", "2") or 2)))
+            retry_sleep_sec = max(0.0, float(os.getenv("DAILY_TELEGRAM_RETRY_SLEEP_SEC", "3.0") or 3.0))
+
+            ok = False
+            last_status: Optional[int] = None
+            last_err = ""
+            for i in range(retries):
+                ok, st, err = _telegram_send_document(
+                    token,
+                    chat_id,
+                    file_path=pdf,
+                    caption=f"Relatório diário BetinAsia ({day})",
+                )
+                last_status = st
+                last_err = err
+                if ok:
+                    break
+                if i < (retries - 1) and retry_sleep_sec > 0:
+                    time.sleep(retry_sleep_sec)
+
             out["telegram_sent"] = bool(ok)
+            out["telegram_attempts"] = int(retries)
+            out["telegram_http_status"] = int(last_status) if last_status is not None else None
+            out["telegram_error"] = str(last_err or "")[:500] if not ok else ""
+
+            if not ok:
+                logger.warning(
+                    "Daily report Telegram send failed: "
+                    f"status={last_status} err={str(last_err or '')[:220]} pdf={pdf} size_mb={out.get('pdf_size_mb')}"
+                )
+                # fallback: tenta ao menos avisar no chat que o envio do PDF falhou.
+                _telegram_send_message(
+                    token,
+                    chat_id,
+                    (
+                        f"[daily_full_report] Falha ao enviar PDF ({day}). "
+                        f"status={last_status or '-'} err={str(last_err or '')[:220]}"
+                    ),
+                )
         else:
             out["telegram_sent"] = False
+            out["telegram_error"] = "missing_token_or_chat_or_pdf"
 
     return out
 
