@@ -23,7 +23,7 @@ export DAILY_WF_REGIMES="${DAILY_WF_REGIMES:-pre}"
 export DAILY_WF_KEY_BY_LEAGUE="${DAILY_WF_KEY_BY_LEAGUE:-1}"
 export DAILY_WF_KEY_BY_LEAGUE_SCOPE="${DAILY_WF_KEY_BY_LEAGUE_SCOPE:-pre}"
 export DAILY_WF_BACKPRE_SLIP_MAX="${DAILY_WF_BACKPRE_SLIP_MAX:-0}"
-export DAILY_WF_BACKPRE_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-diff_pct}"
+export DAILY_WF_BACKPRE_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-slippage_pre_pct}"
 
 echo "[INFO] REQUESTED_BOT_DIR=$REQUESTED_BOT_DIR"
 echo "[INFO] REQUESTED_ENV_FILE=${REQUESTED_ENV_FILE:-<vazio>}"
@@ -36,6 +36,22 @@ echo "[INFO] DAILY_WF_KEY_BY_LEAGUE=$DAILY_WF_KEY_BY_LEAGUE"
 echo "[INFO] DAILY_WF_KEY_BY_LEAGUE_SCOPE=$DAILY_WF_KEY_BY_LEAGUE_SCOPE"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_MAX=$DAILY_WF_BACKPRE_SLIP_MAX"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
+
+# Aviso de configuracao contraditoria: diff_pct<=0 pode conflitar com gate de edge Back.
+if [[ "$DAILY_WF_BACKPRE_SLIP_FIELD" == "diff_pct" ]]; then
+  if python3 - <<'PY_WARN_DIFF'
+import os
+try:
+    v = float(os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0"))
+except Exception:
+    v = 0.0
+raise SystemExit(0 if v <= 0 else 1)
+PY_WARN_DIFF
+  then
+    echo "[WARN] DAILY_WF_BACKPRE_SLIP_FIELD=diff_pct com DAILY_WF_BACKPRE_SLIP_MAX<=0 pode zerar oportunidades." >&2
+    echo "[WARN] Para regra de slippage<0, prefira DAILY_WF_BACKPRE_SLIP_FIELD=slippage_pre_pct." >&2
+  fi
+fi
 
 ROOT_A="$REQUESTED_BOT_DIR"
 ROOT_B="$ROOT_DIR"
