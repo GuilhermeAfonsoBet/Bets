@@ -163,7 +163,8 @@ elif [[ "$AUTO_INSTALL_DEPS" == "1" && -z "$REQ_FILE" ]]; then
   echo "[WARN] requirements.txt nao encontrado; seguindo sem instalacao automatica de deps."
 fi
 
-export PYTHONPATH="$RUN_CWD:$REQUESTED_BOT_DIR:${PYTHONPATH:-}"
+PARENT_CWD="$(dirname "$RUN_CWD")"
+export PYTHONPATH="$RUN_CWD:$PARENT_CWD:$REQUESTED_BOT_DIR:${PYTHONPATH:-}"
 echo "[INFO] PYTHON_BIN=$PYTHON_BIN"
 
 if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
@@ -178,15 +179,42 @@ fi
 
 echo "[INFO] Rodando daily_full_report..."
 echo "[INFO] RUN_CWD=$RUN_CWD"
-echo "[INFO] DAILY_MODE=script"
+echo "[INFO] DAILY_MODE=auto(module->script)"
 echo "[INFO] DAILY_ENTRY=$DAILY_SCRIPT"
 echo "[INFO] PYTHONPATH=$PYTHONPATH"
 (
   cd "$RUN_CWD"
-  if ! "$PYTHON_BIN" "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}" >"$OUT_JSON" 2>"$ERR_LOG"; then
-    echo "[ERRO] Falha ao executar daily_full_report.py" >&2
+  OUT_DIR_ARG="${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}"
+  RUN_OK=0
+
+  MODULE_CANDIDATES=()
+  if [[ -f "$RUN_CWD/ops/__init__.py" ]]; then
+    MODULE_CANDIDATES+=("ops.daily_full_report")
+  fi
+  if [[ -f "$PARENT_CWD/betinasia_bot/ops/__init__.py" ]]; then
+    MODULE_CANDIDATES+=("betinasia_bot.ops.daily_full_report")
+  fi
+
+  for MOD in "${MODULE_CANDIDATES[@]}"; do
+    echo "[INFO] Tentando modulo: $MOD"
+    if "$PYTHON_BIN" -m "$MOD" --out-dir "$OUT_DIR_ARG" >"$OUT_JSON" 2>"$ERR_LOG"; then
+      echo "[INFO] Execucao por modulo OK: $MOD"
+      RUN_OK=1
+      break
+    fi
+  done
+
+  if [[ "$RUN_OK" != "1" ]]; then
+    echo "[INFO] Fallback para execucao por script: $DAILY_SCRIPT"
+    if "$PYTHON_BIN" "$DAILY_SCRIPT" --out-dir "$OUT_DIR_ARG" >"$OUT_JSON" 2>"$ERR_LOG"; then
+      RUN_OK=1
+    fi
+  fi
+
+  if [[ "$RUN_OK" != "1" ]]; then
+    echo "[ERRO] Falha ao executar daily_full_report.py (modulo e script)." >&2
     echo "[ERRO] stderr tail:" >&2
-    tail -n 80 "$ERR_LOG" >&2 || true
+    tail -n 120 "$ERR_LOG" >&2 || true
     exit 5
   fi
 )
