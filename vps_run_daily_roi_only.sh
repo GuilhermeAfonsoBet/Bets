@@ -220,6 +220,63 @@ echo "[INFO] PYTHONPATH=$PYTHONPATH"
 )
 echo "[OK] Saida do daily salva em: $OUT_JSON"
 
+# Prioriza policy candidata gerada neste run (quando disponível),
+# para evitar validar arquivo stale em wf_policy_current.
+if [[ -f "$OUT_JSON" ]]; then
+  POLICY_FROM_RUN="$({
+    "$PYTHON_BIN" - "$OUT_JSON" <<'PY_PICK_POLICY'
+import json
+import os
+import sys
+
+p = sys.argv[1]
+try:
+    with open(p, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    raise SystemExit(0)
+
+cands = []
+pp = data.get('policy_publish') if isinstance(data, dict) else None
+if isinstance(pp, dict):
+    cands.extend([
+        pp.get('candidate_path'),
+        pp.get('effective_path'),
+        pp.get('policy_current'),
+        pp.get('policy_path'),
+    ])
+
+oos = data.get('oos_run') if isinstance(data, dict) else None
+if isinstance(oos, dict):
+    cands.extend([
+        oos.get('policy_path'),
+        oos.get('policy_current'),
+    ])
+
+cands.extend([
+    data.get('policy_current') if isinstance(data, dict) else None,
+    data.get('policy_path') if isinstance(data, dict) else None,
+])
+
+seen = set()
+for c in cands:
+    if not isinstance(c, str):
+        continue
+    c = c.strip()
+    if not c or c in seen:
+        continue
+    seen.add(c)
+    if os.path.isfile(c):
+        print(c)
+        break
+PY_PICK_POLICY
+  } || true)"
+  if [[ -n "$POLICY_FROM_RUN" && -f "$POLICY_FROM_RUN" ]]; then
+    POLICY_JSON="$POLICY_FROM_RUN"
+    echo "[INFO] Policy selecionada a partir do output do run: $POLICY_JSON"
+  fi
+fi
+
 if [[ ! -f "$POLICY_JSON" ]]; then
   POLICY_JSON_FALLBACK="$({
     python3 - "$ROOT_A" "$ROOT_B" "$ROOT_C" <<'PY_FIND_POLICY'
