@@ -871,6 +871,20 @@ async def main() -> int:
         help="Modo de janela de treino no walk-forward: rolling (últimos N dias) ou expanding (tudo até t-1). Default: rolling.",
     )
     parser.add_argument(
+        "--wf-selection-mode",
+        choices=["oos", "insample"],
+        default=os.getenv("WF_SELECTION_MODE", "oos").strip() or "oos",
+        help="Modo de seleção no bloco WF: "
+        "'oos' (walk-forward tradicional treino->teste) ou "
+        "'insample' (seleção in-sample sem validação OOS).",
+    )
+    parser.add_argument(
+        "--wf-insample-days",
+        type=int,
+        default=int(os.getenv("WF_INSAMPLE_DAYS", "45")),
+        help="No modo `wf-selection-mode=insample`, usa os últimos N dias do recorte para selecionar ligas/chaves. Default: 45.",
+    )
+    parser.add_argument(
         "--wf-min-matches",
         type=int,
         default=int(os.getenv("WF_MIN_MATCHES", "20")),
@@ -5003,6 +5017,9 @@ async def main() -> int:
         wf_train_mode_hdr = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
         if wf_train_mode_hdr not in ("rolling", "expanding"):
             wf_train_mode_hdr = "rolling"
+        wf_selection_mode_hdr = str(getattr(args, "wf_selection_mode", "oos") or "oos").strip().lower()
+        if wf_selection_mode_hdr not in ("oos", "insample"):
+            wf_selection_mode_hdr = "oos"
         wf_mode_label = "expanding window" if wf_train_mode_hdr == "expanding" else "rolling window"
         lines.append(f"## 12) OOS walk-forward ({wf_mode_label}): seleção e validação\n")
         lines.append(
@@ -5031,6 +5048,11 @@ async def main() -> int:
         lines.append(
             f"- **ROI mínimo de ativação**: `ROI > {float(getattr(args,'wf_roi_min_activate',0.0) or 0.0):.2f}%`.\n\n"
         )
+        if wf_selection_mode_hdr == "insample":
+            lines.append(
+                f"- **Selection mode**: `insample` (sem passo OOS). "
+                f"Seleção feita nos últimos `{int(max(1, getattr(args, 'wf_insample_days', 45) or 45))}` dias do recorte.\n\n"
+            )
 
         if not bool(getattr(args, "walkforward", False)):
             lines.append(
@@ -5041,6 +5063,10 @@ async def main() -> int:
             wf_train = int(max(1, getattr(args, "wf_train_days", 2)))
             wf_test = int(max(1, getattr(args, "wf_test_days", 1)))
             wf_step = int(max(1, getattr(args, "wf_step_days", 1)))
+            wf_selection_mode = str(getattr(args, "wf_selection_mode", "oos") or "oos").strip().lower()
+            if wf_selection_mode not in ("oos", "insample"):
+                wf_selection_mode = "oos"
+            wf_insample_days = int(max(1, _safe_int(getattr(args, "wf_insample_days", 45)) or 45))
             # `wf_min_matches=0` desabilita a elegibilidade por volume no OOS.
             wf_min_m = int(max(0, getattr(args, "wf_min_matches", 20)))
             wf_train_mode = str(getattr(args, "wf_train_mode", "rolling") or "rolling").strip().lower()
@@ -6017,10 +6043,251 @@ async def main() -> int:
                         return None
                     p99 = float(np.quantile(vals, 0.99))
                     return float(p99) * (1.0 + max(0.0, float(buf_pct)) / 100.0)
+                if wf_selection_mode == "insample":
+                    sel_days = sorted(days)[-min(len(days), int(wf_insample_days)) :]
+                    sel_days_set = set(sel_days)
+
+                    train_raw_ins = [
+                        e for e in combo_events
+                        if e["day"] in sel_days_set and str(e.get("side")) == "Back" and str(e.get("regime")) == "Pre" and _ah_ok(e)
+                    ]
+                    train_ins = _dedup_match_key(train_raw_ins)
+
+                    # thresholds de liquidez no próprio recorte in-sample (sem OOS)
+                    thr_p50_pre = thr_p75_pre = None
+                    thr_p50_all = thr_p75_all = None
+                    liq_train_pre: List[float] = []
+                    liq_train_all: List[float] = []
+                    for e in train_ins:
+                        x = _safe_float(e.get("liq_limit"))
+                        if x is None or not math.isfinite(float(x)) or float(x) <= 0:
+                            continue
+                        liq_train_all.append(float(x))
+                        if str(e.get("regime")) == "Pre":
+                            liq_train_pre.append(float(x))
+                    if liq_train_pre:
+                        thr_p50_pre = float(np.quantile(liq_train_pre, 0.50))
+                        thr_p75_pre = float(np.quantile(liq_train_pre, 0.75))
+                    if liq_train_all:
+                        thr_p50_all = float(np.quantile(liq_train_all, 0.50))
+                        thr_p75_all = float(np.quantile(liq_train_all, 0.75))
+
+                    thr_use = None
+                    if wf_liq_mode == "gate_p50":
+                        thr_use = thr_p50_pre if wf_liq_scope == "pre" else thr_p50_all
+                    elif wf_liq_mode == "gate_p75":
+                        thr_use = thr_p75_pre if wf_liq_scope == "pre" else thr_p75_all
+                    elif wf_liq_mode == "gate_min":
+                        thr_use = float(wf_liq_min)
+
+                    train_ins = [e for e in train_ins if _liq_ok(e, thr=thr_use) and _ah_ok(e)]
+
+                    def _norm_lg(val: Any) -> str:
+                        lg = str(val or "—").strip() or "—"
+                        lg = lg.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+                        if len(lg) > 48:
+                            lg = lg[:48].rstrip() + "…"
+                        return lg
+
+                    def _ci_sig_pos(ci: Optional[Tuple[float, float]]) -> bool:
+                        return bool(ci and float(ci[0]) > 0)
+
+                    def _ci_sig_neg(ci: Optional[Tuple[float, float]]) -> bool:
+                        return bool(ci and float(ci[1]) < 0)
+
+                    by_lg: Dict[str, List[dict]] = {}
+                    for ev in train_ins:
+                        by_lg.setdefault(_norm_lg(ev.get("league")), []).append(ev)
+
+                    active: List[str] = []
+                    diag: Dict[str, dict] = {}
+                    approved_rows: List[dict] = []
+                    wf_key_by_league = bool(getattr(args, "wf_key_by_league", False))
+                    active_set: set[str] = set()
+                    for lg, sub in sorted(by_lg.items(), key=lambda x: x[0]):
+                        bym_roi = _bym([e for e in sub if e.get("roi") is not None], "roi")
+                        roi_mean, roi_ci = _mean_ci90(bym_roi) if bym_roi else (None, None)
+                        roi_above_min = bool(roi_mean is not None and float(roi_mean) > float(wf_roi_min_activate))
+                        roi_sig_pos = _ci_sig_pos(roi_ci)
+                        roi_sig_neg = _ci_sig_neg(roi_ci)
+                        eligible = bool(len(bym_roi) >= wf_min_m)
+
+                        bym_clv = _bym(sub, "clv_back")
+                        clv_mean, clv_ci = _mean_ci90(bym_clv) if bym_clv else (None, None)
+                        clv_pos = bool(clv_mean is not None and float(clv_mean) > 0)
+                        clv_avail = bool(clv_mean is not None)
+
+                        ok_sel = False
+                        reason = ""
+                        if not eligible:
+                            ok_sel = False
+                            reason = f"BackPre: N_ROI<{wf_min_m} (N={len(bym_roi)})"
+                        elif roi_sig_neg:
+                            ok_sel = False
+                            reason = "BackPre: ROI sig<0 (bloqueia)"
+                        elif roi_sig_pos:
+                            ok_sel = bool(roi_above_min)
+                            reason = (
+                                f"BackPre: ROI sig>0 AND ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                                if ok_sel
+                                else f"BackPre: ROI sig>0 mas ROI<= {wf_roi_min_activate:.2f}%"
+                            )
+                        else:
+                            if wf_pre_activation_mode == "roi_only":
+                                ok_sel = bool(roi_above_min)
+                                reason = f"BackPre[ROI_ONLY]: ROI>{wf_roi_min_activate:.2f}={roi_above_min}"
+                            elif roi_above_min and ((not clv_avail) or clv_pos):
+                                ok_sel = True
+                                reason = f"BackPre: ROI>{wf_roi_min_activate:.2f} (NS) AND (CLV ausente OU CLV>0)"
+                            else:
+                                ok_sel = False
+                                reason = (
+                                    f"BackPre: ROI>{wf_roi_min_activate:.2f}={roi_above_min}, "
+                                    f"CLV>0={clv_pos} (CLV ausente={not clv_avail})"
+                                )
+
+                        k = f"Back_Pre_Any__{lg}" if wf_key_by_league else "Back_Pre_Any"
+                        if k not in diag:
+                            diag[k] = {
+                                "ok": False,
+                                "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
+                                "train_matches_total": 0,
+                                "train_matches_clv": 0,
+                                "clv_q10": None,
+                                "clv_mean": None,
+                                "clv_ci90": None,
+                                "clv_available": False,
+                                "train_matches_roi": 0,
+                                "roi_mean": None,
+                                "roi_mean_eff": None,
+                                "roi_ci90": None,
+                                "roi_sig_neg": False,
+                                "roi_sig_pos": False,
+                                "roi_q30": None,
+                            }
+
+                        dref = diag[k]
+                        dref.update(
+                            {
+                                "ok": bool(ok_sel),
+                                "reason": reason,
+                                "pre_activation_mode": wf_pre_activation_mode,
+                                "roi_min_activate": wf_roi_min_activate,
+                                "train_matches_total": int(dref.get("train_matches_total") or 0) + len({e["match_id"] for e in sub}),
+                                "train_matches_clv": int(dref.get("train_matches_clv") or 0) + len(bym_clv),
+                                "clv_q10": _q(bym_clv, 0.10) if bym_clv else dref.get("clv_q10"),
+                                "clv_mean": clv_mean,
+                                "clv_ci90": clv_ci,
+                                "clv_available": clv_avail,
+                                "train_matches_roi": int(dref.get("train_matches_roi") or 0) + len(bym_roi),
+                                "roi_mean": roi_mean,
+                                "roi_mean_eff": roi_mean,
+                                "roi_ci90": roi_ci,
+                                "roi_sig_neg": roi_sig_neg,
+                                "roi_sig_pos": roi_sig_pos,
+                                "roi_q30": _q(bym_roi, 0.30) if bym_roi else dref.get("roi_q30"),
+                            }
+                        )
+
+                        if ok_sel and k not in active_set:
+                            active_set.add(k)
+                            active.append(k)
+                            active_counts[k] = active_counts.get(k, 0) + 1
+                            approved_rows.append(
+                                {
+                                    "league": lg,
+                                    "key": k,
+                                    "matches_roi": len(bym_roi),
+                                    "roi_mean": roi_mean,
+                                    "roi_ci90": roi_ci,
+                                    "clv_mean": clv_mean,
+                                }
+                            )
+
+                    active_base = set()
+                    for k in active:
+                        kb = str(k).split("__", 1)[0] if wf_key_by_league else str(k)
+                        active_base.add(kb)
+
+                    active_for_stats = [
+                        e for e in train_ins
+                        if ((f"Back_Pre_Any__{_norm_lg(e.get('league'))}" if wf_key_by_league else "Back_Pre_Any") in active_set)
+                    ]
+                    bym_roi_active = _bym([e for e in active_for_stats if e.get("roi") is not None], "roi")
+                    is_mean, is_ci = _mean_ci90(bym_roi_active) if bym_roi_active else (None, None)
+
+                    steps.append(
+                        {
+                            "train": (f"{min(sel_days)}→{max(sel_days)}" if sel_days else "—"),
+                            "test": "IN_SAMPLE",
+                            "train_days": sorted(sel_days),
+                            "test_days": [],
+                            "active_keys": list(active),
+                            "active_n": len(active),
+                            "active_n_base": len(active_base),
+                            "active_keys_base": sorted(list(active_base)),
+                            "oos_matches": len(bym_roi_active),
+                            "oos_mean": is_mean,
+                            "oos_ci": is_ci,
+                            "turn_all": 0.0,
+                            "turn_pre": 0.0,
+                            "turn_in": 0.0,
+                            "turn_back": 0.0,
+                            "turn_lay": 0.0,
+                            "n_ev_elig": int(len(active_for_stats)),
+                            "n_ev_sized": 0,
+                            "n_ev_after_budget": 0,
+                            "n_ev_elig_pre": int(len(active_for_stats)),
+                            "n_ev_elig_in": 0,
+                            "n_ev_sized_pre": 0,
+                            "n_ev_sized_in": 0,
+                            "n_ev_after_budget_pre": 0,
+                            "n_ev_after_budget_in": 0,
+                            "fail_sizing_pre": {},
+                            "fail_sizing_in": {},
+                            "fail_sizing_side_pre": {},
+                            "fail_sizing_side_in": {},
+                            "pnl_obs": 0.0,
+                            "pnl_exp": 0.0,
+                            "pnl_obs_back": 0.0,
+                            "pnl_obs_lay": 0.0,
+                            "pnl_exp_back": 0.0,
+                            "pnl_exp_lay": 0.0,
+                            "diag": diag,
+                            "liq_mode": wf_liq_mode,
+                            "liq_scope": wf_liq_scope,
+                            "liq_thr_p50_pre": thr_p50_pre,
+                            "liq_thr_p75_pre": thr_p75_pre,
+                            "liq_thr_p50_all": thr_p50_all,
+                            "liq_thr_p75_all": thr_p75_all,
+                            "liq_thr_use": thr_use,
+                            "selection_mode": "insample",
+                            "approved_leagues": sorted([r["league"] for r in approved_rows]),
+                        }
+                    )
+
+                    lines.append("\n### 12.IS Seleção in-sample (sem OOS)\n")
+                    lines.append(
+                        f"Janela usada: **{len(sel_days)} dias** (últimos dias do recorte). "
+                        f"Critérios: Back Pre, ROI>{wf_roi_min_activate:.2f}%, slippage/filter já aplicado no funil.\n\n"
+                    )
+                    lines.append(f"Ligas aprovadas: **{len(approved_rows)}**.\n\n")
+                    if approved_rows:
+                        lines.append("| Liga | Chave | N ROI (jogos) | ROI mean (IC90) | CLV mean |\n|---|---|---:|---:|---:|\n")
+                        for rr in sorted(approved_rows, key=lambda x: (_safe_float(x.get("roi_mean")) or -999.0), reverse=True):
+                            lines.append(
+                                f"| {rr['league']} | {rr['key']} | {int(rr.get('matches_roi') or 0)} | "
+                                f"{_fmt_pct(_safe_float(rr.get('roi_mean')),2)} {_fmt_ci(rr.get('roi_ci90'),2)} | "
+                                f"{_fmt_pct(_safe_float(rr.get('clv_mean')),2)} |\n"
+                            )
+                        lines.append("\n")
+
                 # Walk-forward por dia:
                 # - `wf_step=1` (default) cria janelas de teste deslizantes; se `wf_test>1`, haverá sobreposição.
                 # - Para janelas de teste não sobrepostas (resultados somáveis por passo), use `wf_step=wf_test`.
-                for i in range(wf_train, len(days) - wf_test + 1, wf_step):
+                for i in ([] if wf_selection_mode == "insample" else range(wf_train, len(days) - wf_test + 1, wf_step)):
                     train_days = set(days[:i]) if wf_train_mode == "expanding" else set(days[i - wf_train : i])
                     test_days = set(days[i : i + wf_test])
 
@@ -6950,6 +7217,8 @@ async def main() -> int:
                             "walkforward": True,
                             "wf": {
                                 "train_mode": str(getattr(args, "wf_train_mode", "expanding") or "expanding"),
+                                "selection_mode": str(getattr(args, "wf_selection_mode", "oos") or "oos"),
+                                "insample_days": int(max(1, _safe_int(getattr(args, "wf_insample_days", 45)) or 45)),
                                 "train_days": int(getattr(args, "wf_train_days", 2)),
                                 "test_days": int(getattr(args, "wf_test_days", 1)),
                                 "step_days": int(getattr(args, "wf_step_days", 1)),
