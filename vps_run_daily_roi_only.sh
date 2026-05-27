@@ -86,6 +86,10 @@ if [[ -z "$DAILY_SCRIPT" || ! -f "$DAILY_SCRIPT" ]]; then
   echo "       - $ROOT_A" >&2
   echo "       - $ROOT_B" >&2
   echo "       - $ROOT_C" >&2
+  echo "[DICA] Esta branch pode nao conter o pipeline operacional (betinasia_bot/ops)." >&2
+  echo "[DICA] Troque para uma branch com o bot completo, ex.:" >&2
+  echo "       git checkout cursor/wf-root-cause-fix-dc34" >&2
+  echo "       # ou git checkout cursor/strict-policy-latency-regime-dc34" >&2
   exit 4
 fi
 
