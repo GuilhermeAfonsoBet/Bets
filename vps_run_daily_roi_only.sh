@@ -2,31 +2,17 @@
 set -euo pipefail
 
 # Wrapper fail-closed para rodar o daily no modo ROI-only Back Pre.
-# Evita dependencia de import de modulo especifico.
+# Resiliente a layouts diferentes de repositorio e sem dependencia de rg.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOT_DIR_DEFAULT="$ROOT_DIR/betinasia_bot"
-BOT_DIR="${BOT_DIR:-$BOT_DIR_DEFAULT}"
-ENV_FILE_CANDIDATE="${ENV_FILE:-}"
+REQUESTED_BOT_DIR="${BOT_DIR:-$ROOT_DIR/betinasia_bot}"
+REQUESTED_ENV_FILE="${ENV_FILE:-}"
 
-if [[ ! -d "$BOT_DIR" ]]; then
-  echo "[ERRO] Diretorio do bot nao encontrado: $BOT_DIR" >&2
-  echo "       Defina BOT_DIR=/caminho/para/betinasia_bot" >&2
+if [[ ! -d "$REQUESTED_BOT_DIR" ]]; then
+  echo "[ERRO] Diretorio BOT_DIR nao encontrado: $REQUESTED_BOT_DIR" >&2
+  echo "       Defina BOT_DIR para a pasta correta do projeto." >&2
   exit 2
 fi
-
-if [[ -z "$ENV_FILE_CANDIDATE" ]]; then
-  if [[ -f "$BOT_DIR/.env" ]]; then
-    ENV_FILE_CANDIDATE="$BOT_DIR/.env"
-  elif [[ -f "$ROOT_DIR/.env" ]]; then
-    ENV_FILE_CANDIDATE="$ROOT_DIR/.env"
-  else
-    ENV_FILE_CANDIDATE="$BOT_DIR/.env"
-  fi
-fi
-
-mkdir -p "$BOT_DIR/logs"
-export ENV_FILE="$ENV_FILE_CANDIDATE"
 
 # Hardening dos parametros criticos do cenario pedido.
 export DAILY_WF_TRAIN_MODE="${DAILY_WF_TRAIN_MODE:-expanding}"
@@ -39,8 +25,8 @@ export DAILY_WF_KEY_BY_LEAGUE_SCOPE="${DAILY_WF_KEY_BY_LEAGUE_SCOPE:-pre}"
 export DAILY_WF_BACKPRE_SLIP_MAX="${DAILY_WF_BACKPRE_SLIP_MAX:-0}"
 export DAILY_WF_BACKPRE_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-diff_pct}"
 
-echo "[INFO] BOT_DIR=$BOT_DIR"
-echo "[INFO] ENV_FILE=$ENV_FILE"
+echo "[INFO] REQUESTED_BOT_DIR=$REQUESTED_BOT_DIR"
+echo "[INFO] REQUESTED_ENV_FILE=${REQUESTED_ENV_FILE:-<vazio>}"
 echo "[INFO] DAILY_WF_TRAIN_MODE=$DAILY_WF_TRAIN_MODE"
 echo "[INFO] DAILY_WF_PRE_ACTIVATION_MODE=$DAILY_WF_PRE_ACTIVATION_MODE"
 echo "[INFO] DAILY_WF_ROI_MIN_ACTIVATE=$DAILY_WF_ROI_MIN_ACTIVATE"
@@ -51,52 +37,82 @@ echo "[INFO] DAILY_WF_KEY_BY_LEAGUE_SCOPE=$DAILY_WF_KEY_BY_LEAGUE_SCOPE"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_MAX=$DAILY_WF_BACKPRE_SLIP_MAX"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
 
-RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
-OUT_JSON="$BOT_DIR/logs/daily_roi_only_run_${RUN_TS}.json"
+ROOT_A="$REQUESTED_BOT_DIR"
+ROOT_B="$ROOT_DIR"
+ROOT_C="$(dirname "$REQUESTED_BOT_DIR")"
 
-DAILY_SCRIPT=""
-for cand in \
-  "$BOT_DIR/ops/daily_full_report.py" \
-  "$BOT_DIR/betinasia_bot/ops/daily_full_report.py" \
-  "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
-do
-  if [[ -f "$cand" ]]; then
-    DAILY_SCRIPT="$cand"
-    break
-  fi
-done
-
-if [[ -z "$DAILY_SCRIPT" ]]; then
-  DAILY_SCRIPT="$(
-    python3 - "$BOT_DIR" <<'PY2'
+DAILY_SCRIPT="$({
+  python3 - "$ROOT_A" "$ROOT_B" "$ROOT_C" <<'PY_FIND_DAILY'
 import os
 import sys
 
-root = sys.argv[1]
-target_suffix = os.path.join("ops", "daily_full_report.py")
-for cur, _, files in os.walk(root):
-    if "daily_full_report.py" not in files:
+roots = []
+seen = set()
+for r in sys.argv[1:]:
+    rr = os.path.abspath(r)
+    if rr in seen or not os.path.isdir(rr):
         continue
-    full = os.path.join(cur, "daily_full_report.py")
-    rel = os.path.relpath(full, root)
-    if rel.endswith(target_suffix):
-        print(full)
-        break
-PY2
-  )"
-fi
+    seen.add(rr)
+    roots.append(rr)
+
+skip = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+cands = []
+for root in roots:
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip]
+        if "daily_full_report.py" not in files:
+            continue
+        p = os.path.join(cur, "daily_full_report.py")
+        rel = os.path.relpath(p, root).replace("\\", "/")
+        score = 0
+        if rel.endswith("ops/daily_full_report.py"):
+            score -= 20
+        npath = p.replace("\\", "/")
+        if "/betinasia_bot/ops/" in npath:
+            score -= 10
+        if "/archive/" in npath or "/old/" in npath:
+            score += 30
+        cands.append((score, len(p), p))
+
+if cands:
+    cands.sort()
+    print(cands[0][2])
+PY_FIND_DAILY
+} || true)"
 
 if [[ -z "$DAILY_SCRIPT" || ! -f "$DAILY_SCRIPT" ]]; then
   echo "[ERRO] Nao encontrei daily_full_report.py por caminho de arquivo." >&2
-  echo "       Tentados diretos:" >&2
-  echo "       - $BOT_DIR/ops/daily_full_report.py" >&2
-  echo "       - $BOT_DIR/betinasia_bot/ops/daily_full_report.py" >&2
-  echo "       - $ROOT_DIR/betinasia_bot/ops/daily_full_report.py" >&2
+  echo "       Roots pesquisados:" >&2
+  echo "       - $ROOT_A" >&2
+  echo "       - $ROOT_B" >&2
+  echo "       - $ROOT_C" >&2
   exit 4
 fi
 
 RUN_CWD="$(dirname "$(dirname "$DAILY_SCRIPT")")"
-export PYTHONPATH="$RUN_CWD:$BOT_DIR:${PYTHONPATH:-}"
+WORK_ROOT="$RUN_CWD"
+RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
+mkdir -p "$WORK_ROOT/logs"
+OUT_JSON="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.json"
+ERR_LOG="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.stderr.log"
+export PYTHONPATH="$RUN_CWD:$REQUESTED_BOT_DIR:${PYTHONPATH:-}"
+
+ENV_FILE_CANDIDATE=""
+if [[ -n "$REQUESTED_ENV_FILE" && -f "$REQUESTED_ENV_FILE" ]]; then
+  ENV_FILE_CANDIDATE="$REQUESTED_ENV_FILE"
+elif [[ -f "$REQUESTED_BOT_DIR/.env" ]]; then
+  ENV_FILE_CANDIDATE="$REQUESTED_BOT_DIR/.env"
+elif [[ -f "$RUN_CWD/.env" ]]; then
+  ENV_FILE_CANDIDATE="$RUN_CWD/.env"
+elif [[ -f "$ROOT_DIR/.env" ]]; then
+  ENV_FILE_CANDIDATE="$ROOT_DIR/.env"
+fi
+if [[ -n "$ENV_FILE_CANDIDATE" ]]; then
+  export ENV_FILE="$ENV_FILE_CANDIDATE"
+  echo "[INFO] ENV_FILE=$ENV_FILE"
+else
+  echo "[WARN] .env nao encontrado automaticamente; seguindo sem ENV_FILE explicito."
+fi
 
 if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
   if [[ "$DAILY_WF_POLICY_CURRENT" = /* ]]; then
@@ -105,7 +121,7 @@ if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
     POLICY_JSON="$RUN_CWD/$DAILY_WF_POLICY_CURRENT"
   fi
 else
-  POLICY_JSON="$BOT_DIR/logs/wf_policy_current.json"
+  POLICY_JSON="$WORK_ROOT/logs/wf_policy_current.json"
 fi
 
 echo "[INFO] Rodando daily_full_report..."
@@ -115,9 +131,52 @@ echo "[INFO] DAILY_ENTRY=$DAILY_SCRIPT"
 echo "[INFO] PYTHONPATH=$PYTHONPATH"
 (
   cd "$RUN_CWD"
-  python3 "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
+  if ! python3 "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}" >"$OUT_JSON" 2>"$ERR_LOG"; then
+    echo "[ERRO] Falha ao executar daily_full_report.py" >&2
+    echo "[ERRO] stderr tail:" >&2
+    tail -n 80 "$ERR_LOG" >&2 || true
+    exit 5
+  fi
 )
 echo "[OK] Saida do daily salva em: $OUT_JSON"
+
+if [[ ! -f "$POLICY_JSON" ]]; then
+  POLICY_JSON_FALLBACK="$({
+    python3 - "$ROOT_A" "$ROOT_B" "$ROOT_C" <<'PY_FIND_POLICY'
+import os
+import sys
+
+roots = []
+seen = set()
+for r in sys.argv[1:]:
+    rr = os.path.abspath(r)
+    if rr in seen or not os.path.isdir(rr):
+        continue
+    seen.add(rr)
+    roots.append(rr)
+
+best = None
+for root in roots:
+    for cur, _, files in os.walk(root):
+        if "wf_policy_current.json" not in files:
+            continue
+        p = os.path.join(cur, "wf_policy_current.json")
+        try:
+            mt = os.path.getmtime(p)
+        except Exception:
+            continue
+        if best is None or mt > best[0]:
+            best = (mt, p)
+
+if best:
+    print(best[1])
+PY_FIND_POLICY
+  } || true)"
+  if [[ -n "$POLICY_JSON_FALLBACK" && -f "$POLICY_JSON_FALLBACK" ]]; then
+    POLICY_JSON="$POLICY_JSON_FALLBACK"
+    echo "[WARN] Policy encontrada por fallback: $POLICY_JSON"
+  fi
+fi
 
 if [[ ! -f "$POLICY_JSON" ]]; then
   echo "[ERRO] Policy nao encontrada apos execucao: $POLICY_JSON" >&2
