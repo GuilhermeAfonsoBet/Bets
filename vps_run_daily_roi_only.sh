@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Wrapper fail-closed para rodar o daily no modo ROI-only Back Pre.
-# Resiliente a layouts diferentes de repositorio e sem dependencia de rg.
+# Resiliente a layouts diferentes de repositorio e com bootstrap opcional de deps.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REQUESTED_BOT_DIR="${BOT_DIR:-$ROOT_DIR/betinasia_bot}"
@@ -99,8 +99,8 @@ RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 mkdir -p "$WORK_ROOT/logs"
 OUT_JSON="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.json"
 ERR_LOG="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.stderr.log"
-export PYTHONPATH="$RUN_CWD:$REQUESTED_BOT_DIR:${PYTHONPATH:-}"
 
+# Resolve ENV_FILE final com fallback, sem falhar se inexistente.
 ENV_FILE_CANDIDATE=""
 if [[ -n "$REQUESTED_ENV_FILE" && -f "$REQUESTED_ENV_FILE" ]]; then
   ENV_FILE_CANDIDATE="$REQUESTED_ENV_FILE"
@@ -117,6 +117,54 @@ if [[ -n "$ENV_FILE_CANDIDATE" ]]; then
 else
   echo "[WARN] .env nao encontrado automaticamente; seguindo sem ENV_FILE explicito."
 fi
+
+# Bootstrap de runtime Python (opcional, mas ligado por padrao).
+USE_VENV="${USE_VENV:-1}"
+AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+VENV_DIR="${PY_VENV_DIR:-$WORK_ROOT/.venv-roi-only}"
+REQ_FILE=""
+
+if [[ "$USE_VENV" == "1" ]]; then
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    echo "[INFO] Criando virtualenv em $VENV_DIR ..."
+    python3 -m venv "$VENV_DIR"
+  fi
+  PYTHON_BIN="$VENV_DIR/bin/python"
+fi
+
+for rf in \
+  "$WORK_ROOT/requirements.txt" \
+  "$REQUESTED_BOT_DIR/requirements.txt" \
+  "$WORK_ROOT/betinasia_bot/requirements.txt"
+do
+  if [[ -f "$rf" ]]; then
+    REQ_FILE="$rf"
+    break
+  fi
+done
+
+if [[ "$AUTO_INSTALL_DEPS" == "1" && -n "$REQ_FILE" ]]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    REQ_HASH="$(sha256sum "$REQ_FILE" | awk '{print $1}')"
+  else
+    REQ_HASH="$(wc -c < "$REQ_FILE" | awk '{print $1}')"
+  fi
+  STAMP_FILE="$VENV_DIR/.deps_${REQ_HASH}.ok"
+  if [[ ! -f "$STAMP_FILE" ]]; then
+    echo "[INFO] Instalando dependencias de $REQ_FILE ..."
+    "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel
+    "$PYTHON_BIN" -m pip install -r "$REQ_FILE"
+    touch "$STAMP_FILE"
+  else
+    echo "[INFO] Dependencias ja instaladas para hash $REQ_HASH"
+  fi
+elif [[ "$AUTO_INSTALL_DEPS" == "1" && -z "$REQ_FILE" ]]; then
+  echo "[WARN] requirements.txt nao encontrado; seguindo sem instalacao automatica de deps."
+fi
+
+export PYTHONPATH="$RUN_CWD:$REQUESTED_BOT_DIR:${PYTHONPATH:-}"
+echo "[INFO] PYTHON_BIN=$PYTHON_BIN"
 
 if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
   if [[ "$DAILY_WF_POLICY_CURRENT" = /* ]]; then
@@ -135,7 +183,7 @@ echo "[INFO] DAILY_ENTRY=$DAILY_SCRIPT"
 echo "[INFO] PYTHONPATH=$PYTHONPATH"
 (
   cd "$RUN_CWD"
-  if ! python3 "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}" >"$OUT_JSON" 2>"$ERR_LOG"; then
+  if ! "$PYTHON_BIN" "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}" >"$OUT_JSON" 2>"$ERR_LOG"; then
     echo "[ERRO] Falha ao executar daily_full_report.py" >&2
     echo "[ERRO] stderr tail:" >&2
     tail -n 80 "$ERR_LOG" >&2 || true
@@ -188,7 +236,7 @@ if [[ ! -f "$POLICY_JSON" ]]; then
 fi
 
 echo "[INFO] Validando policy efetiva em $POLICY_JSON ..."
-python3 - "$POLICY_JSON" <<'PY3'
+"$PYTHON_BIN" - "$POLICY_JSON" <<'PY3'
 import json
 import sys
 from pathlib import Path
