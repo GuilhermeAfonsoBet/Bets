@@ -112,6 +112,7 @@ fi
 RUN_CWD="$(dirname "$(dirname "$DAILY_SCRIPT")")"
 WORK_ROOT="$RUN_CWD"
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
+RUN_START_EPOCH="$(date +%s)"
 mkdir -p "$WORK_ROOT/logs"
 OUT_JSON="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.json"
 ERR_LOG="$WORK_ROOT/logs/daily_roi_only_run_${RUN_TS}.stderr.log"
@@ -240,21 +241,27 @@ echo "[OK] Saida do daily salva em: $OUT_JSON"
 # para evitar validar arquivo stale em wf_policy_current.
 if [[ -f "$OUT_JSON" ]]; then
   POLICY_FROM_RUN="$({
-    "$PYTHON_BIN" - "$OUT_JSON" "$RUN_CWD" "$WORK_ROOT" "$REQUESTED_BOT_DIR" "$ROOT_DIR" <<'PY_PICK_POLICY'
+    "$PYTHON_BIN" - "$OUT_JSON" "$RUN_START_EPOCH" "$RUN_CWD" "$WORK_ROOT" "$REQUESTED_BOT_DIR" "$ROOT_DIR" <<'PY_PICK_POLICY'
 import json
 import os
 import sys
 from pathlib import Path
 
 out_json = Path(sys.argv[1])
-base_dirs = [Path(x).resolve() for x in sys.argv[2:] if x]
+run_start_epoch = int(float(sys.argv[2]))
+base_dirs = [Path(x).resolve() for x in sys.argv[3:] if x]
+
+def _fresh(path: Path, start_epoch: int, tolerance_sec: int = 300) -> bool:
+    try:
+        return path.stat().st_mtime >= (start_epoch - tolerance_sec)
+    except Exception:
+        return False
 
 raw = out_json.read_text(encoding='utf-8', errors='ignore')
 data = None
 try:
     data = json.loads(raw)
 except Exception:
-    # fallback simples para casos com ruído antes/depois do JSON
     i = raw.find('{')
     j = raw.rfind('}')
     if i >= 0 and j > i:
@@ -267,15 +274,15 @@ if not isinstance(data, dict):
     raise SystemExit(0)
 
 def _resolve_existing(path_str: str):
-    p = Path(path_str.strip())
-    if not path_str.strip():
+    if not path_str or not str(path_str).strip():
         return None
+    p = Path(str(path_str).strip())
     if p.is_absolute() and p.is_file():
-        return str(p)
+        return p.resolve()
     for b in base_dirs:
         q = (b / p).resolve()
         if q.is_file():
-            return str(q)
+            return q
     return None
 
 cands = []
@@ -301,6 +308,7 @@ cands.extend([
 ])
 
 seen = set()
+resolved = []
 for c in cands:
     if not isinstance(c, str):
         continue
@@ -310,117 +318,148 @@ for c in cands:
     seen.add(c)
     r = _resolve_existing(c)
     if r:
-        print(r)
+        resolved.append(r)
+
+# escolhe primeira policy fresca; se não houver, não devolve nada.
+for r in resolved:
+    if _fresh(r, run_start_epoch):
+        print(str(r))
         break
 PY_PICK_POLICY
   } || true)"
   if [[ -n "$POLICY_FROM_RUN" && -f "$POLICY_FROM_RUN" ]]; then
     POLICY_JSON="$POLICY_FROM_RUN"
-    echo "[INFO] Policy selecionada a partir do output do run: $POLICY_JSON"
+    echo "[INFO] Policy selecionada a partir do output do run (fresca): $POLICY_JSON"
   else
-    echo "[WARN] Nao foi possivel resolver policy a partir do output do run; usando fallback." >&2
+    echo "[WARN] Nao foi possivel resolver policy fresca a partir do output do run; usando fallback fresco." >&2
   fi
 fi
 
 if [[ ! -f "$POLICY_JSON" ]]; then
   POLICY_JSON_FALLBACK="$({
-    python3 - "$ROOT_A" "$ROOT_B" "$ROOT_C" <<'PY_FIND_POLICY'
+    "$PYTHON_BIN" - "$RUN_START_EPOCH" "$ROOT_A" "$ROOT_B" "$ROOT_C" <<'PY_FIND_POLICY'
 import os
 import sys
+from pathlib import Path
 
+run_start_epoch = int(float(sys.argv[1]))
 roots = []
 seen = set()
-for r in sys.argv[1:]:
+for r in sys.argv[2:]:
     rr = os.path.abspath(r)
     if rr in seen or not os.path.isdir(rr):
         continue
     seen.add(rr)
     roots.append(rr)
 
-best = None
+def fresh(p: Path, start_epoch: int, tolerance_sec: int = 300) -> bool:
+    try:
+        return p.stat().st_mtime >= (start_epoch - tolerance_sec)
+    except Exception:
+        return False
+
+cands = []
 for root in roots:
     for cur, _, files in os.walk(root):
-        if "wf_policy_current.json" not in files:
-            continue
-        p = os.path.join(cur, "wf_policy_current.json")
-        try:
-            mt = os.path.getmtime(p)
-        except Exception:
-            continue
-        if best is None or mt > best[0]:
-            best = (mt, p)
+        if 'wf_policy_current.json' in files:
+            cands.append(Path(cur) / 'wf_policy_current.json')
+        for f in files:
+            if f.startswith('wf_policy_') and f.endswith('.json'):
+                cands.append(Path(cur) / f)
 
-if best:
-    print(best[1])
+# prioriza frescos e mais novos
+cands = [p.resolve() for p in cands if p.is_file()]
+cands = sorted(set(cands), key=lambda p: p.stat().st_mtime, reverse=True)
+for p in cands:
+    if fresh(p, run_start_epoch):
+        print(str(p))
+        break
 PY_FIND_POLICY
   } || true)"
   if [[ -n "$POLICY_JSON_FALLBACK" && -f "$POLICY_JSON_FALLBACK" ]]; then
     POLICY_JSON="$POLICY_JSON_FALLBACK"
-    echo "[WARN] Policy encontrada por fallback: $POLICY_JSON"
+    echo "[WARN] Policy fresca encontrada por fallback: $POLICY_JSON"
   fi
 fi
 
 if [[ ! -f "$POLICY_JSON" ]]; then
-  echo "[ERRO] Policy nao encontrada apos execucao: $POLICY_JSON" >&2
+  echo "[ERRO] Policy fresca nao encontrada apos execucao (run_start=$RUN_START_EPOCH)." >&2
   exit 3
 fi
 
+EXPECT_PRE_ACT="${DAILY_WF_PRE_ACTIVATION_MODE:-roi_only}"
+EXPECT_SIDES="${DAILY_WF_SIDES:-back}"
+EXPECT_REGIMES="${DAILY_WF_REGIMES:-pre}"
+EXPECT_TRAIN_MODE="${DAILY_WF_TRAIN_MODE:-expanding}"
+EXPECT_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-slippage_pre_pct}"
+EXPECT_SLIP_MAX="${DAILY_WF_BACKPRE_SLIP_MAX:-0}"
+
 echo "[INFO] Validando policy efetiva em $POLICY_JSON ..."
-"$PYTHON_BIN" - "$POLICY_JSON" <<'PY3'
+"$PYTHON_BIN" - "$POLICY_JSON" "$RUN_START_EPOCH" "$EXPECT_PRE_ACT" "$EXPECT_SIDES" "$EXPECT_REGIMES" "$EXPECT_TRAIN_MODE" "$EXPECT_SLIP_FIELD" "$EXPECT_SLIP_MAX" <<'PY3'
 import json
 import sys
 from pathlib import Path
 
 primary = Path(sys.argv[1]).resolve()
-
+run_start_epoch = int(float(sys.argv[2]))
 checks_expected = {
-    "pre_activation_mode": "roi_only",
-    "sides": "back",
-    "regimes": "pre",
-    "train_mode": "expanding",
-    "backpre_slip_field": "diff_pct",
+    'pre_activation_mode': str(sys.argv[3]).strip().lower(),
+    'sides': str(sys.argv[4]).strip().lower(),
+    'regimes': str(sys.argv[5]).strip().lower(),
+    'train_mode': str(sys.argv[6]).strip().lower(),
+    'backpre_slip_field': str(sys.argv[7]).strip().lower(),
 }
+try:
+    expect_slip_max = float(sys.argv[8])
+except Exception:
+    expect_slip_max = 0.0
+
+def fresh(path: Path, start_epoch: int, tolerance_sec: int = 300) -> bool:
+    try:
+        return path.stat().st_mtime >= (start_epoch - tolerance_sec)
+    except Exception:
+        return False
 
 def _load_json(path: Path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding='utf-8'))
     except Exception:
         return None
 
 def _validate(path: Path):
     data = _load_json(path)
     if not isinstance(data, dict):
-        return [f"arquivo nao e JSON objeto: {path}"], None
-    wf = data.get("wf")
+        return [f'arquivo nao e JSON objeto: {path}']
+    wf = data.get('wf')
     if not isinstance(wf, dict):
-        return ["policy.wf ausente/ invalido"], None
+        return ['policy.wf ausente/ invalido']
 
     failed = []
     for k, want in checks_expected.items():
-        got = str(wf.get(k, "")).strip().lower()
+        got = str(wf.get(k, '')).strip().lower()
         if got != want:
-            failed.append(f"{k}: esperado={want} obtido={got}")
+            failed.append(f'{k}: esperado={want} obtido={got}')
 
-    slip_max = wf.get("backpre_slip_max")
+    slip_max = wf.get('backpre_slip_max')
     try:
         slip_val = float(slip_max)
     except Exception:
-        failed.append(f"backpre_slip_max invalido: {slip_max!r}")
+        failed.append(f'backpre_slip_max invalido: {slip_max!r}')
     else:
-        if slip_val > 0.0:
-            failed.append(f"backpre_slip_max esperado <=0, obtido={slip_val}")
+        if slip_val > expect_slip_max:
+            failed.append(f'backpre_slip_max esperado <= {expect_slip_max}, obtido={slip_val}')
 
-    return failed, wf
+    return failed
 
 candidates = [primary]
 base = primary.parent
 extra = []
 try:
-    extra.extend(base.glob("wf_policy_*.json"))
+    extra.extend(base.glob('wf_policy_*.json'))
 except Exception:
     pass
 try:
-    extra.extend((base / "policy_history").glob("wf_policy_*.json"))
+    extra.extend((base / 'policy_history').glob('wf_policy_*.json'))
 except Exception:
     pass
 extra = [p.resolve() for p in extra if p.is_file() and p.resolve() != primary]
@@ -435,22 +474,29 @@ for c in candidates:
     seen.add(c)
     ordered.append(c)
 
+fresh_only = [c for c in ordered if fresh(c, run_start_epoch)]
+if not fresh_only:
+    raise SystemExit(
+        '[ERRO] Nenhuma policy fresca para este run; abortando para evitar falso positivo. '
+        f'(run_start={run_start_epoch}, primary={primary})'
+    )
+
 best_fail = None
 best_path = None
-for c in ordered:
-    fail, wf = _validate(c)
+for c in fresh_only:
+    fail = _validate(c)
     if not fail:
-        print(f"[OK] Policy validada com sucesso (ROI_ONLY Back Pre + slippage<=0): {c}")
+        print(f'[OK] Policy validada com sucesso (ROI_ONLY Back Pre + slippage<=0): {c}')
         raise SystemExit(0)
     if best_fail is None:
         best_fail = fail
         best_path = c
 
-msg = "\n".join(f"- {x}" for x in (best_fail or ["falha desconhecida"]))
+msg = '\n'.join(f'- {x}' for x in (best_fail or ['falha desconhecida']))
 raise SystemExit(
-    "[ERRO] Policy fora do esperado (melhor candidata: "
+    '[ERRO] Policy fresca fora do esperado (melhor candidata: '
     + str(best_path)
-    + "):\n"
+    + '):\n'
     + msg
 )
 PY3
