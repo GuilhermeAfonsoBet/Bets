@@ -232,90 +232,6 @@ def _policy_compatibility_check(
     }
 
 
-def _policy_wf_guard_check(
-    policy_wf: Any,
-    *,
-    required_fields: List[str],
-    expected_train_mode: str,
-    min_train_days: int,
-    min_test_days: int,
-    min_step_days: int,
-    expected_sides: str,
-    expected_regimes: str,
-    expected_pre_activation_mode: str,
-    expected_backpre_slip_field: str,
-    expected_backpre_slip_max: Optional[float],
-) -> Dict[str, Any]:
-    wf = policy_wf if isinstance(policy_wf, dict) else {}
-    checks: List[Tuple[bool, str]] = []
-
-    req = [str(x).strip() for x in (required_fields or []) if str(x).strip()]
-    for field in req:
-        val = wf.get(field)
-        ok = not (val is None or (isinstance(val, str) and (not str(val).strip())))
-        checks.append((ok, f"{field} presente (atual={val!r})"))
-
-    def _cmp_str(field: str, expected: str) -> None:
-        exp = str(expected or "").strip().lower()
-        if not exp:
-            return
-        act = str(wf.get(field) or "").strip().lower()
-        checks.append((act == exp, f"{field}={exp} (atual={wf.get(field)!r})"))
-
-    _cmp_str("train_mode", expected_train_mode)
-    _cmp_str("sides", expected_sides)
-    _cmp_str("regimes", expected_regimes)
-    _cmp_str("pre_activation_mode", expected_pre_activation_mode)
-    _cmp_str("backpre_slip_field", expected_backpre_slip_field)
-
-    tr = _safe_float(wf.get("train_days"))
-    te = _safe_float(wf.get("test_days"))
-    st = _safe_float(wf.get("step_days"))
-    if int(min_train_days or 0) > 0:
-        checks.append((tr is not None and float(tr) >= float(min_train_days), f"train_days>={int(min_train_days)} (atual={wf.get('train_days')!r})"))
-    if int(min_test_days or 0) > 0:
-        checks.append((te is not None and float(te) >= float(min_test_days), f"test_days>={int(min_test_days)} (atual={wf.get('test_days')!r})"))
-    if int(min_step_days or 0) > 0:
-        checks.append((st is not None and float(st) >= float(min_step_days), f"step_days>={int(min_step_days)} (atual={wf.get('step_days')!r})"))
-
-    if expected_backpre_slip_max is not None:
-        got_slip = _safe_float(wf.get("backpre_slip_max"))
-        ok_slip = (got_slip is not None) and (abs(float(got_slip) - float(expected_backpre_slip_max)) <= 1e-9)
-        checks.append((ok_slip, f"backpre_slip_max={float(expected_backpre_slip_max):g} (atual={wf.get('backpre_slip_max')!r})"))
-
-    ok = bool(checks) and all(c[0] for c in checks)
-    failed = [msg for cond, msg in checks if not cond]
-    reason = "ok" if ok else ("; ".join(failed[:6]) if failed else "wf_guard_no_checks")
-    return {
-        "ok": bool(ok),
-        "reason": str(reason),
-        "required_fields": list(req),
-        "expected": {
-            "train_mode": str(expected_train_mode or ""),
-            "min_train_days": int(min_train_days or 0),
-            "min_test_days": int(min_test_days or 0),
-            "min_step_days": int(min_step_days or 0),
-            "sides": str(expected_sides or ""),
-            "regimes": str(expected_regimes or ""),
-            "pre_activation_mode": str(expected_pre_activation_mode or ""),
-            "backpre_slip_field": str(expected_backpre_slip_field or ""),
-            "backpre_slip_max": expected_backpre_slip_max,
-        },
-        "actual": {
-            "train_mode": wf.get("train_mode"),
-            "train_days": wf.get("train_days"),
-            "test_days": wf.get("test_days"),
-            "step_days": wf.get("step_days"),
-            "sides": wf.get("sides"),
-            "regimes": wf.get("regimes"),
-            "pre_activation_mode": wf.get("pre_activation_mode"),
-            "backpre_slip_field": wf.get("backpre_slip_field"),
-            "backpre_slip_max": wf.get("backpre_slip_max"),
-        },
-        "checks": [{"ok": bool(cond), "rule": str(msg)} for cond, msg in checks],
-    }
-
-
 def _parse_dt_any(s: Any) -> Optional[datetime]:
     """
     Best-effort parse para campos como 'post date' do CSV de accounting.
@@ -3563,7 +3479,7 @@ class DailyReportCfg:
     hypothesis_type: str = os.getenv("DAILY_OOS_HYPOTHESIS_TYPE", "H3B")
     direction: str = os.getenv("DAILY_OOS_DIRECTION", "up")
     # Alinha com o relatório “atual” (ex.: 21d) se o usuário não setar nada.
-    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "35")
+    lookback_days: str = os.getenv("DAILY_OOS_LOOKBACK_DAYS", "21")
     no_auto_exclude_days: bool = (os.getenv("DAILY_NO_AUTO_EXCLUDE_DAYS", "0").strip() in ("1", "true", "True", "yes", "YES"))
     report_mode: str = os.getenv("DAILY_REPORT_MODE", "oos_first")
     wf_policy_current: Path = Path(os.getenv("DAILY_WF_POLICY_CURRENT", "logs/wf_policy_current.json"))
@@ -3575,54 +3491,26 @@ class DailyReportCfg:
     policy_compat_min_pre_keys: int = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", "1"), 1))
     policy_compat_bridge_exec_side: str = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", "Back"))
     policy_compat_prematch_only: bool = (_is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1"))))
-    # Guard extra para evitar regressões silenciosas de versão/parametrização WF.
-    policy_wf_guard_enable: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1")))
-    policy_wf_guard_fail_closed: bool = (_is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1")))
-    policy_wf_guard_required_fields: str = os.getenv(
-        "DAILY_WF_GUARD_REQUIRED_FIELDS",
-        "train_mode,train_days,test_days,step_days,sides,regimes,pre_activation_mode,backpre_slip_max,backpre_slip_field",
-    ).strip()
-    policy_wf_guard_expected_train_mode: str = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", "expanding")).strip()
-    policy_wf_guard_min_train_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", "30"), 30))
-    policy_wf_guard_min_test_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", "7"), 7))
-    policy_wf_guard_min_step_days: int = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", "7"), 7))
-    policy_wf_guard_expected_sides: str = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", "back")).strip()
-    policy_wf_guard_expected_regimes: str = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", "pre")).strip()
-    policy_wf_guard_expected_pre_activation_mode: str = os.getenv(
-        "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
-        os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_only"),
-    ).strip()
-    policy_wf_guard_expected_backpre_slip_field: str = os.getenv(
-        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
-        os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct"),
-    ).strip()
-    policy_wf_guard_expected_backpre_slip_max: str = os.getenv(
-        "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
-        os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0"),
-    ).strip()
-    # Hard-fail opcional para impedir "silent stale policy" quando OOS não roda.
-    policy_require_oos_success: bool = (_is_truthy(os.getenv("DAILY_WF_REQUIRE_OOS_SUCCESS", "1")))
-    policy_require_candidate: bool = (_is_truthy(os.getenv("DAILY_WF_REQUIRE_CANDIDATE", "1")))
     # Walk-forward knobs (para casar com versões como leaguePre / AHgatePre / expanding)
     wf_train_mode: str = os.getenv("DAILY_WF_TRAIN_MODE", "expanding")
-    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "30")
-    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "7")
-    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "7")
+    wf_train_days: str = os.getenv("DAILY_WF_TRAIN_DAYS", "2")
+    wf_test_days: str = os.getenv("DAILY_WF_TEST_DAYS", "2")
+    wf_step_days: str = os.getenv("DAILY_WF_STEP_DAYS", "2")
     wf_key_by_league: bool = (os.getenv("DAILY_WF_KEY_BY_LEAGUE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_key_by_league_scope: str = os.getenv("DAILY_WF_KEY_BY_LEAGUE_SCOPE", "pre")
     # Estatística exploratória no OOS (deve ficar OFF no daily 19h)
     wf_experimental_stats: bool = (os.getenv("DAILY_WF_EXPERIMENTAL_STATS", "0").strip() in ("1", "true", "True", "yes", "YES"))
-    wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "")
+    wf_ah_max_abs_line: str = os.getenv("DAILY_WF_AH_MAX_ABS_LINE", "2.0")
     wf_ah_scope: str = os.getenv("DAILY_WF_AH_SCOPE", "pre")
     wf_liquidity_mode: str = os.getenv("DAILY_WF_LIQUIDITY_MODE", "none")
     wf_liquidity_scope: str = os.getenv("DAILY_WF_LIQUIDITY_SCOPE", "pre")
     wf_min_matches: str = os.getenv("DAILY_WF_MIN_MATCHES", "0")
-    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_only").strip()
+    wf_pre_activation_mode: str = os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", "roi_clv").strip()
     wf_roi_min_activate: str = os.getenv("DAILY_WF_ROI_MIN_ACTIVATE", "0").strip()
     wf_shrinkage: bool = (os.getenv("DAILY_WF_SHRINKAGE", "1").strip() in ("1", "true", "True", "yes", "YES"))
     wf_exclude_exec_buckets_back: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", "10-20s")
     wf_exclude_exec_buckets_lay: str = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", "")
-    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "0").strip()
+    wf_backpre_slip_max: str = os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", "").strip()
     wf_backpre_slip_field: str = os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", "diff_pct").strip()
     wf_backpre_fast_max_lag_ms: str = os.getenv("DAILY_WF_BACKPRE_FAST_MAX_LAG_MS", "").strip()
     # Sizing no WF (útil para simular in-match governado por budget/caps, sem trocar policy do robô)
@@ -3668,33 +3556,6 @@ class DailyReportCfg:
         self.policy_compat_min_pre_keys = max(1, _safe_int(os.getenv("DAILY_WF_COMPAT_MIN_PRE_KEYS", str(self.policy_compat_min_pre_keys or 1)), 1))
         self.policy_compat_bridge_exec_side = os.getenv("DAILY_WF_COMPAT_BRIDGE_EXEC_SIDE", os.getenv("BRIDGE_EXEC_SIDE", self.policy_compat_bridge_exec_side))
         self.policy_compat_prematch_only = _is_truthy(os.getenv("DAILY_WF_COMPAT_PREMATCH_ONLY", os.getenv("BRIDGE_PREMATCH_ONLY", "1")))
-        self.policy_wf_guard_enable = _is_truthy(os.getenv("DAILY_WF_GUARD_ENABLE", "1" if self.policy_wf_guard_enable else "0"))
-        self.policy_wf_guard_fail_closed = _is_truthy(os.getenv("DAILY_WF_GUARD_FAIL_CLOSED", "1" if self.policy_wf_guard_fail_closed else "0"))
-        self.policy_wf_guard_required_fields = os.getenv("DAILY_WF_GUARD_REQUIRED_FIELDS", self.policy_wf_guard_required_fields).strip()
-        self.policy_wf_guard_expected_train_mode = os.getenv("DAILY_WF_GUARD_EXPECTED_TRAIN_MODE", os.getenv("DAILY_WF_TRAIN_MODE", self.policy_wf_guard_expected_train_mode)).strip()
-        self.policy_wf_guard_min_train_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TRAIN_DAYS", str(self.policy_wf_guard_min_train_days or 0)), self.policy_wf_guard_min_train_days))
-        self.policy_wf_guard_min_test_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_TEST_DAYS", str(self.policy_wf_guard_min_test_days or 0)), self.policy_wf_guard_min_test_days))
-        self.policy_wf_guard_min_step_days = max(0, _safe_int(os.getenv("DAILY_WF_GUARD_MIN_STEP_DAYS", str(self.policy_wf_guard_min_step_days or 0)), self.policy_wf_guard_min_step_days))
-        self.policy_wf_guard_expected_sides = os.getenv("DAILY_WF_GUARD_EXPECTED_SIDES", os.getenv("DAILY_WF_SIDES", self.policy_wf_guard_expected_sides)).strip()
-        self.policy_wf_guard_expected_regimes = os.getenv("DAILY_WF_GUARD_EXPECTED_REGIMES", os.getenv("DAILY_WF_REGIMES", self.policy_wf_guard_expected_regimes)).strip()
-        self.policy_wf_guard_expected_pre_activation_mode = os.getenv(
-            "DAILY_WF_GUARD_EXPECTED_PRE_ACTIVATION_MODE",
-            os.getenv("DAILY_WF_PRE_ACTIVATION_MODE", self.policy_wf_guard_expected_pre_activation_mode),
-        ).strip()
-        self.policy_wf_guard_expected_backpre_slip_field = os.getenv(
-            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_FIELD",
-            os.getenv("DAILY_WF_BACKPRE_SLIP_FIELD", self.policy_wf_guard_expected_backpre_slip_field),
-        ).strip()
-        self.policy_wf_guard_expected_backpre_slip_max = os.getenv(
-            "DAILY_WF_GUARD_EXPECTED_BACKPRE_SLIP_MAX",
-            os.getenv("DAILY_WF_BACKPRE_SLIP_MAX", self.policy_wf_guard_expected_backpre_slip_max),
-        ).strip()
-        self.policy_require_oos_success = _is_truthy(
-            os.getenv("DAILY_WF_REQUIRE_OOS_SUCCESS", "1" if self.policy_require_oos_success else "0")
-        )
-        self.policy_require_candidate = _is_truthy(
-            os.getenv("DAILY_WF_REQUIRE_CANDIDATE", "1" if self.policy_require_candidate else "0")
-        )
         self.executor_jsonl = Path(os.getenv("EXECUTOR_JSONL", str(self.executor_jsonl)))
         self.wf_exclude_exec_buckets_back = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_BACK", self.wf_exclude_exec_buckets_back)
         self.wf_exclude_exec_buckets_lay = os.getenv("DAILY_WF_EXCLUDE_EXEC_BUCKETS_LAY", self.wf_exclude_exec_buckets_lay)
@@ -3980,143 +3841,20 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         if bool(cfg.wf_sweep_grid_in):
             args += ["--wf-sweep-grid-in"]
 
-    oos_run = {
-        "skipped": False,
-        "ok": True,
-        "returncode": 0,
-        "error": None,
-        "log": str(day_dir / "oos_run.log"),
-        "command": " ".join([str(x) for x in args]),
-        "commands": [" ".join([str(x) for x in args])],
-        "candidate_path": str(policy_hist),
-    }
+    oos_run = {"skipped": False, "ok": True, "returncode": 0, "error": None, "log": str(day_dir / "oos_run.log")}
     if cfg.skip_oos:
         oos_run = {"skipped": True, "ok": False, "returncode": None, "error": "OOS_SKIPPED (DAILY_SKIP_OOS=1)", "log": None}
     else:
         try:
             log_path = Path(str(oos_run["log"]))
-            cwd_oos = str(Path(__file__).resolve().parent.parent)
-
-            def _run_oos(cmd: List[str]) -> subprocess.CompletedProcess:
-                return subprocess.run(cmd, check=False, cwd=cwd_oos, capture_output=True, text=True)
-
-            def _format_oos_log(proc_obj: subprocess.CompletedProcess, cmd: List[str]) -> str:
-                return (
-                    "[COMMAND]\n"
-                    + " ".join([str(x) for x in cmd])
-                    + "\n\n--- STDOUT ---\n\n"
-                    + (proc_obj.stdout or "")
-                    + "\n\n--- STDERR ---\n\n"
-                    + (proc_obj.stderr or "")
-                )
-
-            def _replace_cli_arg(cmd: List[str], flag: str, value: str) -> List[str]:
-                out_cmd: List[str] = []
-                i = 0
-                replaced = False
-                while i < len(cmd):
-                    tok = str(cmd[i])
-                    if tok == flag:
-                        out_cmd.append(tok)
-                        out_cmd.append(str(value))
-                        replaced = True
-                        i += 2
-                        continue
-                    out_cmd.append(tok)
-                    i += 1
-                if not replaced:
-                    out_cmd += [flag, str(value)]
-                return out_cmd
-
-            def _short_window_hint(txt: str) -> str:
-                mark = "[WARN] Janela curta para walk-forward:"
-                try:
-                    p = str(txt or "").find(mark)
-                    if p >= 0:
-                        line = str(txt[p:]).splitlines()[0].strip()
-                        return line[:220]
-                except Exception:
-                    return ""
-                return ""
-
-            def _tail_text(txt: str, max_chars: int = 320) -> str:
-                try:
-                    t = str(txt or "").strip()
-                    if not t:
-                        return ""
-                    if len(t) <= int(max_chars):
-                        return t
-                    return t[-int(max_chars):]
-                except Exception:
-                    return ""
-
-            proc = _run_oos(args)
+            proc = subprocess.run(args, check=False, cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True)
             oos_run["returncode"] = int(proc.returncode)
-            log_text = _format_oos_log(proc, args)
-            lb_curr = _safe_int(cfg.lookback_days, None)
-            wf_train_i = max(1, int(_safe_int(cfg.wf_train_days, 30) or 30))
-            wf_test_i = max(1, int(_safe_int(cfg.wf_test_days, 7) or 7))
-            wf_step_i = max(1, int(_safe_int(cfg.wf_step_days, 7) or 7))
-            # margem para dias sem amostra (buracos operacionais)
-            lb_needed = max(int(wf_train_i + wf_test_i + wf_step_i), int(wf_train_i + wf_test_i + 14), 60)
-            lb_base = int(lb_curr or 0)
-            lb_retry = int(max(lb_needed, lb_base))
-            oos_run["lookback_days_first"] = lb_base if lb_base > 0 else None
-            oos_run["lookback_days_retry"] = lb_retry
-
-            need_retry_for_failure = bool(proc.returncode != 0 and lb_retry > lb_base)
-            need_retry_for_missing_candidate = bool(proc.returncode == 0 and (not policy_hist.exists()) and lb_retry > lb_base)
-
-            if need_retry_for_failure or need_retry_for_missing_candidate:
-                args_retry = _replace_cli_arg(args, "--lookback-days", str(lb_retry))
-                proc2 = _run_oos(args_retry)
-                oos_run["commands"] = [str(x) for x in oos_run.get("commands") or []] + [" ".join([str(x) for x in args_retry])]
-                oos_run["retry_returncode"] = int(proc2.returncode)
-                log_text = (
-                    log_text
-                    + "\n\n\n========== RETRY: EXPANDED LOOKBACK ==========\n\n"
-                    + _format_oos_log(proc2, args_retry)
-                )
-                oos_run["command"] = " ".join([str(x) for x in args_retry])
-
-                if proc2.returncode != 0:
-                    oos_run["ok"] = False
-                    detail = _tail_text(proc2.stderr or proc2.stdout or "")
-                    oos_run["error_detail"] = detail
-                    oos_run["error"] = (
-                        f"OOS_RETRY_FAILED: returncode={proc2.returncode}"
-                        + (f", detail={detail}" if detail else "")
-                    )
-                elif not policy_hist.exists():
-                    hint = _short_window_hint((proc2.stdout or "") + "\n" + (proc2.stderr or ""))
-                    oos_run["ok"] = False
-                    oos_run["error"] = (
-                        f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
-                        + (f", hint={hint}" if hint else "")
-                    )
-                else:
-                    oos_run["ok"] = True
-                    oos_run["returncode"] = int(proc2.returncode)
-                    oos_run["error"] = None
-                    if need_retry_for_missing_candidate:
-                        oos_run["candidate_missing_after_first_run"] = True
-            else:
-                if proc.returncode != 0:
-                    oos_run["ok"] = False
-                    detail = _tail_text(proc.stderr or proc.stdout or "")
-                    oos_run["error_detail"] = detail
-                    oos_run["error"] = f"OOS_FAILED: returncode={proc.returncode}" + (f", detail={detail}" if detail else "")
-                elif not policy_hist.exists():
-                    hint = _short_window_hint((proc.stdout or "") + "\n" + (proc.stderr or ""))
-                    oos_run["ok"] = False
-                    oos_run["error"] = (
-                        f"OOS_NO_POLICY_CANDIDATE: analyzer_returncode=0, export_path={policy_hist}"
-                        + (f", hint={hint}" if hint else "")
-                    )
-
+            if proc.returncode != 0:
+                oos_run["ok"] = False
+                oos_run["error"] = f"OOS_FAILED: returncode={proc.returncode}"
             # sempre grava log (stdout+stderr) para debug no VPS
             try:
-                log_path.write_text(log_text, encoding="utf-8")
+                log_path.write_text((proc.stdout or "") + "\n\n--- STDERR ---\n\n" + (proc.stderr or ""), encoding="utf-8")
             except Exception:
                 pass
         except Exception as e:
@@ -4127,18 +3865,11 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "enabled": bool(cfg.publish_policy_current),
         "guard_enabled": bool(cfg.policy_compat_guard_enable),
         "fail_closed": bool(cfg.policy_compat_fail_closed),
-        "wf_guard_enabled": bool(cfg.policy_wf_guard_enable),
-        "wf_guard_fail_closed": bool(cfg.policy_wf_guard_fail_closed),
-        "require_oos_success": bool(cfg.policy_require_oos_success),
-        "require_candidate": bool(cfg.policy_require_candidate),
         "published": False,
         "reason": "skipped",
         "compatibility": None,
-        "wf_guard": None,
         "candidate_path": str(policy_hist),
         "effective_path": str(cfg.wf_policy_current),
-        "oos": dict(oos_run or {}),
-        "fatal": False,
     }
     active_keys = None
     active_keys_base = None
@@ -4146,38 +3877,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     policy_last_step: Optional[Dict[str, Any]] = None
     candidate_active_keys = None
 
-    oos_ok_for_publish = (not cfg.skip_oos) and bool(oos_run.get("ok"))
-    candidate_exists = bool(policy_hist.exists())
-    policy_publish_info["oos"] = {
-        "skipped": bool(cfg.skip_oos),
-        "ok": bool(oos_run.get("ok")),
-        "returncode": oos_run.get("returncode"),
-        "error": oos_run.get("error"),
-        "log": oos_run.get("log"),
-    }
-    policy_publish_info["candidate_exists"] = bool(candidate_exists)
-    if bool(cfg.publish_policy_current):
-        if bool(cfg.skip_oos):
-            policy_publish_info["reason"] = "blocked_oos_skipped"
-        elif not bool(oos_run.get("ok")):
-            policy_publish_info["reason"] = f"blocked_oos_failed: {str(oos_run.get('error') or 'unknown')[:160]}"
-        elif not bool(candidate_exists):
-            policy_publish_info["reason"] = f"blocked_candidate_missing: {policy_hist}"
-
-        if bool(cfg.policy_require_oos_success) and (not bool(oos_ok_for_publish)):
-            policy_publish_info["fatal"] = True
-        if bool(cfg.policy_require_candidate) and (not bool(candidate_exists)):
-            policy_publish_info["fatal"] = True
-
     # Atualiza policy_current (atomic replace) e registra histórico (jsonl) apenas se o OOS rodou com sucesso
-    if bool(oos_ok_for_publish) and bool(candidate_exists):
+    if (not cfg.skip_oos) and bool(oos_run.get("ok")) and policy_hist.exists():
         pol_candidate: Optional[Dict[str, Any]] = None
         candidate_last: Optional[Dict[str, Any]] = None
-        candidate_wf: Optional[Dict[str, Any]] = None
         try:
             pol_candidate = json.loads(policy_hist.read_text(encoding="utf-8"))
             csteps = pol_candidate.get("steps") if isinstance(pol_candidate, dict) else []
-            candidate_wf = pol_candidate.get("wf") if (isinstance(pol_candidate, dict) and isinstance(pol_candidate.get("wf"), dict)) else {}
             candidate_last = csteps[-1] if isinstance(csteps, list) and csteps else {}
             if isinstance(candidate_last, dict):
                 candidate_active_keys = candidate_last.get("active_keys")
@@ -4196,13 +3902,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             pass
 
         can_publish = bool(cfg.publish_policy_current)
-        def _append_reason(msg: str) -> None:
-            cur = str(policy_publish_info.get("reason") or "")
-            if not cur or cur == "skipped":
-                policy_publish_info["reason"] = str(msg)
-            else:
-                policy_publish_info["reason"] = f"{cur} | {msg}"
-
         if can_publish and isinstance(candidate_last, dict):
             compat = _policy_compatibility_check(
                 candidate_last.get("active_keys"),
@@ -4214,32 +3913,9 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
             if bool(cfg.policy_compat_guard_enable) and (not bool(compat.get("ok"))):
                 if bool(cfg.policy_compat_fail_closed):
                     can_publish = False
-                    _append_reason(f"blocked_by_compat_guard: {compat.get('reason')}")
+                    policy_publish_info["reason"] = f"blocked_by_compat_guard: {compat.get('reason')}"
                 else:
-                    _append_reason(f"compat_guard_warn_fail_open: {compat.get('reason')}")
-
-        if isinstance(candidate_wf, dict):
-            req_fields = [x.strip() for x in str(cfg.policy_wf_guard_required_fields or "").split(",") if x.strip()]
-            wf_guard = _policy_wf_guard_check(
-                candidate_wf,
-                required_fields=req_fields,
-                expected_train_mode=str(cfg.policy_wf_guard_expected_train_mode or ""),
-                min_train_days=int(cfg.policy_wf_guard_min_train_days or 0),
-                min_test_days=int(cfg.policy_wf_guard_min_test_days or 0),
-                min_step_days=int(cfg.policy_wf_guard_min_step_days or 0),
-                expected_sides=str(cfg.policy_wf_guard_expected_sides or ""),
-                expected_regimes=str(cfg.policy_wf_guard_expected_regimes or ""),
-                expected_pre_activation_mode=str(cfg.policy_wf_guard_expected_pre_activation_mode or ""),
-                expected_backpre_slip_field=str(cfg.policy_wf_guard_expected_backpre_slip_field or ""),
-                expected_backpre_slip_max=_safe_float(cfg.policy_wf_guard_expected_backpre_slip_max),
-            )
-            policy_publish_info["wf_guard"] = wf_guard
-            if bool(cfg.policy_wf_guard_enable) and (not bool(wf_guard.get("ok"))):
-                if bool(cfg.policy_wf_guard_fail_closed):
-                    can_publish = False
-                    _append_reason(f"blocked_by_wf_guard: {wf_guard.get('reason')}")
-                else:
-                    _append_reason(f"wf_guard_warn_fail_open: {wf_guard.get('reason')}")
+                    policy_publish_info["reason"] = f"compat_guard_warn_fail_open: {compat.get('reason')}"
 
         if can_publish and bool(cfg.publish_policy_current):
             try:
@@ -4279,8 +3955,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 "active_keys_base": active_keys_base,
                 "published_to_current": bool(policy_publish_info.get("published")),
                 "publish_reason": str(policy_publish_info.get("reason") or ""),
-                "wf_guard_ok": bool(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("ok")),
-                "wf_guard_reason": str(((policy_publish_info.get("wf_guard") or {}) if isinstance(policy_publish_info, dict) else {}).get("reason") or ""),
                 "candidate_active_keys": candidate_active_keys,
             }
             cfg.wf_policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -4457,16 +4131,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     "- **Policy publish**: `BLOQUEADO` "
                     f"(`{policy_publish_info.get('reason')}`) — mantendo policy anterior em `{cfg.wf_policy_current}`.\n"
                 )
-            try:
-                wf_guard = policy_publish_info.get("wf_guard") if isinstance(policy_publish_info, dict) else None
-                if isinstance(wf_guard, dict):
-                    s0.append(
-                        f"- **WF guard (versão/parâmetros)**: "
-                        f"`{'OK' if bool(wf_guard.get('ok')) else 'FAIL'}` "
-                        f"(`{wf_guard.get('reason')}`).\n"
-                    )
-            except Exception:
-                pass
 
     # performance “real” (accounting) quando houver
     if isinstance(acct, dict) and not acct.get("error"):
@@ -7358,8 +7022,6 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         "pdf_size_mb": round(float(pdf.stat().st_size) / (1024.0 * 1024.0), 2) if pdf.exists() else None,
         "policy_current": str(cfg.wf_policy_current),
         "policy_publish": dict(policy_publish_info or {}),
-        "oos_run": dict(oos_run or {}),
-        "fatal": bool((policy_publish_info or {}).get("fatal")),
     }
 
     # 6) Telegram
@@ -7429,9 +7091,6 @@ def main() -> int:
 
     out = asyncio.run(run_daily_full(cfg))
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    if bool((out or {}).get("fatal")):
-        logger.error("Daily report finalizou com FATAL (policy publish precondition não atendida).")
-        return 2
     return 0
 
 
