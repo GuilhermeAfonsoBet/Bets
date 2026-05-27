@@ -55,7 +55,10 @@ RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 OUT_JSON="$BOT_DIR/logs/daily_roi_only_run_${RUN_TS}.json"
 
 DAILY_SCRIPT=""
-for cand in   "$BOT_DIR/ops/daily_full_report.py"   "$BOT_DIR/betinasia_bot/ops/daily_full_report.py"   "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
+for cand in \
+  "$BOT_DIR/ops/daily_full_report.py" \
+  "$BOT_DIR/betinasia_bot/ops/daily_full_report.py" \
+  "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
 do
   if [[ -f "$cand" ]]; then
     DAILY_SCRIPT="$cand"
@@ -64,10 +67,23 @@ do
 done
 
 if [[ -z "$DAILY_SCRIPT" ]]; then
-  DAILY_SCRIPT="$(rg --files "$BOT_DIR" 2>/dev/null | rg '/ops/daily_full_report\.py$' | awk 'NR==1{print; exit}')"
-  if [[ -n "$DAILY_SCRIPT" && "$DAILY_SCRIPT" != /* ]]; then
-    DAILY_SCRIPT="$BOT_DIR/$DAILY_SCRIPT"
-  fi
+  DAILY_SCRIPT="$(
+    python3 - "$BOT_DIR" <<'PY2'
+import os
+import sys
+
+root = sys.argv[1]
+target_suffix = os.path.join("ops", "daily_full_report.py")
+for cur, _, files in os.walk(root):
+    if "daily_full_report.py" not in files:
+        continue
+    full = os.path.join(cur, "daily_full_report.py")
+    rel = os.path.relpath(full, root)
+    if rel.endswith(target_suffix):
+        print(full)
+        break
+PY2
+  )"
 fi
 
 if [[ -z "$DAILY_SCRIPT" || ! -f "$DAILY_SCRIPT" ]]; then
@@ -109,7 +125,7 @@ if [[ ! -f "$POLICY_JSON" ]]; then
 fi
 
 echo "[INFO] Validando policy efetiva em $POLICY_JSON ..."
-python3 - "$POLICY_JSON" <<'PY2'
+python3 - "$POLICY_JSON" <<'PY3'
 import json
 import sys
 from pathlib import Path
@@ -147,6 +163,6 @@ if failed:
     raise SystemExit("[ERRO] Policy fora do esperado:\n" + msg)
 
 print("[OK] Policy validada com sucesso (ROI_ONLY Back Pre + slippage<=0).")
-PY2
+PY3
 
 echo "[SUCESSO] Execucao concluida e policy validada."
