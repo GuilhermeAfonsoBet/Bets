@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Wrapper "fail-closed" para rodar o daily no modo ROI-only Back Pre
-# sem depender de CWD e sem depender de defaults frageis de import.
-#
-# Uso rapido:
-#   bash vps_run_daily_roi_only.sh
-#   BOT_DIR=/caminho/betinasia_bot ENV_FILE=/caminho/.env bash vps_run_daily_roi_only.sh
+# Wrapper fail-closed para rodar o daily no modo ROI-only Back Pre.
+# Evita dependencia de import de modulo especifico.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR_DEFAULT="$ROOT_DIR/betinasia_bot"
 BOT_DIR="${BOT_DIR:-$BOT_DIR_DEFAULT}"
-RUN_CWD="$BOT_DIR"
 ENV_FILE_CANDIDATE="${ENV_FILE:-}"
 
 if [[ ! -d "$BOT_DIR" ]]; then
@@ -33,11 +28,7 @@ fi
 mkdir -p "$BOT_DIR/logs"
 export ENV_FILE="$ENV_FILE_CANDIDATE"
 
-# Hardening de parametros criticos para o cenario pedido:
-# - OOS expanding
-# - ativacao pre-match por ROI_ONLY
-# - Back Pre apenas
-# - slippage <= 0 (proxy diff_pct)
+# Hardening dos parametros criticos do cenario pedido.
 export DAILY_WF_TRAIN_MODE="${DAILY_WF_TRAIN_MODE:-expanding}"
 export DAILY_WF_PRE_ACTIVATION_MODE="${DAILY_WF_PRE_ACTIVATION_MODE:-roi_only}"
 export DAILY_WF_ROI_MIN_ACTIVATE="${DAILY_WF_ROI_MIN_ACTIVATE:-0}"
@@ -62,31 +53,34 @@ echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
 
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 OUT_JSON="$BOT_DIR/logs/daily_roi_only_run_${RUN_TS}.json"
-DAILY_ENTRY=""
-DAILY_MODE=""
 
-# Detecta layout do projeto para nao depender de um unico import path.
-if [[ -f "$BOT_DIR/ops/daily_full_report.py" ]]; then
-  DAILY_ENTRY="$BOT_DIR/ops/daily_full_report.py"
-  DAILY_MODE="script"
-elif [[ -f "$BOT_DIR/betinasia_bot/ops/daily_full_report.py" ]]; then
-  DAILY_ENTRY="$BOT_DIR/betinasia_bot/ops/daily_full_report.py"
-  DAILY_MODE="script"
-elif [[ -d "$BOT_DIR/ops" ]]; then
-  DAILY_ENTRY="ops.daily_full_report"
-  DAILY_MODE="module"
-elif [[ -d "$BOT_DIR/betinasia_bot/ops" ]]; then
-  DAILY_ENTRY="betinasia_bot.ops.daily_full_report"
-  DAILY_MODE="module"
-elif [[ -f "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py" ]]; then
-  RUN_CWD="$ROOT_DIR"
-  DAILY_ENTRY="$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
-  DAILY_MODE="script"
-else
-  echo "[ERRO] Nao encontrei daily_full_report.py em layouts conhecidos." >&2
-  echo "       Tentados: $BOT_DIR/ops, $BOT_DIR/betinasia_bot/ops, $ROOT_DIR/betinasia_bot/ops" >&2
+DAILY_SCRIPT=""
+for cand in   "$BOT_DIR/ops/daily_full_report.py"   "$BOT_DIR/betinasia_bot/ops/daily_full_report.py"   "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
+do
+  if [[ -f "$cand" ]]; then
+    DAILY_SCRIPT="$cand"
+    break
+  fi
+done
+
+if [[ -z "$DAILY_SCRIPT" ]]; then
+  DAILY_SCRIPT="$(rg --files "$BOT_DIR" 2>/dev/null | rg '/ops/daily_full_report\.py$' | awk 'NR==1{print; exit}')"
+  if [[ -n "$DAILY_SCRIPT" && "$DAILY_SCRIPT" != /* ]]; then
+    DAILY_SCRIPT="$BOT_DIR/$DAILY_SCRIPT"
+  fi
+fi
+
+if [[ -z "$DAILY_SCRIPT" || ! -f "$DAILY_SCRIPT" ]]; then
+  echo "[ERRO] Nao encontrei daily_full_report.py por caminho de arquivo." >&2
+  echo "       Tentados diretos:" >&2
+  echo "       - $BOT_DIR/ops/daily_full_report.py" >&2
+  echo "       - $BOT_DIR/betinasia_bot/ops/daily_full_report.py" >&2
+  echo "       - $ROOT_DIR/betinasia_bot/ops/daily_full_report.py" >&2
   exit 4
 fi
+
+RUN_CWD="$(dirname "$(dirname "$DAILY_SCRIPT")")"
+export PYTHONPATH="$RUN_CWD:$BOT_DIR:${PYTHONPATH:-}"
 
 if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
   if [[ "$DAILY_WF_POLICY_CURRENT" = /* ]]; then
@@ -100,15 +94,12 @@ fi
 
 echo "[INFO] Rodando daily_full_report..."
 echo "[INFO] RUN_CWD=$RUN_CWD"
-echo "[INFO] DAILY_MODE=$DAILY_MODE"
-echo "[INFO] DAILY_ENTRY=$DAILY_ENTRY"
+echo "[INFO] DAILY_MODE=script"
+echo "[INFO] DAILY_ENTRY=$DAILY_SCRIPT"
+echo "[INFO] PYTHONPATH=$PYTHONPATH"
 (
   cd "$RUN_CWD"
-  if [[ "$DAILY_MODE" == "module" ]]; then
-    python3 -m "$DAILY_ENTRY" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
-  else
-    python3 "$DAILY_ENTRY" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
-  fi
+  python3 "$DAILY_SCRIPT" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
 )
 echo "[OK] Saida do daily salva em: $OUT_JSON"
 
@@ -153,7 +144,7 @@ else:
 
 if failed:
     msg = "\n".join(f"- {x}" for x in failed)
-    raise SystemExit("[ERRO] Policy fora do esperado:\\n" + msg)
+    raise SystemExit("[ERRO] Policy fora do esperado:\n" + msg)
 
 print("[OK] Policy validada com sucesso (ROI_ONLY Back Pre + slippage<=0).")
 PY2
