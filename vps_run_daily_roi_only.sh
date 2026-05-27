@@ -2,19 +2,20 @@
 set -euo pipefail
 
 # Wrapper "fail-closed" para rodar o daily no modo ROI-only Back Pre
-# sem depender de CWD e sem depender de defaults frágeis.
+# sem depender de CWD e sem depender de defaults frageis de import.
 #
-# Uso rápido:
+# Uso rapido:
 #   bash vps_run_daily_roi_only.sh
-#   ENV_FILE=/caminho/.env DAILY_REPORT_OUT_DIR=logs/daily_reports bash vps_run_daily_roi_only.sh
+#   BOT_DIR=/caminho/betinasia_bot ENV_FILE=/caminho/.env bash vps_run_daily_roi_only.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR_DEFAULT="$ROOT_DIR/betinasia_bot"
 BOT_DIR="${BOT_DIR:-$BOT_DIR_DEFAULT}"
+RUN_CWD="$BOT_DIR"
 ENV_FILE_CANDIDATE="${ENV_FILE:-}"
 
 if [[ ! -d "$BOT_DIR" ]]; then
-  echo "[ERRO] Diretório do bot não encontrado: $BOT_DIR" >&2
+  echo "[ERRO] Diretorio do bot nao encontrado: $BOT_DIR" >&2
   echo "       Defina BOT_DIR=/caminho/para/betinasia_bot" >&2
   exit 2
 fi
@@ -30,12 +31,11 @@ if [[ -z "$ENV_FILE_CANDIDATE" ]]; then
 fi
 
 mkdir -p "$BOT_DIR/logs"
-
 export ENV_FILE="$ENV_FILE_CANDIDATE"
 
-# Hardening de parâmetros críticos para o cenário pedido:
+# Hardening de parametros criticos para o cenario pedido:
 # - OOS expanding
-# - ativação pre-match por ROI_ONLY
+# - ativacao pre-match por ROI_ONLY
 # - Back Pre apenas
 # - slippage <= 0 (proxy diff_pct)
 export DAILY_WF_TRAIN_MODE="${DAILY_WF_TRAIN_MODE:-expanding}"
@@ -62,24 +62,63 @@ echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
 
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 OUT_JSON="$BOT_DIR/logs/daily_roi_only_run_${RUN_TS}.json"
-POLICY_JSON="${DAILY_WF_POLICY_CURRENT:-$BOT_DIR/logs/wf_policy_current.json}"
+DAILY_ENTRY=""
+DAILY_MODE=""
+
+# Detecta layout do projeto para nao depender de um unico import path.
+if [[ -f "$BOT_DIR/ops/daily_full_report.py" ]]; then
+  DAILY_ENTRY="$BOT_DIR/ops/daily_full_report.py"
+  DAILY_MODE="script"
+elif [[ -f "$BOT_DIR/betinasia_bot/ops/daily_full_report.py" ]]; then
+  DAILY_ENTRY="$BOT_DIR/betinasia_bot/ops/daily_full_report.py"
+  DAILY_MODE="script"
+elif [[ -d "$BOT_DIR/ops" ]]; then
+  DAILY_ENTRY="ops.daily_full_report"
+  DAILY_MODE="module"
+elif [[ -d "$BOT_DIR/betinasia_bot/ops" ]]; then
+  DAILY_ENTRY="betinasia_bot.ops.daily_full_report"
+  DAILY_MODE="module"
+elif [[ -f "$ROOT_DIR/betinasia_bot/ops/daily_full_report.py" ]]; then
+  RUN_CWD="$ROOT_DIR"
+  DAILY_ENTRY="$ROOT_DIR/betinasia_bot/ops/daily_full_report.py"
+  DAILY_MODE="script"
+else
+  echo "[ERRO] Nao encontrei daily_full_report.py em layouts conhecidos." >&2
+  echo "       Tentados: $BOT_DIR/ops, $BOT_DIR/betinasia_bot/ops, $ROOT_DIR/betinasia_bot/ops" >&2
+  exit 4
+fi
+
+if [[ -n "${DAILY_WF_POLICY_CURRENT:-}" ]]; then
+  if [[ "$DAILY_WF_POLICY_CURRENT" = /* ]]; then
+    POLICY_JSON="$DAILY_WF_POLICY_CURRENT"
+  else
+    POLICY_JSON="$RUN_CWD/$DAILY_WF_POLICY_CURRENT"
+  fi
+else
+  POLICY_JSON="$BOT_DIR/logs/wf_policy_current.json"
+fi
 
 echo "[INFO] Rodando daily_full_report..."
+echo "[INFO] RUN_CWD=$RUN_CWD"
+echo "[INFO] DAILY_MODE=$DAILY_MODE"
+echo "[INFO] DAILY_ENTRY=$DAILY_ENTRY"
 (
-  cd "$BOT_DIR"
-  python3 -m ops.daily_full_report \
-    --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" \
-    >"$OUT_JSON"
+  cd "$RUN_CWD"
+  if [[ "$DAILY_MODE" == "module" ]]; then
+    python3 -m "$DAILY_ENTRY" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
+  else
+    python3 "$DAILY_ENTRY" --out-dir "${DAILY_REPORT_OUT_DIR:-logs/daily_reports}" >"$OUT_JSON"
+  fi
 )
-echo "[OK] Saída do daily salva em: $OUT_JSON"
+echo "[OK] Saida do daily salva em: $OUT_JSON"
 
 if [[ ! -f "$POLICY_JSON" ]]; then
-  echo "[ERRO] Policy não encontrada após execução: $POLICY_JSON" >&2
+  echo "[ERRO] Policy nao encontrada apos execucao: $POLICY_JSON" >&2
   exit 3
 fi
 
 echo "[INFO] Validando policy efetiva em $POLICY_JSON ..."
-python3 - "$POLICY_JSON" <<'PY'
+python3 - "$POLICY_JSON" <<'PY2'
 import json
 import sys
 from pathlib import Path
@@ -88,7 +127,7 @@ policy_path = Path(sys.argv[1])
 data = json.loads(policy_path.read_text(encoding="utf-8"))
 wf = data.get("wf") if isinstance(data, dict) else None
 if not isinstance(wf, dict):
-    raise SystemExit("[ERRO] policy.wf ausente/ inválido")
+    raise SystemExit("[ERRO] policy.wf ausente/ invalido")
 
 checks = {
     "pre_activation_mode": ("roi_only", str(wf.get("pre_activation_mode", "")).strip().lower()),
@@ -107,16 +146,16 @@ slip_max = wf.get("backpre_slip_max")
 try:
     slip_val = float(slip_max)
 except Exception:
-    failed.append(f"backpre_slip_max inválido: {slip_max!r}")
+    failed.append(f"backpre_slip_max invalido: {slip_max!r}")
 else:
     if slip_val > 0.0:
         failed.append(f"backpre_slip_max esperado <=0, obtido={slip_val}")
 
 if failed:
     msg = "\n".join(f"- {x}" for x in failed)
-    raise SystemExit("[ERRO] Policy fora do esperado:\n" + msg)
+    raise SystemExit("[ERRO] Policy fora do esperado:\\n" + msg)
 
 print("[OK] Policy validada com sucesso (ROI_ONLY Back Pre + slippage<=0).")
-PY
+PY2
 
-echo "[SUCESSO] Execução concluída e policy validada."
+echo "[SUCESSO] Execucao concluida e policy validada."
