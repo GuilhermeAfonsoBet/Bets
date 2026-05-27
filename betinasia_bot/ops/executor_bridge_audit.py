@@ -249,6 +249,12 @@ class BridgeConfig:
     # Policy OOS (export do report walk-forward)
     policy_json: Optional[str] = None
     policy_reload_sec: float = 5.0
+    # Quando true (default), opera em fail-closed se a policy não estiver carregada.
+    # Evita execução fora da carteira aprovada por OOS (ex.: ligas não aprovadas).
+    require_policy: bool = True
+    # Quando true (default), se a policy usa key_by_league no escopo do mercado,
+    # exige match exato em active_keys (não colapsa para active_keys_base).
+    strict_league_keys: bool = True
     policy_use_base: bool = False
     # Bankroll (para sizing dinâmico)
     bankroll_ref: Optional[float] = None
@@ -743,6 +749,14 @@ def _load_policy_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _default_policy_json_path() -> str:
+    return (
+        str(os.getenv("BRIDGE_POLICY_JSON", "") or "").strip()
+        or str(os.getenv("DAILY_WF_POLICY_CURRENT", "") or "").strip()
+        or "logs/wf_policy_current.json"
+    )
+
+
 def _combo_key_from_row(row: Dict[str, Any], cfg: BridgeConfig, policy: Dict[str, Any]) -> str:
     is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
     regime = "In" if is_live else "Pre"
@@ -1122,6 +1136,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
         f"poll_sec={cfg.poll_sec} lookback_sec={cfg.lookback_sec} max_per_cycle={cfg.max_per_cycle} "
         f"hyp={cfg.only_hypothesis} prematch_only={cfg.only_prematch} "
         f"policy_json={cfg.policy_json or '-'} use_base={cfg.policy_use_base} "
+        f"require_policy={int(bool(cfg.require_policy))} strict_league={int(bool(cfg.strict_league_keys))} "
         f"use_wf_budget={cfg.use_wf_budget} bankroll_json={cfg.bankroll_json or '-'} "
         f"bankroll_ref={(bankroll_ref if bankroll_ref is not None else '-')} "
         f"min_limit={cfg.min_limit} enforce_wf_filters={int(bool(cfg.enforce_wf_filters))}"
@@ -1330,12 +1345,38 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                     continue
 
                 # policy OOS: só executa se combinação estiver ativa
+                if cfg.require_policy and cfg.policy_json and (policy is None or active_keys is None):
+                    await _mark_seen(
+                        db,
+                        src_id=src_id,
+                        action=action,
+                        execution_id=None,
+                        meta={
+                            "skipped": True,
+                            "reason": "policy_missing",
+                            "policy_json": str(cfg.policy_json),
+                        },
+                    )
+                    continue
                 if policy and active_keys is not None:
                     comb = _combo_key_from_row(row, cfg, policy)
                     ok = False
+                    wf = policy.get("wf") if isinstance(policy.get("wf"), dict) else {}
+                    key_by_league = bool(wf.get("key_by_league"))
+                    key_scope = str(wf.get("key_by_league_scope") or "pre").strip().lower()
+                    market_is_live = bool(row.get("is_live")) if row.get("is_live") is not None else False
+                    # Se chave por liga estiver ativa no escopo vigente, exigimos match estrito da liga.
+                    # Isso evita "vazar" para ligas não aprovadas quando policy_use_base=1 em overrides antigos.
+                    strict_league_scope = bool(cfg.strict_league_keys) and key_by_league and (
+                        key_scope == "all"
+                        or (key_scope == "pre" and not market_is_live)
+                        or (key_scope == "in" and market_is_live)
+                    )
                     # Alinhamento com OOS: quando enforcing, nunca colapsa a key por liga (não usa active_keys_base)
-                    use_base = bool(cfg.policy_use_base) and (not bool(cfg.enforce_wf_filters))
-                    if use_base and active_keys_base is not None and active_keys_base:
+                    use_base = bool(cfg.policy_use_base) and (not bool(cfg.enforce_wf_filters)) and (not strict_league_scope)
+                    if strict_league_scope:
+                        ok = ("__" in str(comb)) and (comb in active_keys)
+                    elif use_base and active_keys_base is not None and active_keys_base:
                         ok = str(comb).split("__", 1)[0] in active_keys_base
                     else:
                         ok = comb in active_keys
@@ -1351,6 +1392,7 @@ async def run_bridge(cfg: BridgeConfig) -> int:
                                 "combo": comb,
                                 "policy_use_base_cfg": bool(cfg.policy_use_base),
                                 "policy_use_base_eff": bool(use_base),
+                                "strict_league_scope": bool(strict_league_scope),
                                 "enforce_wf_filters": bool(cfg.enforce_wf_filters),
                             },
                         )
@@ -1916,8 +1958,20 @@ def main() -> int:
     ap.add_argument("--http-url", default=os.getenv("EXECUTOR_HTTP_URL", "").strip() or None)
     ap.add_argument("--hypothesis", default=os.getenv("BRIDGE_HYPOTHESIS", "H3B"))
     ap.add_argument("--prematch-only", action="store_true", default=(os.getenv("BRIDGE_PREMATCH_ONLY", "1").strip() not in ("0", "false", "False", "no", "NO")))
-    ap.add_argument("--policy-json", default=os.getenv("BRIDGE_POLICY_JSON", "").strip() or None, help="Path para WF policy exportado (JSON).")
+    ap.add_argument("--policy-json", default=_default_policy_json_path(), help="Path para WF policy exportado (JSON).")
     ap.add_argument("--policy-reload-sec", type=float, default=float(os.getenv("BRIDGE_POLICY_RELOAD_SEC", "5.0")))
+    ap.add_argument(
+        "--require-policy",
+        action="store_true",
+        default=(os.getenv("BRIDGE_REQUIRE_POLICY", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Se true (default), opera em fail-closed quando a policy não está carregada.",
+    )
+    ap.add_argument(
+        "--strict-league-keys",
+        action="store_true",
+        default=(os.getenv("BRIDGE_STRICT_LEAGUE_KEYS", "1").strip() not in ("0", "false", "False", "no", "NO")),
+        help="Se true (default), com key_by_league ativo exige match exato da liga em active_keys.",
+    )
     ap.add_argument(
         "--policy-use-base",
         action="store_true",
@@ -1985,6 +2039,8 @@ def main() -> int:
         only_prematch=bool(args.prematch_only),
         policy_json=(str(args.policy_json) if args.policy_json else None),
         policy_reload_sec=float(args.policy_reload_sec),
+        require_policy=bool(args.require_policy),
+        strict_league_keys=bool(args.strict_league_keys),
         policy_use_base=bool(args.policy_use_base),
         min_limit=float(args.min_limit),
         enforce_wf_filters=bool(args.enforce_wf_filters),
