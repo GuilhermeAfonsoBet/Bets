@@ -88,7 +88,18 @@ for r in sys.argv[1:]:
     seen.add(rr)
     roots.append(rr)
 
-skip = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+skip = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    # Evita selecionar entrypoint dentro de backups/logs históricos.
+    "logs",
+    "state_switch_backups",
+}
 cands = []
 for root in roots:
     for cur, dirs, files in os.walk(root):
