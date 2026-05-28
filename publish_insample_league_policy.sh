@@ -126,33 +126,9 @@ SELECT
 FROM roi_events
 GROUP BY league;
 
-\copy (
-  SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct
-  FROM tmp_league_roi
-  ORDER BY roiw_pct DESC, n DESC
-) TO '$TMP_ALL_CSV' CSV HEADER
-
-\copy (
-  SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct
-  FROM tmp_league_roi
-  WHERE n >= $N_MIN AND roiw_pct > $ROI_MIN
-  ORDER BY roiw_pct DESC, n DESC
-) TO '$APPROVED_CSV' CSV HEADER
-
-\copy (
-  SELECT
-    league,
-    n,
-    ROUND(roiw_pct::numeric,6) AS roiw_pct,
-    CASE
-      WHEN n < $N_MIN THEN 'N<$N_MIN'
-      WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN'
-      ELSE 'OUTRO'
-    END AS motivo
-  FROM tmp_league_roi
-  WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN)
-  ORDER BY n DESC, roiw_pct DESC
-) TO '$NOT_APPROVED_CSV' CSV HEADER
+\copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct FROM tmp_league_roi ORDER BY roiw_pct DESC, n DESC) TO '$TMP_ALL_CSV' CSV HEADER
+\copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct FROM tmp_league_roi WHERE n >= $N_MIN AND roiw_pct > $ROI_MIN ORDER BY roiw_pct DESC, n DESC) TO '$APPROVED_CSV' CSV HEADER
+\copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct, CASE WHEN n < $N_MIN THEN 'N<$N_MIN' WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN' ELSE 'OUTRO' END AS motivo FROM tmp_league_roi WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN) ORDER BY n DESC, roiw_pct DESC) TO '$NOT_APPROVED_CSV' CSV HEADER
 SQL
 
 python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" <<'PY'
