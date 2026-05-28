@@ -37,6 +37,9 @@ export DAILY_WF_BACKPRE_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-slippage_pre_
 export DAILY_BACK_DIFF_MIN="${DAILY_BACK_DIFF_MIN:-0}"
 # Compatibilidade: alguns caminhos usam vars sem prefixo DAILY_.
 export BACK_DIFF_MIN="${BACK_DIFF_MIN:-$DAILY_BACK_DIFF_MIN}"
+# Sincronizacao automatica JSONL -> hypothesis_details (fix definitivo operacional).
+export DAILY_SYNC_SLIPPAGE_TO_AUDIT="${DAILY_SYNC_SLIPPAGE_TO_AUDIT:-1}"
+export DAILY_SYNC_SLIPPAGE_FAIL_OPEN="${DAILY_SYNC_SLIPPAGE_FAIL_OPEN:-0}"
 
 echo "[INFO] REQUESTED_BOT_DIR=$REQUESTED_BOT_DIR"
 echo "[INFO] REQUESTED_ENV_FILE=${REQUESTED_ENV_FILE:-<vazio>}"
@@ -53,6 +56,8 @@ echo "[INFO] DAILY_WF_BACKPRE_SLIP_MAX=$DAILY_WF_BACKPRE_SLIP_MAX"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
 echo "[INFO] DAILY_BACK_DIFF_MIN=$DAILY_BACK_DIFF_MIN"
 echo "[INFO] BACK_DIFF_MIN=$BACK_DIFF_MIN"
+echo "[INFO] DAILY_SYNC_SLIPPAGE_TO_AUDIT=$DAILY_SYNC_SLIPPAGE_TO_AUDIT"
+echo "[INFO] DAILY_SYNC_SLIPPAGE_FAIL_OPEN=$DAILY_SYNC_SLIPPAGE_FAIL_OPEN"
 
 # Aviso de configuracao contraditoria: diff_pct<=0 pode conflitar com gate de edge Back.
 if [[ "$DAILY_WF_BACKPRE_SLIP_FIELD" == "diff_pct" ]]; then
@@ -161,6 +166,27 @@ if [[ -n "$ENV_FILE_CANDIDATE" ]]; then
   echo "[INFO] ENV_FILE=$ENV_FILE"
 else
   echo "[WARN] .env nao encontrado automaticamente; seguindo sem ENV_FILE explicito."
+fi
+
+# Fix definitivo operacional: sincroniza slippage_pre_pct do executor_jsonl para hypothesis_details.
+if [[ "$DAILY_SYNC_SLIPPAGE_TO_AUDIT" == "1" || "$DAILY_SYNC_SLIPPAGE_TO_AUDIT" == "true" || "$DAILY_SYNC_SLIPPAGE_TO_AUDIT" == "True" ]]; then
+  SYNC_SCRIPT="$ROOT_DIR/sync_slippage_from_executor_jsonl.sh"
+  if [[ -x "$SYNC_SCRIPT" ]]; then
+    echo "[INFO] Rodando sync de slippage JSONL -> banco ..."
+    if ! BOT_DIR="$REQUESTED_BOT_DIR" ENV_FILE="${ENV_FILE:-}" "$SYNC_SCRIPT"; then
+      if [[ "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" == "1" || "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" == "true" || "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" == "True" ]]; then
+        echo "[WARN] Sync de slippage falhou (FAIL_OPEN=1); continuando." >&2
+      else
+        echo "[ERRO] Sync de slippage falhou (FAIL_OPEN=0); abortando." >&2
+        exit 5
+      fi
+    fi
+  else
+    echo "[WARN] Script de sync nao encontrado/executavel: $SYNC_SCRIPT" >&2
+    if [[ "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" != "1" && "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" != "true" && "$DAILY_SYNC_SLIPPAGE_FAIL_OPEN" != "True" ]]; then
+      exit 5
+    fi
+  fi
 fi
 
 # Bootstrap de runtime Python (opcional, mas ligado por padrao).
