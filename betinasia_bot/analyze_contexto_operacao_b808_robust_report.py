@@ -636,8 +636,18 @@ async def main() -> int:
         action="store_true",
         help="Desliga exclusões automáticas de dias sem dados e dias WS-only sem Lay (qualidade operacional).",
     )
-    parser.add_argument("--back-diff-min", type=float, default=2.0, help="Corte de edge Back (default: 2.0)")
-    parser.add_argument("--lay-diff-max", type=float, default=-2.0, help="Corte de edge Lay (default: -2.0)")
+    parser.add_argument(
+        "--back-diff-min",
+        type=float,
+        default=float(os.getenv("BACK_DIFF_MIN", "2.0")),
+        help="Corte de edge Back (default: 2.0; use 0 para desativar gate de diff no Back).",
+    )
+    parser.add_argument(
+        "--lay-diff-max",
+        type=float,
+        default=float(os.getenv("LAY_DIFF_MAX", "-2.0")),
+        help="Corte de edge Lay (default: -2.0).",
+    )
     # OBS: argparse usa interpolação estilo `%` na help string; por isso `%` precisa ser escapado como `%%`.
     parser.add_argument("--stake-pct-of-limit", type=float, default=0.25, help="Stake fallback (%% do limite), default 0.25")
     parser.add_argument("--stake-cap", type=float, default=0.0, help="Cap opcional para stake fallback (0=sem cap)")

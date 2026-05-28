@@ -33,6 +33,10 @@ export DAILY_WF_KEY_BY_LEAGUE="${DAILY_WF_KEY_BY_LEAGUE:-1}"
 export DAILY_WF_KEY_BY_LEAGUE_SCOPE="${DAILY_WF_KEY_BY_LEAGUE_SCOPE:-pre}"
 export DAILY_WF_BACKPRE_SLIP_MAX="${DAILY_WF_BACKPRE_SLIP_MAX:-0}"
 export DAILY_WF_BACKPRE_SLIP_FIELD="${DAILY_WF_BACKPRE_SLIP_FIELD:-slippage_pre_pct}"
+# Gate de edge por diff no Back (0 = desliga; default aqui segue pedido do diagnóstico)
+export DAILY_BACK_DIFF_MIN="${DAILY_BACK_DIFF_MIN:-0}"
+# Compatibilidade: alguns caminhos usam vars sem prefixo DAILY_.
+export BACK_DIFF_MIN="${BACK_DIFF_MIN:-$DAILY_BACK_DIFF_MIN}"
 
 echo "[INFO] REQUESTED_BOT_DIR=$REQUESTED_BOT_DIR"
 echo "[INFO] REQUESTED_ENV_FILE=${REQUESTED_ENV_FILE:-<vazio>}"
@@ -47,6 +51,8 @@ echo "[INFO] DAILY_WF_KEY_BY_LEAGUE=$DAILY_WF_KEY_BY_LEAGUE"
 echo "[INFO] DAILY_WF_KEY_BY_LEAGUE_SCOPE=$DAILY_WF_KEY_BY_LEAGUE_SCOPE"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_MAX=$DAILY_WF_BACKPRE_SLIP_MAX"
 echo "[INFO] DAILY_WF_BACKPRE_SLIP_FIELD=$DAILY_WF_BACKPRE_SLIP_FIELD"
+echo "[INFO] DAILY_BACK_DIFF_MIN=$DAILY_BACK_DIFF_MIN"
+echo "[INFO] BACK_DIFF_MIN=$BACK_DIFF_MIN"
 
 # Aviso de configuracao contraditoria: diff_pct<=0 pode conflitar com gate de edge Back.
 if [[ "$DAILY_WF_BACKPRE_SLIP_FIELD" == "diff_pct" ]]; then
