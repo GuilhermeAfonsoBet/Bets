@@ -118,15 +118,15 @@ if [[ "$BRIDGE_EXISTS" == "t" ]]; then
   }
 
   TS_COL=""
-  for c in created_at seen_at ts updated_at audited_at; do
+  for c in created_at seen_at ts updated_at audited_at processed_at inserted_at; do
     if has_col "$c"; then TS_COL="$c"; break; fi
   done
   REASON_COL=""
-  for c in skip_reason reason status_reason block_reason; do
+  for c in skip_reason reason status_reason block_reason decision_reason outcome_reason skip_reason_raw; do
     if has_col "$c"; then REASON_COL="$c"; break; fi
   done
   LEAGUE_COL=""
-  for c in league competition league_name; do
+  for c in league competition league_name league_text tournament; do
     if has_col "$c"; then LEAGUE_COL="$c"; break; fi
   done
 
@@ -157,7 +157,95 @@ if [[ "$BRIDGE_EXISTS" == "t" ]]; then
       "
     fi
   else
-    echo "[WARN] Nao foi possivel detectar colunas de timestamp/motivo na executor_bridge_seen."
+    echo "[WARN] Colunas explicitas de motivo nao encontradas. Tentando fallback por JSON/row dump..."
+    if [[ -n "$TS_COL" ]]; then
+      TMP_BRIDGE_JSON="$(mktemp /tmp/bridge_rows.XXXXXX.jsonl)"
+      psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "
+      SELECT row_to_json(t)::text
+      FROM (
+        SELECT *
+        FROM executor_bridge_seen
+        WHERE ${TS_COL} >= now() - interval '${LOOKBACK_HOURS} hours'
+        ORDER BY ${TS_COL} DESC
+        LIMIT 8000
+      ) t;
+      " > "$TMP_BRIDGE_JSON"
+
+      python3 - "$TMP_BRIDGE_JSON" <<'PY'
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+src = Path(sys.argv[1])
+if not src.exists():
+    print("[WARN] fallback bridge: sem dados.")
+    raise SystemExit(0)
+
+reason_keys = [
+    "skip_reason", "reason", "status_reason", "block_reason",
+    "decision_reason", "outcome_reason", "decision", "status"
+]
+league_keys = ["league", "competition", "league_name", "league_text", "tournament"]
+
+reasons = Counter()
+not_active_leagues = Counter()
+rows = 0
+
+def get_val(obj, keys):
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        v = obj.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+for ln in src.read_text(encoding="utf-8", errors="ignore").splitlines():
+    ln = ln.strip()
+    if not ln:
+        continue
+    try:
+        row = json.loads(ln)
+    except Exception:
+        continue
+    rows += 1
+
+    reason = get_val(row, reason_keys)
+    league = get_val(row, league_keys) or "<sem_liga>"
+
+    if reason is None:
+        for v in row.values():
+            if isinstance(v, dict):
+                reason = get_val(v, reason_keys) or reason
+                if league == "<sem_liga>":
+                    league = get_val(v, league_keys) or league
+            elif isinstance(v, str):
+                s = v.strip()
+                if s.startswith("{") and s.endswith("}"):
+                    try:
+                        vv = json.loads(s)
+                    except Exception:
+                        continue
+                    if isinstance(vv, dict):
+                        reason = get_val(vv, reason_keys) or reason
+                        if league == "<sem_liga>":
+                            league = get_val(vv, league_keys) or league
+
+    if reason:
+        reasons[reason] += 1
+        if reason == "not_active":
+            not_active_leagues[league] += 1
+
+print(f"fallback_rows={rows}")
+print(f"fallback_reasons_top={reasons.most_common(40)}")
+if not_active_leagues:
+    print(f"fallback_not_active_leagues_top={not_active_leagues.most_common(25)}")
+PY
+      rm -f "$TMP_BRIDGE_JSON"
+    else
+      echo "[WARN] Nao foi possivel detectar coluna temporal na executor_bridge_seen."
+    fi
   fi
 else
   echo "[WARN] Tabela public.executor_bridge_seen nao existe."
