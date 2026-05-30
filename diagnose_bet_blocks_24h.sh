@@ -7,6 +7,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR="${BOT_DIR:-$ROOT_DIR/betinasia_bot}"
 ENV_FILE_CANDIDATE="${ENV_FILE:-$BOT_DIR/.env}"
+USER_POLICY_CURRENT_RAW="${POLICY_CURRENT-__UNSET__}"
+USER_EXECUTOR_JSONL_RAW="${EXECUTOR_JSONL-__UNSET__}"
 
 if [[ -z "${DATABASE_URL:-}" && -f "$ENV_FILE_CANDIDATE" ]]; then
   set -a
@@ -26,8 +28,24 @@ if ! [[ "$LOOKBACK_HOURS" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-POLICY_CURRENT="${POLICY_CURRENT:-$BOT_DIR/logs/wf_policy_current.json}"
-EXECUTOR_JSONL="${EXECUTOR_JSONL:-$BOT_DIR/logs/executor_live.jsonl}"
+if [[ "$USER_POLICY_CURRENT_RAW" != "__UNSET__" ]]; then
+  POLICY_CURRENT="$USER_POLICY_CURRENT_RAW"
+else
+  POLICY_CURRENT="${POLICY_CURRENT:-$BOT_DIR/logs/wf_policy_current.json}"
+fi
+if [[ "$USER_EXECUTOR_JSONL_RAW" != "__UNSET__" ]]; then
+  EXECUTOR_JSONL="$USER_EXECUTOR_JSONL_RAW"
+else
+  EXECUTOR_JSONL="${EXECUTOR_JSONL:-$BOT_DIR/logs/executor_live.jsonl}"
+fi
+
+# Se vier caminho relativo (comum em .env), ancora no BOT_DIR para evitar ambiguidades.
+if [[ "$POLICY_CURRENT" != /* ]]; then
+  POLICY_CURRENT="$BOT_DIR/$POLICY_CURRENT"
+fi
+if [[ "$EXECUTOR_JSONL" != /* ]]; then
+  EXECUTOR_JSONL="$BOT_DIR/$EXECUTOR_JSONL"
+fi
 
 echo "============================================================"
 echo "Diagnostico de bloqueio de apostas (${LOOKBACK_HOURS}h)"
@@ -103,6 +121,82 @@ ORDER BY n DESC, league
 LIMIT 25;
 "
 echo
+
+ACTIVE_LEAGUES_SQL="$(
+python3 - "$POLICY_CURRENT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+steps = data.get("steps") if isinstance(data, dict) else []
+last = steps[-1] if isinstance(steps, list) and steps else {}
+approved = last.get("approved_leagues") if isinstance(last, dict) else []
+if not isinstance(approved, list):
+    raise SystemExit(0)
+
+vals = []
+for lg in approved:
+    s = str(lg or "").strip()
+    if not s:
+        continue
+    vals.append("'" + s.replace("'", "''") + "'")
+
+print(",".join(vals))
+PY
+)"
+
+if [[ -n "$ACTIVE_LEAGUES_SQL" ]]; then
+  echo ">>> 3.1) Cobertura dos OK vs ligas ativas na policy"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+  WITH active AS (
+    SELECT lower(trim(x)) AS league
+    FROM unnest(ARRAY[$ACTIVE_LEAGUES_SQL]::text[]) AS t(x)
+  ),
+  src AS (
+    SELECT lower(trim(COALESCE(league,''))) AS league
+    FROM betslip_audit_results
+    WHERE audited_at >= now() - interval '${LOOKBACK_HOURS} hours'
+      AND UPPER(COALESCE(status,'')) = 'OK'
+  )
+  SELECT
+    COUNT(*) FILTER (WHERE league <> '' AND league IN (SELECT league FROM active)) AS ok_in_active,
+    COUNT(*) FILTER (WHERE league <> '' AND league NOT IN (SELECT league FROM active)) AS ok_outside_active,
+    COUNT(*) FILTER (WHERE league = '') AS ok_sem_liga,
+    COUNT(*) AS ok_total
+  FROM src;
+  "
+  echo
+
+  echo ">>> 3.2) Top ligas OK fora da policy ativa"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+  WITH active AS (
+    SELECT lower(trim(x)) AS league
+    FROM unnest(ARRAY[$ACTIVE_LEAGUES_SQL]::text[]) AS t(x)
+  ),
+  src AS (
+    SELECT COALESCE(NULLIF(league,''), '<sem_liga>') AS league_raw,
+           lower(trim(COALESCE(league,''))) AS league_norm
+    FROM betslip_audit_results
+    WHERE audited_at >= now() - interval '${LOOKBACK_HOURS} hours'
+      AND UPPER(COALESCE(status,'')) = 'OK'
+  )
+  SELECT league_raw AS league, COUNT(*) AS n
+  FROM src
+  WHERE league_norm <> ''
+    AND league_norm NOT IN (SELECT league FROM active)
+  GROUP BY 1
+  ORDER BY n DESC, league
+  LIMIT 25;
+  "
+  echo
+fi
 
 echo ">>> 4) Bridge - motivos de skip/bloqueio (se tabela existir)"
 BRIDGE_EXISTS="$(psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT to_regclass('public.executor_bridge_seen') IS NOT NULL;")"
