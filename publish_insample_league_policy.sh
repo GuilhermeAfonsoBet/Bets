@@ -23,6 +23,8 @@ fi
 LOOKBACK_DAYS="${INSAMPLE_LOOKBACK_DAYS:-45}"
 ROI_MIN="${INSAMPLE_ROI_MIN:-2}"
 N_MIN="${INSAMPLE_N_MIN:-0}"
+MIN_APPROVED_N="${INSAMPLE_MIN_APPROVED_N:-1}"
+FAIL_CLOSED_EMPTY="${INSAMPLE_FAIL_CLOSED_EMPTY:-1}"
 HYP_TYPE="${INSAMPLE_HYPOTHESIS_TYPE:-H3B}"
 REV_DIR="${INSAMPLE_REVERSAL_DIRECTION:-up}"
 REQ_SLIP_NEG="${INSAMPLE_REQUIRE_SLIPPAGE_NEG:-1}"
@@ -36,12 +38,17 @@ TMP_ALL_CSV="$(mktemp /tmp/league_roi_all.XXXXXX.csv)"
 
 trap 'rm -f "$TMP_ALL_CSV"' EXIT
 
-for v in LOOKBACK_DAYS N_MIN; do
+for v in LOOKBACK_DAYS N_MIN MIN_APPROVED_N; do
   if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
     echo "[ERRO] $v invalido: ${!v}" >&2
     exit 2
   fi
 done
+
+if [[ "$FAIL_CLOSED_EMPTY" != "0" && "$FAIL_CLOSED_EMPTY" != "1" ]]; then
+  echo "[ERRO] INSAMPLE_FAIL_CLOSED_EMPTY invalido: $FAIL_CLOSED_EMPTY (use 0 ou 1)" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "$POLICY_CURRENT")" "$POLICY_HISTORY_DIR" "$(dirname "$POLICY_HISTORY_JSONL")" "$(dirname "$APPROVED_CSV")"
 
@@ -131,7 +138,7 @@ GROUP BY league;
 \copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct, CASE WHEN n < $N_MIN THEN 'N<$N_MIN' WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN' ELSE 'OUTRO' END AS motivo FROM tmp_league_roi WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN) ORDER BY n DESC, roiw_pct DESC) TO '$NOT_APPROVED_CSV' CSV HEADER
 SQL
 
-python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" <<'PY'
+python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" <<'PY'
 import csv
 import json
 import sys
@@ -147,6 +154,8 @@ lookback_days = int(sys.argv[6])
 roi_min = float(sys.argv[7])
 n_min = int(sys.argv[8])
 require_slip = str(sys.argv[9]) == "1"
+min_approved_n = int(sys.argv[10])
+fail_closed_empty = str(sys.argv[11]) == "1"
 
 rows_all = list(csv.DictReader(all_csv.open("r", encoding="utf-8")))
 rows_ok = list(csv.DictReader(approved_csv.open("r", encoding="utf-8")))
@@ -236,11 +245,52 @@ policy = {
     },
 }
 
+policy_history_dir.mkdir(parents=True, exist_ok=True)
+ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+candidate_file = policy_history_dir / f"wf_policy_candidate_{ts}.json"
+candidate_file.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
+
+prev_active_n = None
+prev_generated_at = None
+if policy_current.exists():
+    try:
+        prev = json.loads(policy_current.read_text(encoding="utf-8"))
+        prev_steps = prev.get("steps") if isinstance(prev, dict) else None
+        if isinstance(prev_steps, list) and prev_steps:
+            prev_active_n = int(prev_steps[-1].get("active_n") or 0)
+        prev_generated_at = prev.get("generated_at") if isinstance(prev, dict) else None
+    except Exception:
+        prev_active_n = None
+        prev_generated_at = None
+
+if fail_closed_empty and len(rows_ok) < min_approved_n:
+    policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with policy_history_jsonl.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": generated_at,
+            "policy_current": str(policy_current),
+            "policy_candidate_file": str(candidate_file),
+            "status": "rejected_min_approved",
+            "approved_n": len(rows_ok),
+            "min_approved_n": min_approved_n,
+            "all_leagues_n": len(rows_all),
+            "mode": "insample_sql",
+            "roi_min": roi_min,
+            "n_min": n_min,
+            "lookback_days": lookback_days,
+            "prev_active_n": prev_active_n,
+            "prev_generated_at": prev_generated_at,
+        }, ensure_ascii=False) + "\n")
+    print(
+        f"[ERRO] Fail-closed: approved_n={len(rows_ok)} < min_approved_n={min_approved_n}. "
+        f"Policy atual foi preservada em {policy_current}; candidato salvo em {candidate_file}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(6)
+
 policy_current.parent.mkdir(parents=True, exist_ok=True)
 policy_current.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
 
-policy_history_dir.mkdir(parents=True, exist_ok=True)
-ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 hist_file = policy_history_dir / f"wf_policy_{ts}.json"
 hist_file.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -249,8 +299,11 @@ with policy_history_jsonl.open("a", encoding="utf-8") as f:
     f.write(json.dumps({
         "ts": generated_at,
         "policy_current": str(policy_current),
+        "policy_candidate_file": str(candidate_file),
         "policy_history_file": str(hist_file),
+        "status": "published",
         "approved_n": len(rows_ok),
+        "min_approved_n": min_approved_n,
         "all_leagues_n": len(rows_all),
         "mode": "insample_sql",
         "roi_min": roi_min,
@@ -264,5 +317,6 @@ print(f"policy_history={hist_file}")
 PY
 
 echo "[OK] Policy in-sample SQL publicada."
+echo "[OK] fail_closed_empty=$FAIL_CLOSED_EMPTY min_approved_n=$MIN_APPROVED_N"
 echo "[OK] approved_csv=$APPROVED_CSV"
 echo "[OK] not_approved_csv=$NOT_APPROVED_CSV"
