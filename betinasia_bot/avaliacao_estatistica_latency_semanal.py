@@ -30,7 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
+try:
+    import numpy as np  # type: ignore
+except ModuleNotFoundError:
+    np = None  # type: ignore
 
 
 AUDIT_ID_COLS = ("audit_id", "id", "bet_id", "opportunity_id")
@@ -199,6 +202,28 @@ def _bucket_7_15(e2e_ms: float) -> Optional[str]:
     if 10000.0 <= e2e_ms < 15000.0:
         return "10-15s"
     return None
+
+
+def _quantile(xs: Sequence[float], q: float) -> Optional[float]:
+    if not xs:
+        return None
+    arr = sorted(float(v) for v in xs if math.isfinite(float(v)))
+    if not arr:
+        return None
+    if len(arr) == 1:
+        return arr[0]
+    qq = min(1.0, max(0.0, float(q)))
+    pos = (len(arr) - 1) * qq
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return arr[lo]
+    frac = pos - lo
+    return arr[lo] * (1.0 - frac) + arr[hi] * frac
+
+
+def _median(xs: Sequence[float]) -> Optional[float]:
+    return _quantile(xs, 0.5)
 
 
 def _read_csv(path: Path) -> List[Dict[str, str]]:
@@ -373,9 +398,10 @@ def _bootstrap_ci_week(
             vals.append(float(d))
     if len(vals) < 30:
         return None, None
-    arr = np.asarray(vals, dtype=float)
-    lo = float(np.quantile(arr, 0.05))
-    hi = float(np.quantile(arr, 0.95))
+    lo = _quantile(vals, 0.05)
+    hi = _quantile(vals, 0.95)
+    if lo is None or hi is None:
+        return None, None
     return lo, hi
 
 
@@ -509,6 +535,8 @@ def _wls_fe_effect(
     n = len(rows)
     if n < 20:
         return None, None, None, n, []
+    if np is None:
+        return None, None, None, n, ["pooled_fe_skipped_numpy_unavailable"]
 
     weeks = sorted({r.week for r in rows})
     week_ref = weeks[0]
@@ -519,10 +547,10 @@ def _wls_fe_effect(
     league_ref = leagues[0] if leagues else "<na>"
     league_dummy_names = [f"league:{lg}" for lg in leagues if lg != league_ref] if use_league else []
 
-    odd_vals = np.asarray([r.odd_exec for r in rows if r.odd_exec is not None], dtype=float)
-    line_vals = np.asarray([r.abs_line for r in rows if r.abs_line is not None], dtype=float)
-    odd_med = float(np.median(odd_vals)) if odd_vals.size else None
-    line_med = float(np.median(line_vals)) if line_vals.size else None
+    odd_vals = [float(r.odd_exec) for r in rows if r.odd_exec is not None]
+    line_vals = [float(r.abs_line) for r in rows if r.abs_line is not None]
+    odd_med = _median(odd_vals)
+    line_med = _median(line_vals)
 
     reg_names = ["intercept", "treat_10_15", "log_stake"] + week_dummy_names
     if odd_med is not None:
@@ -669,10 +697,14 @@ def _write_summary_md(
     lines.append(
         "- Modelo: ROI_evento(%) ~ I(10-15s) + FE semana + log(stake) + controles disponiveis.\n"
     )
-    lines.append(
-        f"- Beta ajustado I(10-15s): {_fmt(pooled_beta,3)} p.p.; SE={_fmt(pooled_se,3)}; p~{_fmt(pooled_p,4)}.\n"
-    )
-    lines.append(f"- Regressors: {list(reg_names)}\n\n")
+    if pooled_beta is None and "pooled_fe_skipped_numpy_unavailable" in set(reg_names):
+        lines.append("- Numpy nao disponivel neste ambiente: bloco pooled FE foi pulado.\n")
+        lines.append("- As inferencias semanais (permutacao + bootstrap) seguem validas e foram executadas.\n\n")
+    else:
+        lines.append(
+            f"- Beta ajustado I(10-15s): {_fmt(pooled_beta,3)} p.p.; SE={_fmt(pooled_se,3)}; p~{_fmt(pooled_p,4)}.\n"
+        )
+        lines.append(f"- Regressors: {list(reg_names)}\n\n")
 
     lines.append("## 4) Leitura recomendada\n")
     lines.append(
