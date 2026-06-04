@@ -101,6 +101,20 @@ def _first_nonempty(row: Dict[str, str], candidates: Sequence[str]) -> Optional[
     return None
 
 
+def _merged_first_nonempty(
+    primary: Optional[Dict[str, str]],
+    secondary: Optional[Dict[str, str]],
+    candidates: Sequence[str],
+) -> Optional[str]:
+    if primary is not None:
+        v = _first_nonempty(primary, candidates)
+        if v is not None:
+            return v
+    if secondary is not None:
+        return _first_nonempty(secondary, candidates)
+    return None
+
+
 def _to_float(raw: Optional[str]) -> Optional[float]:
     if raw is None:
         return None
@@ -232,15 +246,28 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
         return [dict(r) for r in rd]
 
 
-def _load_e2e_map(e2e_csv: Path) -> Dict[int, float]:
+def _load_e2e_map(e2e_csv: Path) -> Dict[int, Dict[str, str]]:
     rows = _read_csv(e2e_csv)
-    out: Dict[int, float] = {}
+    out: Dict[int, Dict[str, str]] = {}
+    out_ts: Dict[int, Optional[datetime]] = {}
     for row in rows:
         aid = _to_int(_first_nonempty(row, AUDIT_ID_COLS))
         e2e = _to_float(_first_nonempty(row, E2E_COLS))
         if aid is None or e2e is None or e2e <= 0:
             continue
-        out[aid] = e2e
+        ts = _to_dt(_first_nonempty(row, TS_COLS))
+        prev_ts = out_ts.get(aid)
+        if aid not in out:
+            out[aid] = dict(row)
+            out_ts[aid] = ts
+            continue
+        # prefere linha com timestamp mais recente quando disponivel
+        if prev_ts is None and ts is not None:
+            out[aid] = dict(row)
+            out_ts[aid] = ts
+        elif prev_ts is not None and ts is not None and ts >= prev_ts:
+            out[aid] = dict(row)
+            out_ts[aid] = ts
     return out
 
 
@@ -407,7 +434,7 @@ def _bootstrap_ci_week(
 
 def _build_obs(
     pnl_rows: Sequence[Dict[str, str]],
-    e2e_map: Dict[int, float],
+    e2e_map: Dict[int, Dict[str, str]],
     *,
     start_dt: Optional[datetime],
     end_dt: Optional[datetime],
@@ -422,7 +449,8 @@ def _build_obs(
         if aid is None:
             dropped["missing_audit_id"] += 1
             continue
-        ts = _to_dt(_first_nonempty(row, TS_COLS))
+        aux = e2e_map.get(aid)
+        ts = _to_dt(_merged_first_nonempty(row, aux, TS_COLS))
         if ts is None:
             dropped["missing_timestamp"] += 1
             continue
@@ -445,7 +473,7 @@ def _build_obs(
             dropped["invalid_stake_nonpositive"] += 1
             continue
 
-        e2e = e2e_map.get(aid)
+        e2e = _to_float(_merged_first_nonempty(row, aux, E2E_COLS))
         if e2e is None:
             dropped["missing_e2e_join"] += 1
             continue
@@ -457,10 +485,10 @@ def _build_obs(
             dropped["outside_7_15_window"] += 1
             continue
 
-        side = (_first_nonempty(row, SIDE_COLS) or "").strip().lower()
-        regime_raw = (_first_nonempty(row, REGIME_COLS) or "").strip().lower()
-        is_live = _to_bool(row.get("is_live"))
-        slip = _to_float(_first_nonempty(row, SLIP_COLS))
+        side = (_merged_first_nonempty(row, aux, SIDE_COLS) or "").strip().lower()
+        regime_raw = (_merged_first_nonempty(row, aux, REGIME_COLS) or "").strip().lower()
+        is_live = _to_bool(_merged_first_nonempty(row, aux, ("is_live",)))
+        slip = _to_float(_merged_first_nonempty(row, aux, SLIP_COLS))
 
         is_back = None
         if side == "back":
@@ -486,12 +514,12 @@ def _build_obs(
                 dropped["segment_filtered_out"] += 1
                 continue
 
-        league = (_first_nonempty(row, LEAGUE_COLS) or "<na>").strip().lower()
-        line_v = _to_float(_first_nonempty(row, LINE_COLS))
+        league = (_merged_first_nonempty(row, aux, LEAGUE_COLS) or "<na>").strip().lower()
+        line_v = _to_float(_merged_first_nonempty(row, aux, LINE_COLS))
         line_bin = _line_bin(line_v)
-        odd = _to_float(_first_nonempty(row, ODD_COLS))
+        odd = _to_float(_merged_first_nonempty(row, aux, ODD_COLS))
 
-        cluster_val = _first_nonempty(row, CLUSTER_COLS)
+        cluster_val = _merged_first_nonempty(row, aux, CLUSTER_COLS)
         if cluster_val is None:
             cluster_val = f"audit:{aid}"
         day = ts.date().isoformat()
