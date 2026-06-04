@@ -21,31 +21,57 @@ from __future__ import annotations
 
 import argparse
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-AUDIT_ID_COLS = ("audit_id", "id", "bet_id")
+AUDIT_ID_COLS = ("audit_id", "id", "bet_id", "opportunity_id")
 TS_COLS = (
     "ts_utc",
     "audited_utc",
     "audited_at",
+    "audited_at_utc",
     "timestamp_utc",
     "timestamp",
+    "ts",
+    "date_utc",
+    "datetime_utc",
+    "event_ts",
     "event_ts_utc",
     "created_at",
+    "updated_at",
 )
-E2E_COLS = ("e2e_total_ms", "e2e_ms", "lag_total_ms", "call_to_done_ms")
-STAKE_COLS = ("stake_exec", "stake_real", "stake", "turnover_unit", "stake_usd", "amount")
+E2E_COLS = (
+    "e2e_total_ms",
+    "e2e_ms",
+    "lag_total_ms",
+    "lag_e2e_ms",
+    "detect_to_submit_ms",
+    "executor_submit_to_done_ms",
+    "call_to_done_ms",
+)
+STAKE_COLS = (
+    "stake_exec",
+    "stake_real",
+    "stake",
+    "turnover_unit",
+    "turnover",
+    "turn",
+    "stake_usd",
+    "amount",
+)
 PNL_COLS = (
     "pnl_real",
+    "pnl_real_usd",
     "pnl_ledger",
+    "pnl_usd",
     "pnl",
     "profit_real",
     "result_real",
+    "result",
     "daily_unit_pnl",
     "profit",
 )
@@ -251,6 +277,30 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
         return [dict(r) for r in rd]
 
 
+def _nonempty_count(rows: Sequence[Dict[str, str]], col: str) -> int:
+    n = 0
+    for row in rows:
+        raw = row.get(col)
+        if raw is None:
+            continue
+        if str(raw).strip() != "":
+            n += 1
+    return n
+
+
+def _best_col_report(rows: Sequence[Dict[str, str]], candidates: Sequence[str], label: str) -> str:
+    hits: List[Tuple[int, str]] = []
+    for c in candidates:
+        k = _nonempty_count(rows, c)
+        if k > 0:
+            hits.append((k, c))
+    if not hits:
+        return f"{label}: nenhum candidato com dados"
+    hits.sort(reverse=True)
+    top = ", ".join(f"{c}={k}" for k, c in hits[:5])
+    return f"{label}: {top}"
+
+
 def _load_e2e_map(e2e_csv: Path) -> Dict[int, Tuple[float, Optional[datetime]]]:
     rows = _read_csv(e2e_csv)
     by_aid: Dict[int, Tuple[float, Optional[datetime]]] = {}
@@ -275,10 +325,13 @@ def _load_e2e_map(e2e_csv: Path) -> Dict[int, Tuple[float, Optional[datetime]]]:
 def _resolve_row_fields(
     row: Dict[str, str],
     e2e_map: Optional[Dict[int, Tuple[float, Optional[datetime]]]],
-) -> Optional[Tuple[int, datetime, float, float, float, Optional[bool], Optional[bool], Optional[bool]]]:
+) -> Tuple[
+    Optional[Tuple[int, datetime, float, float, float, Optional[bool], Optional[bool], Optional[bool]]],
+    Optional[str],
+]:
     aid = _to_int(_first_nonempty(row, AUDIT_ID_COLS))
     if aid is None:
-        return None
+        return None, "missing_audit_id"
 
     e2e: Optional[float] = None
     ts: Optional[datetime] = _to_dt(_first_nonempty(row, TS_COLS))
@@ -294,20 +347,31 @@ def _resolve_row_fields(
     stake = _to_float(_first_nonempty(row, STAKE_COLS))
     pnl = _to_float(_first_nonempty(row, PNL_COLS))
 
-    if ts is None or e2e is None or stake is None or pnl is None:
-        return None
-    if e2e <= 0 or stake <= 0:
-        return None
+    if ts is None:
+        return None, "missing_timestamp"
+    if e2e is None:
+        return None, "missing_e2e"
+    if stake is None:
+        return None, "missing_stake"
+    if pnl is None:
+        return None, "missing_pnl"
+    if e2e <= 0:
+        return None, "invalid_e2e_nonpositive"
+    if stake <= 0:
+        return None, "invalid_stake_nonpositive"
 
     return (
-        aid,
-        ts,
-        e2e,
-        stake,
-        pnl,
-        _is_back(row),
-        _is_pre(row),
-        _is_slipneg(row),
+        (
+            aid,
+            ts,
+            e2e,
+            stake,
+            pnl,
+            _is_back(row),
+            _is_pre(row),
+            _is_slipneg(row),
+        ),
+        None,
     )
 
 
@@ -492,12 +556,20 @@ def main() -> int:
     dropped_time = 0
     dropped_e2e = 0
     dropped_segment = 0
+    dropped_reasons: Counter[str] = Counter()
     seen_weeks: set[Tuple[int, int]] = set()
+    aid_in_input: set[int] = set()
 
     for row in rows:
-        parsed = _resolve_row_fields(row, e2e_map)
+        aid_raw = _to_int(_first_nonempty(row, AUDIT_ID_COLS))
+        if aid_raw is not None:
+            aid_in_input.add(aid_raw)
+
+        parsed, reason = _resolve_row_fields(row, e2e_map)
         if parsed is None:
             dropped_missing += 1
+            if reason:
+                dropped_reasons[reason] += 1
             continue
         _, ts, e2e, stake, pnl, is_back, is_pre, is_slipneg = parsed
 
@@ -532,9 +604,29 @@ def main() -> int:
 
     week_order = sorted(seen_weeks)
     if not week_order:
-        raise SystemExit(
-            "nenhuma linha apos filtros; revise colunas de entrada, janela temporal e limites de e2e."
-        )
+        header_cols = sorted({k for r in rows for k in r.keys()})
+        e2e_map_n = len(e2e_map) if e2e_map is not None else 0
+        e2e_map_cov = 0
+        if e2e_map is not None and aid_in_input:
+            e2e_map_cov = sum(1 for aid in aid_in_input if aid in e2e_map)
+
+        diag = [
+            "nenhuma linha apos filtros.",
+            f"rows_in={len(rows)} dropped_missing={dropped_missing} dropped_time={dropped_time} dropped_e2e={dropped_e2e} dropped_segment={dropped_segment}",
+            f"top_missing_reasons={dict(dropped_reasons.most_common(8))}",
+            _best_col_report(rows, AUDIT_ID_COLS, "audit_id_candidates"),
+            _best_col_report(rows, TS_COLS, "timestamp_candidates"),
+            _best_col_report(rows, STAKE_COLS, "stake_candidates"),
+            _best_col_report(rows, PNL_COLS, "pnl_candidates"),
+            _best_col_report(rows, SIDE_COLS, "side_candidates"),
+            _best_col_report(rows, REGIME_COLS, "regime_candidates"),
+            _best_col_report(rows, SLIP_COLS, "slippage_candidates"),
+            f"e2e_map_rows_valid={e2e_map_n} e2e_map_coverage_on_input_aids={e2e_map_cov}/{len(aid_in_input) if aid_in_input else 0}",
+            _best_col_report(rows, E2E_COLS, "e2e_candidates_no_map"),
+            f"headers_detectados={header_cols}",
+            "Dica: teste com --require-back-pre-slipneg 0 para validar cobertura base.",
+        ]
+        raise SystemExit("\n".join(diag))
 
     out_long = Path(args.out_long)
     out_pivot = Path(args.out_pivot)
