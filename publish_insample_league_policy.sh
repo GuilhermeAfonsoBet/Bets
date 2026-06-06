@@ -25,6 +25,10 @@ ROI_MIN="${INSAMPLE_ROI_MIN:-2}"
 N_MIN="${INSAMPLE_N_MIN:-0}"
 MIN_APPROVED_N="${INSAMPLE_MIN_APPROVED_N:-1}"
 FAIL_CLOSED_EMPTY="${INSAMPLE_FAIL_CLOSED_EMPTY:-1}"
+FREEZE_APPROVED_LIST="${INSAMPLE_FREEZE_APPROVED_LIST:-0}"
+FREEZE_REFRESH="${INSAMPLE_FREEZE_REFRESH:-0}"
+FREEZE_FILE="${INSAMPLE_FREEZE_FILE:-$BOT_DIR/logs/approved_leagues_frozen.txt}"
+FORCE_INCLUDE_LEAGUES="${INSAMPLE_FORCE_INCLUDE_LEAGUES:-}"
 HYP_TYPE="${INSAMPLE_HYPOTHESIS_TYPE:-H3B}"
 REV_DIR="${INSAMPLE_REVERSAL_DIRECTION:-up}"
 REQ_SLIP_NEG="${INSAMPLE_REQUIRE_SLIPPAGE_NEG:-1}"
@@ -34,6 +38,7 @@ POLICY_HISTORY_DIR="${INSAMPLE_POLICY_HISTORY_DIR:-$BOT_DIR/logs/policy_history}
 POLICY_HISTORY_JSONL="${INSAMPLE_POLICY_HISTORY_JSONL:-$BOT_DIR/logs/wf_policy_history.jsonl}"
 APPROVED_CSV="${INSAMPLE_APPROVED_CSV:-$BOT_DIR/logs/approved_leagues_insample_45d.csv}"
 NOT_APPROVED_CSV="${INSAMPLE_NOT_APPROVED_CSV:-$BOT_DIR/logs/not_approved_leagues_insample_45d.csv}"
+APPROVED_EFFECTIVE_CSV="${INSAMPLE_APPROVED_EFFECTIVE_CSV:-$BOT_DIR/logs/approved_leagues_effective.csv}"
 TMP_ALL_CSV="$(mktemp /tmp/league_roi_all.XXXXXX.csv)"
 
 trap 'rm -f "$TMP_ALL_CSV"' EXIT
@@ -49,8 +54,22 @@ if [[ "$FAIL_CLOSED_EMPTY" != "0" && "$FAIL_CLOSED_EMPTY" != "1" ]]; then
   echo "[ERRO] INSAMPLE_FAIL_CLOSED_EMPTY invalido: $FAIL_CLOSED_EMPTY (use 0 ou 1)" >&2
   exit 2
 fi
+if [[ "$FREEZE_APPROVED_LIST" != "0" && "$FREEZE_APPROVED_LIST" != "1" ]]; then
+  echo "[ERRO] INSAMPLE_FREEZE_APPROVED_LIST invalido: $FREEZE_APPROVED_LIST (use 0 ou 1)" >&2
+  exit 2
+fi
+if [[ "$FREEZE_REFRESH" != "0" && "$FREEZE_REFRESH" != "1" ]]; then
+  echo "[ERRO] INSAMPLE_FREEZE_REFRESH invalido: $FREEZE_REFRESH (use 0 ou 1)" >&2
+  exit 2
+fi
 
-mkdir -p "$(dirname "$POLICY_CURRENT")" "$POLICY_HISTORY_DIR" "$(dirname "$POLICY_HISTORY_JSONL")" "$(dirname "$APPROVED_CSV")"
+mkdir -p \
+  "$(dirname "$POLICY_CURRENT")" \
+  "$POLICY_HISTORY_DIR" \
+  "$(dirname "$POLICY_HISTORY_JSONL")" \
+  "$(dirname "$APPROVED_CSV")" \
+  "$(dirname "$FREEZE_FILE")" \
+  "$(dirname "$APPROVED_EFFECTIVE_CSV")"
 
 if [[ "$REQ_SLIP_NEG" == "1" ]]; then
   SLIP_FILTER_SQL="AND COALESCE(
@@ -138,7 +157,24 @@ GROUP BY league;
 \copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct, CASE WHEN n < $N_MIN THEN 'N<$N_MIN' WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN' ELSE 'OUTRO' END AS motivo FROM tmp_league_roi WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN) ORDER BY n DESC, roiw_pct DESC) TO '$NOT_APPROVED_CSV' CSV HEADER
 SQL
 
-python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" <<'PY'
+python3 - \
+  "$APPROVED_CSV" \
+  "$TMP_ALL_CSV" \
+  "$POLICY_CURRENT" \
+  "$POLICY_HISTORY_DIR" \
+  "$POLICY_HISTORY_JSONL" \
+  "$LOOKBACK_DAYS" \
+  "$ROI_MIN" \
+  "$N_MIN" \
+  "$REQ_SLIP_NEG" \
+  "$MIN_APPROVED_N" \
+  "$FAIL_CLOSED_EMPTY" \
+  "$FREEZE_APPROVED_LIST" \
+  "$FREEZE_REFRESH" \
+  "$FREEZE_FILE" \
+  "$FORCE_INCLUDE_LEAGUES" \
+  "$APPROVED_EFFECTIVE_CSV" \
+  <<'PY'
 import csv
 import json
 import sys
@@ -156,6 +192,11 @@ n_min = int(sys.argv[8])
 require_slip = str(sys.argv[9]) == "1"
 min_approved_n = int(sys.argv[10])
 fail_closed_empty = str(sys.argv[11]) == "1"
+freeze_approved = str(sys.argv[12]) == "1"
+freeze_refresh = str(sys.argv[13]) == "1"
+freeze_file = Path(sys.argv[14])
+force_include_raw = str(sys.argv[15] or "")
+approved_effective_csv = Path(sys.argv[16])
 
 rows_all = list(csv.DictReader(all_csv.open("r", encoding="utf-8")))
 rows_ok = list(csv.DictReader(approved_csv.open("r", encoding="utf-8")))
@@ -169,7 +210,64 @@ def norm_league(s: str) -> str:
         x = x[:48].rstrip() + "…"
     return x
 
-approved_leagues = [norm_league(r.get("league", "")) for r in rows_ok]
+def parse_force_list(raw: str):
+    txt = (raw or "").replace(";", ",").replace("\n", ",").replace("\r", ",")
+    vals = []
+    for part in txt.split(","):
+        lg = norm_league(part)
+        if lg and lg != "—":
+            vals.append(lg)
+    return vals
+
+def uniq_keep_order(vals):
+    seen = set()
+    out = []
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+approved_dynamic = [norm_league(r.get("league", "")) for r in rows_ok]
+approved_dynamic = [x for x in approved_dynamic if x and x != "—"]
+forced = parse_force_list(force_include_raw)
+
+if freeze_approved:
+    frozen = []
+    if freeze_file.exists() and not freeze_refresh:
+        for ln in freeze_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            lg = norm_league(ln)
+            if lg and lg != "—":
+                frozen.append(lg)
+    else:
+        frozen.extend(approved_dynamic)
+    frozen.extend(forced)
+    approved_leagues = uniq_keep_order(frozen)
+    freeze_file.parent.mkdir(parents=True, exist_ok=True)
+    freeze_file.write_text("\n".join(approved_leagues) + ("\n" if approved_leagues else ""), encoding="utf-8")
+    approved_mode = "frozen_static"
+else:
+    approved_leagues = uniq_keep_order(approved_dynamic + forced)
+    approved_mode = "dynamic_sql"
+
+# Exporta lista efetiva para auditoria operacional.
+approved_effective_csv.parent.mkdir(parents=True, exist_ok=True)
+with approved_effective_csv.open("w", encoding="utf-8", newline="") as f:
+    wr = csv.writer(f)
+    wr.writerow(["league", "source"])
+    dyn_set = set(approved_dynamic)
+    forced_set = set(forced)
+    for lg in approved_leagues:
+        src = []
+        if lg in dyn_set:
+            src.append("sql")
+        if lg in forced_set:
+            src.append("forced")
+        if freeze_approved and lg in set(approved_leagues):
+            src.append("frozen")
+        wr.writerow([lg, "+".join(src) if src else "unknown"])
+
 active_keys = [f"Back_Pre_Any__{lg}" for lg in approved_leagues]
 active_counts = {k: 1 for k in active_keys}
 
@@ -177,12 +275,15 @@ generated_at = datetime.now(timezone.utc).isoformat()
 step = {
     "train": f"last_{lookback_days}d",
     "test": "IN_SAMPLE_SQL",
-    "selection_mode": "insample_sql",
+    "selection_mode": ("insample_sql_frozen" if freeze_approved else "insample_sql"),
     "active_keys": active_keys,
     "active_n": len(active_keys),
     "active_keys_base": (["Back_Pre_Any"] if active_keys else []),
     "active_n_base": (1 if active_keys else 0),
     "approved_leagues": approved_leagues,
+    "approved_list_mode": approved_mode,
+    "approved_list_file": str(freeze_file) if freeze_approved else None,
+    "forced_include_leagues": forced,
     "n_ev_elig_pre": sum(int(float(r.get("n", 0) or 0)) for r in rows_ok),
     "diag": {
         r.get("league", ""): {
@@ -205,6 +306,8 @@ policy = {
     "wf": {
         "train_mode": "expanding",
         "selection_mode": "insample_sql",
+        "approved_list_mode": approved_mode,
+        "approved_list_file": (str(freeze_file) if freeze_approved else None),
         "insample_days": lookback_days,
         "train_days": lookback_days,
         "test_days": 1,
@@ -240,8 +343,13 @@ policy = {
     "steps": [step],
     "active_counts": active_counts,
     "insample_sql_summary": {
-        "approved_n": len(rows_ok),
+        "approved_n_sql": len(rows_ok),
+        "approved_n_effective": len(approved_leagues),
         "all_leagues_n": len(rows_all),
+        "freeze_approved_list": freeze_approved,
+        "freeze_refresh": freeze_refresh,
+        "force_include_leagues": forced,
+        "approved_effective_csv": str(approved_effective_csv),
     },
 }
 
@@ -263,7 +371,8 @@ if policy_current.exists():
         prev_active_n = None
         prev_generated_at = None
 
-if fail_closed_empty and len(rows_ok) < min_approved_n:
+approved_n_guard = len(approved_leagues) if freeze_approved else len(rows_ok)
+if fail_closed_empty and approved_n_guard < min_approved_n:
     policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with policy_history_jsonl.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -271,18 +380,23 @@ if fail_closed_empty and len(rows_ok) < min_approved_n:
             "policy_current": str(policy_current),
             "policy_candidate_file": str(candidate_file),
             "status": "rejected_min_approved",
-            "approved_n": len(rows_ok),
+            "approved_n": approved_n_guard,
+            "approved_n_sql": len(rows_ok),
+            "approved_n_effective": len(approved_leagues),
             "min_approved_n": min_approved_n,
             "all_leagues_n": len(rows_all),
-            "mode": "insample_sql",
+            "mode": ("insample_sql_frozen" if freeze_approved else "insample_sql"),
             "roi_min": roi_min,
             "n_min": n_min,
             "lookback_days": lookback_days,
+            "freeze_approved_list": freeze_approved,
+            "freeze_file": str(freeze_file) if freeze_approved else None,
+            "force_include_leagues": forced,
             "prev_active_n": prev_active_n,
             "prev_generated_at": prev_generated_at,
         }, ensure_ascii=False) + "\n")
     print(
-        f"[ERRO] Fail-closed: approved_n={len(rows_ok)} < min_approved_n={min_approved_n}. "
+        f"[ERRO] Fail-closed: approved_n={approved_n_guard} < min_approved_n={min_approved_n}. "
         f"Policy atual foi preservada em {policy_current}; candidato salvo em {candidate_file}.",
         file=sys.stderr,
     )
@@ -302,21 +416,35 @@ with policy_history_jsonl.open("a", encoding="utf-8") as f:
         "policy_candidate_file": str(candidate_file),
         "policy_history_file": str(hist_file),
         "status": "published",
-        "approved_n": len(rows_ok),
+            "approved_n": approved_n_guard,
+            "approved_n_sql": len(rows_ok),
+            "approved_n_effective": len(approved_leagues),
         "min_approved_n": min_approved_n,
         "all_leagues_n": len(rows_all),
-        "mode": "insample_sql",
+            "mode": ("insample_sql_frozen" if freeze_approved else "insample_sql"),
         "roi_min": roi_min,
         "n_min": n_min,
         "lookback_days": lookback_days,
+            "freeze_approved_list": freeze_approved,
+            "freeze_refresh": freeze_refresh,
+            "freeze_file": str(freeze_file) if freeze_approved else None,
+            "force_include_leagues": forced,
     }, ensure_ascii=False) + "\n")
 
-print(f"approved_n={len(rows_ok)}")
+print(f"approved_n_sql={len(rows_ok)}")
+print(f"approved_n_effective={len(approved_leagues)}")
+print(f"freeze_approved_list={freeze_approved}")
+print(f"freeze_file={freeze_file}")
+print(f"approved_effective_csv={approved_effective_csv}")
 print(f"policy_current={policy_current}")
 print(f"policy_history={hist_file}")
 PY
 
 echo "[OK] Policy in-sample SQL publicada."
 echo "[OK] fail_closed_empty=$FAIL_CLOSED_EMPTY min_approved_n=$MIN_APPROVED_N"
+echo "[OK] freeze_approved_list=$FREEZE_APPROVED_LIST freeze_refresh=$FREEZE_REFRESH"
+echo "[OK] freeze_file=$FREEZE_FILE"
+echo "[OK] force_include_leagues=$FORCE_INCLUDE_LEAGUES"
 echo "[OK] approved_csv=$APPROVED_CSV"
+echo "[OK] approved_effective_csv=$APPROVED_EFFECTIVE_CSV"
 echo "[OK] not_approved_csv=$NOT_APPROVED_CSV"
