@@ -413,6 +413,23 @@ print(f"linhas_no_recorte={total}")
 print(f"status_top={status.most_common(20)}")
 print(f"live_ok={live_ok}")
 print(f"reasons_top={reasons.most_common(20)}")
+
+no_session = int(status.get("NO_SESSION", 0))
+no_root_cookie = sum(c for k, c in reasons.items() if "NO_ROOT_SESSION_COOKIE" in str(k).upper())
+auth_401 = sum(c for k, c in reasons.items() if "401" in str(k))
+heartbeat = int(status.get("HEARTBEAT", 0))
+heartbeat_only = int(total > 0 and len([k for k in status.keys() if k != "HEARTBEAT"]) == 0)
+
+print(f"auth.no_session={no_session}")
+print(f"auth.no_root_cookie={no_root_cookie}")
+print(f"auth.401={auth_401}")
+print(f"auth.heartbeat={heartbeat}")
+print(f"auth.heartbeat_only={heartbeat_only}")
+
+auth_incident = (no_session > 0) or (no_root_cookie > 0) or (auth_401 > 0)
+print(f"auth.incident={int(auth_incident)}")
+if auth_incident:
+    print("auth.next_action=./auto_relogin_on_auth.sh (configure AUTH_GUARD_RELOGIN_CMD/AUTH_GUARD_POST_RELOGIN_CMD)")
 PY
 echo
 
