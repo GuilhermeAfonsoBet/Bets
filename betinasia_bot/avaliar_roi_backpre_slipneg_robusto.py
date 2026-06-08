@@ -224,7 +224,7 @@ def load_rows_from_csv(
         regime_ok = True
         if col_side:
             side_v = str(raw.get(col_side, "")).strip().lower()
-            side_ok = side_v in {"back", "home", "h", "b"}
+            side_ok = side_v in {"back", "home", "away", "h", "a", "b"}
         if col_regime:
             reg_v = str(raw.get(col_regime, "")).strip().lower()
             regime_ok = ("pre" in reg_v) or (reg_v in {"prematch", "pre_match"})
