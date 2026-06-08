@@ -92,11 +92,23 @@ def _iso_week(dt: Optional[datetime]) -> str:
 
 def _pick_col(fieldnames: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
     lookup = {f.lower(): f for f in fieldnames}
+    lookup_norm = { _norm_colname(f): f for f in fieldnames }
     for c in candidates:
         f = lookup.get(c.lower())
         if f:
             return f
+        fn = lookup_norm.get(_norm_colname(c))
+        if fn:
+            return fn
     return None
+
+
+def _norm_colname(s: str) -> str:
+    out = []
+    for ch in str(s).strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
 
 
 def _sniff_csv(path: Path) -> Tuple[csv.Dialect, List[str]]:
@@ -120,6 +132,8 @@ def load_rows_from_csv(
     *,
     enforce_slip_neg: bool = True,
     assume_back_pre_when_missing: bool = True,
+    col_overrides: Optional[Dict[str, str]] = None,
+    allow_unit_stake_fallback: bool = False,
 ) -> Tuple[List[BetRow], Dict[str, int], Dict[str, Optional[str]]]:
     dialect, lines = _sniff_csv(path)
     reader = csv.DictReader(lines, dialect=dialect)
@@ -127,23 +141,72 @@ def load_rows_from_csv(
     if not fields:
         raise RuntimeError(f"CSV sem cabecalho: {path}")
 
-    col_event = _pick_col(fields, ["event_id", "match_id", "game_id", "fixture_id", "event"])
-    col_league = _pick_col(fields, ["league", "league_name", "competition", "tournament"])
-    col_ts = _pick_col(fields, ["audited_at", "timestamp", "ts", "created_at", "post_date_utc"])
-    col_stake = _pick_col(fields, ["stake", "exposure", "stake_usd", "stake_total", "amount"])
-    col_pnl = _pick_col(fields, ["pnl", "pnl_acct", "pnl_real", "profit", "pl", "result"])
-    col_roi = _pick_col(fields, ["roi", "roi_pct", "roiw"])
-    col_slip = _pick_col(fields, ["slippage_pre_pct", "slippage_raw_pct", "slippage"])
-    col_side = _pick_col(fields, ["side", "exec_side", "direction_side"])
-    col_regime = _pick_col(fields, ["regime", "market_regime", "market_period", "phase"])
-    col_is_live = _pick_col(fields, ["is_live", "live"])
+    ov = col_overrides or {}
+
+    def _pick(name: str, candidates: Sequence[str]) -> Optional[str]:
+        manual = str(ov.get(name, "") or "").strip()
+        if manual:
+            f_lookup = {f.lower(): f for f in fields}
+            by_norm = {_norm_colname(f): f for f in fields}
+            if manual.lower() in f_lookup:
+                return f_lookup[manual.lower()]
+            mm = by_norm.get(_norm_colname(manual))
+            if mm:
+                return mm
+            raise RuntimeError(
+                f"Coluna manual '{manual}' ({name}) nao encontrada no CSV. "
+                f"Headers: {fields}"
+            )
+        return _pick_col(fields, candidates)
+
+    col_event = _pick("event", ["event_id", "match_id", "game_id", "fixture_id", "event", "eventid", "matchid"])
+    col_league = _pick("league", ["league", "league_name", "competition", "tournament", "liga"])
+    col_ts = _pick("timestamp", ["audited_at", "timestamp", "ts", "created_at", "post_date_utc", "date_utc", "datetime"])
+    col_stake = _pick(
+        "stake",
+        [
+            "stake",
+            "exposure",
+            "stake_usd",
+            "stake_total",
+            "amount",
+            "stake_liquidado",
+            "stake_liq",
+            "apostado_back",
+            "valor_em_risco",
+            "exposicao",
+            "exposição",
+        ],
+    )
+    col_pnl = _pick(
+        "pnl",
+        [
+            "pnl",
+            "pnl_acct",
+            "pnl_real",
+            "profit",
+            "pl",
+            "result",
+            "lucro",
+            "p&l",
+            "pnl_total",
+        ],
+    )
+    col_roi = _pick("roi", ["roi", "roi_pct", "roiw", "roi%", "roi_w"])
+    col_slip = _pick("slippage", ["slippage_pre_pct", "slippage_raw_pct", "slippage", "slippagepct", "slippage_pre"])
+    col_side = _pick("side", ["side", "exec_side", "direction_side", "lado"])
+    col_regime = _pick("regime", ["regime", "market_regime", "market_period", "phase", "pre_in"])
+    col_is_live = _pick("is_live", ["is_live", "live", "ao_vivo"])
 
     if col_event is None:
         col_event = _pick_col(fields, ["order_id", "audit_id", "id"])
     if col_event is None:
         raise RuntimeError("Nao encontrei coluna de event_id/order_id/audit_id no CSV.")
-    if col_stake is None:
-        raise RuntimeError("Nao encontrei coluna de stake/exposure no CSV.")
+    if col_stake is None and not allow_unit_stake_fallback:
+        raise RuntimeError(
+            "Nao encontrei coluna de stake/exposure no CSV. "
+            "Use --stake-col <nome_coluna> ou --allow-unit-stake-fallback 1."
+        )
     if col_pnl is None and col_roi is None:
         raise RuntimeError("Nao encontrei coluna de pnl (ou roi) no CSV.")
 
@@ -187,16 +250,25 @@ def load_rows_from_csv(
                 dropped["slippage_not_negative"] += 1
                 continue
 
-        stake = _parse_float(raw.get(col_stake))
-        if stake is None or stake <= 0:
-            dropped["invalid_stake"] += 1
-            continue
-
         pnl = _parse_float(raw.get(col_pnl)) if col_pnl else None
-        if pnl is None and col_roi:
-            roi = _parse_float(raw.get(col_roi))
-            if roi is not None:
-                pnl = (roi / 100.0) * stake
+        roi = _parse_float(raw.get(col_roi)) if col_roi else None
+
+        stake = _parse_float(raw.get(col_stake)) if col_stake else None
+        if stake is None and allow_unit_stake_fallback:
+            # fallback conservador: unidade por aposta
+            stake = 1.0
+            dropped["unit_stake_fallback"] += 1
+        if stake is None or stake <= 0:
+            # tenta derivar stake de pnl/roi quando possivel
+            if pnl is not None and roi is not None and abs(roi) > 1e-12:
+                stake = abs(100.0 * pnl / roi)
+                dropped["stake_derived_from_pnl_roi"] += 1
+            else:
+                dropped["invalid_stake"] += 1
+                continue
+
+        if pnl is None and roi is not None:
+            pnl = (roi / 100.0) * stake
         if pnl is None:
             dropped["missing_pnl_and_roi"] += 1
             continue
@@ -481,16 +553,57 @@ def main() -> int:
         help="Se side/regime ausentes, assume que CSV ja esta no recorte Back Pre (default 1).",
     )
     parser.add_argument("--topk", default="1,3,5,10", help="Lista de k para leave-top-k e concentracao")
+    parser.add_argument("--event-col", default="", help="Override manual da coluna de evento (event_id/order_id/audit_id).")
+    parser.add_argument("--league-col", default="", help="Override manual da coluna de liga.")
+    parser.add_argument("--timestamp-col", default="", help="Override manual da coluna de timestamp.")
+    parser.add_argument("--stake-col", default="", help="Override manual da coluna de stake/exposure.")
+    parser.add_argument("--pnl-col", default="", help="Override manual da coluna de pnl.")
+    parser.add_argument("--roi-col", default="", help="Override manual da coluna de roi.")
+    parser.add_argument("--slippage-col", default="", help="Override manual da coluna de slippage.")
+    parser.add_argument("--side-col", default="", help="Override manual da coluna de side.")
+    parser.add_argument("--regime-col", default="", help="Override manual da coluna de regime.")
+    parser.add_argument(
+        "--allow-unit-stake-fallback",
+        type=int,
+        default=0,
+        help="Se 1, usa stake=1 quando coluna de stake estiver ausente/invalida.",
+    )
+    parser.add_argument(
+        "--print-columns-only",
+        type=int,
+        default=0,
+        help="Se 1, imprime colunas do CSV e sai (debug).",
+    )
     args = parser.parse_args()
 
     csv_path = Path(args.input_csv)
     if not csv_path.exists():
         raise RuntimeError(f"CSV nao encontrado: {csv_path}")
 
+    if int(args.print_columns_only) == 1:
+        _, lines = _sniff_csv(csv_path)
+        rd = csv.DictReader(lines)
+        print(rd.fieldnames or [])
+        return 0
+
+    overrides = {
+        "event": args.event_col,
+        "league": args.league_col,
+        "timestamp": args.timestamp_col,
+        "stake": args.stake_col,
+        "pnl": args.pnl_col,
+        "roi": args.roi_col,
+        "slippage": args.slippage_col,
+        "side": args.side_col,
+        "regime": args.regime_col,
+    }
+
     rows, dropped, cols = load_rows_from_csv(
         csv_path,
         enforce_slip_neg=(not args.no_enforce_slip_neg),
         assume_back_pre_when_missing=bool(args.assume_back_pre_when_missing),
+        col_overrides=overrides,
+        allow_unit_stake_fallback=bool(args.allow_unit_stake_fallback),
     )
     if not rows:
         raise RuntimeError(f"Nenhuma linha valida apos filtros. dropped={dropped}")
