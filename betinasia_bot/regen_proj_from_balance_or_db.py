@@ -57,6 +57,17 @@ ORDER_COL_CANDIDATES = [
     "external_id",
     "bet_id",
 ]
+AUDIT_REF_COL_CANDIDATES = [
+    "audit_id",
+    "auditid",
+    "audit_result_id",
+    "auditresultid",
+    "betslip_audit_id",
+    "betslipauditid",
+    "betslip_audit_result_id",
+    "betslipauditresultid",
+    "id_audit",
+]
 CSV_VALUE_COL_CANDIDATES = [
     "amount",
     "pnl_real",
@@ -78,6 +89,7 @@ NUMERIC_TYPES = {
     "double precision",
     "decimal",
 }
+TEXT_TYPES = {"text", "character varying", "character"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +179,18 @@ def count_csv_rows(path: Path) -> int:
     return n
 
 
+def count_csv_nonempty(path: Path, field: str) -> int:
+    if not path.exists():
+        return 0
+    n = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            if str(row.get(field, "")).strip():
+                n += 1
+    return n
+
+
 def list_table_columns(db_url: str, table_name: str) -> Tuple[str, Dict[str, str]]:
     sql = f"""
     SELECT table_schema, column_name, data_type
@@ -198,6 +222,43 @@ def pick_existing(columns: Iterable[str], candidates: Sequence[str]) -> Optional
         if c:
             return c
     return None
+
+
+def pick_orderish_column(columns: Iterable[str]) -> Optional[str]:
+    best = None
+    best_score = -1
+    for c in columns:
+        n = _norm(c)
+        if "order" not in n:
+            continue
+        score = 10
+        if "id" in n:
+            score += 10
+        if "external" in n or "provider" in n:
+            score += 3
+        if score > best_score:
+            best_score = score
+            best = c
+    return best
+
+
+def pick_auditref_column(columns: Iterable[str]) -> Optional[str]:
+    hit = pick_existing(columns, AUDIT_REF_COL_CANDIDATES)
+    if hit:
+        return hit
+    best = None
+    best_score = -1
+    for c in columns:
+        n = _norm(c)
+        if "audit" not in n:
+            continue
+        score = 10
+        if "id" in n:
+            score += 10
+        if score > best_score:
+            best_score = score
+            best = c
+    return best
 
 
 def walk_with_depth(root: Path, max_depth: int) -> Iterable[Path]:
@@ -417,8 +478,8 @@ def export_audit_csv(
     colnames = list(cols.keys())
     q_table = f"{quote_ident(schema)}.{quote_ident('betslip_audit_results')}"
 
-    order_col = pick_existing(colnames, ORDER_COL_CANDIDATES)
-    audit_col = pick_existing(colnames, ["audit_id", "id"]) or "audit_id"
+    order_col = pick_existing(colnames, ORDER_COL_CANDIDATES) or pick_orderish_column(colnames)
+    audit_col = pick_existing(colnames, ["audit_id", "id"]) or pick_auditref_column(colnames)
     event_col = pick_existing(colnames, ["event_id", "match_id", "fixture_id", "game_id"])
     league_col = pick_existing(colnames, ["league", "league_name", "competition", "tournament"])
     ts_col = pick_existing(colnames, ["audited_at", "created_at", "updated_at"])
@@ -426,9 +487,40 @@ def export_audit_csv(
     regime_col = pick_existing(colnames, ["regime", "market_regime", "market_phase", "phase"])
     status_col = pick_existing(colnames, ["status"])
     slip_col = pick_existing(colnames, ["slippage_pre_pct", "slippage_raw_pct", "slippage"])
-    json_col = pick_existing(colnames, ["hypothesis_details"])
+    json_cols = [c for c, typ in cols.items() if typ in {"json", "jsonb"}]
+    if "hypothesis_details" in json_cols:
+        json_cols.remove("hypothesis_details")
+        json_cols.insert(0, "hypothesis_details")
+    text_blob_cols = [
+        c
+        for c, typ in cols.items()
+        if typ in TEXT_TYPES and any(k in _norm(c) for k in ["detail", "payload", "meta", "raw", "json", "response"])
+    ]
+    json_col = json_cols[0] if json_cols else None
 
-    stake_candidates = [c for c in ["stake_real", "exposure_real", "exposure", "stake"] if c in colnames]
+    stake_candidates = [
+        c
+        for c in [
+            "stake_real",
+            "exposure_real",
+            "exposure",
+            "stake",
+            "stake_usd",
+            "bet_amount",
+            "wager",
+            "wager_amount",
+            "size",
+            "amount",
+        ]
+        if c in colnames
+    ]
+    for c, typ in cols.items():
+        if typ not in NUMERIC_TYPES:
+            continue
+        n = _norm(c)
+        if any(tok in n for tok in ["stake", "exposure", "wager"]):
+            if c not in stake_candidates:
+                stake_candidates.append(c)
     stake_terms = [f"NULLIF({quote_ident(c)}::double precision,0)" for c in stake_candidates]
     limit_col = pick_existing(colnames, ["betslip_limit", "limit"])
     stake_pct_col = pick_existing(colnames, ["stake_pct_of_limit", "stake_pct", "stake_percentage"])
@@ -479,8 +571,8 @@ def export_audit_csv(
         if order_col:
             return f"NULLIF({quote_ident(order_col)}::text, '')"
         terms: List[str] = []
-        if json_col:
-            qj = quote_ident(json_col)
+        for jcol in json_cols:
+            qj = quote_ident(jcol)
             qj_b = f"({qj})::jsonb"
             # caminhos comuns + busca recursiva por chave
             terms.extend(
@@ -508,6 +600,14 @@ def export_audit_csv(
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.\"order id\"') #>> '{{}}', '')",
                     f"NULLIF(substring({qj}::text from '(?i)\"order[_ ]?id\"\\s*:\\s*\"([^\"]+)\"'), '')",
                     f"NULLIF(substring({qj}::text from '(?i)\"order[_ ]?id\"\\s*:\\s*([0-9]+)'), '')",
+                ]
+            )
+        for tcol in text_blob_cols:
+            qt = quote_ident(tcol)
+            terms.extend(
+                [
+                    f"NULLIF(substring({qt}::text from '(?i)\"order[_ ]?id\"\\s*[:=]\\s*\"([^\"]+)\"'), '')",
+                    f"NULLIF(substring({qt}::text from '(?i)\"order[_ ]?id\"\\s*[:=]\\s*([0-9]+)'), '')",
                 ]
             )
         if allow_auditid_fallback and audit_col:
@@ -549,6 +649,78 @@ def export_audit_csv(
     return count_csv_rows(out_csv)
 
 
+def discover_and_export_audit_order_map(db_url: str, out_csv: Path) -> Tuple[Optional[str], int]:
+    sql = """
+    SELECT table_schema, table_name, column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema NOT IN ('pg_catalog','information_schema')
+    ORDER BY table_schema, table_name, ordinal_position;
+    """
+    out = run_psql_query(db_url, sql)
+    tbl_cols: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
+    for ln in out.splitlines():
+        parts = ln.split("|")
+        if len(parts) != 4:
+            continue
+        sc, tb, col, typ = parts
+        tbl_cols[(sc, tb)][col] = typ
+
+    candidates: List[Tuple[int, str, str, str, str]] = []
+    for (sc, tb), cols in tbl_cols.items():
+        if _norm(tb) == _norm("betslip_audit_results"):
+            continue
+        colnames = list(cols.keys())
+        audit_ref_col = pick_auditref_column(colnames)
+        if not audit_ref_col:
+            continue
+        order_col = pick_existing(colnames, ORDER_COL_CANDIDATES) or pick_orderish_column(colnames)
+        if not order_col:
+            continue
+        score = 0
+        n = tb.lower()
+        if "bridge" in n:
+            score += 30
+        if "executor" in n:
+            score += 20
+        if "audit" in n:
+            score += 15
+        if "order" in n:
+            score += 10
+        if sc == "public":
+            score += 10
+        candidates.append((score, sc, tb, audit_ref_col, order_col))
+
+    candidates.sort(reverse=True)
+    for _, sc, tb, audit_col, order_col in candidates[:20]:
+        q_table = f"{quote_ident(sc)}.{quote_ident(tb)}"
+        q_a = quote_ident(audit_col)
+        q_o = quote_ident(order_col)
+        q_count = f"SELECT COUNT(*) FROM {q_table} WHERE {q_a} IS NOT NULL AND {q_o} IS NOT NULL"
+        try:
+            n_pairs = int((run_psql_query(db_url, q_count).strip() or "0"))
+        except Exception:
+            continue
+        if n_pairs <= 0:
+            continue
+        q_export = f"""
+        SELECT
+          {q_a}::text AS audit_id,
+          {q_o}::text AS order_id
+        FROM {q_table}
+        WHERE {q_a} IS NOT NULL
+          AND {q_o} IS NOT NULL
+        """
+        try:
+            psql_copy_csv(db_url, q_export, out_csv)
+        except Exception:
+            continue
+        n = count_csv_rows(out_csv)
+        if n > 0:
+            src = f"{sc}.{tb} ({audit_col}->{order_col})"
+            return src, n
+    return None, 0
+
+
 def _key_norm_compact(v: str) -> str:
     return _norm(v)
 
@@ -584,6 +756,7 @@ def join_audit_and_ledger(
     ledger_csv: Path,
     out_csv: Path,
     out_enriched_csv: Path,
+    audit_order_map_csv: Optional[Path] = None,
 ) -> Tuple[int, float, float]:
     pnl_by_oid: Dict[str, float] = defaultdict(float)
     with ledger_csv.open("r", encoding="utf-8", newline="") as f:
@@ -601,6 +774,30 @@ def join_audit_and_ledger(
         rd = csv.DictReader(f)
         for row in rd:
             audit_rows.append(dict(row))
+
+    if audit_order_map_csv and audit_order_map_csv.exists():
+        map_rows = []
+        with audit_order_map_csv.open("r", encoding="utf-8", newline="") as f:
+            rd = csv.DictReader(f)
+            for r in rd:
+                map_rows.append(dict(r))
+        aid_to_order = _build_unique_map(map_rows, lambda s: str(s).strip(), id_field="audit_id")
+        filled = 0
+        for row in audit_rows:
+            oid = str(row.get("order_id", "")).strip()
+            if oid:
+                continue
+            aid = str(row.get("audit_id", "")).strip()
+            m = aid_to_order.get(aid)
+            if not m:
+                continue
+            moid = str(m.get("order_id", "")).strip()
+            if not moid:
+                continue
+            row["order_id"] = moid
+            filled += 1
+        if filled > 0:
+            print(f"[OK] order_id preenchido via mapa audit->order: +{filled} linhas")
 
     strategies = {
         "raw": lambda s: str(s).strip(),
@@ -715,6 +912,7 @@ def main() -> int:
     out_enr = Path(f"/tmp/projecao_por_aposta_enriquecido__regen_db_{ts}.csv")
     ledger_norm = Path(f"/tmp/ledger_norm_{ts}.csv")
     audit_csv = Path(f"/tmp/audit_for_proj_{ts}.csv")
+    audit_order_map_csv = Path(f"/tmp/audit_order_map_{ts}.csv")
 
     if old.exists():
         shutil.copy2(old, bak)
@@ -774,8 +972,26 @@ def main() -> int:
             require_status_ok=False,
         )
     print(f"[OK] auditoria exportada: {audit_csv} (n={n_audit})")
+    order_nonempty = count_csv_nonempty(audit_csv, "order_id")
+    stake_nonempty = count_csv_nonempty(audit_csv, "stake_real")
+    print(f"[OK] auditoria com order_id preenchido: {order_nonempty}")
+    print(f"[OK] auditoria com stake_real preenchido: {stake_nonempty}")
 
-    nrows, ts_min, ts_max = join_audit_and_ledger(audit_csv, ledger_norm, out, out_enr)
+    need_map = (order_nonempty == 0) or (n_audit > 0 and order_nonempty < max(100, int(0.05 * n_audit)))
+    if need_map:
+        map_src, map_n = discover_and_export_audit_order_map(db, audit_order_map_csv)
+        if map_src and map_n > 0:
+            print(f"[OK] mapa audit->order: {audit_order_map_csv} (n={map_n}, source={map_src})")
+        else:
+            print("[WARN] nao encontrei tabela auxiliar de mapeamento audit->order.")
+
+    nrows, ts_min, ts_max = join_audit_and_ledger(
+        audit_csv,
+        ledger_norm,
+        out,
+        out_enr,
+        audit_order_map_csv=audit_order_map_csv if audit_order_map_csv.exists() else None,
+    )
     if nrows <= 0:
         raise RuntimeError("Join auditoria x ledger gerou 0 linhas.")
 
