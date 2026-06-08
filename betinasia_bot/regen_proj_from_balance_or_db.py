@@ -156,6 +156,17 @@ def quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    n = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        for _ in rd:
+            n += 1
+    return n
+
+
 def list_table_columns(db_url: str, table_name: str) -> Tuple[str, Dict[str, str]]:
     sql = f"""
     SELECT table_schema, column_name, data_type
@@ -393,7 +404,15 @@ def normalize_ledger_from_db(db_url: str, out_csv: Path) -> Tuple[str, int]:
     return table, count
 
 
-def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool = False) -> None:
+def export_audit_csv(
+    db_url: str,
+    out_csv: Path,
+    *,
+    allow_auditid_fallback: bool = False,
+    require_order: bool = True,
+    require_positive_stake: bool = True,
+    require_status_ok: bool = True,
+) -> int:
     schema, cols = list_table_columns(db_url, "betslip_audit_results")
     colnames = list(cols.keys())
     q_table = f"{quote_ident(schema)}.{quote_ident('betslip_audit_results')}"
@@ -411,13 +430,31 @@ def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool
 
     stake_candidates = [c for c in ["stake_real", "exposure_real", "exposure", "stake"] if c in colnames]
     stake_terms = [f"NULLIF({quote_ident(c)}::double precision,0)" for c in stake_candidates]
+    limit_col = pick_existing(colnames, ["betslip_limit", "limit"])
+    stake_pct_col = pick_existing(colnames, ["stake_pct_of_limit", "stake_pct", "stake_percentage"])
+    if limit_col and stake_pct_col:
+        q_lim = quote_ident(limit_col)
+        q_pct = quote_ident(stake_pct_col)
+        stake_terms.append(
+            f"NULLIF({q_lim}::double precision * "
+            f"(CASE WHEN abs({q_pct}::double precision)<=1 THEN {q_pct}::double precision "
+            f"ELSE {q_pct}::double precision/100.0 END), 0)"
+        )
     if json_col:
         q_json = quote_ident(json_col)
+        lim_sql = f"{quote_ident(limit_col)}::double precision" if limit_col else "NULL::double precision"
         stake_terms.extend(
             [
                 f"NULLIF(({q_json} #>> '{{value_sizing,stake_real}}')::double precision,0)",
                 f"NULLIF(({q_json} #>> '{{value_sizing,stake}}')::double precision,0)",
                 f"NULLIF(({q_json} #>> '{{value_sizing,exposure}}')::double precision,0)",
+                f"NULLIF(({q_json} #>> '{{finance,stake}}')::double precision,0)",
+                f"NULLIF(({q_json} #>> '{{finance,stake_real}}')::double precision,0)",
+                f"NULLIF(({q_json} #>> '{{finance,exposure}}')::double precision,0)",
+                f"NULLIF( COALESCE({lim_sql}, ({q_json} #>> '{{finance,limit}}')::double precision, ({q_json} #>> '{{value_sizing,limit}}')::double precision ) "
+                f"* (CASE WHEN abs(COALESCE(({q_json} #>> '{{finance,stake_pct_of_limit}}')::double precision, ({q_json} #>> '{{value_sizing,stake_pct_of_limit}}')::double precision, 0))<=1 "
+                f"THEN COALESCE(({q_json} #>> '{{finance,stake_pct_of_limit}}')::double precision, ({q_json} #>> '{{value_sizing,stake_pct_of_limit}}')::double precision, 0) "
+                f"ELSE COALESCE(({q_json} #>> '{{finance,stake_pct_of_limit}}')::double precision, ({q_json} #>> '{{value_sizing,stake_pct_of_limit}}')::double precision, 0)/100.0 END), 0)",
             ]
         )
     if stake_terms:
@@ -469,6 +506,8 @@ def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.order_id') #>> '{{}}', '')",
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.orderId') #>> '{{}}', '')",
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.\"order id\"') #>> '{{}}', '')",
+                    f"NULLIF(substring({qj}::text from '(?i)\"order[_ ]?id\"\\s*:\\s*\"([^\"]+)\"'), '')",
+                    f"NULLIF(substring({qj}::text from '(?i)\"order[_ ]?id\"\\s*:\\s*([0-9]+)'), '')",
                 ]
             )
         if allow_auditid_fallback and audit_col:
@@ -483,10 +522,14 @@ def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool
 
     order_expr_sql = order_expr()
 
-    where_parts = [f"{order_expr_sql} IS NOT NULL", f"{stake_expr} > 0"]
-    if status_col:
+    where_parts: List[str] = []
+    if require_order:
+        where_parts.append(f"{order_expr_sql} IS NOT NULL")
+    if require_positive_stake:
+        where_parts.append(f"{stake_expr} > 0")
+    if require_status_ok and status_col:
         where_parts.append(f"UPPER({quote_ident(status_col)}::text)='OK'")
-    where_sql = " AND ".join(where_parts)
+    where_sql = " AND ".join(where_parts) if where_parts else "TRUE"
 
     sql = f"""
     SELECT
@@ -503,6 +546,7 @@ def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool
     WHERE {where_sql}
     """
     psql_copy_csv(db_url, sql, out_csv)
+    return count_csv_rows(out_csv)
 
 
 def _key_norm_compact(v: str) -> str:
@@ -701,8 +745,35 @@ def main() -> int:
         used_db_fallback = True
         print(f"[OK] ledger DB fallback: {table} (n={n})")
 
-    export_audit_csv(db, audit_csv, allow_auditid_fallback=bool(int(args.allow_auditid_fallback)))
-    print(f"[OK] auditoria exportada: {audit_csv}")
+    n_audit = export_audit_csv(
+        db,
+        audit_csv,
+        allow_auditid_fallback=bool(int(args.allow_auditid_fallback)),
+        require_order=True,
+        require_positive_stake=True,
+        require_status_ok=True,
+    )
+    if n_audit == 0:
+        print("[WARN] auditoria strict=0 linhas; tentando export relaxado (sem stake/status).")
+        n_audit = export_audit_csv(
+            db,
+            audit_csv,
+            allow_auditid_fallback=bool(int(args.allow_auditid_fallback)),
+            require_order=True,
+            require_positive_stake=False,
+            require_status_ok=False,
+        )
+    if n_audit == 0:
+        print("[WARN] auditoria ainda 0 linhas; tentando sem exigir order no SQL (diagnostico).")
+        n_audit = export_audit_csv(
+            db,
+            audit_csv,
+            allow_auditid_fallback=bool(int(args.allow_auditid_fallback)),
+            require_order=False,
+            require_positive_stake=False,
+            require_status_ok=False,
+        )
+    print(f"[OK] auditoria exportada: {audit_csv} (n={n_audit})")
 
     nrows, ts_min, ts_max = join_audit_and_ledger(audit_csv, ledger_norm, out, out_enr)
     if nrows <= 0:
