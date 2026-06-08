@@ -202,7 +202,7 @@ def walk_with_depth(root: Path, max_depth: int) -> Iterable[Path]:
 
 
 def discover_balance_candidates(explicit_csv: str, extra_roots: List[str], max_depth: int) -> List[Path]:
-    out: List[Path] = []
+    scored: List[Tuple[int, float, Path]] = []
     if explicit_csv:
         p = Path(explicit_csv)
         if p.exists() and p.is_file():
@@ -233,9 +233,20 @@ def discover_balance_candidates(explicit_csv: str, extra_roots: List[str], max_d
             if rr in seen:
                 continue
             seen.add(rr)
-            out.append(f.resolve())
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
+            pf = f.resolve()
+            name = pf.name.lower()
+            score = 0
+            # prioriza fonte "real" de balance em relacao a artefatos temporarios gerados por este script
+            if "balance" in name:
+                score += 50
+            if "accounting" in str(pf).lower():
+                score += 20
+            if "ledger_norm_" in name:
+                score -= 40
+            scored.append((score, pf.stat().st_mtime, pf))
+
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [p for _, __, p in scored]
 
 
 def sniff_reader(path: Path) -> csv.DictReader:
