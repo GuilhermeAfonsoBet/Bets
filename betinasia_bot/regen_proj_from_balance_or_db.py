@@ -49,6 +49,12 @@ ORDER_COL_CANDIDATES = [
     "order",
     "id_order",
     "external_order_id",
+    "provider_order_id",
+    "exchange_order_id",
+    "book_order_id",
+    "ticket_id",
+    "ticket",
+    "external_id",
     "bet_id",
 ]
 CSV_VALUE_COL_CANDIDATES = [
@@ -375,9 +381,7 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
     colnames = list(cols.keys())
     q_table = f"{quote_ident(schema)}.{quote_ident('betslip_audit_results')}"
 
-    order_col = pick_existing(colnames, ["order_id"])
-    if not order_col:
-        raise RuntimeError("betslip_audit_results sem coluna order_id.")
+    order_col = pick_existing(colnames, ORDER_COL_CANDIDATES)
     audit_col = pick_existing(colnames, ["audit_id", "id"]) or "audit_id"
     event_col = pick_existing(colnames, ["event_id", "match_id", "fixture_id", "game_id"])
     league_col = pick_existing(colnames, ["league", "league_name", "competition", "tournament"])
@@ -399,7 +403,10 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
                 f"NULLIF(({q_json} #>> '{{value_sizing,exposure}}')::double precision,0)",
             ]
         )
-    stake_expr = f"COALESCE({', '.join(stake_terms)}, 0.0)"
+    if stake_terms:
+        stake_expr = f"COALESCE({', '.join(stake_terms)}, 0.0)"
+    else:
+        stake_expr = "0.0::double precision"
 
     if slip_col:
         slip_expr = f"{quote_ident(slip_col)}::double precision"
@@ -414,7 +421,41 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
             return f"{quote_ident(c)}::{cast} AS {quote_ident(alias)}"
         return f"NULL::{cast} AS {quote_ident(alias)}"
 
-    where_parts = [f"{quote_ident(order_col)} IS NOT NULL", f"{stake_expr} > 0"]
+    def order_expr() -> str:
+        if order_col:
+            return f"NULLIF({quote_ident(order_col)}::text, '')"
+        terms: List[str] = []
+        if json_col:
+            qj = quote_ident(json_col)
+            # caminhos comuns + busca recursiva por chave
+            terms.extend(
+                [
+                    f"NULLIF({qj} #>> '{{order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{order,id}}', '')",
+                    f"NULLIF({qj} #>> '{{execution,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{execution,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{bridge,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{bridge,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{bet,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{bet,orderId}}', '')",
+                    f"NULLIF(jsonb_path_query_first({qj}, '$.**.order_id') #>> '{{}}', '')",
+                    f"NULLIF(jsonb_path_query_first({qj}, '$.**.orderId') #>> '{{}}', '')",
+                ]
+            )
+        if audit_col:
+            # fallback extremo: usa audit_id como chave de ordem
+            terms.append(f"NULLIF({quote_ident(audit_col)}::text, '')")
+        if not terms:
+            raise RuntimeError(
+                "Nao consegui montar chave de order para betslip_audit_results "
+                "(sem coluna order e sem hypothesis_details/audit_id)."
+            )
+        return f"COALESCE({', '.join(terms)})"
+
+    order_expr_sql = order_expr()
+
+    where_parts = [f"{order_expr_sql} IS NOT NULL", f"{stake_expr} > 0"]
     if status_col:
         where_parts.append(f"UPPER({quote_ident(status_col)}::text)='OK'")
     where_sql = " AND ".join(where_parts)
@@ -422,7 +463,7 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
     sql = f"""
     SELECT
       {col_or_null(audit_col, 'audit_id')},
-      {quote_ident(order_col)}::text AS "order_id",
+      {order_expr_sql} AS "order_id",
       {stake_expr} AS "stake_real",
       {col_or_null(event_col, 'event_id')},
       {col_or_null(league_col, 'league')},
