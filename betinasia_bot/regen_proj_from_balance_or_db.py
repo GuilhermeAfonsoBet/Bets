@@ -427,6 +427,7 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
         terms: List[str] = []
         if json_col:
             qj = quote_ident(json_col)
+            qj_b = f"({qj})::jsonb"
             # caminhos comuns + busca recursiva por chave
             terms.extend(
                 [
@@ -439,8 +440,8 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
                     f"NULLIF({qj} #>> '{{bridge,orderId}}', '')",
                     f"NULLIF({qj} #>> '{{bet,order_id}}', '')",
                     f"NULLIF({qj} #>> '{{bet,orderId}}', '')",
-                    f"NULLIF(jsonb_path_query_first({qj}, '$.**.order_id') #>> '{{}}', '')",
-                    f"NULLIF(jsonb_path_query_first({qj}, '$.**.orderId') #>> '{{}}', '')",
+                    f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.order_id') #>> '{{}}', '')",
+                    f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.orderId') #>> '{{}}', '')",
                 ]
             )
         if audit_col:
