@@ -102,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Se 1, copia a saida principal para /tmp/projecao_por_aposta.csv",
     )
+    p.add_argument(
+        "--allow-auditid-fallback",
+        type=int,
+        default=0,
+        help="Se 1, permite usar audit_id como fallback de order_id na auditoria.",
+    )
     return p.parse_args()
 
 
@@ -376,7 +382,7 @@ def normalize_ledger_from_db(db_url: str, out_csv: Path) -> Tuple[str, int]:
     return table, count
 
 
-def export_audit_csv(db_url: str, out_csv: Path) -> None:
+def export_audit_csv(db_url: str, out_csv: Path, *, allow_auditid_fallback: bool = False) -> None:
     schema, cols = list_table_columns(db_url, "betslip_audit_results")
     colnames = list(cols.keys())
     q_table = f"{quote_ident(schema)}.{quote_ident('betslip_audit_results')}"
@@ -440,11 +446,21 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
                     f"NULLIF({qj} #>> '{{bridge,orderId}}', '')",
                     f"NULLIF({qj} #>> '{{bet,order_id}}', '')",
                     f"NULLIF({qj} #>> '{{bet,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{order id}}', '')",
+                    f"NULLIF({qj} #>> '{{value_sizing,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{value_sizing,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{execution_result,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{execution_result,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{provider,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{provider,orderId}}', '')",
+                    f"NULLIF({qj} #>> '{{metadata,order_id}}', '')",
+                    f"NULLIF({qj} #>> '{{metadata,orderId}}', '')",
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.order_id') #>> '{{}}', '')",
                     f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.orderId') #>> '{{}}', '')",
+                    f"NULLIF(jsonb_path_query_first({qj_b}, '$.**.\"order id\"') #>> '{{}}', '')",
                 ]
             )
-        if audit_col:
+        if allow_auditid_fallback and audit_col:
             # fallback extremo: usa audit_id como chave de ordem
             terms.append(f"NULLIF({quote_ident(audit_col)}::text, '')")
         if not terms:
@@ -478,43 +494,132 @@ def export_audit_csv(db_url: str, out_csv: Path) -> None:
     psql_copy_csv(db_url, sql, out_csv)
 
 
-def join_audit_and_ledger(audit_csv: Path, ledger_csv: Path, out_csv: Path, out_enriched_csv: Path) -> Tuple[int, float, float]:
-    pnl_by_oid: Dict[str, float] = {}
+def _key_norm_compact(v: str) -> str:
+    return _norm(v)
+
+
+def _key_norm_digits(v: str) -> str:
+    return "".join(ch for ch in str(v) if ch.isdigit())
+
+
+def _build_unique_map(
+    rows: Iterable[Dict[str, object]],
+    key_fn,
+    *,
+    id_field: str,
+) -> Dict[str, Dict[str, object]]:
+    out: Dict[str, Dict[str, object]] = {}
+    dup = set()
+    for r in rows:
+        k = key_fn(str(r.get(id_field, "")).strip())
+        if not k:
+            continue
+        if k in out:
+            # chave ambigua -> descarta para evitar match errado
+            dup.add(k)
+            continue
+        out[k] = r
+    for k in dup:
+        out.pop(k, None)
+    return out
+
+
+def join_audit_and_ledger(
+    audit_csv: Path,
+    ledger_csv: Path,
+    out_csv: Path,
+    out_enriched_csv: Path,
+) -> Tuple[int, float, float]:
+    pnl_by_oid: Dict[str, float] = defaultdict(float)
     with ledger_csv.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         for row in rd:
             oid = str(row.get("order_id", "")).strip()
             pnl = parse_float(row.get("pnl_real"))
             if oid and pnl is not None:
-                pnl_by_oid[oid] = pnl
+                pnl_by_oid[oid] += pnl
 
-    rows = []
+    ledger_rows = [{"order_id": oid, "pnl_real": pnl} for oid, pnl in pnl_by_oid.items()]
+
+    audit_rows = []
     with audit_csv.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         for row in rd:
-            oid = str(row.get("order_id", "")).strip()
-            if oid not in pnl_by_oid:
-                continue
-            st = parse_float(row.get("stake_real"))
-            if st is None or st <= 0:
-                continue
-            pnl = pnl_by_oid[oid]
-            roi = 100.0 * pnl / st
-            rows.append(
-                {
-                    "audit_id": str(row.get("audit_id", "")).strip(),
-                    "order_id": oid,
-                    "stake_real": f"{st:.10f}",
-                    "pnl_real": f"{pnl:.10f}",
-                    "roi_real_pct": f"{roi:.10f}",
-                    "event_id": str(row.get("event_id", "")).strip(),
-                    "league": str(row.get("league", "")).strip(),
-                    "audited_at": str(row.get("audited_at", "")).strip(),
-                    "side": str(row.get("side", "")).strip(),
-                    "regime": str(row.get("regime", "")).strip(),
-                    "slippage_pre_pct": str(row.get("slippage_pre_pct", "")).strip(),
-                }
-            )
+            audit_rows.append(dict(row))
+
+    strategies = {
+        "raw": lambda s: str(s).strip(),
+        "compact": _key_norm_compact,
+        "digits": _key_norm_digits,
+    }
+
+    best_name = ""
+    best_matches = -1
+    best_audit_map: Dict[str, Dict[str, object]] = {}
+    best_ledger_map: Dict[str, Dict[str, object]] = {}
+    for name, fn in strategies.items():
+        a_map = _build_unique_map(audit_rows, fn, id_field="order_id")
+        l_map = _build_unique_map(ledger_rows, fn, id_field="order_id")
+        n_match = sum(1 for k in a_map.keys() if k in l_map)
+        if n_match > best_matches:
+            best_matches = n_match
+            best_name = name
+            best_audit_map = a_map
+            best_ledger_map = l_map
+
+    rows = []
+    for k, row in best_audit_map.items():
+        led = best_ledger_map.get(k)
+        if not led:
+            continue
+        oid = str(row.get("order_id", "")).strip()
+        pnl = float(led["pnl_real"])
+        st = parse_float(row.get("stake_real"))
+        if st is None or st <= 0:
+            continue
+        roi = 100.0 * pnl / st
+        rows.append(
+            {
+                "audit_id": str(row.get("audit_id", "")).strip(),
+                "order_id": oid,
+                "stake_real": f"{st:.10f}",
+                "pnl_real": f"{pnl:.10f}",
+                "roi_real_pct": f"{roi:.10f}",
+                "event_id": str(row.get("event_id", "")).strip(),
+                "league": str(row.get("league", "")).strip(),
+                "audited_at": str(row.get("audited_at", "")).strip(),
+                "side": str(row.get("side", "")).strip(),
+                "regime": str(row.get("regime", "")).strip(),
+                "slippage_pre_pct": str(row.get("slippage_pre_pct", "")).strip(),
+            }
+        )
+
+    if best_name != "raw":
+        print(f"[WARN] join por normalizacao de chave: strategy={best_name}, matched_keys={best_matches}")
+
+    if not rows:
+        a_samp = [str(r.get("order_id", "")).strip() for r in audit_rows[:5]]
+        l_samp = [str(r.get("order_id", "")).strip() for r in ledger_rows[:5]]
+        m_raw = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["raw"], id_field="order_id").keys()
+            if k in _build_unique_map(ledger_rows, strategies["raw"], id_field="order_id")
+        )
+        m_compact = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["compact"], id_field="order_id").keys()
+            if k in _build_unique_map(ledger_rows, strategies["compact"], id_field="order_id")
+        )
+        m_digits = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["digits"], id_field="order_id").keys()
+            if k in _build_unique_map(ledger_rows, strategies["digits"], id_field="order_id")
+        )
+        raise RuntimeError(
+            "Join auditoria x ledger gerou 0 linhas. "
+            f"matches(raw/compact/digits)=({m_raw}/{m_compact}/{m_digits}). "
+            f"sample_audit={a_samp} sample_ledger={l_samp}"
+        )
 
     headers = [
         "audit_id",
@@ -585,7 +690,7 @@ def main() -> int:
         used_db_fallback = True
         print(f"[OK] ledger DB fallback: {table} (n={n})")
 
-    export_audit_csv(db, audit_csv)
+    export_audit_csv(db, audit_csv, allow_auditid_fallback=bool(int(args.allow_auditid_fallback)))
     print(f"[OK] auditoria exportada: {audit_csv}")
 
     nrows, ts_min, ts_max = join_audit_and_ledger(audit_csv, ledger_norm, out, out_enr)
