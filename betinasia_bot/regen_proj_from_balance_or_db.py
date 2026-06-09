@@ -897,12 +897,17 @@ def join_audit_and_ledger(
 
     ledger_rows = [{"order_id": oid, "pnl_real": pnl} for oid, pnl in pnl_by_oid.items()]
     ledger_audit_rows = [{"audit_id": aid, "pnl_real": pnl} for aid, pnl in pnl_by_aid.items()]
+    print(
+        f"[INFO] ledger normalizado: "
+        f"order_keys={len(ledger_rows)} audit_keys={len(ledger_audit_rows)}"
+    )
 
     audit_rows = []
     with audit_csv.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         for row in rd:
             audit_rows.append(dict(row))
+    print(f"[INFO] auditoria carregada para join: rows={len(audit_rows)}")
 
     if audit_order_map_csv and audit_order_map_csv.exists():
         map_rows = []
@@ -947,6 +952,7 @@ def join_audit_and_ledger(
             best_name = name
             best_audit_map = a_map
             best_ledger_map = l_map
+    print(f"[INFO] melhor estrategia por order_id: {best_name} matches={best_matches}")
 
     best_aid_name = ""
     best_aid_matches = -1
@@ -961,11 +967,12 @@ def join_audit_and_ledger(
             best_aid_name = name
             best_aid_audit_map = a_map
             best_aid_ledger_map = l_map
+    print(f"[INFO] melhor estrategia por audit_id: {best_aid_name} matches={best_aid_matches}")
 
     rows = []
     matched_by_order = 0
     matched_by_audit = 0
-    for row in audit_rows:
+    for i, row in enumerate(audit_rows, start=1):
         st = parse_float(row.get("stake_real"))
         if st is None or st <= 0:
             continue
@@ -1004,6 +1011,11 @@ def join_audit_and_ledger(
                 "slippage_pre_pct": str(row.get("slippage_pre_pct", "")).strip(),
             }
         )
+        if i % 50000 == 0:
+            print(
+                f"[INFO] join progresso: processadas={i}/{len(audit_rows)} "
+                f"matched_rows={len(rows)} (order={matched_by_order}, audit={matched_by_audit})"
+            )
 
     if best_name != "raw":
         print(f"[WARN] join por normalizacao de chave: strategy={best_name}, matched_keys={best_matches}")
