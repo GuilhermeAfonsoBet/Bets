@@ -46,13 +46,19 @@ TYPE_COL_CANDIDATES = [
 ORDER_COL_CANDIDATES = [
     "order_id",
     "orderid",
+    "order id",
+    "order_no",
+    "orderno",
+    "order_number",
     "order",
     "id_order",
     "external_order_id",
+    "reference_order_id",
     "provider_order_id",
     "exchange_order_id",
     "book_order_id",
     "ticket_id",
+    "ticket_no",
     "ticket",
     "external_id",
     "bet_id",
@@ -67,6 +73,11 @@ AUDIT_REF_COL_CANDIDATES = [
     "betslip_audit_result_id",
     "betslipauditresultid",
     "id_audit",
+    "reference_id",
+    "referenceid",
+    "ref_id",
+    "transaction_id",
+    "transactionid",
 ]
 CSV_VALUE_COL_CANDIDATES = [
     "amount",
@@ -90,6 +101,14 @@ NUMERIC_TYPES = {
     "decimal",
 }
 TEXT_TYPES = {"text", "character varying", "character"}
+ORDER_HINT_PATTERNS = [
+    re.compile(r"(?i)\border[_\s-]?id\b\D{0,20}([A-Za-z0-9._:-]{3,})"),
+    re.compile(r"(?i)\b(?:ticket|bet)[_\s-]?id\b\D{0,20}([A-Za-z0-9._:-]{3,})"),
+]
+AUDIT_HINT_PATTERNS = [
+    re.compile(r"(?i)\baudit[_\s-]?id\b\D{0,20}([0-9]{2,})"),
+    re.compile(r"(?i)\bbetslip[_\s-]?audit[_\s-]?(?:result[_\s-]?)?id\b\D{0,20}([0-9]{2,})"),
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +164,79 @@ def parse_float(v: object) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+
+
+def first_nonempty(values: Iterable[object]) -> Optional[str]:
+    for v in values:
+        s = str(v or "").strip()
+        if s:
+            return s
+    return None
+
+
+def extract_with_patterns(text: str, patterns: Sequence[re.Pattern]) -> Optional[str]:
+    if not text:
+        return None
+    for rx in patterns:
+        m = rx.search(text)
+        if m:
+            val = str(m.group(1) or "").strip()
+            if val:
+                return val
+    return None
+
+
+def infer_order_audit_from_row(
+    row: Dict[str, object],
+    *,
+    order_col: Optional[str],
+    audit_col: Optional[str],
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    oid = first_nonempty([row.get(order_col)]) if order_col else None
+    aid = first_nonempty([row.get(audit_col)]) if audit_col else None
+    inferred_order = False
+    inferred_audit = False
+
+    if oid and aid:
+        return oid, aid, inferred_order, inferred_audit
+
+    items = [(str(k), str(v or "").strip()) for k, v in row.items()]
+
+    # 1) tenta por nomes de coluna com semantica explicita
+    if not oid:
+        for k, v in items:
+            if not v:
+                continue
+            kn = _norm(k)
+            if "order" in kn and ("id" in kn or "ticket" in kn or "bet" in kn):
+                oid = extract_with_patterns(v, ORDER_HINT_PATTERNS) or v
+                inferred_order = True
+                break
+    if not aid:
+        for k, v in items:
+            if not v:
+                continue
+            kn = _norm(k)
+            if ("audit" in kn and "id" in kn) or ("reference" in kn and "id" in kn) or kn in {"id"}:
+                aid = extract_with_patterns(v, AUDIT_HINT_PATTERNS)
+                if aid:
+                    inferred_audit = True
+                    break
+
+    # 2) tenta por regex no blob completo da linha
+    blob = " | ".join(f"{k}={v}" for k, v in items if v)
+    if not oid:
+        x = extract_with_patterns(blob, ORDER_HINT_PATTERNS)
+        if x:
+            oid = x
+            inferred_order = True
+    if not aid:
+        x = extract_with_patterns(blob, AUDIT_HINT_PATTERNS)
+        if x:
+            aid = x
+            inferred_audit = True
+
+    return oid, aid, inferred_order, inferred_audit
 
 
 def run_cmd(args: Sequence[str]) -> str:
@@ -250,11 +342,13 @@ def pick_auditref_column(columns: Iterable[str]) -> Optional[str]:
     best_score = -1
     for c in columns:
         n = _norm(c)
-        if "audit" not in n:
+        if ("audit" not in n) and ("reference" not in n) and ("ref" not in n):
             continue
         score = 10
         if "id" in n:
             score += 10
+        if "reference" in n or n.startswith("ref"):
+            score += 4
         if score > best_score:
             best_score = score
             best = c
@@ -361,6 +455,8 @@ def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> Tuple[int, int]:
 
     agg_order: Dict[str, float] = defaultdict(float)
     agg_audit: Dict[str, float] = defaultdict(float)
+    inferred_order_rows = 0
+    inferred_audit_rows = 0
     for row in rd:
         if type_col:
             tx = str(row.get(type_col, "")).strip().lower()
@@ -369,14 +465,19 @@ def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> Tuple[int, int]:
         pnl = parse_float(row.get(pnl_col))
         if pnl is None:
             continue
-        if order_col:
-            oid = str(row.get(order_col, "")).strip()
-            if oid:
-                agg_order[oid] += pnl
-        if audit_col:
-            aid = str(row.get(audit_col, "")).strip()
-            if aid:
-                agg_audit[aid] += pnl
+        oid, aid, i_order, i_audit = infer_order_audit_from_row(
+            row,
+            order_col=order_col,
+            audit_col=audit_col,
+        )
+        if i_order:
+            inferred_order_rows += 1
+        if i_audit:
+            inferred_audit_rows += 1
+        if oid:
+            agg_order[oid] += pnl
+        if aid:
+            agg_audit[aid] += pnl
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8") as f:
@@ -386,6 +487,11 @@ def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> Tuple[int, int]:
             wr.writerow([oid, "", f"{pnl:.10f}"])
         for aid, pnl in agg_audit.items():
             wr.writerow(["", aid, f"{pnl:.10f}"])
+    if inferred_order_rows > 0 or inferred_audit_rows > 0:
+        print(
+            f"[DIAG] inferencia ids no ledger CSV: "
+            f"inferred_order_rows={inferred_order_rows}, inferred_audit_rows={inferred_audit_rows}"
+        )
     return len(agg_order), len(agg_audit)
 
 
