@@ -328,36 +328,40 @@ def sniff_reader(path: Path) -> csv.DictReader:
     return csv.DictReader(lines, dialect=dialect)
 
 
-def choose_csv_ledger_columns(path: Path) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def choose_csv_ledger_columns(path: Path) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     try:
         rd = sniff_reader(path)
     except Exception:
-        return None, None, None
+        return None, None, None, None
     fields = list(rd.fieldnames or [])
     if not fields:
-        return None, None, None
-    order_col = pick_existing(fields, ORDER_COL_CANDIDATES)
+        return None, None, None, None
+    order_col = pick_existing(fields, ORDER_COL_CANDIDATES) or pick_orderish_column(fields)
     pnl_col = pick_existing(fields, CSV_VALUE_COL_CANDIDATES)
     type_col = pick_existing(fields, TYPE_COL_CANDIDATES)
-    return order_col, pnl_col, type_col
+    audit_col = pick_existing(fields, AUDIT_REF_COL_CANDIDATES) or pick_auditref_column(fields)
+    if not audit_col and "id" in fields and "id" != order_col:
+        audit_col = "id"
+    return order_col, pnl_col, type_col, audit_col
 
 
-def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> int:
+def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> Tuple[int, int]:
     rd = sniff_reader(in_csv)
     fields = list(rd.fieldnames or [])
-    order_col = pick_existing(fields, ORDER_COL_CANDIDATES)
+    order_col = pick_existing(fields, ORDER_COL_CANDIDATES) or pick_orderish_column(fields)
     pnl_col = pick_existing(fields, CSV_VALUE_COL_CANDIDATES)
     type_col = pick_existing(fields, TYPE_COL_CANDIDATES)
-    if not order_col or not pnl_col:
+    audit_col = pick_existing(fields, AUDIT_REF_COL_CANDIDATES) or pick_auditref_column(fields)
+    if not audit_col and "id" in fields and "id" != order_col:
+        audit_col = "id"
+    if not pnl_col:
         raise RuntimeError(
-            f"CSV {in_csv} nao parece ledger valido. order_col={order_col}, value_col={pnl_col}"
+            f"CSV {in_csv} nao parece ledger valido. value_col={pnl_col}"
         )
 
-    agg: Dict[str, float] = defaultdict(float)
+    agg_order: Dict[str, float] = defaultdict(float)
+    agg_audit: Dict[str, float] = defaultdict(float)
     for row in rd:
-        oid = str(row.get(order_col, "")).strip()
-        if not oid:
-            continue
         if type_col:
             tx = str(row.get(type_col, "")).strip().lower()
             if tx and EXCLUDE_TX_PAT.search(tx):
@@ -365,18 +369,27 @@ def normalize_ledger_from_csv(in_csv: Path, out_csv: Path) -> int:
         pnl = parse_float(row.get(pnl_col))
         if pnl is None:
             continue
-        agg[oid] += pnl
+        if order_col:
+            oid = str(row.get(order_col, "")).strip()
+            if oid:
+                agg_order[oid] += pnl
+        if audit_col:
+            aid = str(row.get(audit_col, "")).strip()
+            if aid:
+                agg_audit[aid] += pnl
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
-        wr.writerow(["order_id", "pnl_real"])
-        for oid, pnl in agg.items():
-            wr.writerow([oid, f"{pnl:.10f}"])
-    return len(agg)
+        wr.writerow(["order_id", "audit_id", "pnl_real"])
+        for oid, pnl in agg_order.items():
+            wr.writerow([oid, "", f"{pnl:.10f}"])
+        for aid, pnl in agg_audit.items():
+            wr.writerow(["", aid, f"{pnl:.10f}"])
+    return len(agg_order), len(agg_audit)
 
 
-def discover_ledger_table(db_url: str) -> Tuple[str, str, Optional[str]]:
+def discover_ledger_table(db_url: str) -> Tuple[str, str, str, Optional[str], Optional[str]]:
     sql = """
     SELECT table_schema, table_name, column_name, data_type
     FROM information_schema.columns
@@ -392,10 +405,10 @@ def discover_ledger_table(db_url: str) -> Tuple[str, str, Optional[str]]:
         sc, tb, col, typ = parts
         tbl_cols[(sc, tb)][col] = typ
 
-    scored: List[Tuple[int, str, str, str, Optional[str]]] = []
+    scored: List[Tuple[int, str, str, str, str, Optional[str], Optional[str]]] = []
     for (sc, tb), cols in tbl_cols.items():
         colnames = list(cols.keys())
-        order_col = pick_existing(colnames, ORDER_COL_CANDIDATES)
+        order_col = pick_existing(colnames, ORDER_COL_CANDIDATES) or pick_orderish_column(colnames)
         if not order_col:
             continue
         value_col = None
@@ -414,6 +427,7 @@ def discover_ledger_table(db_url: str) -> Tuple[str, str, Optional[str]]:
         if not value_col:
             continue
         type_col = pick_existing(colnames, TYPE_COL_CANDIDATES)
+        audit_col = pick_existing(colnames, AUDIT_REF_COL_CANDIDATES) or pick_auditref_column(colnames)
         score = 0
         n = tb.lower()
         if "ledger" in n:
@@ -424,21 +438,22 @@ def discover_ledger_table(db_url: str) -> Tuple[str, str, Optional[str]]:
             score += 20
         if sc == "public":
             score += 10
-        scored.append((score, sc, tb, value_col, type_col))
+        scored.append((score, sc, tb, order_col, value_col, type_col, audit_col))
 
     if not scored:
         raise RuntimeError("Nao encontrei tabela de ledger no DB com (order_id + coluna numerica de valor).")
     scored.sort(reverse=True)
-    _, sc, tb, val_col, type_col = scored[0]
-    return f"{sc}.{tb}", val_col, type_col
+    _, sc, tb, ord_col, val_col, type_col, audit_col = scored[0]
+    return f"{sc}.{tb}", ord_col, val_col, type_col, audit_col
 
 
 def normalize_ledger_from_db(db_url: str, out_csv: Path) -> Tuple[str, int]:
-    table, value_col, type_col = discover_ledger_table(db_url)
+    table, order_col, value_col, type_col, audit_col = discover_ledger_table(db_url)
     schema, tb = table.split(".", 1)
     q_table = f"{quote_ident(schema)}.{quote_ident(tb)}"
-    q_oid = quote_ident("order_id")
+    q_oid = quote_ident(order_col)
     q_val = quote_ident(value_col)
+    aid_expr = f"{quote_ident(audit_col)}::text" if audit_col else "NULL::text"
 
     where_parts = [f"{q_oid} IS NOT NULL"]
     if type_col:
@@ -451,10 +466,11 @@ def normalize_ledger_from_db(db_url: str, out_csv: Path) -> Tuple[str, int]:
     sql = f"""
     SELECT
       {q_oid}::text AS order_id,
+      {aid_expr} AS audit_id,
       SUM(COALESCE({q_val}::double precision,0)) AS pnl_real
     FROM {q_table}
     WHERE {where_sql}
-    GROUP BY 1
+    GROUP BY 1,2
     """
     psql_copy_csv(db_url, sql, out_csv)
     count = 0
@@ -759,15 +775,22 @@ def join_audit_and_ledger(
     audit_order_map_csv: Optional[Path] = None,
 ) -> Tuple[int, float, float]:
     pnl_by_oid: Dict[str, float] = defaultdict(float)
+    pnl_by_aid: Dict[str, float] = defaultdict(float)
     with ledger_csv.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         for row in rd:
             oid = str(row.get("order_id", "")).strip()
+            aid = str(row.get("audit_id", "")).strip()
             pnl = parse_float(row.get("pnl_real"))
-            if oid and pnl is not None:
+            if pnl is None:
+                continue
+            if oid:
                 pnl_by_oid[oid] += pnl
+            if aid:
+                pnl_by_aid[aid] += pnl
 
     ledger_rows = [{"order_id": oid, "pnl_real": pnl} for oid, pnl in pnl_by_oid.items()]
+    ledger_audit_rows = [{"audit_id": aid, "pnl_real": pnl} for aid, pnl in pnl_by_aid.items()]
 
     audit_rows = []
     with audit_csv.open("r", encoding="utf-8", newline="") as f:
@@ -819,15 +842,45 @@ def join_audit_and_ledger(
             best_audit_map = a_map
             best_ledger_map = l_map
 
+    best_aid_name = ""
+    best_aid_matches = -1
+    best_aid_audit_map: Dict[str, Dict[str, object]] = {}
+    best_aid_ledger_map: Dict[str, Dict[str, object]] = {}
+    for name, fn in strategies.items():
+        a_map = _build_unique_map(audit_rows, fn, id_field="audit_id")
+        l_map = _build_unique_map(ledger_audit_rows, fn, id_field="audit_id")
+        n_match = sum(1 for k in a_map.keys() if k in l_map)
+        if n_match > best_aid_matches:
+            best_aid_matches = n_match
+            best_aid_name = name
+            best_aid_audit_map = a_map
+            best_aid_ledger_map = l_map
+
     rows = []
-    for k, row in best_audit_map.items():
-        led = best_ledger_map.get(k)
-        if not led:
-            continue
-        oid = str(row.get("order_id", "")).strip()
-        pnl = float(led["pnl_real"])
+    matched_by_order = 0
+    matched_by_audit = 0
+    for row in audit_rows:
         st = parse_float(row.get("stake_real"))
         if st is None or st <= 0:
+            continue
+
+        pnl = None
+        oid = str(row.get("order_id", "")).strip()
+        if oid:
+            ok = strategies.get(best_name, lambda s: str(s).strip())(oid)
+            led = best_ledger_map.get(ok)
+            if led:
+                pnl = float(led["pnl_real"])
+                matched_by_order += 1
+        if pnl is None:
+            aid = str(row.get("audit_id", "")).strip()
+            if aid:
+                ak = strategies.get(best_aid_name, lambda s: str(s).strip())(aid)
+                led = best_aid_ledger_map.get(ak)
+                if led:
+                    pnl = float(led["pnl_real"])
+                    matched_by_audit += 1
+        if pnl is None:
             continue
         roi = 100.0 * pnl / st
         rows.append(
@@ -848,10 +901,18 @@ def join_audit_and_ledger(
 
     if best_name != "raw":
         print(f"[WARN] join por normalizacao de chave: strategy={best_name}, matched_keys={best_matches}")
+    if best_aid_name and best_aid_name != "raw":
+        print(f"[WARN] join(audit_id) por normalizacao: strategy={best_aid_name}, matched_keys={best_aid_matches}")
+    if matched_by_audit > 0:
+        print(f"[OK] join via audit_id: {matched_by_audit} linhas")
+    if matched_by_order > 0:
+        print(f"[OK] join via order_id: {matched_by_order} linhas")
 
     if not rows:
         a_samp = [str(r.get("order_id", "")).strip() for r in audit_rows[:5]]
+        a_aid_samp = [str(r.get("audit_id", "")).strip() for r in audit_rows[:5]]
         l_samp = [str(r.get("order_id", "")).strip() for r in ledger_rows[:5]]
+        l_aid_samp = [str(r.get("audit_id", "")).strip() for r in ledger_audit_rows[:5]]
         m_raw = sum(
             1
             for k in _build_unique_map(audit_rows, strategies["raw"], id_field="order_id").keys()
@@ -867,10 +928,27 @@ def join_audit_and_ledger(
             for k in _build_unique_map(audit_rows, strategies["digits"], id_field="order_id").keys()
             if k in _build_unique_map(ledger_rows, strategies["digits"], id_field="order_id")
         )
+        am_raw = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["raw"], id_field="audit_id").keys()
+            if k in _build_unique_map(ledger_audit_rows, strategies["raw"], id_field="audit_id")
+        )
+        am_compact = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["compact"], id_field="audit_id").keys()
+            if k in _build_unique_map(ledger_audit_rows, strategies["compact"], id_field="audit_id")
+        )
+        am_digits = sum(
+            1
+            for k in _build_unique_map(audit_rows, strategies["digits"], id_field="audit_id").keys()
+            if k in _build_unique_map(ledger_audit_rows, strategies["digits"], id_field="audit_id")
+        )
         raise RuntimeError(
             "Join auditoria x ledger gerou 0 linhas. "
             f"matches(raw/compact/digits)=({m_raw}/{m_compact}/{m_digits}). "
-            f"sample_audit={a_samp} sample_ledger={l_samp}"
+            f"matches_auditid(raw/compact/digits)=({am_raw}/{am_compact}/{am_digits}). "
+            f"sample_audit_order={a_samp} sample_ledger_order={l_samp} "
+            f"sample_audit_id={a_aid_samp} sample_ledger_audit_id={l_aid_samp}"
         )
 
     headers = [
@@ -925,16 +1003,21 @@ def main() -> int:
     if try_csv_first:
         cands = discover_balance_candidates(args.balance_csv, args.search_root, args.max_depth)
         for cand in cands:
-            order_col, value_col, _ = choose_csv_ledger_columns(cand)
-            if not order_col or not value_col:
+            order_col, value_col, _, audit_ref_col = choose_csv_ledger_columns(cand)
+            if not value_col:
                 continue
             try:
-                n = normalize_ledger_from_csv(cand, ledger_norm)
+                n_order, n_auditref = normalize_ledger_from_csv(cand, ledger_norm)
             except Exception:
                 continue
-            if n > 0:
+            n_total = int(n_order) + int(n_auditref)
+            if n_total > 0:
                 ledger_source = str(cand)
-                print(f"[OK] ledger CSV: {cand} (order_col={order_col}, value_col={value_col}, n={n})")
+                print(
+                    f"[OK] ledger CSV: {cand} "
+                    f"(order_col={order_col}, audit_ref_col={audit_ref_col}, value_col={value_col}, "
+                    f"n_order={n_order}, n_audit_ref={n_auditref})"
+                )
                 break
 
     if not ledger_source:
