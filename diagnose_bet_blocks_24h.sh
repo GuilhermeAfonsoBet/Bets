@@ -155,13 +155,51 @@ PY
 if [[ -n "$ACTIVE_LEAGUES_SQL" ]]; then
   echo ">>> 3.1) Cobertura dos OK vs ligas ativas na policy"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
-  WITH active AS (
-    SELECT lower(trim(x)) AS league
+  WITH canon AS (
+    SELECT
+      x,
+      trim(regexp_replace(
+        lower(
+          translate(
+            coalesce(x,''),
+            'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+            'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+          )
+        ),
+        '[^a-z0-9 ]+',' ','g'
+      )) AS n
     FROM unnest(ARRAY[$ACTIVE_LEAGUES_SQL]::text[]) AS t(x)
   ),
+  active AS (
+    SELECT
+      CASE
+        WHEN n IN ('fifa world cup','world cup','copa do mundo') THEN 'fifa world cup'
+        WHEN n IN ('fifa club world cup','club world cup','mundial de clubes') THEN 'fifa club world cup'
+        ELSE n
+      END AS league
+    FROM canon
+    WHERE n <> ''
+  ),
   src AS (
-    SELECT lower(trim(COALESCE(league,''))) AS league
+    SELECT
+      CASE
+        WHEN n IN ('fifa world cup','world cup','copa do mundo') THEN 'fifa world cup'
+        WHEN n IN ('fifa club world cup','club world cup','mundial de clubes') THEN 'fifa club world cup'
+        ELSE n
+      END AS league
     FROM betslip_audit_results
+    CROSS JOIN LATERAL (
+      SELECT trim(regexp_replace(
+        lower(
+          translate(
+            COALESCE(league,''),
+            'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+            'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+          )
+        ),
+        '[^a-z0-9 ]+',' ','g'
+      )) AS n
+    ) z
     WHERE audited_at >= now() - interval '${LOOKBACK_HOURS} hours'
       AND UPPER(COALESCE(status,'')) = 'OK'
   )
@@ -176,14 +214,51 @@ if [[ -n "$ACTIVE_LEAGUES_SQL" ]]; then
 
   echo ">>> 3.2) Top ligas OK fora da policy ativa"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
-  WITH active AS (
-    SELECT lower(trim(x)) AS league
+  WITH canon AS (
+    SELECT
+      x,
+      trim(regexp_replace(
+        lower(
+          translate(
+            coalesce(x,''),
+            'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+            'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+          )
+        ),
+        '[^a-z0-9 ]+',' ','g'
+      )) AS n
     FROM unnest(ARRAY[$ACTIVE_LEAGUES_SQL]::text[]) AS t(x)
+  ),
+  active AS (
+    SELECT
+      CASE
+        WHEN n IN ('fifa world cup','world cup','copa do mundo') THEN 'fifa world cup'
+        WHEN n IN ('fifa club world cup','club world cup','mundial de clubes') THEN 'fifa club world cup'
+        ELSE n
+      END AS league
+    FROM canon
+    WHERE n <> ''
   ),
   src AS (
     SELECT COALESCE(NULLIF(league,''), '<sem_liga>') AS league_raw,
-           lower(trim(COALESCE(league,''))) AS league_norm
+           CASE
+             WHEN n IN ('fifa world cup','world cup','copa do mundo') THEN 'fifa world cup'
+             WHEN n IN ('fifa club world cup','club world cup','mundial de clubes') THEN 'fifa club world cup'
+             ELSE n
+           END AS league_norm
     FROM betslip_audit_results
+    CROSS JOIN LATERAL (
+      SELECT trim(regexp_replace(
+        lower(
+          translate(
+            COALESCE(league,''),
+            'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+            'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+          )
+        ),
+        '[^a-z0-9 ]+',' ','g'
+      )) AS n
+    ) z
     WHERE audited_at >= now() - interval '${LOOKBACK_HOURS} hours'
       AND UPPER(COALESCE(status,'')) = 'OK'
   )

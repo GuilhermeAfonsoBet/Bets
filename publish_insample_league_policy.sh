@@ -142,6 +142,8 @@ python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR"
 import csv
 import json
 import sys
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -160,16 +162,53 @@ fail_closed_empty = str(sys.argv[11]) == "1"
 rows_all = list(csv.DictReader(all_csv.open("r", encoding="utf-8")))
 rows_ok = list(csv.DictReader(approved_csv.open("r", encoding="utf-8")))
 
-def norm_league(s: str) -> str:
+def clean_league(s: str) -> str:
     x = (s or "").strip()
     if not x:
         return "—"
     x = x.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
-    if len(x) > 48:
-        x = x[:48].rstrip() + "…"
+    x = re.sub(r"\s+", " ", x)
     return x
 
-approved_leagues = [norm_league(r.get("league", "")) for r in rows_ok]
+def norm_key(s: str) -> str:
+    s = clean_league(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+WORLD_CUP_ALIASES = {
+    "fifa world cup": ["FIFA World Cup", "World Cup", "Copa do Mundo"],
+    "fifa club world cup": ["FIFA Club World Cup", "Club World Cup", "Mundial de Clubes"],
+}
+
+WORLD_CUP_NORM_TO_CANON = {}
+for canon, aliases in WORLD_CUP_ALIASES.items():
+    for a in aliases:
+        WORLD_CUP_NORM_TO_CANON[norm_key(a)] = canon
+
+def expand_aliases(league_raw: str) -> list[str]:
+    base = clean_league(league_raw)
+    nk = norm_key(base)
+    canon = WORLD_CUP_NORM_TO_CANON.get(nk)
+    if canon:
+        return WORLD_CUP_ALIASES.get(canon, [base])
+    return [base]
+
+approved_expanded = []
+seen_norm = set()
+for r in rows_ok:
+    lg = r.get("league", "")
+    for name in expand_aliases(lg):
+        nn = norm_key(name)
+        if not nn or nn in seen_norm:
+            continue
+        seen_norm.add(nn)
+        approved_expanded.append(name)
+
+approved_leagues = approved_expanded
 active_keys = [f"Back_Pre_Any__{lg}" for lg in approved_leagues]
 active_counts = {k: 1 for k in active_keys}
 
@@ -241,7 +280,9 @@ policy = {
     "active_counts": active_counts,
     "insample_sql_summary": {
         "approved_n": len(rows_ok),
+        "approved_n_expanded_alias": len(approved_leagues),
         "all_leagues_n": len(rows_all),
+        "alias_expansion_world_cup": True,
     },
 }
 

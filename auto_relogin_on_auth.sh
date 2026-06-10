@@ -35,6 +35,17 @@ STATE_FILE="${AUTH_GUARD_STATE_FILE:-$BOT_DIR/logs/auth_guard_state.json}"
 ACTIONS_LOG="${AUTH_GUARD_ACTIONS_LOG:-$BOT_DIR/logs/auth_guard_actions.jsonl}"
 LOCK_DIR="${AUTH_GUARD_LOCK_DIR:-/tmp/auth_guard.lock}"
 
+# Resolve caminhos relativos para BOT_DIR (evita depender do cwd do cron/shell).
+if [[ "$EXECUTOR_JSONL" != /* ]]; then
+  EXECUTOR_JSONL="$BOT_DIR/$EXECUTOR_JSONL"
+fi
+if [[ "$STATE_FILE" != /* ]]; then
+  STATE_FILE="$BOT_DIR/$STATE_FILE"
+fi
+if [[ "$ACTIONS_LOG" != /* ]]; then
+  ACTIONS_LOG="$BOT_DIR/$ACTIONS_LOG"
+fi
+
 for v in LOOKBACK_MIN COOLDOWN_SEC MIN_ROWS NO_SESSION_MIN NO_ROOT_COOKIE_MIN AUTH_401_MIN REQUIRE_NO_LIVE_OK HEARTBEAT_ONLY_ENABLE DRY_RUN; do
   if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
     echo "[ERRO] $v invalido: ${!v}" >&2
@@ -173,6 +184,9 @@ if [[ "$AUTH_401" -ge "$AUTH_401_MIN" && "$AUTH_401_MIN" -gt 0 ]]; then
 fi
 if [[ "$HEARTBEAT_ONLY_ENABLE" == "1" && "$TOTAL_ROWS" -ge "$MIN_ROWS" && "$HEARTBEAT_ONLY" == "1" ]]; then
   INCIDENT_REASONS+=("HEARTBEAT_ONLY_WITH_ROWS>=$MIN_ROWS")
+fi
+if [[ "$HEARTBEAT_ONLY_ENABLE" == "0" && "$TOTAL_ROWS" -ge "$MIN_ROWS" && "$HEARTBEAT_ONLY" == "1" ]]; then
+  echo "[WARN] HEARTBEAT_ONLY detectado com total_rows=$TOTAL_ROWS, mas AUTH_GUARD_HEARTBEAT_ONLY_ENABLE=0 (sinal suprimido)."
 fi
 if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
   INCIDENT_REASONS=()
