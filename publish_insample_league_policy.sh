@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Publica policy operacional (wf_policy_current.json) baseada em ROI in-sample por liga.
 # Critério default: ROI > 2% (sem N mínimo), Back Pre, slippage_pre_pct < 0.
+# Suporta inclusao forcada de ligas via INSAMPLE_FORCE_INCLUDE_LEAGUES (CSV).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR="${BOT_DIR:-$ROOT_DIR/betinasia_bot}"
@@ -25,6 +26,7 @@ ROI_MIN="${INSAMPLE_ROI_MIN:-2}"
 N_MIN="${INSAMPLE_N_MIN:-0}"
 MIN_APPROVED_N="${INSAMPLE_MIN_APPROVED_N:-1}"
 FAIL_CLOSED_EMPTY="${INSAMPLE_FAIL_CLOSED_EMPTY:-1}"
+FORCE_INCLUDE_LEAGUES_RAW="${INSAMPLE_FORCE_INCLUDE_LEAGUES:-}"
 HYP_TYPE="${INSAMPLE_HYPOTHESIS_TYPE:-H3B}"
 REV_DIR="${INSAMPLE_REVERSAL_DIRECTION:-up}"
 REQ_SLIP_NEG="${INSAMPLE_REQUIRE_SLIPPAGE_NEG:-1}"
@@ -138,7 +140,7 @@ GROUP BY league;
 \copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct, CASE WHEN n < $N_MIN THEN 'N<$N_MIN' WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN' ELSE 'OUTRO' END AS motivo FROM tmp_league_roi WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN) ORDER BY n DESC, roiw_pct DESC) TO '$NOT_APPROVED_CSV' CSV HEADER
 SQL
 
-python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" <<'PY'
+python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" "$FORCE_INCLUDE_LEAGUES_RAW" <<'PY'
 import csv
 import json
 import sys
@@ -158,6 +160,7 @@ n_min = int(sys.argv[8])
 require_slip = str(sys.argv[9]) == "1"
 min_approved_n = int(sys.argv[10])
 fail_closed_empty = str(sys.argv[11]) == "1"
+force_include_raw = str(sys.argv[12] or "").strip()
 
 rows_all = list(csv.DictReader(all_csv.open("r", encoding="utf-8")))
 rows_ok = list(csv.DictReader(approved_csv.open("r", encoding="utf-8")))
@@ -208,9 +211,46 @@ for r in rows_ok:
         seen_norm.add(nn)
         approved_expanded.append(name)
 
+forced_input = []
+if force_include_raw:
+    for p in force_include_raw.split(","):
+        s = clean_league(p)
+        if s and s != "—":
+            forced_input.append(s)
+
+forced_expanded = []
+for lg in forced_input:
+    for name in expand_aliases(lg):
+        nn = norm_key(name)
+        if not nn or nn in seen_norm:
+            continue
+        seen_norm.add(nn)
+        approved_expanded.append(name)
+        forced_expanded.append(name)
+
 approved_leagues = approved_expanded
 active_keys = [f"Back_Pre_Any__{lg}" for lg in approved_leagues]
 active_counts = {k: 1 for k in active_keys}
+approved_n_effective = len(approved_leagues)
+
+diag = {
+    r.get("league", ""): {
+        "ok": True,
+        "reason": f"INSAMPLE_SQL: n>={n_min} and ROI>{roi_min}",
+        "train_matches_roi": int(float(r.get("n", 0) or 0)),
+        "roi_mean": float(r.get("roiw_pct", 0) or 0),
+        "roi_mean_eff": float(r.get("roiw_pct", 0) or 0),
+    }
+    for r in rows_ok
+}
+for lg in forced_expanded:
+    diag.setdefault(lg, {
+        "ok": True,
+        "reason": "FORCED_INCLUDE_LEAGUE",
+        "train_matches_roi": 0,
+        "roi_mean": None,
+        "roi_mean_eff": None,
+    })
 
 generated_at = datetime.now(timezone.utc).isoformat()
 step = {
@@ -223,16 +263,7 @@ step = {
     "active_n_base": (1 if active_keys else 0),
     "approved_leagues": approved_leagues,
     "n_ev_elig_pre": sum(int(float(r.get("n", 0) or 0)) for r in rows_ok),
-    "diag": {
-        r.get("league", ""): {
-            "ok": True,
-            "reason": f"INSAMPLE_SQL: n>={n_min} and ROI>{roi_min}",
-            "train_matches_roi": int(float(r.get("n", 0) or 0)),
-            "roi_mean": float(r.get("roiw_pct", 0) or 0),
-            "roi_mean_eff": float(r.get("roiw_pct", 0) or 0),
-        }
-        for r in rows_ok
-    },
+    "diag": diag,
 }
 
 policy = {
@@ -280,7 +311,10 @@ policy = {
     "active_counts": active_counts,
     "insample_sql_summary": {
         "approved_n": len(rows_ok),
+        "approved_n_effective": approved_n_effective,
         "approved_n_expanded_alias": len(approved_leagues),
+        "forced_include_input": forced_input,
+        "forced_include_expanded": forced_expanded,
         "all_leagues_n": len(rows_all),
         "alias_expansion_world_cup": True,
     },
@@ -304,7 +338,7 @@ if policy_current.exists():
         prev_active_n = None
         prev_generated_at = None
 
-if fail_closed_empty and len(rows_ok) < min_approved_n:
+if fail_closed_empty and approved_n_effective < min_approved_n:
     policy_history_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with policy_history_jsonl.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -313,17 +347,20 @@ if fail_closed_empty and len(rows_ok) < min_approved_n:
             "policy_candidate_file": str(candidate_file),
             "status": "rejected_min_approved",
             "approved_n": len(rows_ok),
+            "approved_n_effective": approved_n_effective,
             "min_approved_n": min_approved_n,
             "all_leagues_n": len(rows_all),
             "mode": "insample_sql",
             "roi_min": roi_min,
             "n_min": n_min,
             "lookback_days": lookback_days,
+            "forced_include_input": forced_input,
+            "forced_include_expanded": forced_expanded,
             "prev_active_n": prev_active_n,
             "prev_generated_at": prev_generated_at,
         }, ensure_ascii=False) + "\n")
     print(
-        f"[ERRO] Fail-closed: approved_n={len(rows_ok)} < min_approved_n={min_approved_n}. "
+        f"[ERRO] Fail-closed: approved_n_effective={approved_n_effective} < min_approved_n={min_approved_n}. "
         f"Policy atual foi preservada em {policy_current}; candidato salvo em {candidate_file}.",
         file=sys.stderr,
     )
@@ -344,20 +381,27 @@ with policy_history_jsonl.open("a", encoding="utf-8") as f:
         "policy_history_file": str(hist_file),
         "status": "published",
         "approved_n": len(rows_ok),
+        "approved_n_effective": approved_n_effective,
         "min_approved_n": min_approved_n,
         "all_leagues_n": len(rows_all),
         "mode": "insample_sql",
         "roi_min": roi_min,
         "n_min": n_min,
         "lookback_days": lookback_days,
+        "forced_include_input": forced_input,
+        "forced_include_expanded": forced_expanded,
     }, ensure_ascii=False) + "\n")
 
 print(f"approved_n={len(rows_ok)}")
+print(f"approved_n_effective={approved_n_effective}")
+if forced_expanded:
+    print(f"forced_include_expanded={forced_expanded}")
 print(f"policy_current={policy_current}")
 print(f"policy_history={hist_file}")
 PY
 
 echo "[OK] Policy in-sample SQL publicada."
 echo "[OK] fail_closed_empty=$FAIL_CLOSED_EMPTY min_approved_n=$MIN_APPROVED_N"
+echo "[OK] force_include_leagues_raw=${FORCE_INCLUDE_LEAGUES_RAW:-<vazio>}"
 echo "[OK] approved_csv=$APPROVED_CSV"
 echo "[OK] not_approved_csv=$NOT_APPROVED_CSV"
