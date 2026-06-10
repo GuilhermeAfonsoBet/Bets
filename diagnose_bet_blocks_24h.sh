@@ -273,6 +273,123 @@ if [[ -n "$ACTIVE_LEAGUES_SQL" ]]; then
   echo
 fi
 
+echo ">>> 3.3) World Cup (policy + fluxo ${LOOKBACK_HOURS}h)"
+python3 - "$POLICY_CURRENT" <<'PY'
+import json
+import re
+import unicodedata
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("policy.world_cup: policy_missing")
+    raise SystemExit(0)
+
+def norm_key(s: str) -> str:
+    s = str(s or "").strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+world_cup_alias = {"fifa world cup", "world cup", "copa do mundo"}
+club_world_cup_alias = {"fifa club world cup", "club world cup", "mundial de clubes"}
+
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as e:
+    print(f"policy.world_cup: read_error={e}")
+    raise SystemExit(0)
+
+steps = data.get("steps") if isinstance(data, dict) else []
+last = steps[-1] if isinstance(steps, list) and steps else {}
+approved = last.get("approved_leagues") if isinstance(last, dict) else []
+approved = approved if isinstance(approved, list) else []
+norm = {norm_key(x) for x in approved if str(x or "").strip()}
+
+print(f"policy.world_cup_active={int(bool(norm & world_cup_alias))}")
+print(f"policy.club_world_cup_active={int(bool(norm & club_world_cup_alias))}")
+PY
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+WITH src AS (
+  SELECT
+    UPPER(COALESCE(status,'')) AS status_u,
+    trim(regexp_replace(
+      lower(
+        translate(
+          COALESCE(league,''),
+          'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+          'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+        )
+      ),
+      '[^a-z0-9 ]+',' ','g'
+    )) AS league_norm
+  FROM betslip_audit_results
+  WHERE audited_at >= now() - interval '${LOOKBACK_HOURS} hours'
+)
+SELECT
+  COUNT(*) FILTER (
+    WHERE status_u='OK'
+      AND league_norm IN ('fifa world cup','world cup','copa do mundo')
+  ) AS audit_ok_world_cup,
+  COUNT(*) FILTER (
+    WHERE status_u='OK'
+      AND league_norm IN ('fifa club world cup','club world cup','mundial de clubes')
+  ) AS audit_ok_club_world_cup
+FROM src;
+"
+echo
+
+BRIDGE_EXISTS="$(psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT to_regclass('public.executor_bridge_seen') IS NOT NULL;")"
+if [[ "$BRIDGE_EXISTS" == "t" ]]; then
+  BRIDGE_WC_COLS="$(psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='executor_bridge_seen';")"
+  has_bridge_wc_col() {
+    local name="$1"
+    while IFS= read -r c; do
+      [[ "$c" == "$name" ]] && return 0
+    done <<< "$BRIDGE_WC_COLS"
+    return 1
+  }
+  if has_bridge_wc_col "created_at" && has_bridge_wc_col "reason" && has_bridge_wc_col "league"; then
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+    WITH src AS (
+      SELECT
+        COALESCE(NULLIF(reason::text,''), '<none>') AS reason,
+        trim(regexp_replace(
+          lower(
+            translate(
+              COALESCE(league,''),
+              'ÁÀÃÂÄáàãâäÉÈÊËéèêëÍÌÎÏíìîïÓÒÕÔÖóòõôöÚÙÛÜúùûüÇç',
+              'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCc'
+            )
+          ),
+          '[^a-z0-9 ]+',' ','g'
+        )) AS league_norm
+      FROM executor_bridge_seen
+      WHERE created_at >= now() - interval '${LOOKBACK_HOURS} hours'
+    )
+    SELECT
+      COUNT(*) FILTER (
+        WHERE reason='not_active'
+          AND league_norm IN ('fifa world cup','world cup','copa do mundo')
+      ) AS bridge_not_active_world_cup,
+      COUNT(*) FILTER (
+        WHERE reason='not_active'
+          AND league_norm IN ('fifa club world cup','club world cup','mundial de clubes')
+      ) AS bridge_not_active_club_world_cup
+    FROM src;
+    "
+    echo
+  else
+    echo "[WARN] World Cup bridge check: colunas (created_at/reason/league) nao disponiveis."
+    echo
+  fi
+fi
+
 echo ">>> 4) Bridge - motivos de skip/bloqueio (se tabela existir)"
 BRIDGE_EXISTS="$(psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT to_regclass('public.executor_bridge_seen') IS NOT NULL;")"
 if [[ "$BRIDGE_EXISTS" == "t" ]]; then
