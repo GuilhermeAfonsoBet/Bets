@@ -4,6 +4,7 @@ set -euo pipefail
 # Publica policy operacional (wf_policy_current.json) baseada em ROI in-sample por liga.
 # Critério default: ROI > 2% (sem N mínimo), Back Pre, slippage_pre_pct < 0.
 # Suporta inclusao forcada de ligas via INSAMPLE_FORCE_INCLUDE_LEAGUES (CSV).
+# Suporta lista fixa via INSAMPLE_FIXED_APPROVED_LEAGUES (CSV), ignorando a seleção dinâmica.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR="${BOT_DIR:-$ROOT_DIR/betinasia_bot}"
@@ -27,6 +28,7 @@ N_MIN="${INSAMPLE_N_MIN:-0}"
 MIN_APPROVED_N="${INSAMPLE_MIN_APPROVED_N:-1}"
 FAIL_CLOSED_EMPTY="${INSAMPLE_FAIL_CLOSED_EMPTY:-1}"
 FORCE_INCLUDE_LEAGUES_RAW="${INSAMPLE_FORCE_INCLUDE_LEAGUES:-}"
+FIXED_APPROVED_LEAGUES_RAW="${INSAMPLE_FIXED_APPROVED_LEAGUES:-}"
 HYP_TYPE="${INSAMPLE_HYPOTHESIS_TYPE:-H3B}"
 REV_DIR="${INSAMPLE_REVERSAL_DIRECTION:-up}"
 REQ_SLIP_NEG="${INSAMPLE_REQUIRE_SLIPPAGE_NEG:-1}"
@@ -140,7 +142,7 @@ GROUP BY league;
 \copy (SELECT league, n, ROUND(roiw_pct::numeric,6) AS roiw_pct, CASE WHEN n < $N_MIN THEN 'N<$N_MIN' WHEN roiw_pct <= $ROI_MIN THEN 'ROI<=$ROI_MIN' ELSE 'OUTRO' END AS motivo FROM tmp_league_roi WHERE NOT (n >= $N_MIN AND roiw_pct > $ROI_MIN) ORDER BY n DESC, roiw_pct DESC) TO '$NOT_APPROVED_CSV' CSV HEADER
 SQL
 
-python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" "$FORCE_INCLUDE_LEAGUES_RAW" <<'PY'
+python3 - "$APPROVED_CSV" "$TMP_ALL_CSV" "$POLICY_CURRENT" "$POLICY_HISTORY_DIR" "$POLICY_HISTORY_JSONL" "$LOOKBACK_DAYS" "$ROI_MIN" "$N_MIN" "$REQ_SLIP_NEG" "$MIN_APPROVED_N" "$FAIL_CLOSED_EMPTY" "$FORCE_INCLUDE_LEAGUES_RAW" "$FIXED_APPROVED_LEAGUES_RAW" <<'PY'
 import csv
 import json
 import sys
@@ -161,6 +163,7 @@ require_slip = str(sys.argv[9]) == "1"
 min_approved_n = int(sys.argv[10])
 fail_closed_empty = str(sys.argv[11]) == "1"
 force_include_raw = str(sys.argv[12] or "").strip()
+fixed_approved_raw = str(sys.argv[13] or "").strip()
 
 rows_all = list(csv.DictReader(all_csv.open("r", encoding="utf-8")))
 rows_ok = list(csv.DictReader(approved_csv.open("r", encoding="utf-8")))
@@ -211,6 +214,25 @@ for r in rows_ok:
         seen_norm.add(nn)
         approved_expanded.append(name)
 
+fixed_input = []
+if fixed_approved_raw:
+    for p in fixed_approved_raw.split(","):
+        s = clean_league(p)
+        if s and s != "—":
+            fixed_input.append(s)
+
+if fixed_input:
+    # Modo lista fixa: ignora seleção in-sample dinâmica para approved_leagues.
+    approved_expanded = []
+    seen_norm = set()
+    for lg in fixed_input:
+        for name in expand_aliases(lg):
+            nn = norm_key(name)
+            if not nn or nn in seen_norm:
+                continue
+            seen_norm.add(nn)
+            approved_expanded.append(name)
+
 forced_input = []
 if force_include_raw:
     for p in force_include_raw.split(","):
@@ -232,6 +254,8 @@ approved_leagues = approved_expanded
 active_keys = [f"Back_Pre_Any__{lg}" for lg in approved_leagues]
 active_counts = {k: 1 for k in active_keys}
 approved_n_effective = len(approved_leagues)
+selection_mode_effective = "fixed_static_csv" if fixed_input else "insample_sql"
+active_selection_mode = "fixed_static" if fixed_input else "insample_sql"
 
 diag = {
     r.get("league", ""): {
@@ -251,12 +275,22 @@ for lg in forced_expanded:
         "roi_mean": None,
         "roi_mean_eff": None,
     })
+if fixed_input:
+    diag = {}
+    for lg in approved_leagues:
+        diag[lg] = {
+            "ok": True,
+            "reason": "FIXED_APPROVED_LEAGUES",
+            "train_matches_roi": 0,
+            "roi_mean": None,
+            "roi_mean_eff": None,
+        }
 
 generated_at = datetime.now(timezone.utc).isoformat()
 step = {
     "train": f"last_{lookback_days}d",
     "test": "IN_SAMPLE_SQL",
-    "selection_mode": "insample_sql",
+    "selection_mode": active_selection_mode,
     "active_keys": active_keys,
     "active_n": len(active_keys),
     "active_keys_base": (["Back_Pre_Any"] if active_keys else []),
@@ -274,7 +308,7 @@ policy = {
     "walkforward": True,
     "wf": {
         "train_mode": "expanding",
-        "selection_mode": "insample_sql",
+        "selection_mode": selection_mode_effective,
         "insample_days": lookback_days,
         "train_days": lookback_days,
         "test_days": 1,
@@ -313,6 +347,8 @@ policy = {
         "approved_n": len(rows_ok),
         "approved_n_effective": approved_n_effective,
         "approved_n_expanded_alias": len(approved_leagues),
+        "fixed_mode": bool(fixed_input),
+        "fixed_approved_input": fixed_input,
         "forced_include_input": forced_input,
         "forced_include_expanded": forced_expanded,
         "all_leagues_n": len(rows_all),
@@ -351,9 +387,12 @@ if fail_closed_empty and approved_n_effective < min_approved_n:
             "min_approved_n": min_approved_n,
             "all_leagues_n": len(rows_all),
             "mode": "insample_sql",
+            "selection_mode_effective": selection_mode_effective,
             "roi_min": roi_min,
             "n_min": n_min,
             "lookback_days": lookback_days,
+            "fixed_mode": bool(fixed_input),
+            "fixed_approved_input": fixed_input,
             "forced_include_input": forced_input,
             "forced_include_expanded": forced_expanded,
             "prev_active_n": prev_active_n,
@@ -385,15 +424,21 @@ with policy_history_jsonl.open("a", encoding="utf-8") as f:
         "min_approved_n": min_approved_n,
         "all_leagues_n": len(rows_all),
         "mode": "insample_sql",
+        "selection_mode_effective": selection_mode_effective,
         "roi_min": roi_min,
         "n_min": n_min,
         "lookback_days": lookback_days,
+        "fixed_mode": bool(fixed_input),
+        "fixed_approved_input": fixed_input,
         "forced_include_input": forced_input,
         "forced_include_expanded": forced_expanded,
     }, ensure_ascii=False) + "\n")
 
 print(f"approved_n={len(rows_ok)}")
 print(f"approved_n_effective={approved_n_effective}")
+print(f"selection_mode_effective={selection_mode_effective}")
+if fixed_input:
+    print(f"fixed_approved_input={fixed_input}")
 if forced_expanded:
     print(f"forced_include_expanded={forced_expanded}")
 print(f"policy_current={policy_current}")
@@ -402,6 +447,7 @@ PY
 
 echo "[OK] Policy in-sample SQL publicada."
 echo "[OK] fail_closed_empty=$FAIL_CLOSED_EMPTY min_approved_n=$MIN_APPROVED_N"
+echo "[OK] fixed_approved_leagues_raw=${FIXED_APPROVED_LEAGUES_RAW:-<vazio>}"
 echo "[OK] force_include_leagues_raw=${FORCE_INCLUDE_LEAGUES_RAW:-<vazio>}"
 echo "[OK] approved_csv=$APPROVED_CSV"
 echo "[OK] not_approved_csv=$NOT_APPROVED_CSV"
