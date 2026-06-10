@@ -27,6 +27,9 @@ AUTH_401_MIN="${AUTH_GUARD_AUTH401_MIN:-1}"
 REQUIRE_NO_LIVE_OK="${AUTH_GUARD_REQUIRE_NO_LIVE_OK:-1}"
 HEARTBEAT_ONLY_ENABLE="${AUTH_GUARD_HEARTBEAT_ONLY_ENABLE:-1}"
 DRY_RUN="${AUTH_GUARD_DRY_RUN:-0}"
+DB_STALE_ENABLE="${AUTH_GUARD_DB_STALE_ENABLE:-1}"
+DB_STALE_MIN="${AUTH_GUARD_DB_STALE_MIN:-90}"
+DB_STALE_IGNORE_COOLDOWN="${AUTH_GUARD_DB_STALE_IGNORE_COOLDOWN:-1}"
 
 RELOGIN_CMD="${AUTH_GUARD_RELOGIN_CMD:-}"
 POST_RELOGIN_CMD="${AUTH_GUARD_POST_RELOGIN_CMD:-}"
@@ -46,7 +49,7 @@ if [[ "$ACTIONS_LOG" != /* ]]; then
   ACTIONS_LOG="$BOT_DIR/$ACTIONS_LOG"
 fi
 
-for v in LOOKBACK_MIN COOLDOWN_SEC MIN_ROWS NO_SESSION_MIN NO_ROOT_COOKIE_MIN AUTH_401_MIN REQUIRE_NO_LIVE_OK HEARTBEAT_ONLY_ENABLE DRY_RUN; do
+for v in LOOKBACK_MIN COOLDOWN_SEC MIN_ROWS NO_SESSION_MIN NO_ROOT_COOKIE_MIN AUTH_401_MIN REQUIRE_NO_LIVE_OK HEARTBEAT_ONLY_ENABLE DRY_RUN DB_STALE_ENABLE DB_STALE_MIN DB_STALE_IGNORE_COOLDOWN; do
   if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
     echo "[ERRO] $v invalido: ${!v}" >&2
     exit 2
@@ -188,8 +191,41 @@ fi
 if [[ "$HEARTBEAT_ONLY_ENABLE" == "0" && "$TOTAL_ROWS" -ge "$MIN_ROWS" && "$HEARTBEAT_ONLY" == "1" ]]; then
   echo "[WARN] HEARTBEAT_ONLY detectado com total_rows=$TOTAL_ROWS, mas AUTH_GUARD_HEARTBEAT_ONLY_ENABLE=0 (sinal suprimido)."
 fi
+if [[ "$HEARTBEAT_ONLY_ENABLE" == "1" && "$HEARTBEAT_ONLY" == "1" && "$TOTAL_ROWS" -lt "$MIN_ROWS" ]]; then
+  echo "[INFO] HEARTBEAT_ONLY observado, mas total_rows=$TOTAL_ROWS < MIN_ROWS=$MIN_ROWS (sem incidente por este criterio)."
+fi
 if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
   INCIDENT_REASONS=()
+fi
+
+DB_STALE_INCIDENT=0
+AUDIT_LAG_SEC=-1
+BRIDGE_LAG_SEC=-1
+if [[ "$DB_STALE_ENABLE" == "1" && -n "${DATABASE_URL:-}" ]]; then
+  DB_STALE_RAW="$(
+  psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "
+  SELECT
+    COALESCE(EXTRACT(EPOCH FROM (now() - (SELECT max(audited_at) FROM betslip_audit_results))), 1e12)::bigint AS audit_lag_sec,
+    COALESCE(EXTRACT(EPOCH FROM (now() - (SELECT max(created_at) FROM executor_bridge_seen))), 1e12)::bigint AS bridge_lag_sec;
+  " 2>/dev/null || true
+  )"
+  if [[ -n "$DB_STALE_RAW" ]]; then
+    AUDIT_LAG_SEC="$(echo "$DB_STALE_RAW" | awk -F'|' 'NR==1 {print $1}' | tr -d '[:space:]')"
+    BRIDGE_LAG_SEC="$(echo "$DB_STALE_RAW" | awk -F'|' 'NR==1 {print $2}' | tr -d '[:space:]')"
+    if [[ "$AUDIT_LAG_SEC" =~ ^[0-9]+$ && "$BRIDGE_LAG_SEC" =~ ^[0-9]+$ ]]; then
+      DB_STALE_SEC=$((DB_STALE_MIN * 60))
+      if [[ "$AUDIT_LAG_SEC" -ge "$DB_STALE_SEC" && "$BRIDGE_LAG_SEC" -ge "$DB_STALE_SEC" ]]; then
+        DB_STALE_INCIDENT=1
+        if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
+          DB_STALE_INCIDENT=0
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ "$DB_STALE_INCIDENT" == "1" ]]; then
+  INCIDENT_REASONS+=("DB_STALE>=${DB_STALE_MIN}m")
 fi
 
 INCIDENT=0
@@ -218,11 +254,16 @@ PY
 
 NOW_EPOCH="$(date +%s)"
 COOLDOWN_LEFT=0
+IGNORE_COOLDOWN=0
 if [[ "$LAST_ACTION_EPOCH" -gt 0 ]]; then
   NEXT_ALLOWED=$((LAST_ACTION_EPOCH + COOLDOWN_SEC))
   if [[ "$NOW_EPOCH" -lt "$NEXT_ALLOWED" ]]; then
     COOLDOWN_LEFT=$((NEXT_ALLOWED - NOW_EPOCH))
   fi
+fi
+if [[ "$DB_STALE_INCIDENT" == "1" && "$DB_STALE_IGNORE_COOLDOWN" == "1" ]]; then
+  IGNORE_COOLDOWN=1
+  COOLDOWN_LEFT=0
 fi
 
 ACTION_TAKEN=0
@@ -256,6 +297,12 @@ else
   if [[ -z "$RELOGIN_CMD" && -z "$POST_RELOGIN_CMD" ]]; then
     echo "[ERRO] Incidente detectado (${INCIDENT_REASONS[*]}), mas AUTH_GUARD_RELOGIN_CMD/POST_RELOGIN_CMD nao configurados." >&2
   else
+    if [[ "$RELOGIN_CMD" == "true" || "$RELOGIN_CMD" == ":" ]]; then
+      echo "[WARN] AUTH_GUARD_RELOGIN_CMD='$RELOGIN_CMD' parece no-op; apenas POST_RELOGIN_CMD pode surtir efeito."
+    fi
+    if [[ "$IGNORE_COOLDOWN" == "1" ]]; then
+      echo "[WARN] DB stale incidente com cooldown ignorado por AUTH_GUARD_DB_STALE_IGNORE_COOLDOWN=1."
+    fi
     ACTION_TAKEN=1
     if run_cmd "relogin_cmd" "$RELOGIN_CMD"; then
       RELOGIN_EXIT="0"
@@ -313,6 +360,9 @@ PY
 
 echo "[INFO] Auth guard finalizado."
 echo "[INFO] metricas: total_rows=$TOTAL_ROWS live_ok=$LIVE_OK no_session=$NO_SESSION no_root_cookie=$NO_ROOT_COOKIE auth_401=$AUTH_401 heartbeat_only=$HEARTBEAT_ONLY"
+if [[ "$AUDIT_LAG_SEC" =~ ^[0-9]+$ && "$BRIDGE_LAG_SEC" =~ ^[0-9]+$ ]]; then
+  echo "[INFO] db_lag_sec: audit=$AUDIT_LAG_SEC bridge=$BRIDGE_LAG_SEC threshold=${DB_STALE_MIN}m"
+fi
 if [[ "$INCIDENT" == "1" ]]; then
   echo "[WARN] incidente_detectado=1 reasons=${INCIDENT_REASONS[*]}"
 else
