@@ -26,6 +26,7 @@ NO_ROOT_COOKIE_MIN="${AUTH_GUARD_NO_ROOT_COOKIE_MIN:-1}"
 AUTH_401_MIN="${AUTH_GUARD_AUTH401_MIN:-1}"
 REQUIRE_NO_LIVE_OK="${AUTH_GUARD_REQUIRE_NO_LIVE_OK:-1}"
 HEARTBEAT_ONLY_ENABLE="${AUTH_GUARD_HEARTBEAT_ONLY_ENABLE:-1}"
+HEARTBEAT_ONLY_REQUIRE_DB_STALE="${AUTH_GUARD_HEARTBEAT_ONLY_REQUIRE_DB_STALE:-1}"
 DRY_RUN="${AUTH_GUARD_DRY_RUN:-0}"
 DB_STALE_ENABLE="${AUTH_GUARD_DB_STALE_ENABLE:-1}"
 DB_STALE_MIN="${AUTH_GUARD_DB_STALE_MIN:-90}"
@@ -49,7 +50,7 @@ if [[ "$ACTIONS_LOG" != /* ]]; then
   ACTIONS_LOG="$BOT_DIR/$ACTIONS_LOG"
 fi
 
-for v in LOOKBACK_MIN COOLDOWN_SEC MIN_ROWS NO_SESSION_MIN NO_ROOT_COOKIE_MIN AUTH_401_MIN REQUIRE_NO_LIVE_OK HEARTBEAT_ONLY_ENABLE DRY_RUN DB_STALE_ENABLE DB_STALE_MIN DB_STALE_IGNORE_COOLDOWN; do
+for v in LOOKBACK_MIN COOLDOWN_SEC MIN_ROWS NO_SESSION_MIN NO_ROOT_COOKIE_MIN AUTH_401_MIN REQUIRE_NO_LIVE_OK HEARTBEAT_ONLY_ENABLE HEARTBEAT_ONLY_REQUIRE_DB_STALE DRY_RUN DB_STALE_ENABLE DB_STALE_MIN DB_STALE_IGNORE_COOLDOWN; do
   if ! [[ "${!v}" =~ ^[0-9]+$ ]]; then
     echo "[ERRO] $v invalido: ${!v}" >&2
     exit 2
@@ -185,8 +186,9 @@ fi
 if [[ "$AUTH_401" -ge "$AUTH_401_MIN" && "$AUTH_401_MIN" -gt 0 ]]; then
   INCIDENT_REASONS+=("AUTH_401>=$AUTH_401_MIN")
 fi
+HEARTBEAT_ONLY_CANDIDATE=0
 if [[ "$HEARTBEAT_ONLY_ENABLE" == "1" && "$TOTAL_ROWS" -ge "$MIN_ROWS" && "$HEARTBEAT_ONLY" == "1" ]]; then
-  INCIDENT_REASONS+=("HEARTBEAT_ONLY_WITH_ROWS>=$MIN_ROWS")
+  HEARTBEAT_ONLY_CANDIDATE=1
 fi
 if [[ "$HEARTBEAT_ONLY_ENABLE" == "0" && "$TOTAL_ROWS" -ge "$MIN_ROWS" && "$HEARTBEAT_ONLY" == "1" ]]; then
   echo "[WARN] HEARTBEAT_ONLY detectado com total_rows=$TOTAL_ROWS, mas AUTH_GUARD_HEARTBEAT_ONLY_ENABLE=0 (sinal suprimido)."
@@ -199,9 +201,18 @@ if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
 fi
 
 DB_STALE_INCIDENT=0
+DB_STALE_BY_LAG=0
+DB_LAG_VALID=0
 AUDIT_LAG_SEC=-1
 BRIDGE_LAG_SEC=-1
-if [[ "$DB_STALE_ENABLE" == "1" && -n "${DATABASE_URL:-}" ]]; then
+NEED_DB_LAG_CHECK=0
+if [[ "$DB_STALE_ENABLE" == "1" || ( "$HEARTBEAT_ONLY_ENABLE" == "1" && "$HEARTBEAT_ONLY_REQUIRE_DB_STALE" == "1" && "$HEARTBEAT_ONLY_CANDIDATE" == "1" ) ]]; then
+  NEED_DB_LAG_CHECK=1
+fi
+if [[ "$NEED_DB_LAG_CHECK" == "1" && -z "${DATABASE_URL:-}" ]]; then
+  echo "[WARN] DATABASE_URL ausente; sem validacao de lag de DB para DB_STALE/HEARTBEAT_ONLY."
+fi
+if [[ "$NEED_DB_LAG_CHECK" == "1" && -n "${DATABASE_URL:-}" ]]; then
   DB_STALE_RAW="$(
   psql "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "
   SELECT
@@ -213,14 +224,32 @@ if [[ "$DB_STALE_ENABLE" == "1" && -n "${DATABASE_URL:-}" ]]; then
     AUDIT_LAG_SEC="$(echo "$DB_STALE_RAW" | awk -F'|' 'NR==1 {print $1}' | tr -d '[:space:]')"
     BRIDGE_LAG_SEC="$(echo "$DB_STALE_RAW" | awk -F'|' 'NR==1 {print $2}' | tr -d '[:space:]')"
     if [[ "$AUDIT_LAG_SEC" =~ ^[0-9]+$ && "$BRIDGE_LAG_SEC" =~ ^[0-9]+$ ]]; then
+      DB_LAG_VALID=1
       DB_STALE_SEC=$((DB_STALE_MIN * 60))
       if [[ "$AUDIT_LAG_SEC" -ge "$DB_STALE_SEC" && "$BRIDGE_LAG_SEC" -ge "$DB_STALE_SEC" ]]; then
-        DB_STALE_INCIDENT=1
-        if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
-          DB_STALE_INCIDENT=0
+        DB_STALE_BY_LAG=1
+        if [[ "$DB_STALE_ENABLE" == "1" ]]; then
+          DB_STALE_INCIDENT=1
+          if [[ "$REQUIRE_NO_LIVE_OK" == "1" && "$LIVE_OK" -gt 0 ]]; then
+            DB_STALE_INCIDENT=0
+          fi
         fi
       fi
     fi
+  fi
+fi
+
+if [[ "$HEARTBEAT_ONLY_CANDIDATE" == "1" ]]; then
+  if [[ "$HEARTBEAT_ONLY_REQUIRE_DB_STALE" == "1" ]]; then
+    if [[ "$DB_LAG_VALID" == "1" && "$DB_STALE_BY_LAG" == "1" ]]; then
+      INCIDENT_REASONS+=("HEARTBEAT_ONLY_WITH_ROWS>=$MIN_ROWS")
+    elif [[ "$DB_LAG_VALID" == "1" ]]; then
+      echo "[INFO] HEARTBEAT_ONLY suprimido por DB recente (audit_lag_sec=$AUDIT_LAG_SEC bridge_lag_sec=$BRIDGE_LAG_SEC threshold=${DB_STALE_MIN}m)."
+    else
+      echo "[WARN] HEARTBEAT_ONLY candidato suprimido: lag de DB indisponivel."
+    fi
+  else
+    INCIDENT_REASONS+=("HEARTBEAT_ONLY_WITH_ROWS>=$MIN_ROWS")
   fi
 fi
 
