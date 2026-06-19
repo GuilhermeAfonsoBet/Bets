@@ -22,6 +22,7 @@ import csv
 import json
 import math
 import random
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -125,6 +126,7 @@ class BetRow:
     week: str
     stake: float
     pnl: float
+    ts: Optional[datetime]
 
 
 def load_rows_from_csv(
@@ -279,7 +281,7 @@ def load_rows_from_csv(
         if not league:
             league = "league:unknown"
 
-        rows.append(BetRow(event_id=event_id, league=league, week=week, stake=stake, pnl=pnl))
+        rows.append(BetRow(event_id=event_id, league=league, week=week, stake=stake, pnl=pnl, ts=dt))
 
     meta_cols = {
         "event_id": col_event,
@@ -301,6 +303,29 @@ def weighted_roi_pct(rows: Iterable[BetRow]) -> Optional[float]:
     if st <= 0:
         return None
     return 100.0 * (sum(r.pnl for r in rows) / st)
+
+
+def _norm_text(s: str) -> str:
+    s = str(s or "").strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch == " ":
+            out.append(ch)
+        else:
+            out.append(" ")
+    return " ".join("".join(out).split())
+
+
+def parse_world_cup_aliases(raw: str) -> set[str]:
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    return {_norm_text(p) for p in parts if _norm_text(p)}
+
+
+def is_world_cup_league(league: str, wc_aliases_norm: set[str]) -> bool:
+    return _norm_text(league) in wc_aliases_norm
 
 
 def aggregate_by_event(rows: Sequence[BetRow]) -> List[Dict[str, Any]]:
@@ -367,7 +392,17 @@ def permutation_pvalue_stratified(
 ) -> Optional[float]:
     if not events:
         return None
-    obs = weighted_roi_pct(BetRow(event_id=e["event_id"], league=e["league"], week=e["week"], stake=e["stake"], pnl=e["pnl"]) for e in events)
+    obs = weighted_roi_pct(
+        BetRow(
+            event_id=e["event_id"],
+            league=e["league"],
+            week=e["week"],
+            stake=e["stake"],
+            pnl=e["pnl"],
+            ts=None,
+        )
+        for e in events
+    )
     if obs is None:
         return None
 
@@ -534,7 +569,110 @@ def build_markdown(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Regras acionadas na decisao\n")
     lines.append(f"- Checks aprovados: {', '.join(dec['checks_passed']) if dec['checks_passed'] else 'nenhum'}\n")
+    seg = report.get("segmentation")
+    if isinstance(seg, dict):
+        lines.append("")
+        lines.append("## Segmentacao adicional\n")
+        if seg.get("split_date"):
+            lines.append(f"- Corte temporal: `{seg['split_date']}`\n")
+        if seg.get("world_cup_aliases"):
+            lines.append(f"- Aliases World Cup: {seg['world_cup_aliases']}\n")
+        missing_ts = int(seg.get("missing_timestamp_rows", 0) or 0)
+        if missing_ts > 0:
+            lines.append(f"- Linhas sem timestamp (fora de cortes por data): {missing_ts}\n")
+        lines.append("")
+        lines.append("| Segmento | n_bets | n_events | ROI | p_perm | ci90_lo | ROI sem Top-3 | top1_abs | Decisao |\n")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
+        for s in seg.get("segments", []):
+            err = s.get("error")
+            if err:
+                lines.append(
+                    f"| {s.get('name')} | {s.get('n_bets', 0)} | {s.get('n_events', 0)} | NA | NA | NA | NA | NA | {err} |\n"
+                )
+                continue
+            lines.append(
+                "| {name} | {n_bets} | {n_events} | {roi} | {p_perm} | {ci90_lo} | {roi_l3} | {top1_abs} | {label} |\n".format(
+                    name=s.get("name"),
+                    n_bets=s.get("core", {}).get("n_bets", 0),
+                    n_events=s.get("core", {}).get("n_events", 0),
+                    roi=_pct(s.get("core", {}).get("roi_pct")),
+                    p_perm=(
+                        f"{s.get('permutation_pvalue'):.4f}"
+                        if isinstance(s.get("permutation_pvalue"), (float, int))
+                        else "NA"
+                    ),
+                    ci90_lo=_pct(s.get("bootstrap", {}).get("ci90_lo")),
+                    roi_l3=_pct(s.get("leave_topk_roi_pct", {}).get(3)),
+                    top1_abs=(
+                        _pct(
+                            (
+                                s.get("concentration", {}).get("top1_abs_share") * 100.0
+                                if s.get("concentration", {}).get("top1_abs_share") is not None
+                                else None
+                            )
+                        )
+                    ),
+                    label=s.get("decision", {}).get("label", "NA"),
+                )
+            )
     return "".join(lines)
+
+
+def analyze_rows(
+    rows: Sequence[BetRow],
+    *,
+    bootstrap_iters: int,
+    perm_iters: int,
+    seed: int,
+    ks: Sequence[int],
+) -> Dict[str, Any]:
+    events = aggregate_by_event(rows)
+    roi = weighted_roi_pct(rows)
+    boot = bootstrap_cluster_roi(events, n_boot=bootstrap_iters, seed=seed)
+    p_perm = permutation_pvalue_stratified(events, n_perm=perm_iters, seed=seed)
+    conc_top = {k: topk_concentration(events, k) for k in ks}
+    leave_top = {k: leave_topk_out_roi(events, k) for k in ks}
+    wk = weekly_stability(events)
+    dec_label, dec_checks = classify_result(
+        ci95_lo=boot["ci95_lo"],
+        p_perm=p_perm,
+        roi_leave_top5=leave_top.get(5),
+        top1_abs_share=(conc_top.get(1, {}).get("share_abs_pnl")),
+        positive_week_ratio=wk.get("positive_week_ratio"),
+    )
+    return {
+        "core": {
+            "n_bets": len(rows),
+            "n_events": len(events),
+            "stake_total": sum(r.stake for r in rows),
+            "pnl_total": sum(r.pnl for r in rows),
+            "roi_pct": roi,
+        },
+        "bootstrap": boot,
+        "permutation_pvalue": p_perm,
+        "concentration": {
+            "top1_total_share": conc_top.get(1, {}).get("share_total_pnl"),
+            "top1_abs_share": conc_top.get(1, {}).get("share_abs_pnl"),
+            "top5_total_share": conc_top.get(5, {}).get("share_total_pnl"),
+            "top5_abs_share": conc_top.get(5, {}).get("share_abs_pnl"),
+            "hhi_abs_pnl": hhi_abs_pnl(events),
+            "gini_abs_pnl": gini_abs_pnl(events),
+        },
+        "leave_topk_roi_pct": leave_top,
+        "weekly": wk,
+        "decision": {
+            "label": dec_label,
+            "checks_passed": dec_checks,
+        },
+    }
+
+
+def _segment_payload(name: str, seg_rows: Sequence[BetRow], *, bootstrap_iters: int, perm_iters: int, seed: int, ks: Sequence[int]) -> Dict[str, Any]:
+    if not seg_rows:
+        return {"name": name, "n_bets": 0, "n_events": 0, "error": "segmento_vazio"}
+    out = analyze_rows(seg_rows, bootstrap_iters=bootstrap_iters, perm_iters=perm_iters, seed=seed, ks=ks)
+    out["name"] = name
+    return out
 
 
 def main() -> int:
@@ -574,6 +712,22 @@ def main() -> int:
         default=0,
         help="Se 1, imprime colunas do CSV e sai (debug).",
     )
+    parser.add_argument(
+        "--split-date",
+        default="",
+        help="Data de corte para segmentacao pre/pos (ex.: 2026-05-25T00:00:00+00:00).",
+    )
+    parser.add_argument(
+        "--split-world-cup",
+        type=int,
+        default=0,
+        help="Se 1, inclui segmentacao com e sem World Cup (e cruzada com pre/pos quando --split-date estiver preenchido).",
+    )
+    parser.add_argument(
+        "--world-cup-aliases",
+        default="FIFA World Cup,World Cup,Copa do Mundo,FIFA Club World Cup,Club World Cup,Mundial de Clubes",
+        help="CSV de aliases para classificacao 'World Cup'.",
+    )
     args = parser.parse_args()
 
     csv_path = Path(args.input_csv)
@@ -608,11 +762,6 @@ def main() -> int:
     if not rows:
         raise RuntimeError(f"Nenhuma linha valida apos filtros. dropped={dropped}")
 
-    events = aggregate_by_event(rows)
-    roi = weighted_roi_pct(rows)
-    boot = bootstrap_cluster_roi(events, n_boot=args.bootstrap_iters, seed=args.seed)
-    p_perm = permutation_pvalue_stratified(events, n_perm=args.perm_iters, seed=args.seed)
-
     ks = []
     for tok in str(args.topk).split(","):
         tok = tok.strip()
@@ -622,16 +771,12 @@ def main() -> int:
     if not ks:
         ks = [1, 3, 5, 10]
 
-    conc_top = {k: topk_concentration(events, k) for k in ks}
-    leave_top = {k: leave_topk_out_roi(events, k) for k in ks}
-    wk = weekly_stability(events)
-
-    dec_label, dec_checks = classify_result(
-        ci95_lo=boot["ci95_lo"],
-        p_perm=p_perm,
-        roi_leave_top5=leave_top.get(5),
-        top1_abs_share=(conc_top.get(1, {}).get("share_abs_pnl")),
-        positive_week_ratio=wk.get("positive_week_ratio"),
+    base_report = analyze_rows(
+        rows,
+        bootstrap_iters=args.bootstrap_iters,
+        perm_iters=args.perm_iters,
+        seed=args.seed,
+        ks=ks,
     )
 
     report: Dict[str, Any] = {
@@ -640,30 +785,52 @@ def main() -> int:
             "detected_columns": cols,
             "dropped_reasons": dropped,
         },
-        "core": {
-            "n_bets": len(rows),
-            "n_events": len(events),
-            "stake_total": sum(r.stake for r in rows),
-            "pnl_total": sum(r.pnl for r in rows),
-            "roi_pct": roi,
-        },
-        "bootstrap": boot,
-        "permutation_pvalue": p_perm,
-        "concentration": {
-            "top1_total_share": conc_top.get(1, {}).get("share_total_pnl"),
-            "top1_abs_share": conc_top.get(1, {}).get("share_abs_pnl"),
-            "top5_total_share": conc_top.get(5, {}).get("share_total_pnl"),
-            "top5_abs_share": conc_top.get(5, {}).get("share_abs_pnl"),
-            "hhi_abs_pnl": hhi_abs_pnl(events),
-            "gini_abs_pnl": gini_abs_pnl(events),
-        },
-        "leave_topk_roi_pct": leave_top,
-        "weekly": wk,
-        "decision": {
-            "label": dec_label,
-            "checks_passed": dec_checks,
-        },
     }
+    report.update(base_report)
+
+    split_date = None
+    split_date_raw = str(args.split_date or "").strip()
+    if split_date_raw:
+        split_date = _parse_dt(split_date_raw)
+        if split_date is None:
+            raise RuntimeError(f"--split-date invalida: {split_date_raw}")
+
+    split_world_cup = bool(int(args.split_world_cup))
+    if split_date is not None or split_world_cup:
+        wc_aliases_norm = parse_world_cup_aliases(args.world_cup_aliases)
+        missing_ts_rows = sum(1 for r in rows if r.ts is None)
+        segments = []
+        seed_inc = 100
+
+        if split_date is not None and split_world_cup:
+            pre_rows = [r for r in rows if r.ts is not None and r.ts < split_date]
+            pos_rows = [r for r in rows if r.ts is not None and r.ts >= split_date]
+            pre_wc = [r for r in pre_rows if is_world_cup_league(r.league, wc_aliases_norm)]
+            pre_no_wc = [r for r in pre_rows if not is_world_cup_league(r.league, wc_aliases_norm)]
+            pos_wc = [r for r in pos_rows if is_world_cup_league(r.league, wc_aliases_norm)]
+            pos_no_wc = [r for r in pos_rows if not is_world_cup_league(r.league, wc_aliases_norm)]
+            segments.append(_segment_payload("pre_com_world_cup", pre_wc, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks)); seed_inc += 1
+            segments.append(_segment_payload("pre_sem_world_cup", pre_no_wc, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks)); seed_inc += 1
+            segments.append(_segment_payload("pos_com_world_cup", pos_wc, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks)); seed_inc += 1
+            segments.append(_segment_payload("pos_sem_world_cup", pos_no_wc, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks))
+        elif split_date is not None:
+            pre_rows = [r for r in rows if r.ts is not None and r.ts < split_date]
+            pos_rows = [r for r in rows if r.ts is not None and r.ts >= split_date]
+            segments.append(_segment_payload("pre", pre_rows, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks)); seed_inc += 1
+            segments.append(_segment_payload("pos", pos_rows, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks))
+        else:
+            wc_rows = [r for r in rows if is_world_cup_league(r.league, wc_aliases_norm)]
+            no_wc_rows = [r for r in rows if not is_world_cup_league(r.league, wc_aliases_norm)]
+            segments.append(_segment_payload("com_world_cup", wc_rows, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks)); seed_inc += 1
+            segments.append(_segment_payload("sem_world_cup", no_wc_rows, bootstrap_iters=args.bootstrap_iters, perm_iters=args.perm_iters, seed=args.seed + seed_inc, ks=ks))
+
+        report["segmentation"] = {
+            "split_date": split_date.isoformat() if split_date is not None else None,
+            "split_world_cup": split_world_cup,
+            "world_cup_aliases": sorted(wc_aliases_norm),
+            "missing_timestamp_rows": missing_ts_rows if split_date is not None else 0,
+            "segments": segments,
+        }
 
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
