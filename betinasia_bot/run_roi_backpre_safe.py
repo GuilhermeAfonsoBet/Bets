@@ -85,6 +85,22 @@ def main() -> int:
     ap.add_argument("--bootstrap-iters", type=int, default=10000)
     ap.add_argument("--perm-iters", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument(
+        "--split-date",
+        default="2026-05-25T00:00:00+00:00",
+        help="Corte temporal para segmentacao pre/pos (default: 2026-05-25T00:00:00+00:00). Use vazio para desabilitar.",
+    )
+    ap.add_argument(
+        "--split-world-cup",
+        type=int,
+        default=1,
+        help="Se 1, inclui cortes com/sem World Cup (default 1).",
+    )
+    ap.add_argument(
+        "--world-cup-aliases",
+        default="FIFA World Cup,World Cup,Copa do Mundo,FIFA Club World Cup,Club World Cup,Mundial de Clubes",
+        help="Aliases de World Cup usados no corte com/sem World Cup.",
+    )
     args = ap.parse_args()
 
     in_csv = choose_input_csv(args.input_csv)
@@ -149,6 +165,11 @@ def main() -> int:
         cmd += ["--side-col", mapping["side"]]
     if mapping["regime"]:
         cmd += ["--regime-col", mapping["regime"]]
+    if str(args.split_date or "").strip():
+        cmd += ["--split-date", str(args.split_date).strip()]
+    if int(args.split_world_cup) == 1:
+        cmd += ["--split-world-cup", "1"]
+        cmd += ["--world-cup-aliases", str(args.world_cup_aliases)]
 
     print(f"[CSV] {in_csv}")
     print(f"[MAP] {mapping}")
