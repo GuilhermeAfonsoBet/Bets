@@ -40,6 +40,15 @@ export BACK_DIFF_MIN="${BACK_DIFF_MIN:-$DAILY_BACK_DIFF_MIN}"
 # Sincronizacao automatica JSONL -> hypothesis_details (fix definitivo operacional).
 export DAILY_SYNC_SLIPPAGE_TO_AUDIT="${DAILY_SYNC_SLIPPAGE_TO_AUDIT:-1}"
 export DAILY_SYNC_SLIPPAGE_FAIL_OPEN="${DAILY_SYNC_SLIPPAGE_FAIL_OPEN:-0}"
+export DAILY_MS_SEGMENT_ENABLE="${DAILY_MS_SEGMENT_ENABLE:-1}"
+export DAILY_MS_SEGMENT_FAIL_OPEN="${DAILY_MS_SEGMENT_FAIL_OPEN:-1}"
+export DAILY_MS_SEGMENT_INPUT_CSV="${DAILY_MS_SEGMENT_INPUT_CSV:-}"
+export DAILY_MS_SEGMENT_SPLIT_DATE="${DAILY_MS_SEGMENT_SPLIT_DATE:-2026-05-25T00:00:00+00:00}"
+export DAILY_MS_SEGMENT_BOOTSTRAP_ITERS="${DAILY_MS_SEGMENT_BOOTSTRAP_ITERS:-10000}"
+export DAILY_MS_SEGMENT_PERM_ITERS="${DAILY_MS_SEGMENT_PERM_ITERS:-10000}"
+export DAILY_MS_SEGMENT_SEED="${DAILY_MS_SEGMENT_SEED:-1337}"
+export DAILY_MS_SEGMENT_WORLD_CUP_ALIASES="${DAILY_MS_SEGMENT_WORLD_CUP_ALIASES:-FIFA World Cup,World Cup,Copa do Mundo,FIFA Club World Cup,Club World Cup,Mundial de Clubes}"
+export DAILY_MS_SEGMENT_PDF="${DAILY_MS_SEGMENT_PDF:-1}"
 
 echo "[INFO] REQUESTED_BOT_DIR=$REQUESTED_BOT_DIR"
 echo "[INFO] REQUESTED_ENV_FILE=${REQUESTED_ENV_FILE:-<vazio>}"
@@ -58,6 +67,14 @@ echo "[INFO] DAILY_BACK_DIFF_MIN=$DAILY_BACK_DIFF_MIN"
 echo "[INFO] BACK_DIFF_MIN=$BACK_DIFF_MIN"
 echo "[INFO] DAILY_SYNC_SLIPPAGE_TO_AUDIT=$DAILY_SYNC_SLIPPAGE_TO_AUDIT"
 echo "[INFO] DAILY_SYNC_SLIPPAGE_FAIL_OPEN=$DAILY_SYNC_SLIPPAGE_FAIL_OPEN"
+echo "[INFO] DAILY_MS_SEGMENT_ENABLE=$DAILY_MS_SEGMENT_ENABLE"
+echo "[INFO] DAILY_MS_SEGMENT_FAIL_OPEN=$DAILY_MS_SEGMENT_FAIL_OPEN"
+echo "[INFO] DAILY_MS_SEGMENT_INPUT_CSV=${DAILY_MS_SEGMENT_INPUT_CSV:-<auto>}"
+echo "[INFO] DAILY_MS_SEGMENT_SPLIT_DATE=$DAILY_MS_SEGMENT_SPLIT_DATE"
+echo "[INFO] DAILY_MS_SEGMENT_BOOTSTRAP_ITERS=$DAILY_MS_SEGMENT_BOOTSTRAP_ITERS"
+echo "[INFO] DAILY_MS_SEGMENT_PERM_ITERS=$DAILY_MS_SEGMENT_PERM_ITERS"
+echo "[INFO] DAILY_MS_SEGMENT_SEED=$DAILY_MS_SEGMENT_SEED"
+echo "[INFO] DAILY_MS_SEGMENT_PDF=$DAILY_MS_SEGMENT_PDF"
 
 # Aviso de configuracao contraditoria: diff_pct<=0 pode conflitar com gate de edge Back.
 if [[ "$DAILY_WF_BACKPRE_SLIP_FIELD" == "diff_pct" ]]; then
@@ -554,5 +571,115 @@ raise SystemExit(
     + msg
 )
 PY3
+
+if [[ "$DAILY_MS_SEGMENT_ENABLE" == "1" || "$DAILY_MS_SEGMENT_ENABLE" == "true" || "$DAILY_MS_SEGMENT_ENABLE" == "True" ]]; then
+  MS_SCRIPT_CANDS=(
+    "$REQUESTED_BOT_DIR/ms_por_segmento_completo.py"
+    "$ROOT_DIR/betinasia_bot/ms_por_segmento_completo.py"
+    "$RUN_CWD/ms_por_segmento_completo.py"
+  )
+  MS_SCRIPT=""
+  for c in "${MS_SCRIPT_CANDS[@]}"; do
+    if [[ -f "$c" ]]; then
+      MS_SCRIPT="$c"
+      break
+    fi
+  done
+
+  if [[ -z "$MS_SCRIPT" ]]; then
+    echo "[WARN] Script de Ms por segmento nao encontrado; pulando bloco automatico." >&2
+    if [[ "$DAILY_MS_SEGMENT_FAIL_OPEN" != "1" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "true" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "True" ]]; then
+      exit 6
+    fi
+  else
+    MS_INPUT="$DAILY_MS_SEGMENT_INPUT_CSV"
+    if [[ -n "$MS_INPUT" && ! -f "$MS_INPUT" ]]; then
+      echo "[WARN] DAILY_MS_SEGMENT_INPUT_CSV nao encontrado: $MS_INPUT" >&2
+      MS_INPUT=""
+    fi
+    if [[ -z "$MS_INPUT" ]]; then
+      MS_INPUT="$({
+        "$PYTHON_BIN" - <<'PY_PICK_MS_INPUT'
+import csv
+from pathlib import Path
+
+def count_rows(p: Path) -> int:
+    try:
+        with p.open("r", encoding="utf-8", newline="") as f:
+            rd = csv.DictReader(f)
+            return sum(1 for _ in rd)
+    except Exception:
+        return -1
+
+cands = []
+for pattern in [
+    "/tmp/base_5ms_from_bets_*.csv",
+    "/tmp/projecao_por_aposta_enriquecido.csv",
+    "/tmp/base_5ms_real_ate_*inferred_*.csv",
+    "/tmp/projecao_por_aposta_enriquecido__regen_db_*.csv",
+]:
+    cands.extend(Path("/").glob(pattern.lstrip("/")))
+
+ranked = []
+for p in cands:
+    if not p.exists() or not p.is_file():
+        continue
+    n = count_rows(p)
+    if n <= 0:
+        continue
+    ranked.append((p.stat().st_mtime, n, p))
+
+ranked.sort(key=lambda t: t[0], reverse=True)
+if ranked:
+    print(str(ranked[0][2]))
+PY_PICK_MS_INPUT
+      } || true)"
+    fi
+
+    if [[ -z "$MS_INPUT" || ! -f "$MS_INPUT" ]]; then
+      echo "[WARN] Nenhum CSV valido para Ms por segmento; pulando." >&2
+      if [[ "$DAILY_MS_SEGMENT_FAIL_OPEN" != "1" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "true" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "True" ]]; then
+        exit 6
+      fi
+    else
+      MS_OUT_DIR="${DAILY_REPORT_OUT_DIR:-$WORK_ROOT/logs/daily_reports}"
+      mkdir -p "$MS_OUT_DIR"
+      MS_JSON="$MS_OUT_DIR/ms_por_segmento_${RUN_TS}.json"
+      MS_MD="$MS_OUT_DIR/ms_por_segmento_${RUN_TS}.md"
+      MS_PDF="$MS_OUT_DIR/ms_por_segmento_${RUN_TS}.pdf"
+
+      MS_CMD=(
+        "$PYTHON_BIN" "$MS_SCRIPT"
+        --input-csv "$MS_INPUT"
+        --split-date "$DAILY_MS_SEGMENT_SPLIT_DATE"
+        --bootstrap-iters "$DAILY_MS_SEGMENT_BOOTSTRAP_ITERS"
+        --perm-iters "$DAILY_MS_SEGMENT_PERM_ITERS"
+        --seed "$DAILY_MS_SEGMENT_SEED"
+        --world-cup-aliases "$DAILY_MS_SEGMENT_WORLD_CUP_ALIASES"
+        --out-json "$MS_JSON"
+        --out-md "$MS_MD"
+      )
+      if [[ "$DAILY_MS_SEGMENT_PDF" == "1" || "$DAILY_MS_SEGMENT_PDF" == "true" || "$DAILY_MS_SEGMENT_PDF" == "True" ]]; then
+        MS_CMD+=(--out-pdf "$MS_PDF")
+      fi
+
+      echo "[INFO] Rodando Ms por segmento automaticamente..."
+      echo "[INFO] MS_INPUT=$MS_INPUT"
+      if ! "${MS_CMD[@]}"; then
+        echo "[WARN] Falha ao gerar Ms por segmento." >&2
+        if [[ "$DAILY_MS_SEGMENT_FAIL_OPEN" != "1" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "true" && "$DAILY_MS_SEGMENT_FAIL_OPEN" != "True" ]]; then
+          exit 6
+        fi
+      else
+        echo "[OK] Ms por segmento gerado:"
+        echo "      JSON: $MS_JSON"
+        echo "      MD:   $MS_MD"
+        if [[ -f "$MS_PDF" ]]; then
+          echo "      PDF:  $MS_PDF"
+        fi
+      fi
+    fi
+  fi
+fi
 
 echo "[SUCESSO] Execucao concluida e policy validada."
