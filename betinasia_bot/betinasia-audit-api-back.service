@@ -1,0 +1,41 @@
+[Unit]
+Description=BetinAsia H3B API Audit (Back) - Auditoria via API (back-only)
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PATH=/home/betbot/Bets/betinasia_bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+
+# Override apenas para este serviço (reduz carga/rate-limit)
+Environment="AUDIT_EXECUTOR_WORKERS=1"
+Environment="AUDIT_TEMPORAL_WORKERS=0"
+Environment="AUDIT_MAX_QUEUE_DEPTH=20"
+Environment="AUDIT_MAX_QUEUE_WAIT_MS=20000"
+Environment="AUDIT_API_SIDES=back"
+
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStart=/home/betbot/Bets/betinasia_bot/venv/bin/python audit_h3b_api.py --direction up --mode api --api-sides back
+Restart=always
+RestartSec=60
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/audit_api_back.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/audit_api_back_error.log
+
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
+

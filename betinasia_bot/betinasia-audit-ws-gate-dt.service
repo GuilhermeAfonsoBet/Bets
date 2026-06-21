@@ -1,0 +1,49 @@
+[Unit]
+Description=BetinAsia DT Audit (WS gate Back) - direction down
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PATH=/home/betbot/Bets/betinasia_bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+
+# Override isolado para DT (nao impacta H3B/H3BUP).
+Environment="AUDIT_EXECUTOR_WORKERS=2"
+Environment="AUDIT_TEMPORAL_WORKERS=0"
+Environment="AUDIT_MAX_QUEUE_DEPTH=200"
+Environment="AUDIT_MAX_QUEUE_WAIT_MS=20000"
+Environment="AUDIT_MODE=ws_gate_back"
+Environment="AUDIT_HYPOTHESIS_TYPE=DT"
+Environment="AUDIT_API_SIDES=back"
+Environment="DT_MIN_CONSEC_DOWNS=3"
+Environment="DT_MIN_STEP_DROP_PCT=0.20"
+Environment="DT_MIN_CUM_DROP_PCT=0.80"
+Environment="DT_MAX_STEP_GAP_SEC=30"
+Environment="DT_SIGNAL_COOLDOWN_SEC=45"
+Environment="GATE_RISE_OFFSET_SEC=5"
+Environment="GATE_RISE_RATIO=1.02"
+
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStart=/home/betbot/Bets/betinasia_bot/venv/bin/python audit_downward_trend_api.py --direction down --mode ws_gate_back --hypothesis-type DT --api-sides back
+Restart=always
+RestartSec=20
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/audit_ws_gate_dt.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/audit_ws_gate_dt_error.log
+
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=BetinAsia Ops AI Copilot (read-only diagnostics + approval queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Restart=always
+RestartSec=5
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.telegram_ai_copilot; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot /home/betbot/Bets/venv/bin/python -m ops.telegram_ai_copilot; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.telegram_ai_copilot; fi'
+
+[Install]
+WantedBy=multi-user.target

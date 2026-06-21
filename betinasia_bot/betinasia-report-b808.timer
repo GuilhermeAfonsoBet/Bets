@@ -1,0 +1,12 @@
+[Unit]
+Description=BetinAsia Report b808 - agendamento (gera PDF e faz push)
+
+[Timer]
+# Rodar 4x ao dia para aumentar chance de ter FT/ROI no free
+OnCalendar=*-*-* 00,06,12,18:15:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+

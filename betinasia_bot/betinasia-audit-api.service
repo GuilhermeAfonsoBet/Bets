@@ -1,0 +1,32 @@
+[Unit]
+Description=BetinAsia H3B API Audit - Auditoria via API (~2-3s)
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PATH=/home/betbot/Bets/betinasia_bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStart=/home/betbot/Bets/betinasia_bot/venv/bin/python audit_h3b_api.py --direction up --mode ws_gate_lay
+Restart=always
+RestartSec=60
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/audit_api.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/audit_api_error.log
+
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target

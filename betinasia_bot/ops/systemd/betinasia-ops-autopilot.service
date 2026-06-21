@@ -1,0 +1,14 @@
+[Unit]
+Description=BetinAsia Ops Auto-Pilot (safe restart + alert)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+# O health monitor usa exit codes (0=PASS, 1=WARN, 2=FAIL).
+# Este unit roda via timer; WARN/FAIL não significa que o unit "quebrou".
+SuccessExitStatus=1 2
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec env PYTHONPATH=betinasia_bot ./venv/bin/python -m ops.health_monitor --since-minutes 30 --telegram --autopilot --telegram-source ops-autopilot; else exec env PYTHONPATH=betinasia_bot /usr/bin/python3 -m ops.health_monitor --since-minutes 30 --telegram --autopilot --telegram-source ops-autopilot; fi'
+
