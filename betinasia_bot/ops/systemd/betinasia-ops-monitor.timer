@@ -1,0 +1,12 @@
+[Unit]
+Description=BetinAsia Ops Monitor (timer)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=betinasia-ops-monitor.service
+
+[Install]
+WantedBy=timers.target
+

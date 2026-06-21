@@ -1,0 +1,31 @@
+[Unit]
+Description=BetinAsia Executor Bridge - Audit -> Executor
+After=network-online.target postgresql.service betinasia-executor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/bin/mkdir -p /home/betbot/Bets/betinasia_bot/logs
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && if [ -x ./venv/bin/python ]; then exec ./venv/bin/python -m ops.executor_bridge_audit; elif [ -x /home/betbot/Bets/venv/bin/python ]; then exec /home/betbot/Bets/venv/bin/python -m ops.executor_bridge_audit; else exec /usr/bin/python3 -m ops.executor_bridge_audit; fi'
+
+Restart=always
+RestartSec=10
+
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/executor_bridge.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/executor_bridge_error.log
+
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+MemoryMax=1G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
+
