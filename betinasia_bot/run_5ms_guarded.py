@@ -199,6 +199,7 @@ def _doctor() -> int:
 
     must = [
         Path("betinasia_bot/regen_proj_from_balance_or_db.py"),
+        Path("betinasia_bot/build_5ms_base_bridge_exec.py"),
         Path("betinasia_bot/run_5ms_prepos_worldcup_fast.py"),
         Path("betinasia_bot/run_roi_backpre_safe.py"),
         Path("betinasia_bot/ms_por_segmento_completo.py"),
@@ -210,6 +211,23 @@ def _doctor() -> int:
             ok = False
             print(f"[ERRO] faltando script={p}")
     return 0 if ok else 3
+
+
+def _profile_check(chosen: CsvProfile, end_ts: datetime, args: argparse.Namespace) -> tuple[bool, float, list[str]]:
+    reasons: list[str] = []
+    if chosen.rows < int(args.min_rows):
+        reasons.append(f"rows={chosen.rows} < min_rows={args.min_rows}")
+    if chosen.pre < int(args.min_pre):
+        reasons.append(f"pre={chosen.pre} < min_pre={args.min_pre}")
+    if chosen.pos < int(args.min_pos):
+        reasons.append(f"pos={chosen.pos} < min_pos={args.min_pos}")
+    if chosen.max_ts is None:
+        reasons.append("max_ts ausente")
+        return False, float("inf"), reasons
+    lag_h = (end_ts - chosen.max_ts).total_seconds() / 3600.0
+    if lag_h > float(args.max_lag_hours):
+        reasons.append(f"lag_h={lag_h:.2f} > max_lag_hours={args.max_lag_hours}")
+    return len(reasons) == 0, lag_h, reasons
 
 
 def _run_pipeline(args: argparse.Namespace) -> int:
@@ -241,6 +259,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     print(f"[INFO] end_ts_real={end_ts.isoformat()}")
 
     chosen: Optional[CsvProfile] = None
+    used_bridge_fallback = False
+    bridge_base_path: Optional[str] = None
     if str(args.input_csv or "").strip():
         pr = _profile_csv(Path(args.input_csv), split_dt)
         if pr is None:
@@ -290,22 +310,49 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         f"period={chosen.min_ts}->{chosen.max_ts}"
     )
 
-    # asserts obrigatórios
-    if chosen.rows < int(args.min_rows):
-        print(f"[ERRO] base com poucas linhas: {chosen.rows} < min_rows={args.min_rows}")
-        return 20
-    if chosen.pre < int(args.min_pre):
-        print(f"[ERRO] base com pre insuficiente: {chosen.pre} < min_pre={args.min_pre}")
-        return 21
-    if chosen.pos < int(args.min_pos):
-        print(f"[ERRO] base com pos insuficiente: {chosen.pos} < min_pos={args.min_pos}")
-        return 22
-    if chosen.max_ts is None:
-        print("[ERRO] base sem max_ts.")
-        return 23
-    lag_h = (end_ts - chosen.max_ts).total_seconds() / 3600.0
-    if lag_h > float(args.max_lag_hours):
-        print(f"[ERRO] base stale: lag_h={lag_h:.2f} > max_lag_hours={args.max_lag_hours}")
+    ok_profile, lag_h, reasons = _profile_check(chosen, end_ts, args)
+
+    # fallback estrutural: audit->exec->order->ledger
+    if (not ok_profile) and str(args.input_csv or "").strip() == "" and int(args.bridge_fallback) == 1:
+        print(f"[WARN] base inicial reprovada: {'; '.join(reasons)}")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        bridge_out = Path(f"/tmp/base_5ms_real_ate_{end_ts.strftime('%Y%m%d')}_inferred_bridge_{ts}.csv")
+        bridge_cmd = [
+            "python3",
+            "betinasia_bot/build_5ms_base_bridge_exec.py",
+            "--start-ts",
+            str(args.start_ts),
+            "--end-ts",
+            end_ts.isoformat(),
+            "--balance-csv",
+            str(bal),
+            "--max-log-files",
+            str(args.bridge_max_log_files),
+            "--out-csv",
+            str(bridge_out),
+        ]
+        for r in args.executor_root:
+            rr = str(r or "").strip()
+            if rr:
+                bridge_cmd += ["--executor-root", rr]
+        print("[INFO] executando fallback bridge/exec/order ...")
+        rc_fb = _run_stream(bridge_cmd, timeout_sec=int(args.bridge_timeout_sec))
+        if rc_fb == 0 and bridge_out.exists():
+            pr_fb = _profile_csv(bridge_out, split_dt)
+            if pr_fb is not None:
+                chosen = pr_fb
+                ok_profile, lag_h, reasons = _profile_check(chosen, end_ts, args)
+                used_bridge_fallback = True
+                bridge_base_path = str(bridge_out)
+                print(
+                    f"[INFO] base fallback={chosen.path} rows={chosen.rows} pre={chosen.pre} pos={chosen.pos} "
+                    f"period={chosen.min_ts}->{chosen.max_ts}"
+                )
+        else:
+            print(f"[WARN] fallback bridge retornou rc={rc_fb}")
+
+    if not ok_profile:
+        print(f"[ERRO] base reprovada apos tentativas: {'; '.join(reasons)}")
         return 24
 
     start = datetime.now(timezone.utc)
@@ -370,6 +417,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "max_lag_hours": float(args.max_lag_hours),
             "lag_hours_observed": lag_h,
         },
+        "fallback": {
+            "bridge_fallback_enabled": int(args.bridge_fallback) == 1,
+            "bridge_fallback_used": used_bridge_fallback,
+            "bridge_base_path": bridge_base_path,
+        },
         "artifacts": {
             "roi_json": roi_json,
             "ms_json": ms_json,
@@ -391,14 +443,26 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mode", choices=["doctor", "run"], default="run")
     ap.add_argument("--input-csv", default="")
     ap.add_argument("--split-date", default="2026-05-25T00:00:00+00:00")
+    ap.add_argument("--start-ts", default="2026-01-01T00:00:00+00:00")
     ap.add_argument("--regen-first", type=int, default=1)
     ap.add_argument("--regen-timeout-sec", type=int, default=900)
+    ap.add_argument("--bridge-fallback", type=int, default=1)
+    ap.add_argument("--bridge-timeout-sec", type=int, default=1800)
+    ap.add_argument("--bridge-max-log-files", type=int, default=1500)
     ap.add_argument("--pipeline-timeout-sec", type=int, default=1800)
     ap.add_argument("--max-depth", type=int, default=4)
     ap.add_argument(
         "--search-root",
         action="append",
         default=["/home/betbot/Bets/betinasia_bot/logs/accounting"],
+    )
+    ap.add_argument(
+        "--executor-root",
+        action="append",
+        default=[
+            "/home/betbot/Bets/betinasia_bot/logs",
+            "/workspace/betinasia_bot/logs",
+        ],
     )
     ap.add_argument("--min-rows", type=int, default=120)
     ap.add_argument("--min-pre", type=int, default=40)
