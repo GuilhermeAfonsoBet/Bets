@@ -200,6 +200,7 @@ def _doctor() -> int:
     must = [
         Path("betinasia_bot/regen_proj_from_balance_or_db.py"),
         Path("betinasia_bot/build_5ms_base_bridge_exec.py"),
+        Path("betinasia_bot/diagnose_5ms_chain_coverage.py"),
         Path("betinasia_bot/run_5ms_prepos_worldcup_fast.py"),
         Path("betinasia_bot/run_roi_backpre_safe.py"),
         Path("betinasia_bot/ms_por_segmento_completo.py"),
