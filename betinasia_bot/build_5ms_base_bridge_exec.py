@@ -611,10 +611,12 @@ def build_base(
                 continue
             n_with_exec += 1
             od = _lookup_order(ex, ex_map_raw, ex_map_comp, ex_map_dig)
-            if not od:
-                continue
-            n_with_order += 1
-            pnl, odd = _lookup_pnl_odd(od, pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp, odd_dig)
+            if od:
+                n_with_order += 1
+            pnl = None
+            odd = None
+            if od:
+                pnl, odd = _lookup_pnl_odd(od, pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp, odd_dig)
             if pnl is None:
                 pnl, odd = _lookup_pnl_odd_ref(
                     ex,
@@ -664,7 +666,7 @@ def build_base(
                     "audited_at": str(r.get("audited_at", "")).strip(),
                     "slippage_pre_pct": str(r.get("slippage_pre_pct", "")).strip(),
                     "execution_id": ex,
-                    "order_id": od,
+                    "order_id": od or "",
                     "pnl_real": f"{float(pnl):.10f}",
                     "stake": f"{float(st):.10f}",
                     "side": str(r.get("side", "back")).strip() or "back",
