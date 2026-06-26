@@ -372,10 +372,9 @@ def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, h
             f"NULLIF({qh} #>> '{{executionId}}',''),"
             f"NULLIF({qh} #>> '{{exec_id}}',''),"
             f"NULLIF({qh} #>> '{{execution,id}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.execution_id') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.executionId') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.exec_id') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.execution.id') #>> '{{}}','')"
+            f"NULLIF({qh} #>> '{{value_sizing,execution_id}}',''),"
+            f"NULLIF({qh} #>> '{{finance,value_sizing,execution_id}}',''),"
+            f"NULLIF({qh} #>> '{{execution,id}}','')"
             ")"
         )
         order_hint_expr = (
@@ -384,10 +383,9 @@ def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, h
             f"NULLIF({qh} #>> '{{orderId}}',''),"
             f"NULLIF({qh} #>> '{{ticket_id}}',''),"
             f"NULLIF({qh} #>> '{{bet_id}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.order_id') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.orderId') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.ticket_id') #>> '{{}}',''),"
-            f"NULLIF(jsonb_path_query_first({qh}, '$.**.bet_id') #>> '{{}}','')"
+            f"NULLIF({qh} #>> '{{value_sizing,order_id}}',''),"
+            f"NULLIF({qh} #>> '{{finance,value_sizing,order_id}}',''),"
+            f"NULLIF({qh} #>> '{{order,id}}','')"
             ")"
         )
     else:
