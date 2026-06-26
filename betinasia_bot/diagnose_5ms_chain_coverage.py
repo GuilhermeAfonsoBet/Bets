@@ -223,7 +223,7 @@ def _export_bridge(db: str, out_csv: Path, start_ts: str, end_ts: str) -> int:
     audit_terms = []
     exec_terms = []
     c_aid = _pick(cols, ["audit_id"])
-    c_src = _pick(cols, ["src_id"])
+    c_src = _pick(cols, ["src_id", "source_id", "sourceid"])
     c_ex = _pick(cols, ["execution_id"])
     if c_aid:
         audit_terms.append(f"NULLIF({_qident(c_aid)}::text,'')")
@@ -236,13 +236,29 @@ def _export_bridge(db: str, out_csv: Path, start_ts: str, end_ts: str) -> int:
         qj = _qident(jc)
         audit_terms += [
             f"NULLIF({qj}::jsonb #>> '{{audit_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{auditId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{audit,id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{src_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{srcId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{source_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{sourceId}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.audit_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.auditId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.audit.id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.src_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.srcId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.source_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.sourceId') #>> '{{}}','')",
         ]
         exec_terms += [
             f"NULLIF({qj}::jsonb #>> '{{execution_id}}','')",
             f"NULLIF({qj}::jsonb #>> '{{executionId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{exec_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{execution,id}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.execution_id') #>> '{{}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.executionId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.exec_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.execution.id') #>> '{{}}','')",
         ]
     audit_expr = "COALESCE(" + ",".join(audit_terms + ["NULL::text"]) + ")"
     exec_expr = "COALESCE(" + ",".join(exec_terms + ["NULL::text"]) + ")"
@@ -288,8 +304,10 @@ def _audit_day_map(audit_csv: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
     return aid_day, day_cnt
 
 
-def _bridge_latest_map(bridge_csv: Path) -> Dict[str, str]:
-    latest: Dict[str, Tuple[datetime, str]] = {}
+def _bridge_latest_map(bridge_csv: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    latest_raw: Dict[str, Tuple[datetime, str]] = {}
+    latest_norm: Dict[str, Tuple[datetime, str]] = {}
+    latest_dig: Dict[str, Tuple[datetime, str]] = {}
     with bridge_csv.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         rd = csv.DictReader(f)
         for r in rd:
@@ -298,10 +316,24 @@ def _bridge_latest_map(bridge_csv: Path) -> Dict[str, str]:
             dt = _pdt(r.get("created_at", ""))
             if not aid or not ex or dt is None:
                 continue
-            prev = latest.get(aid)
-            if prev is None or dt > prev[0]:
-                latest[aid] = (dt, ex)
-    return {k: v[1] for k, v in latest.items()}
+            prev_raw = latest_raw.get(aid)
+            if prev_raw is None or dt > prev_raw[0]:
+                latest_raw[aid] = (dt, ex)
+            an = _norm(aid)
+            if an:
+                prev_norm = latest_norm.get(an)
+                if prev_norm is None or dt > prev_norm[0]:
+                    latest_norm[an] = (dt, ex)
+            ad = "".join(ch for ch in aid if ch.isdigit())
+            if ad:
+                prev_dig = latest_dig.get(ad)
+                if prev_dig is None or dt > prev_dig[0]:
+                    latest_dig[ad] = (dt, ex)
+    return (
+        {k: v[1] for k, v in latest_raw.items()},
+        {k: v[1] for k, v in latest_norm.items()},
+        {k: v[1] for k, v in latest_dig.items()},
+    )
 
 
 def _iter_lines(path: Path):
@@ -339,13 +371,26 @@ def _build_exec_order_map(roots: Sequence[str], max_files: int) -> Tuple[Dict[st
         rr = Path(str(root))
         if not rr.exists():
             continue
-        files += list(rr.rglob("*executor*jsonl"))
-        files += list(rr.rglob("*executor*jsonl.gz"))
-        files += list(rr.rglob("*executor*log"))
-        files += list(rr.rglob("*executor*log.gz"))
-        files += list(rr.rglob("*live*jsonl"))
-        files += list(rr.rglob("*live*jsonl.gz"))
-    uniq = {str(p.resolve()): p for p in files}
+        patterns = [
+            "*executor*jsonl",
+            "*executor*jsonl.*",
+            "*executor*ndjson*",
+            "*executor*json*",
+            "*executor*log*",
+            "*executor_live*",
+            "*live*jsonl*",
+        ]
+        for pat in patterns:
+            files += list(rr.rglob(pat))
+    uniq = {}
+    for p in files:
+        if not p.is_file():
+            continue
+        try:
+            rp = str(p.resolve())
+        except Exception:
+            rp = str(p)
+        uniq[rp] = p
     files2 = sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
     if max_files > 0:
         files2 = files2[:max_files]
@@ -430,7 +475,7 @@ def main() -> int:
     n_audit = _export_audit(db, audit_csv, args.start_ts, end_ts, args.hypothesis_type, args.reversal_direction, args.slippage_max)
     n_bridge = _export_bridge(db, bridge_csv, args.start_ts, end_ts)
     aid_day, day_total = _audit_day_map(audit_csv)
-    aid_exec = _bridge_latest_map(bridge_csv)
+    aid_exec_raw, aid_exec_norm, aid_exec_dig = _bridge_latest_map(bridge_csv)
     ex_order, n_logs = _build_exec_order_map(args.executor_root, int(args.max_log_files))
     ledger_keys = _build_order_pnl_keys(bal)
 
@@ -451,8 +496,13 @@ def main() -> int:
             return None
         return ex_order.get(ex) or ex_comp.get(_norm(ex)) or ex_dig.get("".join(ch for ch in ex if ch.isdigit()))
 
+    def lookup_exec(aid: str) -> str:
+        if not aid:
+            return ""
+        return aid_exec_raw.get(aid, "") or aid_exec_norm.get(_norm(aid), "") or aid_exec_dig.get("".join(ch for ch in aid if ch.isdigit()), "")
+
     for aid, day in aid_day.items():
-        ex = aid_exec.get(aid, "")
+        ex = lookup_exec(aid)
         if ex:
             day_exec[day] += 1
         else:

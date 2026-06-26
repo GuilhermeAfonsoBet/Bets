@@ -373,24 +373,43 @@ def _export_bridge_audit_exec(db: str, out_csv: Path, start_ts: str, end_ts: str
     json_cols = [c for c in cols if _norm_compact(c) in {_norm_compact(x) for x in ["meta", "payload_json", "row_json", "payload", "message", "data"]}]
     expr_exec_terms = []
     expr_audit_terms = []
-    if _pick(cols, ["execution_id"]):
-        expr_exec_terms.append(f"NULLIF({_qident(_pick(cols, ['execution_id']))}::text,'')")
-    if _pick(cols, ["audit_id"]):
-        expr_audit_terms.append(f"NULLIF({_qident(_pick(cols, ['audit_id']))}::text,'')")
-    if _pick(cols, ["src_id"]):
-        expr_audit_terms.append(f"NULLIF({_qident(_pick(cols, ['src_id']))}::text,'')")
+    c_ex = _pick(cols, ["execution_id"])
+    c_aid = _pick(cols, ["audit_id"])
+    c_src = _pick(cols, ["src_id", "source_id", "sourceid"])
+    if c_ex:
+        expr_exec_terms.append(f"NULLIF({_qident(c_ex)}::text,'')")
+    if c_aid:
+        expr_audit_terms.append(f"NULLIF({_qident(c_aid)}::text,'')")
+    if c_src:
+        expr_audit_terms.append(f"NULLIF({_qident(c_src)}::text,'')")
 
     for jc in json_cols:
         qj = _qident(jc)
         expr_exec_terms += [
             f"NULLIF({qj}::jsonb #>> '{{execution_id}}','')",
             f"NULLIF({qj}::jsonb #>> '{{executionId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{exec_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{execution,id}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.execution_id') #>> '{{}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.executionId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.exec_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.execution.id') #>> '{{}}','')",
         ]
         expr_audit_terms += [
             f"NULLIF({qj}::jsonb #>> '{{audit_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{auditId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{audit,id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{src_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{srcId}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{source_id}}','')",
+            f"NULLIF({qj}::jsonb #>> '{{sourceId}}','')",
             f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.audit_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.auditId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.audit.id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.src_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.srcId') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.source_id') #>> '{{}}','')",
+            f"NULLIF(jsonb_path_query_first({qj}::jsonb, '$.**.sourceId') #>> '{{}}','')",
         ]
 
     expr_exec = "COALESCE(" + ",".join(expr_exec_terms + ["NULL::text"]) + ")"
@@ -421,8 +440,10 @@ def _count_rows(path: Path) -> int:
     return n
 
 
-def _build_latest_audit_exec_map(path: Path) -> Dict[str, str]:
-    latest: Dict[str, Tuple[datetime, str]] = {}
+def _build_latest_audit_exec_map(path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    latest_raw: Dict[str, Tuple[datetime, str]] = {}
+    latest_comp: Dict[str, Tuple[datetime, str]] = {}
+    latest_dig: Dict[str, Tuple[datetime, str]] = {}
     with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         rd = csv.DictReader(f)
         for r in rd:
@@ -431,10 +452,29 @@ def _build_latest_audit_exec_map(path: Path) -> Dict[str, str]:
             dt = _pdt(r.get("created_at", ""))
             if not aid or not ex or dt is None:
                 continue
-            prev = latest.get(aid)
-            if prev is None or dt > prev[0]:
-                latest[aid] = (dt, ex)
-    return {k: v[1] for k, v in latest.items()}
+            prev_raw = latest_raw.get(aid)
+            if prev_raw is None or dt > prev_raw[0]:
+                latest_raw[aid] = (dt, ex)
+            ac = _norm_compact(aid)
+            if ac:
+                prev_comp = latest_comp.get(ac)
+                if prev_comp is None or dt > prev_comp[0]:
+                    latest_comp[ac] = (dt, ex)
+            ad = _norm_digits(aid)
+            if ad:
+                prev_dig = latest_dig.get(ad)
+                if prev_dig is None or dt > prev_dig[0]:
+                    latest_dig[ad] = (dt, ex)
+    out_raw = {k: v[1] for k, v in latest_raw.items()}
+    out_comp = {k: v[1] for k, v in latest_comp.items()}
+    out_dig = {k: v[1] for k, v in latest_dig.items()}
+    return out_raw, out_comp, out_dig
+
+
+def _lookup_exec_by_audit(audit_id: str, aid_raw: Dict[str, str], aid_comp: Dict[str, str], aid_dig: Dict[str, str]) -> str:
+    if not audit_id:
+        return ""
+    return aid_raw.get(audit_id, "") or aid_comp.get(_norm_compact(audit_id), "") or aid_dig.get(_norm_digits(audit_id), "")
 
 
 def _extract_ids_from_obj(obj: object, exec_ids: set[str], order_ids: set[str]) -> None:
@@ -472,13 +512,25 @@ def _build_exec_order_map(log_roots: Sequence[str], max_files: int) -> Dict[str,
         rr = Path(str(root))
         if not rr.exists():
             continue
-        files += list(rr.rglob("*executor*jsonl"))
-        files += list(rr.rglob("*executor*jsonl.gz"))
-        files += list(rr.rglob("*executor_live*.log"))
-        files += list(rr.rglob("*executor_live*.log.gz"))
+        patterns = [
+            "*executor*jsonl",
+            "*executor*jsonl.*",
+            "*executor*ndjson*",
+            "*executor*json*",
+            "*executor*log*",
+            "*executor_live*",
+        ]
+        for pat in patterns:
+            files += list(rr.rglob(pat))
     uniq = {}
     for p in files:
-        uniq[str(p.resolve())] = p
+        if not p.is_file():
+            continue
+        try:
+            rp = str(p.resolve())
+        except Exception:
+            rp = str(p)
+        uniq[rp] = p
     files2 = sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
     if max_files > 0:
         files2 = files2[:max_files]
@@ -596,8 +648,8 @@ def build_base(
     n_bridge = _export_bridge_audit_exec(db, bridge_csv, start_ts, end_ts)
     print(f"[OK] bridge rows: {n_bridge} ({bridge_csv})")
 
-    audit_to_exec = _build_latest_audit_exec_map(bridge_csv)
-    print(f"[OK] audit->exec mapeados: {len(audit_to_exec)}")
+    aid_raw, aid_comp, aid_dig = _build_latest_audit_exec_map(bridge_csv)
+    print(f"[OK] audit->exec mapeados: raw={len(aid_raw)} compact={len(aid_comp)} digits={len(aid_dig)}")
 
     ex_map_raw = _build_exec_order_map(executor_roots, max_log_files)
     ex_map_comp = {_norm_compact(k): v for k, v in ex_map_raw.items() if _norm_compact(k)}
@@ -650,7 +702,7 @@ def build_base(
         wr.writeheader()
         for i, r in enumerate(rd, start=1):
             aid = str(r.get("audit_id", "")).strip()
-            ex = audit_to_exec.get(aid, "")
+            ex = _lookup_exec_by_audit(aid, aid_raw, aid_comp, aid_dig)
             if not ex:
                 continue
             n_with_exec += 1
