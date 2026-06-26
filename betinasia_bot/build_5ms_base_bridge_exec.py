@@ -116,6 +116,38 @@ def _table_cols(db: str, table: str) -> Tuple[str, List[str]]:
     return schema, cols
 
 
+def _split_table_ref(table_ref: str, *, default_schema: str = "public") -> Tuple[str, str]:
+    raw = str(table_ref or "").strip()
+    if not raw:
+        raise RuntimeError("table_ref vazio")
+    if "." in raw:
+        sc, tb = raw.split(".", 1)
+        sc = sc.strip() or default_schema
+        tb = tb.strip()
+    else:
+        sc = default_schema
+        tb = raw
+    if not tb:
+        raise RuntimeError(f"table_ref invalido: {table_ref}")
+    return sc, tb
+
+
+def _table_exists(db: str, table_ref: str) -> bool:
+    sc, tb = _split_table_ref(table_ref)
+    sql = f"""
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = '{sc}'
+      AND table_name = '{tb}'
+    LIMIT 1;
+    """
+    try:
+        out = _psql(db, sql, at=True).strip()
+    except Exception:
+        return False
+    return bool(out)
+
+
 def _pick(cols: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
     by = {_norm_compact(c): c for c in cols}
     for cand in candidates:
@@ -334,9 +366,35 @@ def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, h
             stake_expr = f"COALESCE(NULLIF({_qident(c_stake)}::text,'')::double precision, NULLIF({qh} #>> '{{value_sizing,stake}}','')::double precision, NULLIF({qh} #>> '{{finance,value_sizing,stake}}','')::double precision)"
         else:
             stake_expr = f"COALESCE(NULLIF({qh} #>> '{{value_sizing,stake}}','')::double precision, NULLIF({qh} #>> '{{finance,value_sizing,stake}}','')::double precision)"
+        exec_hint_expr = (
+            "COALESCE("
+            f"NULLIF({qh} #>> '{{execution_id}}',''),"
+            f"NULLIF({qh} #>> '{{executionId}}',''),"
+            f"NULLIF({qh} #>> '{{exec_id}}',''),"
+            f"NULLIF({qh} #>> '{{execution,id}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.execution_id') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.executionId') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.exec_id') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.execution.id') #>> '{{}}','')"
+            ")"
+        )
+        order_hint_expr = (
+            "COALESCE("
+            f"NULLIF({qh} #>> '{{order_id}}',''),"
+            f"NULLIF({qh} #>> '{{orderId}}',''),"
+            f"NULLIF({qh} #>> '{{ticket_id}}',''),"
+            f"NULLIF({qh} #>> '{{bet_id}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.order_id') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.orderId') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.ticket_id') #>> '{{}}',''),"
+            f"NULLIF(jsonb_path_query_first({qh}, '$.**.bet_id') #>> '{{}}','')"
+            ")"
+        )
     else:
         slip_expr = "NULL::double precision"
         stake_expr = f"NULLIF({_qident(c_stake)}::text,'')::double precision" if c_stake else "NULL::double precision"
+        exec_hint_expr = "NULL::text"
+        order_hint_expr = "NULL::text"
 
     where_parts = [f"{_qident(c_ts)} >= '{start_ts}'::timestamptz", f"{_qident(c_ts)} <= '{end_ts}'::timestamptz"]
     if c_hyp_type:
@@ -354,6 +412,8 @@ def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, h
       {_qident(c_ts)}::text AS audited_at,
       {slip_expr} AS slippage_pre_pct,
       {stake_expr} AS stake_real,
+      {exec_hint_expr} AS execution_id_hint,
+      {order_hint_expr} AS order_id_hint,
       {col_or_null(c_side, 'side')},
       {col_or_null(c_regime, 'regime')}
     FROM {qtbl}
@@ -475,6 +535,54 @@ def _lookup_exec_by_audit(audit_id: str, aid_raw: Dict[str, str], aid_comp: Dict
     if not audit_id:
         return ""
     return aid_raw.get(audit_id, "") or aid_comp.get(_norm_compact(audit_id), "") or aid_dig.get(_norm_digits(audit_id), "")
+
+
+def _load_audit_exec_map_from_db(db: str, table_ref: str, out_csv: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    if not _table_exists(db, table_ref):
+        return {}, {}, {}
+    sc, tb = _split_table_ref(table_ref)
+    qtbl = f"{_qident(sc)}.{_qident(tb)}"
+    sql = f"""
+    SELECT
+      audit_id::text AS audit_id,
+      execution_id::text AS execution_id,
+      COALESCE(last_seen_at, updated_at, now())::text AS created_at
+    FROM {qtbl}
+    WHERE audit_id IS NOT NULL
+      AND execution_id IS NOT NULL
+      AND audit_id::text <> ''
+      AND execution_id::text <> ''
+    """
+    _psql_copy(db, sql, out_csv)
+    return _build_latest_audit_exec_map(out_csv)
+
+
+def _load_exec_order_map_from_db(db: str, table_ref: str) -> Dict[str, str]:
+    if not _table_exists(db, table_ref):
+        return {}
+    sc, tb = _split_table_ref(table_ref)
+    qtbl = f"{_qident(sc)}.{_qident(tb)}"
+    sql = f"""
+    SELECT
+      execution_id::text AS execution_id,
+      order_id::text AS order_id
+    FROM {qtbl}
+    WHERE execution_id IS NOT NULL
+      AND order_id IS NOT NULL
+      AND execution_id::text <> ''
+      AND order_id::text <> ''
+    """
+    out = _psql(db, sql, at=True).strip()
+    m: Dict[str, str] = {}
+    for ln in out.splitlines():
+        parts = ln.split("|")
+        if len(parts) != 2:
+            continue
+        ex = str(parts[0]).strip()
+        od = str(parts[1]).strip()
+        if ex and od and ex not in m:
+            m[ex] = od
+    return m
 
 
 def _extract_ids_from_obj(obj: object, exec_ids: set[str], order_ids: set[str]) -> None:
@@ -638,10 +746,13 @@ def build_base(
     hypothesis_type: str,
     reversal_direction: str,
     slippage_max: float,
+    audit_exec_map_table: str,
+    exec_order_map_table: str,
 ) -> Tuple[int, Optional[datetime], Optional[datetime]]:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     audit_csv = Path(f"/tmp/base_audit_{ts}.csv")
     bridge_csv = Path(f"/tmp/base_bridge_audit_exec_{ts}.csv")
+    map_audit_csv = Path(f"/tmp/base_audit_exec_map_{ts}.csv")
 
     n_audit = _export_audit_universe(db, audit_csv, start_ts, end_ts, hypothesis_type, reversal_direction, slippage_max)
     print(f"[OK] audit rows: {n_audit} ({audit_csv})")
@@ -649,9 +760,21 @@ def build_base(
     print(f"[OK] bridge rows: {n_bridge} ({bridge_csv})")
 
     aid_raw, aid_comp, aid_dig = _build_latest_audit_exec_map(bridge_csv)
-    print(f"[OK] audit->exec mapeados: raw={len(aid_raw)} compact={len(aid_comp)} digits={len(aid_dig)}")
+    print(f"[OK] audit->exec mapeados(bridge): raw={len(aid_raw)} compact={len(aid_comp)} digits={len(aid_dig)}")
+    db_aid_raw, db_aid_comp, db_aid_dig = _load_audit_exec_map_from_db(db, audit_exec_map_table, map_audit_csv)
+    if db_aid_raw:
+        print(f"[OK] audit->exec mapeados(db): raw={len(db_aid_raw)} compact={len(db_aid_comp)} digits={len(db_aid_dig)}")
+        aid_raw = {**db_aid_raw, **aid_raw}
+        aid_comp = {**db_aid_comp, **aid_comp}
+        aid_dig = {**db_aid_dig, **aid_dig}
+        print(f"[OK] audit->exec mapeados(merged): raw={len(aid_raw)} compact={len(aid_comp)} digits={len(aid_dig)}")
 
     ex_map_raw = _build_exec_order_map(executor_roots, max_log_files)
+    db_ex_map_raw = _load_exec_order_map_from_db(db, exec_order_map_table)
+    if db_ex_map_raw:
+        print(f"[OK] exec->order mapeados(db): {len(db_ex_map_raw)}")
+        ex_map_raw = {**db_ex_map_raw, **ex_map_raw}
+        print(f"[OK] exec->order mapeados(merged): {len(ex_map_raw)}")
     ex_map_comp = {_norm_compact(k): v for k, v in ex_map_raw.items() if _norm_compact(k)}
     ex_map_dig = {_norm_digits(k): v for k, v in ex_map_raw.items() if _norm_digits(k)}
 
@@ -674,7 +797,9 @@ def build_base(
 
     rows_out = 0
     n_with_exec = 0
+    n_with_exec_hint = 0
     n_with_order = 0
+    n_with_order_hint = 0
     n_with_pnl = 0
     n_with_pnl_ref_exec = 0
     n_with_pnl_ref_audit = 0
@@ -702,11 +827,19 @@ def build_base(
         wr.writeheader()
         for i, r in enumerate(rd, start=1):
             aid = str(r.get("audit_id", "")).strip()
+            ex_hint = str(r.get("execution_id_hint", "")).strip()
+            od_hint = str(r.get("order_id_hint", "")).strip()
             ex = _lookup_exec_by_audit(aid, aid_raw, aid_comp, aid_dig)
             if not ex:
-                continue
-            n_with_exec += 1
-            od = _lookup_order(ex, ex_map_raw, ex_map_comp, ex_map_dig)
+                ex = ex_hint
+                if ex:
+                    n_with_exec_hint += 1
+            if ex:
+                n_with_exec += 1
+            od = _lookup_order(ex, ex_map_raw, ex_map_comp, ex_map_dig) if ex else None
+            if not od and od_hint:
+                od = od_hint
+                n_with_order_hint += 1
             if od:
                 n_with_order += 1
             pnl = None
@@ -775,7 +908,8 @@ def build_base(
 
     print(f"[OK] rows_out={rows_out}")
     print(
-        f"[OK] coverage audit->exec={n_with_exec} exec->order={n_with_order} "
+        f"[OK] coverage audit->exec={n_with_exec} (hint_exec={n_with_exec_hint}) "
+        f"exec->order={n_with_order} (hint_order={n_with_order_hint}) "
         f"order/ref->pnl={n_with_pnl} (ref_exec={n_with_pnl_ref_exec}, ref_audit={n_with_pnl_ref_audit})"
     )
     print(f"[OK] period={mn} -> {mx}")
@@ -799,6 +933,8 @@ def parse_args() -> argparse.Namespace:
         ],
     )
     ap.add_argument("--max-log-files", type=int, default=1500)
+    ap.add_argument("--audit-exec-map-table", default="public.audit_execution_map", help="Tabela persistente audit->execution")
+    ap.add_argument("--exec-order-map-table", default="public.execution_order_map", help="Tabela persistente execution->order")
     ap.add_argument("--database-url", default="", help="Override do DATABASE_URL")
     ap.add_argument("--out-csv", default="")
     return ap.parse_args()
@@ -838,6 +974,8 @@ def main() -> int:
         hypothesis_type=args.hypothesis_type,
         reversal_direction=args.reversal_direction,
         slippage_max=float(args.slippage_max),
+        audit_exec_map_table=str(args.audit_exec_map_table),
+        exec_order_map_table=str(args.exec_order_map_table),
     )
     if rows <= 0:
         raise SystemExit("rows_out=0 (sem base util via bridge/exec/order)")
