@@ -246,15 +246,11 @@ def _m4_blocks(events: Sequence[Dict[str, Any]]) -> Tuple[Optional[float], Optio
 def _m5(rows: Sequence[Row]) -> Tuple[Optional[float], Optional[float]]:
     if not rows:
         return None, None
-    ev = sum(r.pnl for r in rows) / len(rows)
-    wins = [r.pnl for r in rows if r.pnl > 0]
-    losses = [r.pnl for r in rows if r.pnl < 0]
-    if not wins or not losses:
-        return ev, None
-    avg_win = sum(wins) / len(wins)
-    avg_loss = abs(sum(losses) / len(losses))
-    payoff = (avg_win / avg_loss) if avg_loss > 0 else None
-    return ev, payoff
+    pnl = sum(r.pnl for r in rows)
+    stake = sum(r.stake for r in rows)
+    ev_nominal = pnl / len(rows)
+    ev_pct = 100.0 * pnl / stake if stake > 0 else None
+    return ev_nominal, ev_pct
 
 
 def _fmt(x: Optional[float], nd: int = 2, pct: bool = False) -> str:
@@ -274,13 +270,13 @@ def _analyze_segment(name: str, rows: Sequence[Row], boot: int, perm: int, seed:
     top1_abs = _top1_abs_pct(events)
     pos_ratio, med_week = _weekly_stats(events)
     r1, r2, r3 = _m4_blocks(events)
-    ev_aposta, payoff_ratio = _m5(rows)
+    ev_aposta, ev_pct = _m5(rows)
 
     m1 = (p_perm is not None and p_perm <= 0.10 and ci90_lo is not None and ci90_lo > 0)
     m2 = (roi_sem_top3 is not None and roi_sem_top3 > 0 and top1_abs is not None and top1_abs <= 35)
     m3 = (pos_ratio is not None and pos_ratio >= 55 and med_week is not None and med_week > 0)
     m4 = (((r1 is not None and r1 > 0) + (r2 is not None and r2 > 0) + (r3 is not None and r3 > 0)) >= 2 and (r3 is not None and r3 > 0))
-    m5 = (ev_aposta is not None and ev_aposta > 0 and payoff_ratio is not None and payoff_ratio >= 1.8)
+    m5 = (ev_aposta is not None and ev_aposta > 0 and ev_pct is not None and ev_pct > 0)
 
     score = sum([m1, m2, m3, m4, m5])
     label = "robusto" if score >= 4 else ("moderado" if score >= 2 else "fragil")
@@ -292,7 +288,7 @@ def _analyze_segment(name: str, rows: Sequence[Row], boot: int, perm: int, seed:
         "M2": {"roi_sem_top3": roi_sem_top3, "top1_abs_pct": top1_abs, "status": "OK" if m2 else "FAIL"},
         "M3": {"pos_ratio_pct": pos_ratio, "mediana_semanal_pct": med_week, "status": "OK" if m3 else "FAIL"},
         "M4": {"r1_pct": r1, "r2_pct": r2, "r3_pct": r3, "status": "OK" if m4 else "FAIL"},
-        "M5": {"ev_por_aposta": ev_aposta, "payoff_ratio": payoff_ratio, "status": "OK" if m5 else "FAIL"},
+        "M5": {"ev_por_aposta": ev_aposta, "ev_pct": ev_pct, "status": "OK" if m5 else "FAIL"},
         "score_5ms": score,
         "label": label,
     }
@@ -451,7 +447,7 @@ def main() -> int:
         lines.append(f"| M2 | ROI sem Top-3 / top1_abs | {_fmt(s['M2']['roi_sem_top3'], 2, True)} / {_fmt(s['M2']['top1_abs_pct'], 2, True)} | {s['M2']['status']} |")
         lines.append(f"| M3 | pos_ratio / mediana semanal | {_fmt(s['M3']['pos_ratio_pct'], 2, True)} / {_fmt(s['M3']['mediana_semanal_pct'], 2, True)} | {s['M3']['status']} |")
         lines.append(f"| M4 | r1 / r2 / r3 | {_fmt(s['M4']['r1_pct'], 2, True)} / {_fmt(s['M4']['r2_pct'], 2, True)} / {_fmt(s['M4']['r3_pct'], 2, True)} | {s['M4']['status']} |")
-        lines.append(f"| M5 | EV/aposta / payoff_ratio | {_fmt(s['M5']['ev_por_aposta'], 4)} / {_fmt(s['M5']['payoff_ratio'], 4)} | {s['M5']['status']} |\n")
+        lines.append(f"| M5 | EV/aposta / EV% | {_fmt(s['M5']['ev_por_aposta'], 4)} / {_fmt(s['M5']['ev_pct'], 2, True)} | {s['M5']['status']} |\n")
     out_md.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"[OK] JSON: {out_json}")
