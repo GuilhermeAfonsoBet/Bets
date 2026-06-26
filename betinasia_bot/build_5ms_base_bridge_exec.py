@@ -159,28 +159,65 @@ def _max_post_date(balance_csv: Path) -> Optional[datetime]:
         return mx
 
 
-def _build_ledger_maps(balance_csv: Path) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
+def _build_ledger_maps(
+    balance_csv: Path,
+) -> Tuple[
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+]:
     with balance_csv.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         rd = csv.DictReader(f)
         fields = list(rd.fieldnames or [])
         oid_col = _pick(fields, ["order id", "order_id", "orderid", "bet id", "bet_id", "ticket id", "ticket_id"])
         val_col = _pick(fields, ["amount", "pnl_real", "pnl", "profit", "pl", "result", "net"])
+        ref_col = _pick(
+            fields,
+            [
+                "transaction id",
+                "transaction_id",
+                "reference id",
+                "reference_id",
+                "ref_id",
+                "audit_id",
+                "execution_id",
+                "execution id",
+            ],
+        )
         odd_col = _pick(fields, ["got price", "got_price", "price", "odd", "odds", "matched price"])
         if not oid_col or not val_col:
             raise RuntimeError(f"balance sem colunas esperadas: oid_col={oid_col} val_col={val_col}")
         pnl_raw: Dict[str, float] = defaultdict(float)
+        pnl_ref_raw: Dict[str, float] = defaultdict(float)
         odd_vals: Dict[str, List[float]] = defaultdict(list)
+        odd_ref_vals: Dict[str, List[float]] = defaultdict(list)
         for r in rd:
             oid = str(r.get(oid_col, "")).strip()
             if not oid:
-                continue
+                oid = ""
+            refv = str(r.get(ref_col, "")).strip() if ref_col else ""
             v = _pf(r.get(val_col))
             if v is not None:
-                pnl_raw[oid] += float(v)
+                if oid:
+                    pnl_raw[oid] += float(v)
+                if refv:
+                    pnl_ref_raw[refv] += float(v)
             if odd_col:
                 od = _pf(r.get(odd_col))
                 if od is not None and od > 1:
-                    odd_vals[oid].append(float(od))
+                    if oid:
+                        odd_vals[oid].append(float(od))
+                    if refv:
+                        odd_ref_vals[refv].append(float(od))
     odd_raw: Dict[str, float] = {}
     for k, arr in odd_vals.items():
         if not arr:
@@ -188,12 +225,36 @@ def _build_ledger_maps(balance_csv: Path) -> Tuple[Dict[str, float], Dict[str, f
         arr2 = sorted(arr)
         n = len(arr2)
         odd_raw[k] = arr2[n // 2] if n % 2 == 1 else 0.5 * (arr2[n // 2 - 1] + arr2[n // 2])
+    odd_ref_raw: Dict[str, float] = {}
+    for k, arr in odd_ref_vals.items():
+        if not arr:
+            continue
+        arr2 = sorted(arr)
+        n = len(arr2)
+        odd_ref_raw[k] = arr2[n // 2] if n % 2 == 1 else 0.5 * (arr2[n // 2 - 1] + arr2[n // 2])
 
     pnl_comp = {_norm_compact(k): v for k, v in pnl_raw.items() if _norm_compact(k)}
     pnl_dig = {_norm_digits(k): v for k, v in pnl_raw.items() if _norm_digits(k)}
     odd_comp = {_norm_compact(k): v for k, v in odd_raw.items() if _norm_compact(k)}
     odd_dig = {_norm_digits(k): v for k, v in odd_raw.items() if _norm_digits(k)}
-    return pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp, odd_dig
+    pnl_ref_comp = {_norm_compact(k): v for k, v in pnl_ref_raw.items() if _norm_compact(k)}
+    pnl_ref_dig = {_norm_digits(k): v for k, v in pnl_ref_raw.items() if _norm_digits(k)}
+    odd_ref_comp = {_norm_compact(k): v for k, v in odd_ref_raw.items() if _norm_compact(k)}
+    odd_ref_dig = {_norm_digits(k): v for k, v in odd_ref_raw.items() if _norm_digits(k)}
+    return (
+        pnl_raw,
+        pnl_comp,
+        pnl_dig,
+        odd_raw,
+        odd_comp,
+        odd_dig,
+        pnl_ref_raw,
+        pnl_ref_comp,
+        pnl_ref_dig,
+        odd_ref_raw,
+        odd_ref_comp,
+        odd_ref_dig,
+    )
 
 
 def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, hypothesis_type: str, reversal_direction: str, slippage_max: float) -> int:
@@ -445,6 +506,31 @@ def _lookup_pnl_odd(order_id: str, pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp
     return pnl, odd
 
 
+def _lookup_pnl_odd_ref(
+    ref_id: str,
+    pnl_ref_raw,
+    pnl_ref_comp,
+    pnl_ref_dig,
+    odd_ref_raw,
+    odd_ref_comp,
+    odd_ref_dig,
+) -> Tuple[Optional[float], Optional[float]]:
+    if not ref_id:
+        return None, None
+    pnl = pnl_ref_raw.get(ref_id)
+    if pnl is None:
+        pnl = pnl_ref_comp.get(_norm_compact(ref_id))
+    if pnl is None:
+        pnl = pnl_ref_dig.get(_norm_digits(ref_id))
+
+    odd = odd_ref_raw.get(ref_id)
+    if odd is None:
+        odd = odd_ref_comp.get(_norm_compact(ref_id))
+    if odd is None:
+        odd = odd_ref_dig.get(_norm_digits(ref_id))
+    return pnl, odd
+
+
 def build_base(
     db: str,
     start_ts: str,
@@ -473,13 +559,29 @@ def build_base(
     ex_map_comp = {_norm_compact(k): v for k, v in ex_map_raw.items() if _norm_compact(k)}
     ex_map_dig = {_norm_digits(k): v for k, v in ex_map_raw.items() if _norm_digits(k)}
 
-    pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp, odd_dig = _build_ledger_maps(balance_csv)
+    (
+        pnl_raw,
+        pnl_comp,
+        pnl_dig,
+        odd_raw,
+        odd_comp,
+        odd_dig,
+        pnl_ref_raw,
+        pnl_ref_comp,
+        pnl_ref_dig,
+        odd_ref_raw,
+        odd_ref_comp,
+        odd_ref_dig,
+    ) = _build_ledger_maps(balance_csv)
     print(f"[OK] ledger keys: raw={len(pnl_raw)}")
+    print(f"[OK] ledger ref_keys: raw={len(pnl_ref_raw)}")
 
     rows_out = 0
     n_with_exec = 0
     n_with_order = 0
     n_with_pnl = 0
+    n_with_pnl_ref_exec = 0
+    n_with_pnl_ref_audit = 0
     mn = None
     mx = None
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -513,6 +615,30 @@ def build_base(
                 continue
             n_with_order += 1
             pnl, odd = _lookup_pnl_odd(od, pnl_raw, pnl_comp, pnl_dig, odd_raw, odd_comp, odd_dig)
+            if pnl is None:
+                pnl, odd = _lookup_pnl_odd_ref(
+                    ex,
+                    pnl_ref_raw,
+                    pnl_ref_comp,
+                    pnl_ref_dig,
+                    odd_ref_raw,
+                    odd_ref_comp,
+                    odd_ref_dig,
+                )
+                if pnl is not None:
+                    n_with_pnl_ref_exec += 1
+            if pnl is None:
+                pnl, odd = _lookup_pnl_odd_ref(
+                    aid,
+                    pnl_ref_raw,
+                    pnl_ref_comp,
+                    pnl_ref_dig,
+                    odd_ref_raw,
+                    odd_ref_comp,
+                    odd_ref_dig,
+                )
+                if pnl is not None:
+                    n_with_pnl_ref_audit += 1
             if pnl is None:
                 continue
             n_with_pnl += 1
@@ -550,7 +676,10 @@ def build_base(
                 print(f"[INFO] progresso audit={i} rows_out={rows_out}")
 
     print(f"[OK] rows_out={rows_out}")
-    print(f"[OK] coverage audit->exec={n_with_exec} exec->order={n_with_order} order->pnl={n_with_pnl}")
+    print(
+        f"[OK] coverage audit->exec={n_with_exec} exec->order={n_with_order} "
+        f"order/ref->pnl={n_with_pnl} (ref_exec={n_with_pnl_ref_exec}, ref_audit={n_with_pnl_ref_audit})"
+    )
     print(f"[OK] period={mn} -> {mx}")
     return rows_out, mn, mx
 
