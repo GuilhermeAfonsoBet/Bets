@@ -199,6 +199,18 @@ def _ensure_tables(db: str, audit_exec_table: str, exec_order_table: str) -> Non
       hit_count bigint NOT NULL DEFAULT 1,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    ALTER TABLE {q1} ADD COLUMN IF NOT EXISTS last_seen_at timestamptz NULL;
+    ALTER TABLE {q1} ADD COLUMN IF NOT EXISTS source text;
+    ALTER TABLE {q1} ADD COLUMN IF NOT EXISTS hit_count bigint;
+    ALTER TABLE {q1} ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+    ALTER TABLE {q1} ALTER COLUMN source SET DEFAULT 'bridge';
+    ALTER TABLE {q1} ALTER COLUMN hit_count SET DEFAULT 1;
+    ALTER TABLE {q1} ALTER COLUMN updated_at SET DEFAULT now();
+    UPDATE {q1}
+       SET source = COALESCE(NULLIF(source,''), 'bridge'),
+           hit_count = COALESCE(hit_count, 1),
+           updated_at = COALESCE(updated_at, now())
+     WHERE source IS NULL OR source = '' OR hit_count IS NULL OR updated_at IS NULL;
     CREATE INDEX IF NOT EXISTS {_qident(idx1)} ON {q1} (execution_id);
 
     CREATE TABLE IF NOT EXISTS {q2} (
@@ -209,6 +221,18 @@ def _ensure_tables(db: str, audit_exec_table: str, exec_order_table: str) -> Non
       hit_count bigint NOT NULL DEFAULT 1,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    ALTER TABLE {q2} ADD COLUMN IF NOT EXISTS last_seen_at timestamptz NULL;
+    ALTER TABLE {q2} ADD COLUMN IF NOT EXISTS source text;
+    ALTER TABLE {q2} ADD COLUMN IF NOT EXISTS hit_count bigint;
+    ALTER TABLE {q2} ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+    ALTER TABLE {q2} ALTER COLUMN source SET DEFAULT 'logs';
+    ALTER TABLE {q2} ALTER COLUMN hit_count SET DEFAULT 1;
+    ALTER TABLE {q2} ALTER COLUMN updated_at SET DEFAULT now();
+    UPDATE {q2}
+       SET source = COALESCE(NULLIF(source,''), 'logs'),
+           hit_count = COALESCE(hit_count, 1),
+           updated_at = COALESCE(updated_at, now())
+     WHERE source IS NULL OR source = '' OR hit_count IS NULL OR updated_at IS NULL;
     CREATE INDEX IF NOT EXISTS {_qident(idx2)} ON {q2} (order_id);
     """
     _psql(db, sql, at=False)
