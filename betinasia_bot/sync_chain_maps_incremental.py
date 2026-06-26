@@ -470,7 +470,7 @@ def _upsert_audit_exec_rows(db: str, table_ref: str, rows: List[Dict[str, str]])
         wr.writeheader()
         wr.writerows(rows)
     tmp_esc = str(tmp).replace("'", "''")
-    create_tmp = "CREATE TEMP TABLE tmp_audit_exec (audit_id text, execution_id text, last_seen_at timestamptz, source text, hit_count bigint) ON COMMIT DROP;"
+    create_tmp = "CREATE TEMP TABLE tmp_audit_exec (audit_id text, execution_id text, last_seen_at timestamptz, source text, hit_count bigint);"
     copy_tmp = f"\\copy tmp_audit_exec FROM '{tmp_esc}' WITH CSV HEADER"
     upsert = f"""
     INSERT INTO {qtbl} (audit_id, execution_id, last_seen_at, source, hit_count, updated_at)
@@ -500,7 +500,7 @@ def _upsert_exec_order_rows(db: str, table_ref: str, rows: List[Dict[str, str]])
         wr.writeheader()
         wr.writerows(rows)
     tmp_esc = str(tmp).replace("'", "''")
-    create_tmp = "CREATE TEMP TABLE tmp_exec_order (execution_id text, order_id text, last_seen_at timestamptz, source text, hit_count bigint) ON COMMIT DROP;"
+    create_tmp = "CREATE TEMP TABLE tmp_exec_order (execution_id text, order_id text, last_seen_at timestamptz, source text, hit_count bigint);"
     copy_tmp = f"\\copy tmp_exec_order FROM '{tmp_esc}' WITH CSV HEADER"
     upsert = f"""
     INSERT INTO {qtbl} (execution_id, order_id, last_seen_at, source, hit_count, updated_at)
