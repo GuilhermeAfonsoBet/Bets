@@ -471,11 +471,12 @@ def _choose_best_exec_order_rows(log_pairs: Dict[Tuple[str, str], int], bal_pair
             src = "logs"
         else:
             src = "balance_ref"
+        now_iso = datetime.now(timezone.utc).isoformat()
         rows.append(
             {
                 "execution_id": ex,
                 "order_id": od,
-                "last_seen_at": "",
+                "last_seen_at": now_iso,
                 "source": src,
                 "hit_count": str(c_logs + c_bal),
             }
