@@ -333,7 +333,16 @@ def _build_ledger_maps(
     )
 
 
-def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, hypothesis_type: str, reversal_direction: str, slippage_max: float) -> int:
+def _export_audit_universe(
+    db: str,
+    out_csv: Path,
+    start_ts: str,
+    end_ts: str,
+    hypothesis_type: str,
+    reversal_direction: str,
+    slippage_max: float,
+    apply_slippage_filter: bool,
+) -> int:
     schema, cols = _table_cols(db, "betslip_audit_results")
     qtbl = f"{_qident(schema)}.{_qident('betslip_audit_results')}"
     c_id = _pick(cols, ["id", "audit_id"])
@@ -399,7 +408,8 @@ def _export_audit_universe(db: str, out_csv: Path, start_ts: str, end_ts: str, h
         where_parts.append(f"{_qident(c_hyp_type)} = '{hypothesis_type}'")
     if c_rev:
         where_parts.append(f"{_qident(c_rev)} = '{reversal_direction}'")
-    where_parts.append(f"{slip_expr} < {float(slippage_max)}")
+    if apply_slippage_filter:
+        where_parts.append(f"{slip_expr} < {float(slippage_max)}")
     where_sql = " AND ".join(where_parts)
 
     sql = f"""
@@ -612,7 +622,7 @@ def _iter_log_lines(path: Path):
                 yield ln
 
 
-def _build_exec_order_map(log_roots: Sequence[str], max_files: int) -> Dict[str, str]:
+def _executor_log_files(log_roots: Sequence[str], max_files: int) -> List[Path]:
     files: List[Path] = []
     for root in log_roots:
         rr = Path(str(root))
@@ -640,6 +650,11 @@ def _build_exec_order_map(log_roots: Sequence[str], max_files: int) -> Dict[str,
     files2 = sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
     if max_files > 0:
         files2 = files2[:max_files]
+    return files2
+
+
+def _build_exec_order_map(log_roots: Sequence[str], max_files: int) -> Dict[str, str]:
+    files2 = _executor_log_files(log_roots, max_files)
     print(f"[INFO] logs executor candidatos: {len(files2)}")
 
     pair_count: Dict[Tuple[str, str], int] = defaultdict(int)
@@ -682,6 +697,70 @@ def _build_exec_order_map(log_roots: Sequence[str], max_files: int) -> Dict[str,
         arr.sort(key=lambda t: (t[0], len(t[1])), reverse=True)
         out[ex] = arr[0][1]
     print(f"[OK] exec->order mapeados: {len(out)}")
+    return out
+
+
+def _get_path(obj: object, path: Sequence[str]) -> object:
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _build_exec_details_map(log_roots: Sequence[str], max_files: int) -> Dict[str, Dict[str, object]]:
+    files2 = _executor_log_files(log_roots, max_files)
+    out: Dict[str, Dict[str, object]] = {}
+    for i, p in enumerate(files2, start=1):
+        if i % 100 == 0:
+            print(f"[INFO] parsing executor details: {i}/{len(files2)}")
+        try:
+            for ln in _iter_log_lines(p):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = json.loads(ln)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                req = obj.get("request") if isinstance(obj.get("request"), dict) else {}
+                res = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+                raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+                ex = str(res.get("execution_id") or req.get("execution_id") or "").strip()
+                if not ex:
+                    continue
+                exec_ids: set[str] = set()
+                order_ids: set[str] = set()
+                _extract_ids_from_obj(obj, exec_ids, order_ids)
+                slip = _pf(_get_path(raw, ["value_sizing", "slippage_pre_pct"]))
+                if slip is None:
+                    slip = _pf(_get_path(raw, ["slippage_telemetry", "delta_pct"]))
+                if slip is None:
+                    slip = _pf(res.get("delta_pct"))
+                stake = _pf(_get_path(raw, ["value_sizing", "stake_chosen"]))
+                if stake is None:
+                    stake = _pf(_get_path(res, ["policy", "stake_requested"]))
+                if stake is None:
+                    stake = _pf(_get_path(req, ["policy", "stake_requested"]))
+                detail = {
+                    "execution_id": ex,
+                    "order_id": sorted(order_ids)[0] if order_ids else "",
+                    "slippage_pre_pct": slip,
+                    "stake": stake,
+                    "odd_at_decision": _pf(res.get("odd_at_decision") or req.get("odd_at_decision")),
+                    "odd_final": _pf(res.get("odd_final") or _get_path(raw, ["value_sizing", "odd_pre_submit"])),
+                    "status": str(res.get("status") or "").strip(),
+                    "created_at": str(res.get("created_at") or req.get("created_at") or "").strip(),
+                }
+                prev = out.get(ex)
+                if prev is None or str(detail.get("status")) == "LIVE_OK":
+                    out[ex] = detail
+        except Exception:
+            continue
+    print(f"[OK] executor details mapeados: {len(out)}")
     return out
 
 
@@ -746,13 +825,23 @@ def build_base(
     slippage_max: float,
     audit_exec_map_table: str,
     exec_order_map_table: str,
+    slippage_source: str,
 ) -> Tuple[int, Optional[datetime], Optional[datetime]]:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     audit_csv = Path(f"/tmp/base_audit_{ts}.csv")
     bridge_csv = Path(f"/tmp/base_bridge_audit_exec_{ts}.csv")
     map_audit_csv = Path(f"/tmp/base_audit_exec_map_{ts}.csv")
 
-    n_audit = _export_audit_universe(db, audit_csv, start_ts, end_ts, hypothesis_type, reversal_direction, slippage_max)
+    n_audit = _export_audit_universe(
+        db,
+        audit_csv,
+        start_ts,
+        end_ts,
+        hypothesis_type,
+        reversal_direction,
+        slippage_max,
+        apply_slippage_filter=(slippage_source == "audit"),
+    )
     print(f"[OK] audit rows: {n_audit} ({audit_csv})")
     n_bridge = _export_bridge_audit_exec(db, bridge_csv, start_ts, end_ts)
     print(f"[OK] bridge rows: {n_bridge} ({bridge_csv})")
@@ -775,6 +864,7 @@ def build_base(
         print(f"[OK] exec->order mapeados(merged): {len(ex_map_raw)}")
     ex_map_comp = {_norm_compact(k): v for k, v in ex_map_raw.items() if _norm_compact(k)}
     ex_map_dig = {_norm_digits(k): v for k, v in ex_map_raw.items() if _norm_digits(k)}
+    exec_details = _build_exec_details_map(executor_roots, max_log_files) if slippage_source in {"executor", "coalesce"} else {}
 
     (
         pnl_raw,
@@ -834,7 +924,24 @@ def build_base(
                     n_with_exec_hint += 1
             if ex:
                 n_with_exec += 1
-            od = _lookup_order(ex, ex_map_raw, ex_map_comp, ex_map_dig) if ex else None
+            detail = exec_details.get(ex, {}) if ex else {}
+            audit_slip = _pf(r.get("slippage_pre_pct", ""))
+            exec_slip = _pf(detail.get("slippage_pre_pct"))
+            if slippage_source == "executor":
+                if exec_slip is None or float(exec_slip) >= float(slippage_max):
+                    continue
+                slip_out = exec_slip
+            elif slippage_source == "coalesce":
+                slip_ref = audit_slip if audit_slip is not None else exec_slip
+                if slip_ref is None or float(slip_ref) >= float(slippage_max):
+                    continue
+                slip_out = slip_ref
+            else:
+                slip_out = audit_slip
+
+            od = str(detail.get("order_id") or "").strip() if detail else ""
+            if not od:
+                od = _lookup_order(ex, ex_map_raw, ex_map_comp, ex_map_dig) if ex else None
             if not od and od_hint:
                 od = od_hint
                 n_with_order_hint += 1
@@ -872,6 +979,8 @@ def build_base(
                 continue
             n_with_pnl += 1
             st = _pf(r.get("stake_real", ""))
+            if (st is None or st <= 0) and detail:
+                st = _pf(detail.get("stake"))
             if st is None or st <= 0:
                 if pnl < 0:
                     st = -float(pnl)
@@ -891,7 +1000,7 @@ def build_base(
                     "event_id": str(r.get("event_id", "")).strip(),
                     "league": str(r.get("league", "")).strip(),
                     "audited_at": str(r.get("audited_at", "")).strip(),
-                    "slippage_pre_pct": str(r.get("slippage_pre_pct", "")).strip(),
+                    "slippage_pre_pct": "" if slip_out is None else f"{float(slip_out):.10f}",
                     "execution_id": ex,
                     "order_id": od or "",
                     "pnl_real": f"{float(pnl):.10f}",
@@ -922,6 +1031,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hypothesis-type", default="H3B")
     ap.add_argument("--reversal-direction", default="up")
     ap.add_argument("--slippage-max", type=float, default=0.0, help="Filtro slippage_pre_pct < slippage-max")
+    ap.add_argument(
+        "--slippage-source",
+        choices=["audit", "executor", "coalesce"],
+        default="audit",
+        help="Fonte do filtro de slippage: audit preserva comportamento historico; executor usa logs de execucao; coalesce tenta audit e depois executor.",
+    )
     ap.add_argument(
         "--executor-root",
         action="append",
@@ -974,6 +1089,7 @@ def main() -> int:
         slippage_max=float(args.slippage_max),
         audit_exec_map_table=str(args.audit_exec_map_table),
         exec_order_map_table=str(args.exec_order_map_table),
+        slippage_source=str(args.slippage_source),
     )
     if rows <= 0:
         raise SystemExit("rows_out=0 (sem base util via bridge/exec/order)")
