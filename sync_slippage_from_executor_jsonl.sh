@@ -67,7 +67,8 @@ for ln in src.read_text(encoding="utf-8", errors="ignore").splitlines():
         continue
     req = o.get("request") if isinstance(o.get("request"), dict) else {}
     res = o.get("result") if isinstance(o.get("result"), dict) else {}
-    if str(res.get("status", "")).upper() != "LIVE_OK":
+    status = str(res.get("status", "")).upper()
+    if status not in {"LIVE_OK", "CAP_BLOCKED"}:
         continue
     side = str(res.get("exec_side") or req.get("exec_side") or "").lower()
     if side != "back":
