@@ -138,6 +138,50 @@ def _latest_balance_csv() -> Path:
     return Path(cands[-1])
 
 
+def _read_database_url_from_env_file(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                s = ln.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("export "):
+                    s = s[len("export ") :].strip()
+                if not s.startswith("DATABASE_URL="):
+                    continue
+                v = s.split("=", 1)[1].strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1].strip()
+                return v
+    except Exception:
+        return ""
+    return ""
+
+
+def _resolve_database_url(cli_value: str) -> str:
+    if str(cli_value or "").strip():
+        return str(cli_value).strip()
+    env = os.environ.get("DATABASE_URL", "").strip()
+    if env:
+        return env
+    env_candidates = [
+        Path.cwd() / "betinasia_bot/.env",
+        Path.cwd() / ".env",
+        Path("/home/betbot/Bets/betinasia_bot/.env"),
+        Path("/home/betbot/Bets/.env"),
+        Path("/workspace/betinasia_bot/.env"),
+        Path("/workspace/.env"),
+    ]
+    for p in env_candidates:
+        db = _read_database_url_from_env_file(p)
+        if db:
+            print(f"[INFO] DATABASE_URL carregado de {p}")
+            return db
+    return ""
+
+
 def glob_list(pattern: str) -> List[str]:
     import glob
 
@@ -703,15 +747,16 @@ def parse_args() -> argparse.Namespace:
         ],
     )
     ap.add_argument("--max-log-files", type=int, default=1500)
+    ap.add_argument("--database-url", default="", help="Override do DATABASE_URL")
     ap.add_argument("--out-csv", default="")
     return ap.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    db = os.environ.get("DATABASE_URL", "").strip()
+    db = _resolve_database_url(args.database_url)
     if not db:
-        raise SystemExit("DATABASE_URL nao definido")
+        raise SystemExit("DATABASE_URL nao definido (exporte no shell, passe --database-url ou configure .env)")
 
     bal = Path(args.balance_csv).expanduser() if str(args.balance_csv or "").strip() else _latest_balance_csv()
     if not bal.exists():
