@@ -497,15 +497,23 @@ def _upsert_audit_exec_rows(db: str, table_ref: str, rows: List[Dict[str, str]])
     create_tmp = "CREATE TEMP TABLE tmp_audit_exec (audit_id text, execution_id text, last_seen_at timestamptz, source text, hit_count bigint);"
     copy_tmp = f"\\copy tmp_audit_exec FROM '{tmp_esc}' WITH CSV HEADER"
     upsert = f"""
+    UPDATE {qtbl} t
+       SET execution_id = s.execution_id,
+           last_seen_at = COALESCE(GREATEST(t.last_seen_at, s.last_seen_at), s.last_seen_at, t.last_seen_at),
+           source = COALESCE(NULLIF(s.source,''), 'bridge'),
+           hit_count = COALESCE(t.hit_count, 0) + COALESCE(s.hit_count, 1),
+           updated_at = now()
+      FROM tmp_audit_exec s
+     WHERE t.audit_id = s.audit_id;
+
     INSERT INTO {qtbl} (audit_id, execution_id, last_seen_at, source, hit_count, updated_at)
-    SELECT audit_id, execution_id, last_seen_at, COALESCE(NULLIF(source,''),'bridge'), COALESCE(hit_count,1), now()
-    FROM tmp_audit_exec
-    ON CONFLICT (audit_id) DO UPDATE
-    SET execution_id = EXCLUDED.execution_id,
-        last_seen_at = COALESCE(GREATEST({qtbl}.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at, {qtbl}.last_seen_at),
-        source = EXCLUDED.source,
-        hit_count = {qtbl}.hit_count + EXCLUDED.hit_count,
-        updated_at = now();
+    SELECT s.audit_id, s.execution_id, s.last_seen_at, COALESCE(NULLIF(s.source,''),'bridge'), COALESCE(s.hit_count,1), now()
+      FROM tmp_audit_exec s
+     WHERE NOT EXISTS (
+       SELECT 1
+         FROM {qtbl} t
+        WHERE t.audit_id = s.audit_id
+     );
     """
     p = _run(["psql", db, "-v", "ON_ERROR_STOP=1", "-c", create_tmp, "-c", copy_tmp, "-c", upsert])
     if p.returncode != 0:
@@ -527,15 +535,23 @@ def _upsert_exec_order_rows(db: str, table_ref: str, rows: List[Dict[str, str]])
     create_tmp = "CREATE TEMP TABLE tmp_exec_order (execution_id text, order_id text, last_seen_at timestamptz, source text, hit_count bigint);"
     copy_tmp = f"\\copy tmp_exec_order FROM '{tmp_esc}' WITH CSV HEADER"
     upsert = f"""
+    UPDATE {qtbl} t
+       SET order_id = s.order_id,
+           last_seen_at = COALESCE(GREATEST(t.last_seen_at, s.last_seen_at), s.last_seen_at, t.last_seen_at),
+           source = COALESCE(NULLIF(s.source,''), 'logs'),
+           hit_count = COALESCE(t.hit_count, 0) + COALESCE(s.hit_count, 1),
+           updated_at = now()
+      FROM tmp_exec_order s
+     WHERE t.execution_id = s.execution_id;
+
     INSERT INTO {qtbl} (execution_id, order_id, last_seen_at, source, hit_count, updated_at)
-    SELECT execution_id, order_id, last_seen_at, COALESCE(NULLIF(source,''),'logs'), COALESCE(hit_count,1), now()
-    FROM tmp_exec_order
-    ON CONFLICT (execution_id) DO UPDATE
-    SET order_id = EXCLUDED.order_id,
-        last_seen_at = COALESCE(GREATEST({qtbl}.last_seen_at, EXCLUDED.last_seen_at), EXCLUDED.last_seen_at, {qtbl}.last_seen_at),
-        source = EXCLUDED.source,
-        hit_count = {qtbl}.hit_count + EXCLUDED.hit_count,
-        updated_at = now();
+    SELECT s.execution_id, s.order_id, s.last_seen_at, COALESCE(NULLIF(s.source,''),'logs'), COALESCE(s.hit_count,1), now()
+      FROM tmp_exec_order s
+     WHERE NOT EXISTS (
+       SELECT 1
+         FROM {qtbl} t
+        WHERE t.execution_id = s.execution_id
+     );
     """
     p = _run(["psql", db, "-v", "ON_ERROR_STOP=1", "-c", create_tmp, "-c", copy_tmp, "-c", upsert])
     if p.returncode != 0:
