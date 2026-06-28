@@ -693,7 +693,7 @@ def main() -> int:
     }
     out["answers"] = {
         "Apostas/mes potencial sem filtro de ligas": "Ver coluna potential_bets_month na curva de cap; usa oportunidades H3BUP observadas sem aplicar filtro de liga.",
-        "Apostas/mes por execucao real": f"{_summary(executed)['n'] / max(1, _summary(executed)['active_days']) * 30:.1f} por run-rate de dias ativos.",
+        "Apostas/mes por execucao real": f"{len(executed) / max(1, _active_days(executed)) * 30:.1f} por run-rate de dias ativos.",
         "Reducao por filtro de ligas": "Comparar sem_filtro_ligas vs filtro_historico; se potencial cai e ROI OOS nao melhora consistentemente, filtro muda universo mais que prova alpha.",
         "Max stake medio/mediano/p75/p90/p95": "Reportado na distribuicao max_stake.",
         "Turnover/capital por cap": "Reportado na curva cap aplicado; capital medio = turnover/3.",
