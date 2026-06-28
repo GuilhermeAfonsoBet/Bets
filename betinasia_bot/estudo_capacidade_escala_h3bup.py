@@ -428,12 +428,39 @@ def _scale_tests(executed: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         data.append((row, y))
     beta = None
     if len(data) >= 10:
-        # Normal equations with small ridge for stability.
-        import numpy as np
-        X = np.array([d[0] for d in data], dtype=float)
-        Y = np.array([d[1] for d in data], dtype=float)
-        lam = 1e-6
-        beta = np.linalg.solve(X.T @ X + lam*np.eye(X.shape[1]), X.T @ Y).tolist()
+        # Normal equations with small ridge for stability, sem depender de numpy.
+        n_cols = len(data[0][0])
+        xtx = [[0.0 for _ in range(n_cols)] for __ in range(n_cols)]
+        xty = [0.0 for _ in range(n_cols)]
+        for row, y in data:
+            for i in range(n_cols):
+                xty[i] += row[i] * y
+                for j in range(n_cols):
+                    xtx[i][j] += row[i] * row[j]
+        for i in range(n_cols):
+            xtx[i][i] += 1e-6
+        # Gaussian elimination.
+        a = [xtx[i][:] + [xty[i]] for i in range(n_cols)]
+        for col in range(n_cols):
+            pivot = max(range(col, n_cols), key=lambda r: abs(a[r][col]))
+            if abs(a[pivot][col]) < 1e-12:
+                beta = None
+                break
+            if pivot != col:
+                a[col], a[pivot] = a[pivot], a[col]
+            div = a[col][col]
+            for j in range(col, n_cols + 1):
+                a[col][j] /= div
+            for r in range(n_cols):
+                if r == col:
+                    continue
+                factor = a[r][col]
+                if factor == 0:
+                    continue
+                for j in range(col, n_cols + 1):
+                    a[r][j] -= factor * a[col][j]
+        else:
+            beta = [a[i][n_cols] for i in range(n_cols)]
     return {
         "bucket_stats": bucket_stats,
         "quartiles": grp(quart),
