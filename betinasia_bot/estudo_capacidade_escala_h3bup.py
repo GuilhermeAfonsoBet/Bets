@@ -536,7 +536,7 @@ def _render_md(out: Dict[str, Any], md: Path) -> None:
     lines.append("## Bases\n")
     lines.append("| Base | N | Eventos | Dias ativos | Turnover potencial/real | ROI realizado |")
     lines.append("|---|---:|---:|---:|---:|---:|")
-    lines.append(f"| Executada | {b['executed']['n']} | {b['executed']['events']} | {b['executed']['active_days']} | {_fmt(b['executed']['stake'],2)} | {_fmt(b['executed']['roi'],2,True)} |")
+    lines.append(f"| Executada | {b['executed']['n']} | {b['executed']['events']} | NA | {_fmt(b['executed']['stake'],2)} | {_fmt(b['executed']['roi'],2,True)} |")
     lines.append(f"| Elegivel observada | {b['potential']['n']} | {b['potential']['events']} | {b['potential']['active_days']} | {_fmt(b['potential']['potential_turnover'],2)} | NA |")
     lines.append(f"| Shadow/contrafactual sem P&L | {b['shadow']['n']} | {b['shadow']['events']} | {b['shadow']['active_days']} | {_fmt(b['shadow']['potential_turnover'],2)} | NA |\n")
     lines.append("## Distribuicao exata de max_stake/capacity\n")
