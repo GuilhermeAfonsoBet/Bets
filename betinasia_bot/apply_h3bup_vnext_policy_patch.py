@@ -97,10 +97,13 @@ CREATE TABLE IF NOT EXISTS backpre_shadow_all (
   order_id TEXT NULL,
   raw JSONB NULL
 );
-CREATE INDEX IF NOT EXISTS idx_backpre_shadow_event ON backpre_shadow_all (event_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_backpre_shadow_policy ON backpre_shadow_all (policy_id, policy_version, created_at);
-CREATE INDEX IF NOT EXISTS idx_backpre_shadow_flags ON backpre_shadow_all (is_h3bup_vnext, is_executed, is_shadow_only);
 """
+
+DDL_BACKPRE_SHADOW_IDX = [
+    "CREATE INDEX IF NOT EXISTS idx_backpre_shadow_event ON backpre_shadow_all (event_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_backpre_shadow_policy ON backpre_shadow_all (policy_id, policy_version, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_backpre_shadow_flags ON backpre_shadow_all (is_h3bup_vnext, is_executed, is_shadow_only);",
+]
 
 ''' + anchor
         if anchor not in text:
@@ -109,6 +112,13 @@ CREATE INDEX IF NOT EXISTS idx_backpre_shadow_flags ON backpre_shadow_all (is_h3
         changed = True
     if "await conn.execute(text(DDL_BACKPRE_SHADOW_ALL))" not in text:
         text = text.replace("        await conn.execute(text(DDL_POSITIONS))\n", "        await conn.execute(text(DDL_POSITIONS))\n        await conn.execute(text(DDL_BACKPRE_SHADOW_ALL))\n", 1)
+        changed = True
+    if "for stmt in DDL_BACKPRE_SHADOW_IDX" not in text:
+        text = text.replace(
+            "        for stmt in DDL_POSITIONS_IDX:\n            await conn.execute(text(stmt))\n",
+            "        for stmt in DDL_POSITIONS_IDX:\n            await conn.execute(text(stmt))\n        for stmt in DDL_BACKPRE_SHADOW_IDX:\n            await conn.execute(text(stmt))\n",
+            1,
+        )
         changed = True
     if "def _h3bup_vnext_eval" not in text:
         anchor = "\n\nasync def _fetch_candidates(\n"
