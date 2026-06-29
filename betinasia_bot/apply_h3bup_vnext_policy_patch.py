@@ -127,6 +127,7 @@ DDL_BACKPRE_SHADOW_IDX = [
 POLICY_ID_H3BUP_VNEXT = "{POLICY_ID}"
 POLICY_VERSION_H3BUP_VNEXT = "{POLICY_VERSION}"
 POLICY_STARTED_AT_H3BUP_VNEXT = "{POLICY_STARTED_AT}"
+POLICY_STARTED_AT_H3BUP_VNEXT_DT = datetime.fromisoformat(POLICY_STARTED_AT_H3BUP_VNEXT)
 
 
 def _details_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -236,7 +237,7 @@ async def _record_backpre_shadow(db: Database, row: Dict[str, Any], action: str,
             "detected_at": row.get("audited_at"),
             "policy_id": ev.get("policy_id"),
             "policy_version": ev.get("policy_version"),
-            "policy_started_at": ev.get("policy_started_at"),
+            "policy_started_at": POLICY_STARTED_AT_H3BUP_VNEXT_DT,
             "event_id": str(row.get("event_id") or ""),
             "market_id": str(row.get("event_id") or ""),
             "league": league,
