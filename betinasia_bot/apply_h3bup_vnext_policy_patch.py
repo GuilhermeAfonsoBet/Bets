@@ -10,7 +10,7 @@ alteracao operacional de forma reaplicavel:
 - Bridge Back Pre passa a aprovar H3BUP_vNext sem filtro de ligas:
   Back Pre + odd 1.85..2.15 + capacity/limit > 100.
 - Executor continua sendo o gate final de slippage_pre_pct < 0.
-- Stake H3BUP_vNext passa a 30 e max_stake operacional minimo a 30.
+- Stake H3BUP_vNext passa a 10 e max_stake operacional minimo a 10.
 - Cria registro shadow amplo BackPre_Shadow_All em tabela backpre_shadow_all.
 """
 
@@ -326,13 +326,13 @@ async def _record_backpre_shadow(db: Database, row: Dict[str, Any], action: str,
             raise SystemExit("anchor policy not ok nao encontrado")
         text = text.replace(old, new, 1)
         changed = True
-    if "H3BUP_vNext_force_stake_30" not in text:
+    if "H3BUP_vNext_force_stake_10" not in text:
         anchor = '''                # Gate de slippage (enforced no executor antes do LIVE):
 '''
-        insert = '''                # H3BUP_vNext: policy versionada, sem filtro de ligas, stake 30.
+        insert = '''                # H3BUP_vNext: policy versionada, sem filtro de ligas, stake 10.
                 try:
                     if cfg.exec_side == ExecSide.BACK and h3bup_vnext_eval.get("is_h3bup_vnext_pre_exec"):
-                        req.policy.stake_requested = 30.0
+                        req.policy.stake_requested = 10.0
                         req.policy.liability_requested = None
                         req.policy.policy_version = POLICY_VERSION_H3BUP_VNEXT
                         req.meta.setdefault("policy", {})
@@ -347,9 +347,9 @@ async def _record_backpre_shadow(db: Database, row: Dict[str, Any], action: str,
                                 "capacity_gt": 100,
                                 "league_filter": "disabled",
                             },
-                            "parameters": {"stake": 30.0},
+                            "parameters": {"stake": 10.0},
                             "change_reason": "H3BUP_vNext: slippage<0 + odd 1.85-2.15 + capacity>100; remover filtro de ligas e manter shadow amplo",
-                            "H3BUP_vNext_force_stake_30": True,
+                            "H3BUP_vNext_force_stake_10": True,
                         })
                 except Exception:
                     pass
@@ -391,19 +391,19 @@ async def _record_backpre_shadow(db: Database, row: Dict[str, Any], action: str,
 def patch_executor(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     changed = False
-    if "H3BUP_vNext_min_max_stake_30" not in text:
+    if "H3BUP_vNext_min_max_stake_10" not in text:
         old = '        max_stake = float(os.getenv("EXECUTOR_LIVE_MAX_STAKE", "5.0"))\n'
         new = old + '''        if "H3BUP_vNext" in str(getattr(req.policy, "policy_version", "")):
-            max_stake = max(float(max_stake), 30.0)  # H3BUP_vNext_min_max_stake_30
+            max_stake = max(float(max_stake), 10.0)  # H3BUP_vNext_min_max_stake_10
 '''
         if old not in text:
             raise SystemExit("executor max_stake anchor nao encontrado")
         text = text.replace(old, new, 1)
         changed = True
-    if "H3BUP_vNext_force_stake_30" not in text:
+    if "H3BUP_vNext_force_stake_10" not in text:
         old = "                stake = float(stake_pre_fast if is_pre_fast else stake_back_default)\n"
         new = '''                if "H3BUP_vNext" in str(getattr(req.policy, "policy_version", "")):
-                    stake = 30.0  # H3BUP_vNext_force_stake_30
+                    stake = 10.0  # H3BUP_vNext_force_stake_10
                 else:
                     stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
 '''
