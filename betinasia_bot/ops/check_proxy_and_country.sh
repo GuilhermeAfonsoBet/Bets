@@ -139,10 +139,11 @@ echo
 echo "SUMMARY: DIRECT_OK=$DIRECT_OK PROXY_OK=$PROXY_OK COUNTRY_BLOCK=$COUNTRY_BLOCK"
 if [[ "$PROXY_OK" -eq 0 && "$DIRECT_OK" -eq 1 && -z "${PROXY_SERVER:-}" ]]; then
   echo "[WARN] Sem proxy: login direto pode funcionar, mas LIVE tende a falhar com login_country_not_allowed (ex.: SG)."
-  EXIT_CODE=1
+  if [[ "$EXIT_CODE" -lt 1 ]]; then EXIT_CODE=1; fi
 fi
 if [[ "$COUNTRY_BLOCK" -eq 1 ]]; then
   echo "[FAIL] Apostas bloqueadas por pais. Reconfigure PROXY_SERVER de pais permitido, limpe sessao e relogin via proxy."
+  EXIT_CODE=2
 fi
 if [[ "$PROXY_OK" -eq 0 && -n "${PROXY_SERVER:-}" ]]; then
   echo "[FAIL] Proxy configurado mas inacessivel."
