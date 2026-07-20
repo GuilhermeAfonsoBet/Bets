@@ -65,14 +65,54 @@ Environment="EXECUTOR_LIVE_MAX_STAKE=10"
 EOF
 fi
 
+# Critico: o processo herda EnvironmentFile=.env; so drop-in systemd NAO basta.
+ENV_FILE="/home/betbot/Bets/betinasia_bot/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  cp -a "$ENV_FILE" "$BACKUP_DIR/dotenv.env"
+  python3 - <<'PY'
+from pathlib import Path
+p = Path("/home/betbot/Bets/betinasia_bot/.env")
+replacements = {
+    "EXECUTOR_LIVE_STAKE": "10",
+    "EXECUTOR_LIVE_MAX_STAKE": "10",
+    "EXECUTOR_BACKPRE_FAST_STAKE_ENABLE": "0",
+    "EXECUTOR_BACKPRE_FAST_STAKE_ENFORCE": "0",
+    "EXECUTOR_BACKPRE_FAST_STAKE": "10",
+    "EXECUTOR_BACKPRE_FAST_STAKE_HI": "10",
+    "EXECUTOR_BACKPRE_FAST_STAKE_LO": "10",
+    "EXECUTOR_BACK_STAKE_DEFAULT": "10",
+    "EXECUTOR_BACK_STAKE_SIZING_ENABLE": "0",
+    "BRIDGE_STAKE": "10",
+}
+out = []
+seen = set()
+for line in p.read_text().splitlines(True):
+    if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+        out.append(line)
+        continue
+    k, _ = line.split("=", 1)
+    k = k.strip()
+    if k in replacements:
+        out.append(f"{k}={replacements[k]}\n")
+        seen.add(k)
+    else:
+        out.append(line)
+for k, v in replacements.items():
+    if k not in seen:
+        out.append(f"{k}={v}\n")
+p.write_text("".join(out))
+print("[OK] .env stake keys alinhados a H3BUP stake10")
+PY
+fi
+
 systemctl daemon-reload
 systemctl restart betinasia-executor.service
 
 echo "[OK] backups em: $BACKUP_DIR"
 echo "[OK] ativo: $H3BUP_CONF"
-echo "[OK] env efetivo (stake):"
-systemctl show betinasia-executor -p Environment --no-pager \
-  | tr ' ' '\n' \
-  | grep -iE 'STAKE|SIZING' \
-  || true
+echo "[OK] /proc environ efetivo (stake):"
+pid="$(systemctl show -p MainPID --value betinasia-executor)"
+tr '\0' '\n' <"/proc/$pid/environ" \
+  | grep -E 'EXECUTOR_(BACKPRE_FAST_STAKE|LIVE_STAKE|LIVE_MAX|BACK_STAKE)|BRIDGE_STAKE' \
+  | sort || true
 systemctl is-active betinasia-executor.service
