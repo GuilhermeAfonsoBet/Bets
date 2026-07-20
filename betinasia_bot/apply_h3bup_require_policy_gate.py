@@ -52,6 +52,44 @@ SIZING_NEW = """                if \"H3BUP_vNext\" in str(getattr(req.policy, \"
                     stake = float(stake_back_default)  # no_fast_bump_without_h3bup
 """
 
+HARD_OLD = """        # valida max stake após sizing
+        if stake > max_stake:
+            dry.error = f\"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}\"
+            return dry
+"""
+
+HARD_NEW = """        # HARD CAP operacional H3BUP: Back Pre LIVE so stake==10; rejeita qualquer outro sizing.
+        try:
+            is_back_pre_hard = bool(req.exec_side == ExecSide.BACK and not bool(market_is_live))
+            pol_v = str(getattr(req.policy, \"policy_version\", \"\") or \"\")
+            is_h3b = \"H3BUP_vNext\" in pol_v
+            if is_back_pre_hard:
+                if (not is_h3b) or (stake is None) or (abs(float(stake) - 10.0) > 1e-6):
+                    dry.status = ExecStatus.CAP_BLOCKED
+                    dry.http_status = 200
+                    dry.error = f\"H3BUP_STAKE_HARD_CAP hard_stake_cap_h3bup_only_10 pol={pol_v!r} stake={stake}\"
+                    dry.raw = dict(dry.raw or {})
+                    dry.raw[\"stake_hard_cap\"] = {
+                        \"policy_version\": pol_v,
+                        \"stake\": (float(stake) if stake is not None else None),
+                        \"required_policy\": \"H3BUP_vNext*\",
+                        \"required_stake\": 10.0,
+                    }
+                    try:
+                        await asyncio.wait_for(self._api.close_betslip(betslip_id), timeout=float(os.getenv(\"EXECUTOR_LIVE_CLOSE_TIMEOUT_SEC\", \"1.2\")))
+                    except Exception:
+                        pass
+                    return dry
+                stake = 10.0
+        except Exception:
+            pass
+
+        # valida max stake após sizing
+        if stake > max_stake:
+            dry.error = f\"LIVE_STAKE_TOO_HIGH stake={stake} max={max_stake}\"
+            return dry
+"""
+
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
@@ -76,6 +114,15 @@ def main() -> int:
         print(f"[OK] defesa sizing (sem bump 20) aplicada: {path}")
     else:
         print(f"[OK] defesa sizing ja presente: {path}")
+
+    if "hard_stake_cap_h3bup_only_10" not in text:
+        if HARD_OLD not in text:
+            raise SystemExit(f"anchor hard-cap nao encontrado em {path}")
+        text = text.replace(HARD_OLD, HARD_NEW, 1)
+        changed = True
+        print(f"[OK] hard-cap stake10 aplicado: {path}")
+    else:
+        print(f"[OK] hard-cap ja presente: {path}")
 
     if changed:
         path.write_text(text, encoding="utf-8")
