@@ -3,7 +3,13 @@
 
 Motivo operacional (2026-07-20):
 o servico betinasia-executor-bridge-dt rodava em paralelo como Back/H3B live
-(com codigo/env legado) e submetia apostas stake=1.5 fora da policy H3BUP_vNext.
+(com codigo/env legado) e submetia apostas com policy stake_requested=1.5.
+
+O executor ainda bumpava essas ordens para sent.stake=20 via
+EXECUTOR_BACKPRE_FAST_STAKE_HI=20 (drop-in zz-999-backpre-fast20.conf).
+Este gate bloqueia qualquer Back Pre LIVE sem policy H3BUP_vNext.
+Complementar: ops/align_h3bup_stake_overrides.sh desliga o fast-path e fixa
+LIVE_STAKE/MAX_STAKE=10.
 """
 
 from __future__ import annotations
@@ -33,18 +39,46 @@ NEW = """            is_back_pre = bool(req.exec_side == ExecSide.BACK and not b
             slip_val = None
 """
 
+SIZING_OLD = """                if \"H3BUP_vNext\" in str(getattr(req.policy, \"policy_version\", \"\")):
+                    stake = 10.0  # H3BUP_vNext_force_stake_10
+                else:
+                    stake = float(stake_pre_fast if is_pre_fast else stake_back_default)
+"""
+
+SIZING_NEW = """                if \"H3BUP_vNext\" in str(getattr(req.policy, \"policy_version\", \"\")):
+                    stake = 10.0  # H3BUP_vNext_force_stake_10
+                else:
+                    # Nunca bumpa stake legado (ex.: 1.5 -> 20). Gate H3BUP rejeita depois.
+                    stake = float(stake_back_default)  # no_fast_bump_without_h3bup
+"""
+
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     path = root / "executor" / "worker.py"
     text = path.read_text(encoding="utf-8")
-    if "non_h3bup_backpre_rejected" in text:
-        print(f"[OK] ja aplicado: {path}")
-        return 0
-    if OLD not in text:
-        raise SystemExit(f"anchor nao encontrado em {path}")
-    path.write_text(text.replace(OLD, NEW, 1), encoding="utf-8")
-    print(f"[OK] patch aplicado: {path}")
+    changed = False
+
+    if "non_h3bup_backpre_rejected" not in text:
+        if OLD not in text:
+            raise SystemExit(f"anchor gate nao encontrado em {path}")
+        text = text.replace(OLD, NEW, 1)
+        changed = True
+        print(f"[OK] gate H3BUP aplicado: {path}")
+    else:
+        print(f"[OK] gate H3BUP ja presente: {path}")
+
+    if "no_fast_bump_without_h3bup" not in text:
+        if SIZING_OLD not in text:
+            raise SystemExit(f"anchor sizing nao encontrado em {path}")
+        text = text.replace(SIZING_OLD, SIZING_NEW, 1)
+        changed = True
+        print(f"[OK] defesa sizing (sem bump 20) aplicada: {path}")
+    else:
+        print(f"[OK] defesa sizing ja presente: {path}")
+
+    if changed:
+        path.write_text(text, encoding="utf-8")
     return 0
 
 
