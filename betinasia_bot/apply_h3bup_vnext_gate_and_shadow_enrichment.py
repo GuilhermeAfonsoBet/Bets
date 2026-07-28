@@ -142,7 +142,9 @@ def patch_worker(path: Path) -> bool:
                 odd_val = None
             cap_val = None
             try:
-                cap_val = float(limit_final) if limit_final is not None else None
+                # Em _execute_unlocked a capacidade vem do dry-run (dry.limit_final).
+                # limit_final solto nao existe neste escopo (NameError -> capacity sempre null).
+                cap_val = float(dry.limit_final) if getattr(dry, "limit_final", None) is not None else None
             except Exception:
                 cap_val = None
             h3bup_block_reasons = []
