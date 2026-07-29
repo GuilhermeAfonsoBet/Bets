@@ -1,0 +1,46 @@
+{
+  "captured_at_utc": "2026-07-29T15:50:14.866456+00:00",
+  "checksums": {
+    "audit_h3b_api.py": "6d163e5e88d498f74873026a3edf328e",
+    "ops/executor_bridge_audit.py": "3ccdc438bc590c961fc1431e2861e3ef",
+    "executor/worker.py": "298f8073a56f63806909f51d043241de",
+    "executor/service.py": "78aed4229d77891ad1bf7a366f63ea14",
+    "executor/store.py": "d33558a727001f4b900076ce63ecc3ee",
+    "ops/daily_full_report.py": "7d0f6b50c80f7f3506deadf988d610c8"
+  },
+  "systemd_units": [
+    "betinasia-audit-ws-gate-back.service",
+    "betinasia-audit-ws-gate-back.service.d",
+    "betinasia-executor-bridge-back.service",
+    "betinasia-executor-bridge-back.service.d",
+    "betinasia-executor-bridge-dt.service",
+    "betinasia-executor-bridge-dt.service.d",
+    "betinasia-executor-bridge-lay.service",
+    "betinasia-executor-bridge-lay.service.d",
+    "betinasia-executor-bridge.service",
+    "betinasia-executor-bridge.service.disabled.20260424-110308",
+    "betinasia-executor.service",
+    "betinasia-executor.service.d"
+  ],
+  "systemd_status": {
+    "betinasia-audit-ws-gate-back.service": "active\n3696860 Wed 2026-07-29 15:14:50 UTC ",
+    "betinasia-audit-ws-gate-back.service.d": "inactive\n0  ",
+    "betinasia-executor-bridge-back.service": "active\n3696093 Wed 2026-07-29 15:10:06 UTC ",
+    "betinasia-executor-bridge-back.service.d": "inactive\n0  ",
+    "betinasia-executor-bridge-dt.service": "inactive\n0  ",
+    "betinasia-executor-bridge-dt.service.d": "inactive\n0  ",
+    "betinasia-executor-bridge-lay.service": "active\n3553143 Tue 2026-07-28 06:45:48 UTC ",
+    "betinasia-executor-bridge-lay.service.d": "inactive\n0  ",
+    "betinasia-executor-bridge.service": "inactive\n0  ",
+    "betinasia-executor-bridge.service.disabled.20260424-110308": "inactive\n0  ",
+    "betinasia-executor.service": "active\n3696091 Wed 2026-07-29 15:10:06 UTC ",
+    "betinasia-executor.service.d": "inactive\n0  "
+  },
+  "process_sample": "3553143  1.6  0.9 python          ./venv/bin/python -m ops.executor_bridge_audit --exec-side Lay\n3553800  0.7  2.3 python          /home/betbot/Bets/betinasia_bot/venv/bin/python audit_h3b_betslip.py --continuous --num-audits 50 --direction up\n3696091  0.7  1.1 python          ./venv/bin/python run_executor_dryrun.py --unix-socket /tmp/betinasia-exec.sock --workers 2 --jsonl logs/executor_live.jsonl\n3696093  1.9  0.9 python          ./venv/bin/python -m ops.executor_bridge_audit\n3696860  2.2  1.3 python          /home/betbot/Bets/betinasia_bot/venv/bin/python audit_h3b_api.py --direction up --mode ws_gate_back\n3700435  0.0  0.0 grep            grep -E audit_h3b|executor_bridge|executor\n",
+  "accounting_health": {
+    "status": "ACCOUNTING_OK",
+    "health": "HEALTHY"
+  },
+  "env_snippets": {},
+  "trace_enabled_before": null
+}
