@@ -157,6 +157,10 @@ def classify_health(
     ages = [a for a in (balance_age_sec, open_age_sec) if a is not None]
     max_age = max(ages) if ages else None
 
+    # Stale snapshot always dominates (even if this cycle failed).
+    if max_age is not None and max_age > lim.critical_stale_sec:
+        return CRITICAL
+
     if status in (
         ACCOUNTING_AUTH_FAILED,
         ACCOUNTING_SCHEMA_CHANGED,
@@ -169,8 +173,6 @@ def classify_health(
         if consecutive_failures >= lim.max_consecutive_failures:
             return CRITICAL
         return CRITICAL if status in (ACCOUNTING_EMPTY_RESPONSE, ACCOUNTING_WRITE_FAILED) else WATCH
-    if max_age is not None and max_age > lim.critical_stale_sec:
-        return CRITICAL
     if status == ACCOUNTING_PARTIAL:
         return WATCH
     if consecutive_failures > 0:

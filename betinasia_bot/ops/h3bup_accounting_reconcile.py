@@ -120,53 +120,64 @@ def iter_live_ok_from_jsonl(
                 o = json.loads(line)
             except Exception:
                 continue
-            status = str(o.get("status") or o.get("result", {}).get("status") or "")
+            result = o.get("result") or {}
+            req = o.get("request") or {}
+            status = str(result.get("status") or o.get("status") or "")
             if status != "LIVE_OK":
-                # nested shapes
-                if str((o.get("result") or {}).get("status") or "") != "LIVE_OK":
-                    if str((o.get("response") or {}).get("status") or "") != "LIVE_OK":
-                        continue
-                    status = "LIVE_OK"
+                continue
+            pol_obj = result.get("policy") if isinstance(result.get("policy"), dict) else {}
             pol = str(
                 o.get("policy_version")
-                or (o.get("request") or {}).get("policy_version")
+                or req.get("policy_version")
+                or pol_obj.get("policy_version")
                 or (o.get("shadow") or {}).get("policy_version")
                 or ""
             )
             if policy_substr not in pol:
                 continue
-            finished = _parse_ts(
-                (o.get("result") or {}).get("finished_at")
-                or o.get("finished_at")
-                or o.get("ts")
-            )
-            created = _parse_ts((o.get("request") or {}).get("created_at") or o.get("created_at"))
+            finished = _parse_ts(result.get("finished_at") or o.get("finished_at") or o.get("ts"))
+            created = _parse_ts(req.get("created_at") or o.get("created_at"))
             ts = finished or created
             if ts is None or ts < cutoff:
                 continue
-            req = o.get("request") or {}
+            raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+            order_resp = raw.get("order_resp") if isinstance(raw.get("order_resp"), dict) else {}
+            order_data = order_resp.get("data") if isinstance(order_resp.get("data"), dict) else {}
             sent = o.get("sent") or {}
-            dry = o.get("dry") or {}
+            dry = o.get("dry") or req.get("dry") or {}
+            if not isinstance(dry, dict):
+                dry = {}
+            # value_sizing / enrichment fields often nested in request or result
+            vs = result.get("value_sizing") if isinstance(result.get("value_sizing"), dict) else {}
             yield {
                 "raw": o,
                 "order_id": order_id_key(
                     o.get("order_id")
-                    or (o.get("result") or {}).get("order_id")
+                    or result.get("order_id")
+                    or order_data.get("order_id")
                     or sent.get("order_id")
                     or (o.get("response") or {}).get("order_id")
                 ),
-                "execution_id": str(o.get("execution_id") or req.get("execution_id") or ""),
-                "audit_id": str(o.get("audit_id") or req.get("audit_id") or (o.get("shadow") or {}).get("audit_id") or ""),
-                "event_id": str(o.get("event_id") or req.get("event_id") or ""),
-                "event_name": str(o.get("event_name") or req.get("event_name") or ""),
-                "market": str(o.get("market") or req.get("market") or "AH"),
-                "side": str(o.get("side") or req.get("side") or ""),
-                "line": o.get("line") if o.get("line") is not None else req.get("line"),
-                "odd_at_decision": o.get("odd_at_decision") or req.get("odd_at_decision"),
-                "odd_final": o.get("odd_final") or sent.get("odd") or dry.get("odd_final"),
-                "stake": _safe_float(sent.get("stake") or req.get("stake") or o.get("stake") or 10),
+                "execution_id": str(result.get("execution_id") or req.get("execution_id") or o.get("execution_id") or ""),
+                "audit_id": str(result.get("audit_id") or req.get("audit_id") or (o.get("shadow") or {}).get("audit_id") or ""),
+                "event_id": str(result.get("event_id") or req.get("event_id") or ""),
+                "event_name": str(result.get("event_name") or req.get("event_name") or req.get("match_name") or ""),
+                "market": str(result.get("market_type") or req.get("market_type") or req.get("market") or "AH"),
+                "side": str(result.get("side") or req.get("side") or ""),
+                "line": result.get("line") if result.get("line") is not None else req.get("line"),
+                "odd_at_decision": result.get("odd_at_decision") or req.get("odd_at_decision"),
+                "odd_final": result.get("odd_final") or sent.get("odd") or dry.get("odd_final"),
+                "stake": _safe_float(
+                    (result.get("sent") or {}).get("stake")
+                    if isinstance(result.get("sent"), dict)
+                    else None
+                    or sent.get("stake")
+                    or req.get("stake")
+                    or pol_obj.get("stake_requested")
+                    or 10
+                ),
                 "live_ok_ts": (finished or ts).isoformat(),
-                "kickoff_ts": str(o.get("kickoff") or req.get("kickoff") or ""),
+                "kickoff_ts": str(result.get("kickoff") or req.get("kickoff") or req.get("event_date") or ""),
                 "policy_version": pol,
             }
 

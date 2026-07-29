@@ -1,0 +1,114 @@
+{
+  "captured_at_utc": "2026-07-29T14:10:11.640550+00:00",
+  "health": {
+    "checked_at_utc": "2026-07-29T14:08:16.586029+00:00",
+    "status": "ACCOUNTING_OK",
+    "health": "HEALTHY",
+    "balance": {
+      "source_ok": true,
+      "rows": 5444,
+      "source_ts": "2026-07-29T14:07:52.087056+00:00",
+      "file_path": "logs/accounting/20260729_140752__balance.csv",
+      "file_mtime_utc": "2026-07-29T14:07:52.087056+00:00",
+      "age_sec": 24.498918056488037
+    },
+    "open_stakes": {
+      "source_ok": true,
+      "rows": 69,
+      "source_ts": "2026-07-29T14:08:16.480172+00:00",
+      "file_path": "logs/accounting/20260729_140816__open_stakes.csv",
+      "file_mtime_utc": "2026-07-29T14:08:16.480172+00:00",
+      "age_sec": 0.10580229759216309
+    },
+    "session_ok": true,
+    "proxy_ok": true,
+    "api_status": "ACCOUNTING_OK",
+    "error_type": null,
+    "error_message": null,
+    "run_id": "7e0af8ff-f157-4e28-8b91-c9eed408fe58",
+    "duration_ms": 68950,
+    "consecutive_failures": 0,
+    "limits": {
+      "warn_stale_sec": 900.0,
+      "critical_stale_sec": 3600.0,
+      "max_consecutive_failures": 3
+    }
+  },
+  "summary": {
+    "n_live_ok": 12,
+    "counts": {
+      "SETTLED_ACCOUNTING_OK": 1,
+      "VOID_OR_PUSH": 1,
+      "SETTLED_AFTER_PREVIOUS_SNAPSHOT": 1,
+      "OPEN_NOT_SETTLED": 9
+    },
+    "n_settled_confirmed": 3,
+    "stake_settled": 30.0,
+    "pnl_settled": -0.4300000000000015,
+    "roi_settled": -0.014333333333333384,
+    "accounting_coverage": 0.25,
+    "disclaimer_low_n": true,
+    "disclaimer_low_coverage": true,
+    "funnel": [
+      {
+        "stage": "LIVE_OK",
+        "n": 12
+      },
+      {
+        "stage": "EVENT_NOT_STARTED",
+        "n": 0
+      },
+      {
+        "stage": "EVENT_IN_PROGRESS",
+        "n": 0
+      },
+      {
+        "stage": "OPEN_NOT_SETTLED",
+        "n": 9
+      },
+      {
+        "stage": "SETTLED_FOUND",
+        "n": 3
+      },
+      {
+        "stage": "SETTLED_MISSING_ACCOUNTING",
+        "n": 0
+      },
+      {
+        "stage": "ORDER_ID_JOIN_FAILURE",
+        "n": 0
+      },
+      {
+        "stage": "UNKNOWN",
+        "n": 0
+      }
+    ]
+  },
+  "files": {
+    "latest_balance": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_140752__balance.csv",
+      "mtime_utc": "2026-07-29T14:07:52.087056+00:00",
+      "size": 2972285,
+      "rows": 5444
+    },
+    "latest_open_stakes": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_140816__open_stakes.csv",
+      "mtime_utc": "2026-07-29T14:08:16.480172+00:00",
+      "size": 34013,
+      "rows": 69
+    }
+  },
+  "services_raw": "MainPID=3689324\nId=betinasia-accounting-monitor.service\nActiveEnterTimestamp=Wed 2026-07-29 14:06:55 UTC\n\nMainPID=3682164\nId=betinasia-executor.service\nActiveEnterTimestamp=Wed 2026-07-29 13:30:07 UTC\n\nMainPID=3682166\nId=betinasia-executor-bridge-back.service\nActiveEnterTimestamp=Wed 2026-07-29 13:30:07 UTC\n\nMainPID=3685212\nId=betinasia-audit-ws-gate-back.service\nActiveEnterTimestamp=Wed 2026-07-29 13:46:12 UTC\n",
+  "checksums": {
+    "accounting_monitor.py": "8838367d8c664a35c8972c637d7800e4",
+    "executor_bridge_audit.py": "3ccdc438bc590c961fc1431e2861e3ef",
+    "executor/worker.py": "298f8073a56f63806909f51d043241de",
+    "scraper/betinasia.py": "cbcfe7143e076f06448d6b5947642572"
+  },
+  "execution_untouched": {
+    "bridge_md5": "3ccdc438bc590c961fc1431e2861e3ef",
+    "worker_md5": "298f8073a56f63806909f51d043241de",
+    "expected_bridge": "3ccdc438bc590c961fc1431e2861e3ef",
+    "expected_worker": "298f8073a56f63806909f51d043241de"
+  }
+}

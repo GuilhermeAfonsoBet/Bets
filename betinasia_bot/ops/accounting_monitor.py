@@ -19,12 +19,14 @@ from scraper.betinasia import BetinAsiaScraper
 
 from .accounting_io import atomic_write_bytes, atomic_write_json
 from .accounting_status import (
+    ACCOUNTING_API_FAILED,
     ACCOUNTING_AUTH_FAILED,
     ACCOUNTING_BROWSER_DEAD,
     ACCOUNTING_EMPTY_RESPONSE,
     ACCOUNTING_OK,
     ACCOUNTING_PARTIAL,
     ACCOUNTING_PARSE_FAILED,
+    ACCOUNTING_RATE_LIMIT,
     ACCOUNTING_SCHEMA_CHANGED,
     ACCOUNTING_TIMEOUT,
     ACCOUNTING_UNKNOWN_FAILURE,
@@ -127,6 +129,201 @@ async def recover_browser(scraper: BetinAsiaScraper, *, force_login: bool = True
         return False, classify_exception(e)
 
 
+def _customer_username() -> str:
+    u = (os.getenv("BETINASIA_USERNAME") or os.getenv("ACCOUNTING_CUSTOMER_USERNAME") or "").strip()
+    return u
+
+
+def _api_balance_urls(username: str) -> Dict[str, str]:
+    # Endpoints historically observed in successful CSV response captures.
+    base = "https://black.betinasia.com"
+    u = username.strip()
+    return {
+        "balance": f"{base}/v1/customers/{u}/balances/balance/?include_bet_details=true&layout=list&page_size=65535",
+        "open_stakes": f"{base}/v1/customers/{u}/balances/stake/?include_bet_details=true&layout=list&page_size=65535",
+    }
+
+
+def _json_rows_to_csv_bytes(payload: Any) -> Optional[bytes]:
+    """Best-effort convert API JSON list/dict into CSV bytes with required columns."""
+    rows = None
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        for k in ("results", "rows", "data", "items"):
+            if isinstance(payload.get(k), list):
+                rows = payload.get(k)
+                break
+    if not isinstance(rows, list) or not rows:
+        return None
+    # flatten shallow keys; keep string values
+    flat_rows: list[Dict[str, Any]] = []
+    cols: list[str] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        fr: Dict[str, Any] = {}
+        for k, v in r.items():
+            key = str(k)
+            # normalize common aliases
+            kl = key.lower().replace("_", " ")
+            if kl in ("order id", "orderid"):
+                key = "order id"
+            elif kl == "post date":
+                key = "post date"
+            elif kl == "got price":
+                key = "got price"
+            fr[key] = v if not isinstance(v, (dict, list)) else json.dumps(v, ensure_ascii=False)
+            if key not in cols:
+                cols.append(key)
+        flat_rows.append(fr)
+    if not flat_rows:
+        return None
+    # ensure required cols exist (empty if absent)
+    for req in ("order id", "amount", "type", "post date"):
+        if req not in cols:
+            cols.insert(0, req)
+    import io
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for fr in flat_rows:
+        w.writerow({c: fr.get(c, "") for c in cols})
+    return buf.getvalue().encode("utf-8")
+
+
+async def _download_via_api(
+    scraper: BetinAsiaScraper,
+    *,
+    name: str,
+    url: str,
+    out_dir: Path,
+    timeout_ms: int = 60000,
+) -> Tuple[Optional[Path], Dict[str, Any]]:
+    """Authenticated fetch of accounting CSV/JSON using root-session (no UI click)."""
+    meta: Dict[str, Any] = {"name": name, "url": url, "downloaded_via": None}
+    page = scraper._page
+    if page is None or page.is_closed():
+        meta["error_type"] = ACCOUNTING_BROWSER_DEAD
+        meta["error"] = "PAGE_CLOSED"
+        return None, meta
+
+    session_token = ""
+    try:
+        cookies = await scraper._context.cookies()
+        for c in cookies or []:
+            if c.get("name") == "root-session" and c.get("value"):
+                session_token = str(c.get("value"))
+                break
+    except Exception as e:
+        meta["error_type"] = classify_exception(e)
+        meta["error"] = sanitize_error_message(e)
+        return None, meta
+    if not session_token:
+        meta["error_type"] = ACCOUNTING_AUTH_FAILED
+        meta["error"] = "NO_ROOT_SESSION"
+        return None, meta
+
+    # Ensure correct origin for relative fetch fallback
+    try:
+        if "betinasia.com" not in str(page.url or ""):
+            await page.goto("https://black.betinasia.com/", timeout=timeout_ms, wait_until="commit")
+    except Exception as e:
+        meta["origin_goto_error"] = sanitize_error_message(e, limit=160)
+
+    try:
+        resp = await page.evaluate(
+            """
+            async (params) => {
+              try {
+                const r = await fetch(params.url, {
+                  method: 'GET',
+                  credentials: 'same-origin',
+                  headers: {
+                    'Accept': 'text/csv, application/json, text/plain, */*',
+                    'session': params.sessionToken,
+                    'x-molly-client-name': 'sonic',
+                    'x-molly-client-version': '2.5.54'
+                  }
+                });
+                const ct = (r.headers.get('content-type') || '');
+                const text = await r.text();
+                return {ok: r.ok, status: r.status, contentType: ct, text: text};
+              } catch (e) {
+                return {ok: false, status: 0, contentType: '', text: '', error: String(e && e.message ? e.message : e)};
+              }
+            }
+            """,
+            {"url": url, "sessionToken": session_token},
+        )
+    except Exception as e:
+        meta["error_type"] = classify_exception(e)
+        meta["error"] = sanitize_error_message(e)
+        return None, meta
+
+    if not isinstance(resp, dict):
+        meta["error_type"] = ACCOUNTING_UNKNOWN_FAILURE
+        meta["error"] = "BAD_API_RESP"
+        return None, meta
+
+    meta["http_status"] = resp.get("status")
+    meta["content_type"] = str(resp.get("contentType") or "")[:120]
+    status = int(resp.get("status") or 0)
+    text = str(resp.get("text") or "")
+    if status in (401, 403):
+        meta["error_type"] = ACCOUNTING_AUTH_FAILED
+        meta["error"] = f"HTTP_{status}"
+        return None, meta
+    if status == 429:
+        meta["error_type"] = ACCOUNTING_RATE_LIMIT
+        meta["error"] = "HTTP_429"
+        return None, meta
+    if not resp.get("ok") or status >= 400:
+        meta["error_type"] = classify_exception(f"http {status} {text[:120]}")
+        meta["error"] = sanitize_error_message(text[:200] or f"HTTP_{status}")
+        return None, meta
+    if not text.strip():
+        meta["error_type"] = ACCOUNTING_EMPTY_RESPONSE
+        meta["error"] = "empty body"
+        return None, meta
+
+    ct = meta["content_type"].lower()
+    raw: Optional[bytes] = None
+    if ("csv" in ct) or text.lstrip().lower().startswith("amount,") or ("order id" in text[:200].lower()):
+        raw = text.encode("utf-8")
+        meta["downloaded_via"] = "api_csv"
+    else:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            # maybe csv without header content-type
+            if "," in text.splitlines()[0]:
+                raw = text.encode("utf-8")
+                meta["downloaded_via"] = "api_csv_guess"
+            else:
+                meta["error_type"] = ACCOUNTING_PARSE_FAILED
+                meta["error"] = "unrecognized payload"
+                return None, meta
+        else:
+            raw = _json_rows_to_csv_bytes(payload)
+            meta["downloaded_via"] = "api_json_to_csv"
+            if raw is None:
+                meta["error_type"] = ACCOUNTING_EMPTY_RESPONSE
+                meta["error"] = "json had no rows"
+                return None, meta
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{ts}__{name}.csv"
+    try:
+        atomic_write_bytes(out_path, raw)
+    except Exception as e:
+        meta["error_type"] = ACCOUNTING_WRITE_FAILED
+        meta["error"] = sanitize_error_message(e)
+        return None, meta
+    return out_path, meta
+
+
 async def _download_from_accounting_page(
     scraper: BetinAsiaScraper,
     *,
@@ -145,7 +342,7 @@ async def _download_from_accounting_page(
         return None, meta
 
     try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        resp = await page.goto(url, wait_until="commit", timeout=timeout_ms)
     except Exception as e:
         meta["error"] = sanitize_error_message(e)
         meta["error_type"] = classify_exception(e)
@@ -344,10 +541,14 @@ async def run_one_cycle(
 ) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
     t0 = time.time()
-    urls = {
+    ui_urls = {
         "balance": "https://black.betinasia.com/accounting/balance",
         "open_stakes": "https://black.betinasia.com/accounting/open-stakes",
     }
+    username = _customer_username()
+    api_urls = _api_balance_urls(username) if username else {}
+    prefer_api = os.getenv("ACCOUNTING_PREFER_API", "1").strip() not in ("0", "false", "False", "no", "NO")
+    require_api_auth = os.getenv("ACCOUNTING_REQUIRE_API_AUTH", "1").strip() not in ("0", "false", "False", "no", "NO")
     snap: Dict[str, Any] = {
         "ts": _utcnow(),
         "run_id": run_id,
@@ -370,74 +571,121 @@ async def run_one_cycle(
             error_type = et or ACCOUNTING_BROWSER_DEAD
             error_message = "browser recover failed"
 
+    async def _session_api_ok() -> bool:
+        if not username:
+            return False
+        try:
+            chk = await scraper._api_auth_check_orders(username=username)
+            return bool(chk.get("ok")) and int(chk.get("status") or 0) == 200
+        except Exception:
+            return False
+
     if browser_ok:
         try:
-            session_ok = bool(await scraper.is_session_valid())
+            has_root = bool(await scraper._has_root_session_cookie())
+        except Exception:
+            has_root = False
+        try:
+            api_ok = await _session_api_ok() if has_root else False
         except Exception as e:
-            session_ok = False
+            api_ok = False
             error_type = classify_exception(e)
             error_message = sanitize_error_message(e)
+        # Accounting needs root-session cookie; orders API check is best-effort.
+        session_ok = bool(has_root and (api_ok or not require_api_auth or has_root))
+        # Simplify: root cookie is sufficient to attempt downloads.
+        session_ok = bool(has_root)
         if not session_ok:
             try:
                 ok = await scraper.login(force=True)
-                session_ok = bool(ok)
-                if not ok:
+                has_root = bool(ok) and bool(await scraper._has_root_session_cookie())
+                session_ok = has_root
+                if not session_ok:
                     error_type = ACCOUNTING_AUTH_FAILED
-                    error_message = "LOGIN_FAILED"
+                    error_message = "LOGIN_FAILED_OR_NO_ROOT_SESSION"
             except Exception as e:
                 error_type = classify_exception(e)
                 error_message = sanitize_error_message(e)
+        elif require_api_auth and not api_ok:
+            # Soft warning only — still attempt balance/open_stakes fetches.
+            error_message = error_message or "ORDERS_API_AUTH_CHECK_FAILED"
 
     files_ok: Dict[str, bool] = {"balance": False, "open_stakes": False}
     paths: Dict[str, Optional[Path]] = {"balance": None, "open_stakes": None}
 
-    async def _fetch_one(name: str, url: str) -> None:
+    async def _accept_path(name: str, p: Path, meta: Dict[str, Any]) -> bool:
+        nonlocal error_type, error_message
+        parsed = _parse_csv_best_effort(p)
+        snap["parsed"][name] = parsed
+        snap["meta"][name] = meta
+        if parsed.get("schema_ok") is False:
+            error_type = ACCOUNTING_SCHEMA_CHANGED if "missing columns" in str(parsed.get("error") or "") else ACCOUNTING_PARSE_FAILED
+            error_message = sanitize_error_message(parsed.get("error"))
+            paths[name] = p
+            files_ok[name] = False
+            snap["files"][name] = str(p)
+            return False
+        paths[name] = p
+        files_ok[name] = True
+        snap["files"][name] = str(p)
+        return True
+
+    async def _fetch_one(name: str, ui_url: str) -> None:
         nonlocal error_type, error_message, browser_ok
-        last_meta: Dict[str, Any] = {"name": name, "url": url}
+        last_meta: Dict[str, Any] = {"name": name, "url": ui_url}
         for attempt in range(int(cfg.max_retries) + 1):
             if not await _page_alive(scraper):
                 recovered, et = await recover_browser(scraper, force_login=True)
                 browser_ok = recovered
                 if not recovered:
-                    last_meta = {"name": name, "url": url, "error_type": et or ACCOUNTING_BROWSER_DEAD, "error": "browser dead"}
+                    last_meta = {"name": name, "url": ui_url, "error_type": et or ACCOUNTING_BROWSER_DEAD, "error": "browser dead"}
                     error_type = et or ACCOUNTING_BROWSER_DEAD
                     break
             try:
+                p = None
+                meta: Dict[str, Any] = {"name": name}
+                if prefer_api and api_urls.get(name):
+                    p, meta = await _download_via_api(
+                        scraper,
+                        name=name,
+                        url=api_urls[name],
+                        out_dir=cfg.out_dir,
+                        timeout_ms=max(int(cfg.timeout_ms), 60000),
+                    )
+                    if p and p.exists() and p.stat().st_size > 0:
+                        if await _accept_path(name, p, meta):
+                            return
+                        return
+                    # auth failure -> force re-login once
+                    if meta.get("error_type") == ACCOUNTING_AUTH_FAILED and attempt < int(cfg.max_retries):
+                        await scraper.login(force=True)
+                        await asyncio.sleep(float(cfg.retry_backoff_sec) * (attempt + 1))
+                        continue
+                # UI fallback
                 p, meta = await _download_from_accounting_page(
                     scraper,
                     name=name,
-                    url=url,
+                    url=ui_url,
                     out_dir=cfg.out_dir,
-                    timeout_ms=int(cfg.timeout_ms),
+                    timeout_ms=max(int(cfg.timeout_ms), 60000),
                 )
                 last_meta = meta
                 if p and p.exists() and p.stat().st_size > 0:
-                    parsed = _parse_csv_best_effort(p)
-                    snap["parsed"][name] = parsed
-                    if parsed.get("schema_ok") is False:
-                        error_type = ACCOUNTING_SCHEMA_CHANGED if "missing columns" in str(parsed.get("error") or "") else ACCOUNTING_PARSE_FAILED
-                        error_message = sanitize_error_message(parsed.get("error"))
-                        # do not keep invalid schema as success; leave file on disk for forensics
-                        paths[name] = p
-                        files_ok[name] = False
-                        snap["files"][name] = str(p)
+                    if await _accept_path(name, p, meta):
                         return
-                    paths[name] = p
-                    files_ok[name] = True
-                    snap["files"][name] = str(p)
                     return
                 et = meta.get("error_type") or classify_exception(meta.get("error") or ACCOUNTING_EMPTY_RESPONSE)
-                if et == ACCOUNTING_BROWSER_DEAD and attempt < int(cfg.max_retries):
-                    await recover_browser(scraper, force_login=True)
-                    await asyncio.sleep(float(cfg.retry_backoff_sec) * (attempt + 1))
-                    continue
-                if et == ACCOUNTING_TIMEOUT and attempt < int(cfg.max_retries):
+                if et in (ACCOUNTING_BROWSER_DEAD, ACCOUNTING_TIMEOUT, ACCOUNTING_AUTH_FAILED) and attempt < int(cfg.max_retries):
+                    if et == ACCOUNTING_BROWSER_DEAD:
+                        await recover_browser(scraper, force_login=True)
+                    elif et == ACCOUNTING_AUTH_FAILED:
+                        await scraper.login(force=True)
                     await asyncio.sleep(float(cfg.retry_backoff_sec) * (attempt + 1))
                     continue
                 error_type = error_type or et
                 error_message = error_message or sanitize_error_message(meta.get("error") or et)
             except Exception as e:
-                last_meta = {"name": name, "url": url, "error": sanitize_error_message(e), "error_type": classify_exception(e)}
+                last_meta = {"name": name, "url": ui_url, "error": sanitize_error_message(e), "error_type": classify_exception(e)}
                 et = classify_exception(e)
                 if et == ACCOUNTING_BROWSER_DEAD and attempt < int(cfg.max_retries):
                     await recover_browser(scraper, force_login=True)
@@ -449,10 +697,10 @@ async def run_one_cycle(
         snap["files"][name] = str(paths[name]) if paths[name] else None
 
     if browser_ok and session_ok:
-        for name, url in urls.items():
+        for name, url in ui_urls.items():
             await _fetch_one(name, url)
     else:
-        for name, url in urls.items():
+        for name, url in ui_urls.items():
             snap["files"][name] = None
             snap["meta"][name] = {
                 "name": name,
@@ -639,7 +887,7 @@ def main() -> int:
         action="store_true",
         default=(os.getenv("ACCOUNTING_ONCE", "0").strip() in ("1", "true", "True", "yes", "YES")),
     )
-    ap.add_argument("--timeout-ms", type=int, default=int(os.getenv("ACCOUNTING_TIMEOUT_MS", "20000")))
+    ap.add_argument("--timeout-ms", type=int, default=int(os.getenv("ACCOUNTING_TIMEOUT_MS", "60000")))
     ap.add_argument("--max-retries", type=int, default=int(os.getenv("ACCOUNTING_MAX_RETRIES", "2")))
     args = ap.parse_args()
 
