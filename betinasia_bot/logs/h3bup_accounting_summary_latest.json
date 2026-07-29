@@ -1,0 +1,50 @@
+{
+  "n_live_ok": 12,
+  "counts": {
+    "SETTLED_ACCOUNTING_OK": 1,
+    "VOID_OR_PUSH": 1,
+    "SETTLED_AFTER_PREVIOUS_SNAPSHOT": 1,
+    "OPEN_NOT_SETTLED": 9
+  },
+  "n_settled_confirmed": 3,
+  "stake_settled": 30.0,
+  "pnl_settled": -0.4300000000000015,
+  "roi_settled": -0.014333333333333384,
+  "accounting_coverage": 0.25,
+  "disclaimer_low_n": true,
+  "disclaimer_low_coverage": true,
+  "funnel": [
+    {
+      "stage": "LIVE_OK",
+      "n": 12
+    },
+    {
+      "stage": "EVENT_NOT_STARTED",
+      "n": 0
+    },
+    {
+      "stage": "EVENT_IN_PROGRESS",
+      "n": 0
+    },
+    {
+      "stage": "OPEN_NOT_SETTLED",
+      "n": 9
+    },
+    {
+      "stage": "SETTLED_FOUND",
+      "n": 3
+    },
+    {
+      "stage": "SETTLED_MISSING_ACCOUNTING",
+      "n": 0
+    },
+    {
+      "stage": "ORDER_ID_JOIN_FAILURE",
+      "n": 0
+    },
+    {
+      "stage": "UNKNOWN",
+      "n": 0
+    }
+  ]
+}

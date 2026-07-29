@@ -1,0 +1,70 @@
+{
+  "captured_at_utc": "2026-07-29T13:35:02.954977+00:00",
+  "services": {
+    "betinasia-accounting-monitor.service": {
+      "MainPID": "3553021",
+      "Id": "betinasia-accounting-monitor.service",
+      "ActiveEnterTimestamp": "Tue 2026-07-28 06:45:47 UTC"
+    },
+    "betinasia-executor.service": {
+      "MainPID": "3682164",
+      "Id": "betinasia-executor.service",
+      "ActiveEnterTimestamp": "Wed 2026-07-29 13:30:07 UTC"
+    },
+    "betinasia-executor-bridge-back.service": {
+      "MainPID": "3682166",
+      "Id": "betinasia-executor-bridge-back.service",
+      "ActiveEnterTimestamp": "Wed 2026-07-29 13:30:07 UTC"
+    },
+    "betinasia-audit-ws-gate-back.service": {
+      "MainPID": "3683627",
+      "Id": "betinasia-audit-ws-gate-back.service",
+      "ActiveEnterTimestamp": "Wed 2026-07-29 13:34:49 UTC"
+    }
+  },
+  "files": {
+    "latest_balance": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260728_220133__balance.csv",
+      "mtime_utc": "2026-07-28T22:01:54.793806+00:00",
+      "size": 1794337,
+      "rows_approx": 5443
+    },
+    "latest_open_stakes": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260728_220220__open_stakes.csv",
+      "mtime_utc": "2026-07-28T22:02:41.613024+00:00",
+      "size": 16308,
+      "rows_approx": 59
+    },
+    "jsonl_typo": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounring_snapshots.jsonl",
+      "mtime_utc": "2026-07-29T13:31:27.072865+00:00",
+      "size": 18247168,
+      "rows_approx": 28231
+    },
+    "jsonl_correct": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting_snapshots.jsonl",
+      "mtime_utc": "2026-05-24T19:22:21.885205+00:00",
+      "size": 20344895,
+      "rows_approx": 15203
+    }
+  },
+  "checksums": {
+    "accounting_monitor.py": "643d23681f0c68f21ac157bc381f1e76",
+    "executor_bridge_audit.py": "3ccdc438bc590c961fc1431e2861e3ef",
+    "executor/worker.py": "298f8073a56f63806909f51d043241de"
+  },
+  "env_public": {
+    "ACCOUNTING_POLL_SEC": null,
+    "ACCOUNTING_OUT_DIR": null,
+    "ACCOUNTING_JSONL": null,
+    "PROXY_SERVER_SET": false
+  },
+  "root_cause_hypothesis": {
+    "browser_pipe_closed_without_reconnect": true,
+    "files_none_logged_as_snapshot_ok": true,
+    "jsonl_env_typo_accounring": true,
+    "degraded_since_utc": "2026-07-28T13:21:00Z",
+    "last_monitor_success_utc": "2026-07-28T13:17:48Z",
+    "last_daily_success_utc": "2026-07-28T22:02:41Z"
+  }
+}
