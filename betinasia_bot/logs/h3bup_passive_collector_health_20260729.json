@@ -1,0 +1,12 @@
+{
+  "checked_at_utc": "2026-07-29T20:13:02.563440+00:00",
+  "status": "HEALTHY",
+  "enabled": true,
+  "external_requests": 0,
+  "betslip_opens": 0,
+  "active_obligations": 0,
+  "keys": 0,
+  "persisted": 0,
+  "errors": 0,
+  "error": null
+}

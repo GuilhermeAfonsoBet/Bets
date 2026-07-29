@@ -1,0 +1,23 @@
+{
+  "captured_at_utc": "2026-07-29T16:14:39.301696+00:00",
+  "checksums": {
+    "audit_h3b_api.py": "0004717ca38474914f645d4f2e40527f",
+    "ops/executor_bridge_audit.py": "621fe3bae456485d6b8a36b8c4638223",
+    "executor/worker.py": "b7ff45d05814068b95a1f2ddb174c745",
+    "executor/service.py": "9c89ef315634b6b65dc6d9a52e967544",
+    "executor/store.py": "fde526a72b499916dcf26d9a895bb8ee",
+    "ops/h3bup_e2e_trace.py": "2f6b3141d49ce39d8a6e54e79958a7b5"
+  },
+  "systemd_active": {
+    "betinasia-audit-ws-gate-back.service": "active",
+    "betinasia-executor-bridge-back.service": "active",
+    "betinasia-executor.service": "active"
+  },
+  "accounting_health": {
+    "status": "ACCOUNTING_OK",
+    "health": "HEALTHY"
+  },
+  "trace_events": 1468,
+  "trace_enabled": true,
+  "rollback": "H3BUP_E2E_TRACE_ENABLED=0 in drop-in h3bup-e2e-trace.conf"
+}
