@@ -1,0 +1,25 @@
+field,definition,source,type,unit,nullable,used_by_bridge,notes
+id,PK audit row,betslip_audit_results,int,id,False,True,src_id / audit_id
+hypothesis_type,hypothesis label,detector/save fixed H3B,str,,False,True,filter = H3B
+event_id,exchange/event key,WS event,str,,False,True,required
+market_type,AH/OU/...,WS,str,,False,True,bridge requires AH
+market_period,full_time/half_time,WS,str,,True,False,stored
+line,handicap/ou line,detector ah_line,str,,False,True
+side,home/away/over/under,detector side,str,,False,True
+websocket_odd,odd at reversal/detection,h3b.odd_at_reversal,float,odds,False,True,odd_at_decision source
+betslip_odd,betslip odd if opened,API betslip,float,odds,True,True,null in ws_gate_back OK
+betslip_limit,betslip capacity if opened,API,float,USD,True,True,often 0/null in ws_gate_back
+status,audit status string,gate function,str,,False,False,NOT filtered by bridge; is_valid_opportunity is
+is_valid_opportunity,consumability flag,gate sets True on OK,bool,,False,True,bridge WHERE true
+is_live,pre/live inference,kickoff<=now,bool,,True,True,prematch filter
+reversal_direction,up/down,direction_after,str,,True,False
+hypothesis_details,JSON bag,save_result,json,,True,True,"exec_side_hint, telemetry, ws_gate_series"
+hypothesis_details.exec_side_hint,Back/Lay hint,ws_gate_back sets Back,str,,True,True,strict in LIVE
+hypothesis_details.telemetry,queue/gate timings,gate,json,,True,False
+hypothesis_details.ws_gate_series,offset samples,gate/async,json,,True,False
+hypothesis_detected_at,detection time UTC,detected_at epoch,timestamptz,UTC,True,False
+audited_at,persist/finish time,DB default/now,timestamptz,UTC,False,True,lookback window
+audit_version,version tag,v5.3-ws-gate-back,str,,False,False,env BRIDGE_SOURCE_AUDIT_VERSIONS unused in code
+audit_total_duration_ms,pipeline ms,telemetry,int,ms,True,False
+league/home/away,fixture labels,events_info,str,,True,False
+match kickoff via JOIN matches.kickoff_time,kickoff,matches.external_id=event_id,timestamptz,UTC,True,False,used for prematch heuristics
