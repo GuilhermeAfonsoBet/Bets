@@ -1,0 +1,23 @@
+[Unit]
+Description=BetinAsia H3BUP CLV Passive Collector (BOH copy, no betslip)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=H3BUP_CLV_ENABLED=0
+Environment=H3BUP_CLV_PASSIVE_COLLECTOR_ENABLED=0
+Environment=H3BUP_CLV_ALLOW_BETSLIP_SOURCE=0
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && ./venv/bin/python -m ops.h3bup_clv_passive_collector'
+Restart=always
+RestartSec=20
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_passive.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_passive_error.log
+
+[Install]
+WantedBy=multi-user.target

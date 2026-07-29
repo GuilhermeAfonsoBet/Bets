@@ -1,0 +1,33 @@
+{
+  "captured_at_utc": "2026-07-29T20:09:15.330195+00:00",
+  "checksums": {
+    "executor/store.py": "4dbeafbba2864054bcc9dbb379cba1e0",
+    "ops/h3bup_clv_worker.py": "b2087302f697ff1e3aeae7b42ff2f6f2",
+    "ops/h3bup_clv_register.py": "69613897d4256fac2e842c2616e015ea",
+    "ops/h3bup_e2e_trace.py": "2f6b3141d49ce39d8a6e54e79958a7b5"
+  },
+  "systemd": {
+    "betinasia-executor": "active",
+    "betinasia-h3bup-clv-worker": "active",
+    "betinasia-h3bup-clv-passive": "active",
+    "betinasia-audit-ws-gate-back": "active",
+    "betinasia-executor-bridge-back": "active",
+    "betinasia-collector": "active"
+  },
+  "accounting": {
+    "status": "ACCOUNTING_OK",
+    "health": "HEALTHY"
+  },
+  "clv_health": {
+    "status": "WATCH",
+    "enabled": true,
+    "live_ok_after_activation": 0,
+    "obligations_created": 0,
+    "collector_status": "ENABLED"
+  },
+  "e2e_lines": 14625,
+  "soak_classification": "E2E_SOAK_SUFFICIENT",
+  "soak_live_ok": 10,
+  "collection_started_at": "2026-07-29T20:07:50+00:00",
+  "rollback": "H3BUP_CLV_ENABLED=0 CREATE=0 WORKER=0 PASSIVE=0"
+}

@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-07-29T19:59:40.075820+00:00",
+  "checksums": {
+    "executor/store.py": "fde526a72b499916dcf26d9a895bb8ee",
+    "executor/worker.py": "b7ff45d05814068b95a1f2ddb174c745",
+    "ops/h3bup_e2e_trace.py": "2f6b3141d49ce39d8a6e54e79958a7b5",
+    "ops/executor_bridge_audit.py": "621fe3bae456485d6b8a36b8c4638223"
+  },
+  "systemd": {
+    "betinasia-audit-ws-gate-back": "active",
+    "betinasia-executor-bridge-back": "active",
+    "betinasia-executor": "active",
+    "betinasia-collector": "active"
+  },
+  "accounting": {
+    "status": "ACCOUNTING_OK",
+    "health": "HEALTHY"
+  },
+  "e2e_lines": 14391,
+  "policy_version": "H3BUP_vNext_20260629",
+  "stake": 10
+}

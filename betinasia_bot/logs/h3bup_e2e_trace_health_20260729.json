@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "schema_version": 1,
+  "path": "logs/h3bup_e2e_trace.jsonl",
+  "events": 919,
+  "traces": 136,
+  "live_ok": 0,
+  "trace_events_dropped": 0,
+  "clock_skew": 3,
+  "ordering_violations": 3,
+  "generated_at_utc": "2026-07-29T16:06:03.344858+00:00"
+}
