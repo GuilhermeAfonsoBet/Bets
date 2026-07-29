@@ -292,3 +292,77 @@ def test_empty_healthy_cohort(tmp_path):
     out = compute_settlement_and_performance(orders=orders, pnl_by_oid={}, open_oids=set())
     assert out["live_ok_total"] == 0
     assert out["roi_settled"]["status"] == "AVAILABLE"
+
+
+def test_stake20_legacy_flagged_in_exceptions(tmp_path):
+    from ops.daily_v2.canonical import build_snapshot
+    from ops.daily_v2.time_windows import resolve_window
+    from datetime import date
+    # minimal fixture root
+    root = tmp_path
+    (root / "logs").mkdir()
+    exec_p = root / "logs" / "executor_live.jsonl"
+    rows = [
+        _live_ok_row(created_at="2026-07-28T12:00:00+00:00", order_id="1", policy_version="H3BUP_vNext_20260629", stake=20.0, pre_submit_ms=1000),
+        _live_ok_row(created_at="2026-07-28T13:00:00+00:00", order_id="2", policy_version="H3BUP_vNext_20260629", stake=10.0, pre_submit_ms=1000),
+    ]
+    _write_jsonl(exec_p, rows)
+    snap = build_snapshot(root=root, window=resolve_window(report_type="DAILY_CLOSED", report_date=date(2026,7,28)), require_h3bup=True)
+    alerts = [e["alert_id"] for e in snap.get("exceptions") or []]
+    assert any(a.startswith("stake_mismatch:1") for a in alerts)
+
+
+def test_json_markdown_consistent_live_ok(tmp_path):
+    from ops.daily_v2.canonical import build_snapshot
+    from ops.daily_v2.render import render_markdown
+    from ops.daily_v2.time_windows import resolve_window
+    from datetime import date
+    root = tmp_path
+    (root / "logs").mkdir()
+    _write_jsonl(root / "logs" / "executor_live.jsonl", [
+        _live_ok_row(created_at="2026-07-28T12:00:00+00:00", order_id="9", policy_version="H3BUP_vNext_20260629")
+    ])
+    snap = build_snapshot(root=root, window=resolve_window(report_type="DAILY_CLOSED", report_date=date(2026,7,28)))
+    md = render_markdown(snap)
+    assert str(((snap.get("execution_funnel") or {}).get("live_ok") or {}).get("value")) in md
+
+
+def test_missing_not_zero_in_envelope():
+    m = metric_envelope(value=0, status="STALE", unit="count")
+    assert m["value"] is None
+
+
+def test_clv_windows_keys_separated(tmp_path):
+    from ops.daily_v2.canonical import build_snapshot
+    from ops.daily_v2.time_windows import resolve_window
+    from datetime import date
+    root = tmp_path
+    (root / "logs").mkdir()
+    (root / "logs" / "executor_live.jsonl").write_text("")
+    health = {
+        "status": "WATCH",
+        "collection_started_at_utc": "2026-07-29T20:07:50+00:00",
+        "live_ok_after_activation": 2,
+        "post_5m_valid_strict": 1,
+        "post_15m_valid_strict": 0,
+        "closing_valid_strict": 0,
+    }
+    (root / "logs" / "h3bup_clv_health.json").write_text(json.dumps(health))
+    snap = build_snapshot(root=root, window=resolve_window(report_type="DAILY_CLOSED", report_date=date(2026,7,28)))
+    clv = snap["clv"]
+    assert "post_5m_valid_strict" in clv and "post_15m_valid_strict" in clv and "closing_valid_strict" in clv
+    assert clv["fair_edge"]["status"] == "NOT_IMPLEMENTED"
+
+
+def test_publish_flag_default_off_in_cli(monkeypatch, tmp_path):
+    from ops.daily_v2 import __main__ as m
+    monkeypatch.setenv("H3BUP_DAILY_V2_ENABLED", "1")
+    monkeypatch.setenv("H3BUP_DAILY_V2_PUBLISH", "0")
+    monkeypatch.setenv("H3BUP_DAILY_V2_FAIL_OPEN", "1")
+    root = tmp_path
+    (root / "logs").mkdir()
+    (root / "logs" / "executor_live.jsonl").write_text("")
+    out = root / "out"
+    rc = m.run(["--root", str(root), "--out-dir", str(out), "--report-type", "DAILY_CLOSED", "--report-date", "2026-07-28"])
+    assert rc == 0
+    assert not (out / "published").exists()

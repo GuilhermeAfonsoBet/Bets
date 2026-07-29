@@ -39,3 +39,31 @@
 - Execução LIVE: não afectada
 - Policy/stake: não alterados
 - Ordens/betslips: nenhum criado
+
+## Continuação 2026-07-29T21:15Z
+
+### Smoke-test Daily V1 (pré-22:00)
+- Corrida segura: `DAILY_SKIP_ACCOUNTING=1` `DAILY_REPORT_TELEGRAM=0` → `logs/daily_reports_smoke_2r/20260729/`
+- Resultado: **DAILY_OK** (exit 0), PDF gerado
+- Secções presentes no markdown:
+  - `## Accounting Health — H3BUP`
+  - `## H3BUP End-to-End Latency`
+  - `## H3BUP CLV Forward Collection`
+- Sem `NameError` / sem referência a `out_lines`
+- Conclusão: hotfix `s0.append` validado end-to-end antes do timer oficial
+
+### Replay matrix (V2)
+Ver `logs/h3bup_daily_v2_replay_matrix_20260729.json`.
+
+| Dia | LIVE_OK H3BUP_vNext | Nota |
+|---|---:|---|
+| 2026-07-20 | 0 (12 se sem filtro) | Policy `bridge_h3b_live_v0`, stake **20** — leak legado; excluído do universo H3BUP_vNext |
+| 2026-07-28 | 3 | Pós capacity-fix; stake 10; ROI settled -1.43% |
+| 2026-07-29 | 22 (parcial/intraday até cutoff) | 6 open → ROI PARTIAL; todos DAILY_FAST_LE_6S |
+
+### Testes
+- `tests/test_h3bup_daily_v2.py` → **28 passed** (antes 23)
+
+### Publicação
+- Continua **OFF** (`PUBLISH=0`)
+- V1 permanece oficial às 22:00 UTC

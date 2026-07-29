@@ -158,3 +158,13 @@ Abrir Fase B (soak shadow + compare diário) sem Telegram V2; só avançar PUBLI
 
 Nota: V1 do dia `20260728` foi gerado às 22:01Z e reportou 2 LIVE_OK na janela rolling 24h; a coorte fechada UTC do mesmo dia civil inclui ainda `23:58Z` → N=3. Isto valida a separação DAILY_CLOSED vs snapshot operacional.
 
+
+---
+
+## Continuação — validação pré-timer
+
+- Smoke V1 com hotfix: **OK** (Accounting Health + E2E + CLV renderizados; exit 0).
+- Testes V2: **28 passed**.
+- Replay: 2026-07-20 = stake-20 legado (`bridge_h3b_live_v0`) fora do filtro H3BUP_vNext; 2026-07-28 = 3 LIVE_OK; 2026-07-29 = 22 LIVE_OK (PARTIAL settlement).
+- Publicação V2: **não**.
+- Status inalterado: `DAILY_AUDIT_TECHNICAL_GAPS` · `DAILY_V2_IMPLEMENTED_SHADOW` · `DAILY_REDESIGN_COMPLETE_SHADOW`.
