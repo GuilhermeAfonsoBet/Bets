@@ -1,0 +1,616 @@
+{
+  "meta": {
+    "package_date": "2026-07-29",
+    "metrics_cutoff_utc": "2026-07-29T11:03:41Z",
+    "strategy_focus": "H3BUP_vNext",
+    "operational_changes_made_during_handoff": false,
+    "handoff_status": "HANDOFF_MOSTLY_COMPLETE",
+    "language": "pt-BR"
+  },
+  "strategy_identity": {
+    "official_name": "H3BUP_vNext",
+    "internal_names": [
+      "H3BUP",
+      "H3b"
+    ],
+    "aliases": [
+      "H3BUP_vNext_20260629"
+    ],
+    "strategy_id": null,
+    "policy_id": "H3BUP_vNext",
+    "current_version": "H3BUP_vNext_20260629",
+    "previous_versions": null,
+    "created_at": "2026-06-29T00:00:00+00:00",
+    "activated_at_notes": "policy_started 2026-06-29; LIVE resume after proxy restore 2026-07-20T15:16:08Z; capacity gate fixed 2026-07-28T13:19:39Z",
+    "freeze_at": null,
+    "last_change_at": "2026-07-28T13:19:39Z",
+    "status": "live_controlled",
+    "repository": "github.com/GuilhermeAfonsoBet/Bets",
+    "branches": [
+      "cursor/h3bup-capacity-gate-fix-47ee",
+      "cursor/h3bup-post-restore-review-47ee",
+      "cursor/roi-only-hardening-47ee",
+      "cursor/proxy-dead-failover-47ee"
+    ],
+    "related_services": [
+      "betinasia-executor",
+      "betinasia-executor-bridge-back",
+      "betinasia-audit-ws-gate-back",
+      "betinasia-accounting-monitor"
+    ],
+    "technical_owner": null,
+    "operational_owner": null
+  },
+  "current_policy": {
+    "side": "Back",
+    "regime": "prematch_back_pre",
+    "odd_min": 1.85,
+    "odd_max": 2.15,
+    "capacity_gt": 100,
+    "capacity_source_executor": "dry.limit_final",
+    "slippage_pre_pct_max_exclusive": 0.0,
+    "stake_usd": 10.0,
+    "league_filter": "disabled",
+    "requires_policy_version_substring": "H3BUP_vNext",
+    "natural_language": "Back Pre LIVE only if H3BUP_vNext, odd in [1.85,2.15], dry.limit_final>100, slippage_pre_pct<0, stake==10; no league filter.",
+    "logical_expression": "H3BUP and BackPre and odd_in_range and capacity>100 and slip<0 and stake==10",
+    "governing_artifacts": [
+      "VPS ops/executor_bridge_audit.py",
+      "VPS executor/worker.py",
+      "logs/H3BUP_VNEXT_POLICY_LOCK",
+      "logs/bridge_risk_params.json",
+      ".env stake keys"
+    ],
+    "not_used_filters": [
+      "cum_drop_pct",
+      "last_share",
+      "non_Friendly",
+      "CLV",
+      "fair_edge"
+    ]
+  },
+  "economic_thesis": {
+    "summary": "Back Pre near even-money with sufficient betslip capacity and non-adverse pre-submit slippage may retain historical edge versus broad Back Pre.",
+    "proven_mechanism": null,
+    "plausible_mechanisms": [
+      "reduced immediate adverse selection when slippage_pre_pct<0",
+      "liquidity selection via capacity>100",
+      "odds band around 2.00 as studied zone (H3b)"
+    ],
+    "speculative_mechanisms": [
+      "specific actor causing move (sharp/recreational/MM)",
+      "edge persistence duration in minutes"
+    ],
+    "refuted_mechanisms": [
+      "markets systematically have capacity<=100 after restore (was code bug)"
+    ],
+    "invalidators": [
+      "OOS ROI<=0 with adequate N",
+      "slippage_pre_pct not predictive",
+      "extreme concentration fragility"
+    ]
+  },
+  "differences_vs_reference": [
+    {
+      "dimension": "signal_type",
+      "reference_user_spec": "DT cumulative drop / last_share filters",
+      "h3bup": "filter on H3B audits by odd/capacity/slip",
+      "impact": "high"
+    },
+    {
+      "dimension": "cum_drop_pct",
+      "reference_user_spec": ">3%",
+      "h3bup": "not used",
+      "code_dt_conflict": "DT code defaults use min cum drop 0.80%",
+      "impact": "high"
+    },
+    {
+      "dimension": "last_share",
+      "reference_user_spec": ">=0.35",
+      "h3bup": "not used",
+      "impact": "high"
+    },
+    {
+      "dimension": "non_Friendly",
+      "reference_user_spec": "exclude Friendly",
+      "h3bup": "league filter disabled (Friendly can pass if other gates pass)",
+      "impact": "high"
+    },
+    {
+      "dimension": "operational_maturity_on_this_vps",
+      "reference_user_spec": "DT",
+      "h3bup": "LIVE controlled",
+      "dt_on_vps": "bridge inactive/disabled; audit DT failed",
+      "impact": "high"
+    }
+  ],
+  "technical_flow": {
+    "diagram": [
+      "websocket_odds",
+      "audit_h3b_ws_gate_back",
+      "audit_db_ok",
+      "executor_bridge_audit_h3b_back",
+      "h3bup_pre_exec_eval",
+      "backpre_shadow_all",
+      "execution_request_unix_socket",
+      "executor_dryrun_betslip",
+      "h3bup_final_gate",
+      "place_order",
+      "executor_live_jsonl",
+      "accounting"
+    ],
+    "clv_scheduler_in_path": false,
+    "dt_detector_in_path": false
+  },
+  "data_sources": [
+    {
+      "name": "websocket_odds",
+      "type": "stream",
+      "use": "H3B audit"
+    },
+    {
+      "name": "betslip_api",
+      "type": "api",
+      "use": "limit_final/odd_final/place"
+    },
+    {
+      "name": "postgresql",
+      "type": "db",
+      "use": "audits/shadow/seen"
+    },
+    {
+      "name": "executor_live.jsonl",
+      "type": "jsonl",
+      "use": "execution truth"
+    },
+    {
+      "name": "accounting_csv_json",
+      "type": "files",
+      "use": "settlement/pnl",
+      "caveat": "may lag"
+    },
+    {
+      "name": "bridge_risk_params.json",
+      "type": "json",
+      "use": "disable_back"
+    },
+    {
+      "name": "wf_policy_current.json",
+      "type": "json",
+      "use": "legacy leagues bypassed by H3BUP"
+    }
+  ],
+  "data_dictionary": [
+    {
+      "field": "order_id",
+      "definition": "exchange order id",
+      "source": "result.raw.order_id / accounting",
+      "nullable": false,
+      "in_h3bup_live_ok": true
+    },
+    {
+      "field": "event_id",
+      "definition": "event key",
+      "source": "request.event_id",
+      "nullable": true
+    },
+    {
+      "field": "policy_version",
+      "definition": "policy tag",
+      "source": "request.policy.policy_version",
+      "nullable": false
+    },
+    {
+      "field": "odd_at_decision",
+      "definition": "decision odd",
+      "source": "request",
+      "unit": "odds"
+    },
+    {
+      "field": "odd_final",
+      "definition": "betslip odd",
+      "source": "result",
+      "unit": "odds"
+    },
+    {
+      "field": "sent.stake",
+      "definition": "stake submitted",
+      "source": "result.raw.sent.stake",
+      "unit": "USD"
+    },
+    {
+      "field": "limit_final",
+      "definition": "betslip capacity/limit",
+      "source": "result.limit_final / dry.limit_final",
+      "unit": "USD"
+    },
+    {
+      "field": "slippage_pre_pct",
+      "definition": "(price-dec)/dec*100",
+      "source": "value_sizing",
+      "unit": "percent"
+    },
+    {
+      "field": "amount",
+      "definition": "settlement pnl in accounting",
+      "source": "balance csv",
+      "unit": "USD",
+      "coverage_note": "partial vs live fills"
+    },
+    {
+      "field": "last_share",
+      "definition": "reference-strategy metric",
+      "source": null,
+      "in_h3bup": false
+    },
+    {
+      "field": "cum_drop_pct",
+      "definition": "DT cumulative drop",
+      "source": "DT detector (not H3BUP)",
+      "in_h3bup": false
+    },
+    {
+      "field": "clv_raw",
+      "definition": "analytics CLV",
+      "source": "B808 studies",
+      "in_h3bup_policy": false
+    },
+    {
+      "field": "fair_edge",
+      "definition": "analytics fair edge",
+      "source": "studies",
+      "in_h3bup_policy": false
+    }
+  ],
+  "signal_detection": {
+    "h3bup_has_own_detector": false,
+    "upstream_detector": "audit_h3b_api ws_gate_back direction=up",
+    "rise_filter_enforced": false,
+    "formulas": {
+      "slippage_pre_pct": "(odd_pre_submit - odd_at_decision) / odd_at_decision * 100",
+      "capacity": "dry.limit_final"
+    },
+    "cum_drop_used": false,
+    "last_share_used": false
+  },
+  "policy_gate": {
+    "bridge_function": "_h3bup_vnext_eval",
+    "executor_error_prefix": "H3BUP_VNEXT_GATE",
+    "rejection_reasons_observed_or_coded": [
+      "capacity_lte_100",
+      "slippage_non_negative",
+      "slippage_missing",
+      "odd_outside_1.85_2.15",
+      "non_h3bup_backpre_rejected",
+      "hard_stake_cap_h3bup_only_10",
+      "capacity_unknown_pre_exec",
+      "rule_rejected",
+      "disabled_back"
+    ]
+  },
+  "timestamps": {
+    "executor_created_at": {
+      "tz": "UTC",
+      "reliability": "high"
+    },
+    "executor_finished_at": {
+      "tz": "UTC",
+      "reliability": "high"
+    },
+    "accounting_post_date": {
+      "tz": "unspecified_in_csv",
+      "reliability": "medium"
+    },
+    "latency_aggregates": null
+  },
+  "kickoff": {
+    "prematch_only": true,
+    "best_kickoff_resolver_details": null,
+    "null_kickoff_behavior": null
+  },
+  "execution": {
+    "allow_live": true,
+    "statuses_observed_h3bup": [
+      "LIVE_OK",
+      "CAP_BLOCKED",
+      "API_FAILED",
+      "STALE",
+      "NO_SESSION"
+    ],
+    "stake_sent_on_live_ok": 10.0,
+    "unix_socket": "/tmp/betinasia-exec.sock"
+  },
+  "stake": {
+    "current_fixed_usd": 10.0,
+    "variable": false,
+    "fast_path_enabled": false,
+    "historical_leak_stake": 20.0,
+    "daily_cap_h3bup": null,
+    "currency": "USD"
+  },
+  "clv": {
+    "used_in_policy": false,
+    "definition_in_h3bup_runtime": null,
+    "live_coverage": null
+  },
+  "fair_edge": {
+    "used_in_policy": false,
+    "live_metrics": null,
+    "classification": "INSUFFICIENT_N"
+  },
+  "performance": {
+    "cutoff_utc": "2026-07-29T11:03:41Z",
+    "post_capacity_fix": {
+      "window_start_utc": "2026-07-28T13:19:39Z",
+      "h3bup_attempts": 59,
+      "live_ok": 8,
+      "cap_blocked": 49,
+      "api_failed": 2,
+      "stake_notional_usd": 80.0,
+      "mean_odd_final": 1.9365,
+      "limit_final_min": 112.7673,
+      "limit_final_max": 655.3063,
+      "mean_slippage_pre_pct": -1.93137296027211,
+      "settled_in_accounting_csv_20260728_220133": {
+        "n": 2,
+        "pnl_sum": -9.97,
+        "orders": [
+          {
+            "order_id": "1931674091",
+            "amount": -9.97
+          },
+          {
+            "order_id": "1932353274",
+            "amount": 0.0
+          }
+        ]
+      },
+      "roi_fully_reconciled": null
+    },
+    "pre_fix_after_restore_cut": {
+      "window_start_utc": "2026-07-20T18:47:00Z",
+      "live_ok_h3bup": 0,
+      "note": "many CAP_BLOCKED with null capacity due to bug"
+    }
+  },
+  "statistical_validation": {
+    "live_classification": "INSUFFICIENT_N",
+    "studies_available": [
+      "estudo_ligas_odds_backpre.py (H3b)",
+      "estimar_capacidade_h3bup.py",
+      "estudo_capacidade_escala_h3bup.py",
+      "docs/estudo_5ms_pre_pos_20260611.md (broader slip-neg, not exact H3BUP)"
+    ],
+    "study_numbers_recomputed_in_this_audit": false,
+    "oos_live_sufficient": false
+  },
+  "concentration": {
+    "live_classification": "INSUFFICIENT_N",
+    "details": null
+  },
+  "data_quality": {
+    "jsonl_execution": "high",
+    "accounting_lag_risk": "high",
+    "shadow_capacity_flag_pre_exec": "low_utility",
+    "clv_operational_coverage": "absent_or_unconfirmed"
+  },
+  "known_issues": [
+    {
+      "issue": "capacity gate used undefined limit_final",
+      "status": "RESOLVED",
+      "fixed_at": "2026-07-28T13:19:39Z"
+    },
+    {
+      "issue": "stake 20 leak via DT/fast-path",
+      "status": "RESOLVED_CONTAINED"
+    },
+    {
+      "issue": "proxy dead SG login_country_not_allowed",
+      "status": "RESOLVED_OPS"
+    },
+    {
+      "issue": "accounting CSV lag vs new LIVE_OK",
+      "status": "OPEN"
+    },
+    {
+      "issue": "DT user-spec thresholds vs DT code defaults",
+      "status": "CONFLICTING_SOURCES"
+    },
+    {
+      "issue": "no dedicated H3BUP CLV scheduler found",
+      "status": "OPEN"
+    }
+  ],
+  "recent_changes": [
+    {
+      "date": "2026-06-29",
+      "change": "H3BUP_vNext policy+shadow",
+      "status": "applied"
+    },
+    {
+      "date": "2026-07-20",
+      "change": "proxy restore; disable_back=false; later stake20 leak containment",
+      "status": "applied"
+    },
+    {
+      "date": "2026-07-28",
+      "change": "dry.limit_final capacity fix",
+      "status": "applied",
+      "pr": 29
+    }
+  ],
+  "feature_flags": [
+    {
+      "name": "EXECUTOR_ALLOW_LIVE",
+      "value": "1"
+    },
+    {
+      "name": "BRIDGE_MODE_effective",
+      "value": "live"
+    },
+    {
+      "name": "BRIDGE_HYPOTHESIS",
+      "value": "H3B"
+    },
+    {
+      "name": "BRIDGE_PREMATCH_ONLY",
+      "value": "1"
+    },
+    {
+      "name": "disable_back",
+      "value": false
+    },
+    {
+      "name": "EXECUTOR_BACKPRE_FAST_STAKE_ENABLE",
+      "value": "0"
+    },
+    {
+      "name": "EXECUTOR_LIVE_STAKE",
+      "value": "10"
+    },
+    {
+      "name": "EXECUTOR_LIVE_MAX_STAKE",
+      "value": "10"
+    },
+    {
+      "name": "GATE_BACK_ENFORCE_RISE_FILTER",
+      "value": "0"
+    },
+    {
+      "name": "BRIDGE_USE_WF_BUDGET",
+      "value": "0"
+    },
+    {
+      "name": "DRY_RUN",
+      "value": "false"
+    }
+  ],
+  "controls": {
+    "disable_back_kill_switch": "IMPLEMENTED_ACTIVE_VALUE_FALSE",
+    "non_h3bup_backpre_reject": "IMPLEMENTED_ACTIVE",
+    "hard_stake_cap_10": "IMPLEMENTED_ACTIVE",
+    "capacity_slip_odd_gate": "IMPLEMENTED_ACTIVE",
+    "policy_publish_lock": "IMPLEMENTED_ACTIVE",
+    "dt_bridge": "DISABLED",
+    "daily_cap_h3bup": null,
+    "seen_key_dedup": "IMPLEMENTED_ACTIVE"
+  },
+  "services": [
+    {
+      "name": "betinasia-executor",
+      "status": "active"
+    },
+    {
+      "name": "betinasia-executor-bridge-back",
+      "status": "active_live_effective"
+    },
+    {
+      "name": "betinasia-executor-bridge-dt",
+      "status": "inactive_disabled"
+    },
+    {
+      "name": "betinasia-audit-ws-gate-back",
+      "status": "active"
+    },
+    {
+      "name": "betinasia-audit-ws-gate-dt",
+      "status": "failed"
+    },
+    {
+      "name": "betinasia-accounting-monitor",
+      "status": "active"
+    }
+  ],
+  "tests": {
+    "h3bup_capacity_verifier": "ops/verify_h3bup_capacity_gate_source.py",
+    "post_restore_verifier": "ops/verify_h3bup_post_restore.py",
+    "dt_unit_tests": "branch downward-trend tests/test_downward_trend_detector.py",
+    "ci_last_run": null
+  },
+  "reports": [
+    {
+      "path": "betinasia_bot/docs/handoff/strategy_complete_handoff_dossier_20260729.md",
+      "type": "handoff_dossier"
+    },
+    {
+      "path": "betinasia_bot/docs/handoff/strategy_context_pack_for_new_ai_20260729.md",
+      "type": "context_pack"
+    },
+    {
+      "path": "logs/executor_live.jsonl",
+      "type": "execution_log",
+      "location": "VPS"
+    },
+    {
+      "path": "logs/accounting_daily_report.json",
+      "type": "accounting",
+      "as_of": "2026-07-28T22:02Z",
+      "location": "VPS"
+    },
+    {
+      "path": "betinasia_bot/docs/estudo_5ms_pre_pos_20260611.md",
+      "type": "historical_study"
+    }
+  ],
+  "open_questions": [
+    {
+      "priority": "critical",
+      "q": "Full settlement/PnL for all H3BUP LIVE_OK?"
+    },
+    {
+      "priority": "critical",
+      "q": "Where is DT rule cum_drop>3% + last_share>=0.35 + non-Friendly implemented, if anywhere?"
+    },
+    {
+      "priority": "critical",
+      "q": "Exact H3B audit OK criteria consumed by bridge?"
+    },
+    {
+      "priority": "important",
+      "q": "Kickoff resolver precedence in prematch bridge?"
+    },
+    {
+      "priority": "important",
+      "q": "Recompute H3b study metrics on current bases?"
+    },
+    {
+      "priority": "secondary",
+      "q": "RACI owners?"
+    }
+  ],
+  "evidence": [
+    {
+      "claim": "policy_version H3BUP_vNext_20260629",
+      "source": "patches+lock+jsonl",
+      "confidence": "high"
+    },
+    {
+      "claim": "capacity gate uses dry.limit_final",
+      "source": "VPS worker+verifier",
+      "confidence": "high"
+    },
+    {
+      "claim": "8 LIVE_OK stake 10 after fix",
+      "source": "executor_live.jsonl",
+      "confidence": "high"
+    },
+    {
+      "claim": "full H3BUP ROI",
+      "source": "incomplete accounting",
+      "confidence": "low"
+    },
+    {
+      "claim": "user DT thresholds active on this VPS",
+      "source": "not found",
+      "confidence": "n/a_conflict"
+    }
+  ],
+  "confidence_assessment": {
+    "policy_clarity": "CLEAR",
+    "technical_flow": "MOSTLY_CLEAR",
+    "live_edge_statistics": "STATISTICALLY_INCONCLUSIVE",
+    "data_settlement_coverage": "DATA_RISK",
+    "overall_handoff": "HANDOFF_MOSTLY_COMPLETE",
+    "overall_confidence": "medium_high_technical_low_statistical"
+  }
+}
