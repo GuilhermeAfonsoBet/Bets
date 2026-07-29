@@ -18,8 +18,8 @@ SNIPPET = '''
         import os as _os
         _hp = _Path(_os.getenv("H3BUP_CLV_HEALTH_PATH", "logs/h3bup_clv_health.json"))
         _h = _json.loads(_hp.read_text(encoding="utf-8")) if _hp.exists() else {{"status": "WATCH", "enabled": False}}
-        out_lines.append("## H3BUP CLV Forward Collection\\n\\n")
-        out_lines.append("| Métrica | Valor |\\n|---|---|\\n")
+        s0.append("## H3BUP CLV Forward Collection\\n\\n")
+        s0.append("| Métrica | Valor |\\n|---|---|\\n")
         for k in [
             ("collection status", _h.get("status")),
             ("collection started at", _h.get("collection_started_at_utc")),
@@ -37,11 +37,11 @@ SNIPPET = '''
             ("retry backlog", _h.get("retry_backlog")),
             ("status estatístico", ("INSUFFICIENT_N" if int(_h.get("live_ok_after_activation") or 0) < 30 else "OK")),
         ]:
-            out_lines.append(f"| {{k[0]}} | {{k[1]}} |\\n")
-        out_lines.append("\\n")
+            s0.append(f"| {{k[0]}} | {{k[1]}} |\\n")
+        s0.append("\\n")
     except Exception as _e_clv:
-        out_lines.append("## H3BUP CLV Forward Collection\\n\\n")
-        out_lines.append(f"_indisponível (fail-open): {{str(_e_clv)[:160]}}_\\n\\n")
+        s0.append("## H3BUP CLV Forward Collection\\n\\n")
+        s0.append(f"_indisponível (fail-open): {{str(_e_clv)[:160]}}_\\n\\n")
     {end}
 '''.format(begin=MARKER_BEGIN, end=MARKER_END)
 

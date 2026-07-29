@@ -28,15 +28,15 @@ SNIPPET = '''
             "clock_skew": sum(1 for r in _rows if r.get("clock_skew_suspected")),
             "ordering_violations": sum(1 for r in _rows if r.get("ordering_violations")),
         }}
-        out_lines.append(render_daily_section(
+        s0.append(render_daily_section(
             _summary, _cov, health=_health,
             n_traces=len(_rows),
             n_live=sum(1 for r in _rows if r.get("status") == "LIVE_OK"),
         ))
-        out_lines.append("\\n")
+        s0.append("\\n")
     except Exception as _e_e2e:
-        out_lines.append("## H3BUP End-to-End Latency\\n\\n")
-        out_lines.append(f"_indisponível (fail-open): {{str(_e_e2e)[:160]}}_\\n\\n")
+        s0.append("## H3BUP End-to-End Latency\\n\\n")
+        s0.append(f"_indisponível (fail-open): {{str(_e_e2e)[:160]}}_\\n\\n")
     {end}
 '''.format(begin=MARKER_BEGIN, end=MARKER_END)
 

@@ -138,3 +138,23 @@ Status: `DAILY_AUDIT_TECHNICAL_GAPS` · `DAILY_V2_IMPLEMENTED_SHADOW` · `DAILY_
 ## Próximo passo recomendado
 
 Abrir Fase B (soak shadow + compare diário) sem Telegram V2; só avançar PUBLISH após gates G1–G7 do plano de migração.
+
+
+---
+
+## Resultado shadow real (2026-07-28 closed)
+
+| Campo | Valor |
+|---|---|
+| run_id | `3adbd07716f9` |
+| LIVE_OK H3BUP | 3 |
+| stake placed | 30 |
+| ROI settled | -1.43% AVAILABLE |
+| DAILY_FAST_LE_6S | 3/3 |
+| STUDY_FAST_LT_4S | 3/3 (exploratório) |
+| fair_edge | NOT_IMPLEMENTED |
+| published | false |
+| V1 oficial | sim (Telegram) |
+
+Nota: V1 do dia `20260728` foi gerado às 22:01Z e reportou 2 LIVE_OK na janela rolling 24h; a coorte fechada UTC do mesmo dia civil inclui ainda `23:58Z` → N=3. Isto valida a separação DAILY_CLOSED vs snapshot operacional.
+
