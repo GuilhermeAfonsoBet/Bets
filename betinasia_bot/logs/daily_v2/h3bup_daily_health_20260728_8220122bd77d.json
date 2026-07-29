@@ -1,0 +1,92 @@
+{
+  "report_health": {
+    "status": "HEALTHY",
+    "notes": [
+      "REPORT_HEALTH distinct from STRATEGY_OPERATIONS_HEALTH"
+    ]
+  },
+  "operations_health": {
+    "status": "WATCH",
+    "notes": [
+      "derived from services externally; Daily V2 does not restart services"
+    ]
+  },
+  "data_quality": {
+    "accounting": "HEALTHY",
+    "e2e": "HEALTHY",
+    "clv": "WATCH"
+  },
+  "statistical_readiness": {
+    "roi": "AVAILABLE",
+    "clv": "INSUFFICIENT_N",
+    "e2e": "AVAILABLE"
+  },
+  "parity": {
+    "v1_report_path": "logs/daily_reports/20260728/report_daily.md",
+    "v1_report_day_folder": "20260728",
+    "v1_report_cutoff_utc": "2026-07-28T22:01:08.644407+00:00",
+    "v2_generated_at_utc": "2026-07-29T21:36:39.985105+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-28T22:01:08.644407+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Comparação de paridade usa o cutoff lógico do V1. Eventos após v1_report_cutoff_utc até v2_generated_at_utc são apenas diagnóstico intraday e não entram na paridade."
+  },
+  "source_manifest": {
+    "executor_live": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:36:23.071918+00:00",
+      "age_seconds": 16.913105
+    },
+    "accounting_health": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:32:24.153513+00:00",
+      "age_seconds": 255.83151
+    },
+    "accounting_daily_report": {
+      "status": "WATCH",
+      "cutoff": "2026-07-28T22:02:42.108069+00:00",
+      "age_seconds": 84837.876954
+    },
+    "e2e_trace": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:36:36.677140+00:00",
+      "age_seconds": 3.307883
+    },
+    "clv_health": {
+      "status": "WATCH",
+      "cutoff": "2026-07-29T21:36:27.979359+00:00",
+      "age_seconds": 12.005664
+    },
+    "clv_obligations": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:29:54.266169+00:00",
+      "age_seconds": 405.718854
+    },
+    "policy_current": {
+      "status": "STALE",
+      "cutoff": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2622096.689927
+    },
+    "risk_params": {
+      "status": "STALE",
+      "cutoff": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 800431.717583
+    },
+    "accounting_balance": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:32:20.922225+00:00",
+      "age_seconds": 259.062798
+    },
+    "accounting_open_stakes": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:32:24.134511+00:00",
+      "age_seconds": 255.850512
+    }
+  },
+  "generated_at_utc": "2026-07-29T21:36:39.985105+00:00",
+  "run_id": "8220122bd77d",
+  "official": false,
+  "telegram_preview_enabled": true,
+  "pdf": "/home/betbot/Bets/betinasia_bot/logs/daily_v2/H3BUP_DAILY_V2_PREVIEW_20260728_8220122bd77d.pdf",
+  "pdf_preview_labeled": true
+}

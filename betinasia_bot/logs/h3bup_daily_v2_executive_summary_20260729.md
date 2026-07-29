@@ -168,3 +168,16 @@ Nota: V1 do dia `20260728` foi gerado às 22:01Z e reportou 2 LIVE_OK na janela 
 - Replay: 2026-07-20 = stake-20 legado (`bridge_h3b_live_v0`) fora do filtro H3BUP_vNext; 2026-07-28 = 3 LIVE_OK; 2026-07-29 = 22 LIVE_OK (PARTIAL settlement).
 - Publicação V2: **não**.
 - Status inalterado: `DAILY_AUDIT_TECHNICAL_GAPS` · `DAILY_V2_IMPLEMENTED_SHADOW` · `DAILY_REDESIGN_COMPLETE_SHADOW`.
+
+
+---
+
+## Telegram PREVIEW activo (2026-07-29)
+
+- Status: `DAILY_V2_PREVIEW_TELEGRAM_HEALTHY`
+- Geral: `DAILY_REDESIGN_COMPLETE_SHADOW_PREVIEW_ACTIVE`
+- Run preview: `8220122bd77d` · message_id=`77887` · `SENT`
+- Filename: `H3BUP_DAILY_V2_PREVIEW_20260728_8220122bd77d.pdf`
+- Parity cutoff alinhado ao V1: `2026-07-28T22:01:08.644407+00:00`
+- V1 md/pdf checksums inalterados
+- OFFICIAL permanece 0; V1 permanece oficial às 22:00 UTC

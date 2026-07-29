@@ -366,3 +366,144 @@ def test_publish_flag_default_off_in_cli(monkeypatch, tmp_path):
     rc = m.run(["--root", str(root), "--out-dir", str(out), "--report-type", "DAILY_CLOSED", "--report-date", "2026-07-28"])
     assert rc == 0
     assert not (out / "published").exists()
+
+
+def test_preview_banner_in_markdown():
+    from ops.daily_v2.render import render_markdown
+    from ops.daily_v2.statuses import metric_envelope
+    snap = {
+        "schema_version": 2,
+        "run_id": "abc",
+        "report_type": "DAILY_CLOSED",
+        "report_date_utc": "2026-07-28",
+        "window_start_utc": "2026-07-28T00:00:00+00:00",
+        "window_end_utc": "2026-07-29T00:00:00+00:00",
+        "report_cutoff_utc": "2026-07-28T22:01:00+00:00",
+        "generated_at_utc": "2026-07-28T22:10:00+00:00",
+        "git_commit": None,
+        "policy_id": "H3BUP_vNext",
+        "policy_version": "H3BUP_vNext_20260629",
+        "source_manifest": {},
+        "report_health": {"status": "HEALTHY"},
+        "operations_health": {},
+        "data_quality": {},
+        "statistical_readiness": {},
+        "execution_funnel": {"live_ok": metric_envelope(value=0, status="AVAILABLE", unit="count"), "fast_buckets": {}},
+        "settlement": {"maturity_status": "FULLY_SETTLED", "n_open": 0, "n_settled": 0, "n_void_push": 0, "n_missing_accounting": 0},
+        "performance": {
+            "roi_settled": metric_envelope(status="AVAILABLE", value=0, unit="fraction"),
+            "roiw_total_v1": metric_envelope(status="AVAILABLE", value=0, unit="percent"),
+            "roiw_total_v2": metric_envelope(status="AVAILABLE", value=0, unit="percent"),
+            "principal_metric": "roi_settled",
+        },
+        "latency": {
+            "daily_fast_le_6s": metric_envelope(value=0, status="AVAILABLE"),
+            "study_fast_lt_4s": metric_envelope(value=0, status="AVAILABLE"),
+            "e2e_ws_to_live_ok": metric_envelope(status="INSUFFICIENT_N"),
+            "detect_to_audit_overhead": metric_envelope(status="WATCH"),
+        },
+        "clv": {"fair_edge": metric_envelope(status="NOT_IMPLEMENTED"), "funnel": {}},
+        "concentration": {"status": "INSUFFICIENT_N"},
+        "exceptions": [],
+        "methodology": {},
+        "parity": {"parity_status": "CUTOFF_ALIGNED", "v1_report_cutoff_utc": "2026-07-28T22:01:00+00:00", "v2_comparison_cutoff_utc": "2026-07-28T22:01:00+00:00"},
+    }
+    md = render_markdown(snap)
+    assert "DAILY V2 — PREVIEW / NÃO OFICIAL" in md
+
+
+def test_preview_filename_contract():
+    from ops.daily_v2.preview_labels import preview_pdf_filename, validate_preview_artifacts
+    name = preview_pdf_filename("20260728", "deadbeef")
+    assert name.startswith("H3BUP_DAILY_V2_PREVIEW_")
+    ok, _ = validate_preview_artifacts(md="# DAILY V2 — PREVIEW / NÃO OFICIAL\n", pdf_name=name)
+    assert ok
+    ok2, reason = validate_preview_artifacts(md="# no label", pdf_name=name)
+    assert not ok2
+
+
+def test_telegram_caption_contains_preview():
+    from ops.daily_v2.preview_labels import build_telegram_caption
+    cap = build_telegram_caption(
+        report_date_utc="2026-07-28",
+        report_cutoff_utc="2026-07-28T22:01:00+00:00",
+        generated_at_utc="2026-07-28T22:10:00+00:00",
+        schema_version=2,
+        run_id="abc",
+        parity_status="CUTOFF_ALIGNED",
+    )
+    assert "PREVIEW / NÃO OFICIAL" in cap
+    assert "Não substitui o Daily V1 oficial" in cap
+
+
+def test_official_flag_refused(monkeypatch, tmp_path):
+    from ops.daily_v2 import __main__ as m
+    monkeypatch.setenv("H3BUP_DAILY_V2_ENABLED", "1")
+    monkeypatch.setenv("H3BUP_DAILY_V2_OFFICIAL", "1")
+    monkeypatch.setenv("H3BUP_DAILY_V2_FAIL_OPEN", "1")
+    root = tmp_path
+    (root / "logs").mkdir()
+    (root / "logs" / "executor_live.jsonl").write_text("")
+    rc = m.run(["--root", str(root), "--out-dir", str(root / "out"), "--report-date", "2026-07-28"])
+    assert rc == 0
+    assert not list((root / "out").glob("H3BUP_DAILY_V2_PREVIEW_*.pdf"))
+
+
+def test_parity_cutoff_alignment():
+    from ops.daily_v2.cutoff import resolve_parity_cutoffs
+    from datetime import datetime, timezone
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        day_dir = root / "logs" / "daily_reports" / "20260728"
+        day_dir.mkdir(parents=True)
+        (day_dir / "report_daily.md").write_text(
+            "# Daily\n\n- Dia do relatório (UTC): `20260728`\n- Gerado em (UTC): `2026-07-28T22:01:08+00:00`\n",
+            encoding="utf-8",
+        )
+        out = resolve_parity_cutoffs(
+            root=root,
+            report_date_utc="2026-07-28",
+            v2_generated_at=datetime(2026, 7, 28, 22, 10, tzinfo=timezone.utc),
+        )
+        assert out["parity_status"] == "CUTOFF_ALIGNED"
+        assert out["v1_report_cutoff_utc"].startswith("2026-07-28T22:01:08")
+        assert out["v2_comparison_cutoff_utc"] == out["v1_report_cutoff_utc"]
+        assert out["cutoffs_equal"] is True
+
+
+def test_pdf_preview_label(tmp_path):
+    pytest.importorskip("reportlab")
+    from ops.daily_v2.pdf_preview import render_preview_pdf, pdf_contains_preview_label
+    # ensure renderer available via workspace docs path
+    md = "# DAILY V2 — PREVIEW / NÃO OFICIAL\n\nHello\n\n## Sec\n\n- a\n"
+    pdf = tmp_path / "H3BUP_DAILY_V2_PREVIEW_20260728_test.pdf"
+    # docs path relative to cwd when tests run from betinasia_bot
+    render_preview_pdf(md, pdf, root=Path('.').resolve())
+    assert pdf.exists() and pdf.stat().st_size > 100
+    assert pdf_contains_preview_label(pdf)
+
+
+def test_token_not_in_telegram_evidence(tmp_path, monkeypatch):
+    from ops.daily_v2.telegram_preview import maybe_send_telegram_preview
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:FAKE_SECRET_TOKEN_VALUE")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "999")
+    # force skip by missing preview label in md / bad pdf
+    pdf = tmp_path / "bad.pdf"
+    pdf.write_text("x")
+    evid = maybe_send_telegram_preview(
+        root=tmp_path,
+        out_dir=tmp_path,
+        day_s="20260728",
+        run_id="r1",
+        snap={"generated_at_utc": "2026-07-28T22:10:00+00:00", "report_date_utc": "2026-07-28", "schema_version": 2, "parity": {}},
+        md_text="no banner",
+        pdf_path=pdf,
+        parity_status="X",
+        telegram_preview_enabled=True,
+        official=False,
+    )
+    blob = str(evid)
+    assert "FAKE_SECRET_TOKEN_VALUE" not in blob
+    assert evid["telegram_status"] == "PREVIEW_LABEL_VALIDATION_FAILED"

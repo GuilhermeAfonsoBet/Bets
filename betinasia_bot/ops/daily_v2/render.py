@@ -31,18 +31,29 @@ def _m(metric: Any) -> str:
 def render_markdown(snapshot: Dict[str, Any]) -> str:
     lines: List[str] = []
     a = lines.append
+    # Mandatory preview identity (Telegram/PDF validation depends on this exact banner).
+    a("# DAILY V2 — PREVIEW / NÃO OFICIAL\n\n")
+    a("> Este relatório está em validação shadow. Não substitui o Daily V1 oficial das 22:00 UTC.\n\n")
     a(f"# H3BUP Daily V2 — {snapshot.get('report_date_utc')}\n")
     a("## 0) Manifesto\n")
+    a("- status: `SHADOW / PREVIEW / NÃO OFICIAL`\n")
     a(f"- report_type: `{snapshot.get('report_type')}`\n")
     a(f"- report_date_utc: `{snapshot.get('report_date_utc')}`\n")
     a(f"- window: `{snapshot.get('window_start_utc')}` → `{snapshot.get('window_end_utc')}`\n")
     a(f"- report_cutoff_utc: `{snapshot.get('report_cutoff_utc')}`\n")
+    parity = snapshot.get("parity") or {}
+    if parity:
+        a(f"- v1_report_cutoff_utc: `{parity.get('v1_report_cutoff_utc')}`\n")
+        a(f"- v2_comparison_cutoff_utc: `{parity.get('v2_comparison_cutoff_utc')}`\n")
+        a(f"- parity_status: `{parity.get('parity_status')}`\n")
     a(f"- generated_at_utc: `{snapshot.get('generated_at_utc')}`\n")
     a(f"- schema_version: `{snapshot.get('schema_version')}`\n")
     a(f"- run_id: `{snapshot.get('run_id')}`\n")
     a(f"- git_commit: `{snapshot.get('git_commit')}`\n")
     a(f"- policy: `{snapshot.get('policy_id')}` / `{snapshot.get('policy_version')}`\n")
-    a(f"- report_health: `{(snapshot.get('report_health') or {}).get('status')}`\n\n")
+    a(f"- report_health: `{(snapshot.get('report_health') or {}).get('status')}`\n")
+    a(f"- data_quality: `{snapshot.get('data_quality')}`\n")
+    a(f"- statistical_readiness: `{snapshot.get('statistical_readiness')}`\n\n")
 
     a("## 1) Resumo executivo\n")
     fun = snapshot.get("execution_funnel") or {}
@@ -122,4 +133,7 @@ def render_markdown(snapshot: Dict[str, Any]) -> str:
     for k, v in (snapshot.get("methodology") or {}).items():
         a(f"- **{k}**: {v}\n")
     a("\n")
+    a("---\n\n")
+    a("**DAILY V2 — PREVIEW / NÃO OFICIAL** — Uso: validação técnica e metodológica. "
+      "Não utilizar este preview como substituto do relatório oficial.\n")
     return "".join(lines)
