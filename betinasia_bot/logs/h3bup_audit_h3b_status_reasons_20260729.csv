@@ -1,0 +1,2 @@
+status,is_valid_opportunity,n,exact_condition_from_code
+OK,True,1996,GATE_BACK_ENFORCE_RISE_FILTER=0: status OK if ws_state_key and side present AND websocket_odd(ws0)>0; is_valid_opportunity forced True at return

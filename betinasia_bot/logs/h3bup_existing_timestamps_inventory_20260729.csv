@@ -1,0 +1,20 @@
+timestamp,source,file_or_table,type,timezone,reliability,coverage_notes
+hypothesis_detected_at,audit DB,betslip_audit_results,timestamptz,UTC,high,from detected_at epoch
+audited_at,audit DB,betslip_audit_results,timestamptz,UTC,high,persist time
+audit_total_duration_ms,audit DB,betslip_audit_results,int ms,UTC N/A,medium,~detected→pre-db
+telemetry.queue_wait_ms,hypothesis_details,JSON,int ms,,medium,enqueue→worker
+telemetry.end_to_end_ms,hypothesis_details,JSON,int ms,,medium,detected→OK return
+ws_gate_series[].ts,hypothesis_details,JSON,epoch float,UTC,medium,offset samples
+shadow.created_at / detected_at / decision_at,DB,backpre_shadow_all,timestamptz,UTC,high,
+request.created_at,jsonl,executor_live.jsonl,ISO Z,UTC,high,
+result.finished_at,jsonl,executor_live.jsonl,ISO Z,UTC,high,
+timing.queue_delay_ms,jsonl,result.timing,int ms,,high,
+timing.call_to_done_ms,jsonl,result.timing,int ms,,high,
+timing.post_ms,jsonl,result.timing,int ms,,high,betslip API
+value_sizing.pre_submit_ms,jsonl,raw.value_sizing,int ms,,high,created_at→pre place
+value_sizing.slippage_pre_pct,jsonl,raw.value_sizing,percent,,high,
+accounting post date,CSV,logs/accounting/*balance*.csv,naive datetime,tz unspecified,medium,stale since 2026-07-28T22:02Z
+ws_received_ts,—,—,—,—,missing,NOT FOUND as dedicated field
+bridge_fetched_ts,—,—,—,—,missing,NOT FOUND
+policy_eval_ts,—,—,—,—,missing,NOT FOUND dedicated
+dryrun_started_ts / place_started_ts,—,—,—,—,missing,NOT FOUND dedicated

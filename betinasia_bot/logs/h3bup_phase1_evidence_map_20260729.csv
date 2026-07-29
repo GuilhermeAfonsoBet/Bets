@@ -1,0 +1,11 @@
+claim,evidence,source,confidence
+OK condition enforce=0,audit_h3b_api.py:_execute_ws_gate_back L2632-2707,VPS md5 6d163e5e,high
+direction=up means odds rose then reversal to up,hypothesis/detectors.py H3bTemporalReversalDetector,VPS,high
+bridge consumes is_valid_opportunity not status,ops/executor_bridge_audit.py:_fetch_candidates,VPS,high
+BRIDGE_SOURCE_STATUSES unused,grep count 0 in bridge code vs env set,CONFLICT,high
+lookback 120s poll 0.3s,process env + argparse,VPS,high
+LIVE_OK n=12 post-fix,executor_live.jsonl,cut 2026-07-29T12:31:52Z,high
+accounting files None,accounting_monitor_error.log snapshot ok files None,VPS,high
+CLV formula B808,analyze_contexto... clv_bs=(bs-closing)/closing*100,VPS,high
+no H3BUP CLV scheduler,grep ops/services,VPS,high
+services not restarted this phase,ActiveEnterTimestamp unchanged vs before,impact check,high
