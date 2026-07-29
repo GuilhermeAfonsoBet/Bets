@@ -62,7 +62,20 @@ def normalize_jsonl_path(raw: str) -> str:
 def classify_exception(exc: BaseException | str) -> str:
     msg = str(exc or "")
     low = msg.lower()
-    if any(x in low for x in ("login_failed", "auth required", "unauthorized", "401", "no_session", "sessão inválida", "session")):
+    if any(
+        x in low
+        for x in (
+            "login_failed",
+            "auth required",
+            "unauthorized",
+            "401",
+            "no_session",
+            "sessão inválida",
+            "session expired",
+            "sessão expirada",
+            "api auth",
+        )
+    ):
         return ACCOUNTING_AUTH_FAILED
     if any(x in low for x in ("proxy", "err_proxy", "tunnel", "econnreset via proxy")):
         return ACCOUNTING_PROXY_FAILED
