@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "status": "DAILY_PARITY_HARDENED_MATCH",
+  "run_id": "964f1a41abe4",
+  "out_dir": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/parity_hardening/20260729/964f1a41abe4",
+  "parity_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+  "matured_as_of_utc": "2026-07-30T20:23:40.223866+00:00",
+  "only_in_v2": [
+    "1938082582",
+    "1938105954"
+  ],
+  "order_set_match_parity": true,
+  "official_preserved": true,
+  "pdf": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/parity_hardening/20260729/964f1a41abe4/H3BUP_DAILY_V2_PARITY_HARDENING_PREVIEW_20260729_964f1a41abe4.pdf"
+}
