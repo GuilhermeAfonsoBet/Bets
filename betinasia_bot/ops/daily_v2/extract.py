@@ -113,6 +113,10 @@ def extract_source_manifest(window: ReportWindow, *, root: Path | None = None) -
             except Exception:
                 pass
         meta["age_seconds"] = age
+        # P0-7: static config files are NOT STALE by mtime — fingerprint/drift handled in health_model
+        if name in {"policy_current", "risk_params"} and meta["exists"] and status in {"STALE", "WATCH"}:
+            status = "CURRENT_UNCHANGED"
+            meta["notes"] = ["mtime age ignored for static config; see config fingerprint"]
         meta["status"] = status
         manifest[name] = meta
     return manifest

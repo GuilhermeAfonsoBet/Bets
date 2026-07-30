@@ -4111,6 +4111,22 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
     # --- Seção 0: Resumo / conclusões (executivo) ---
     s0 = []
     s0.append("## 0) Resumo e conclusões (executivo)\n\n")
+    # BEGIN H3BUP_VNEXT_OFFICIAL_SUMMARY_P0
+    try:
+        from .daily_v2.v1_h3bup_summary import render_h3bup_vnext_official_summary
+
+        s0.append(render_h3bup_vnext_official_summary(Path(".")))
+        s0.append("\n")
+    except Exception as _e_h3b_sum:
+        s0.append("## H3BUP_vNext — Resumo Oficial da Estratégia\n\n")
+        s0.append(f"_indisponível (fail-open): {str(_e_h3b_sum)[:160]}_\n\n")
+        s0.append(
+            "> Os valores de banca, P&L semanal/mensal da conta e estudos históricos "
+            "não representam necessariamente a performance da H3BUP_vNext.\n\n"
+        )
+    # END H3BUP_VNEXT_OFFICIAL_SUMMARY_P0
+
+    s0.append("### CONTA TOTAL (não confundir com H3BUP_vNext)\n\n")
     if cfg.skip_oos or (isinstance(oos_run, dict) and not bool(oos_run.get("ok"))):
         s0.append("**Status do OOS (walk-forward)**\n\n")
         if cfg.skip_oos:
@@ -4132,12 +4148,15 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                     f"(`{policy_publish_info.get('reason')}`) — mantendo policy anterior em `{cfg.wf_policy_current}`.\n"
                 )
 
-    # performance “real” (accounting) quando houver
+    # performance “real” (accounting) quando houver — CONTA TOTAL
     if isinstance(acct, dict) and not acct.get("error"):
-        s0.append(f"- **Banca real (saldo atual)**: `{acct.get('balance_current')}`\n")
-        s0.append(f"- **P&L (hoje / semana / mês)**: `{acct.get('pnl_today')} / {acct.get('pnl_week')} / {acct.get('pnl_month')}`\n")
+        s0.append(f"- **Banca real (saldo atual) — CONTA TOTAL**: `{acct.get('balance_current')}`\n")
+        s0.append(
+            f"- **P&L conta (hoje / semana / mês) — CONTA TOTAL**: "
+            f"`{acct.get('pnl_today')} / {acct.get('pnl_week')} / {acct.get('pnl_month')}`\n"
+        )
     else:
-        s0.append("- **Accounting**: indisponível (ver apêndice 99.1)\n")
+        s0.append("- **Accounting (CONTA TOTAL)**: indisponível (ver apêndice 99.1)\n")
 
     # BEGIN H3BUP_ACCOUNTING_HEALTH_SECTION
     try:
@@ -4632,25 +4651,28 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
         hard_fails.append("erros `too_many_open_betslips` presentes")
 
     verdict = "APTO (com cautela)" if not hard_fails else "NÃO APTO"
-    s0.append(f"**Veredito**: **{verdict}**\n\n")
+    s0.append(f"**Veredito operacional (observação — sem alteração de risco)**: **{verdict}**\n\n")
     if hard_fails:
-        s0.append("**Motivos (prioridade)**\n\n")
+        s0.append("**Observação / Evidência / Status / Limitação**\n\n")
         for x in hard_fails[:8]:
-            s0.append(f"- {x}\n")
+            s0.append(f"- Observação: {x}\n")
+            s0.append("  - Evidência: KPIs das últimas 24h no audit/executor\n")
+            s0.append("  - Status: WATCH\n")
+            s0.append("  - Limitação: este Daily **não recomenda** alteração de stake, exposição, filtro ou threshold\n")
         s0.append("\n")
         s0.append(
-            "**Próximos passos recomendados (para destravar LIVE)**\n\n"
-            "- Atacar `No PMMs received` (timeout/min_wait/idle + estabilidade de sessão) antes de aumentar volume.\n"
-            "- Zerar `too_many_open_betslips` (caps/janelas + cleanup agressivo) para evitar bloqueio global.\n"
-            "- Reduzir `STALE_QUEUE_WAIT` (fila/concurrency) para não operar atrasado.\n\n"
+            "> **APÊNDICE DE PESQUISA — NÃO OPERACIONAL** (antigas 'recomendações' de desbloqueio LIVE "
+            "foram removidas do núcleo; não alterar policy/stake a partir deste relatório).\n\n"
         )
 
-    # leitura executiva (heurística): onde atacar primeiro
+    # leitura executiva: observação sem recomendações de risco
     s0.append(
-        "\n**Conclusões operacionais (prioridades)**\n\n"
-        "- **Objetivo 1 (conversão)**: reduzir `API_FAILED` (especialmente `No PMMs received`) e `STALE_QUEUE_WAIT` para aumentar taxa de execução sem inflar risco.\n"
-        "- **Objetivo 2 (governança de risco)**: consolidar sizing/limites (banca teórica vs banca real) e travas para evitar picos (`too_many_open_betslips`, rate limit, backoff).\n"
-        "- **Objetivo 3 (qualidade de entrada)**: acompanhar slippage **com sinal** e seu impacto em ROI por bucket (negativo/flat/positivo) para validar edge e execução.\n\n"
+        "\n**Observações operacionais (sem sizing / sem alteração de stake)**\n\n"
+        "- Formato: Observação · Evidência · Status · Limitação.\n"
+        "- Conversão / API_FAILED / STALE: monitorar KPIs; **não** alterar thresholds neste Daily.\n"
+        "- Cap / open betslips: evidência no audit; **não** alterar caps a partir deste relatório.\n"
+        "- Slippage / ROI por bucket: diagnóstico; **não** afirmar edge nem mudar policy.\n"
+        "- Estudos Kelly/sizing/contrafactuais: ver **APÊNDICE DE PESQUISA — NÃO OPERACIONAL**.\n\n"
     )
 
     # ------------------------------------------------------------
@@ -6240,11 +6262,13 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 s1.append(f"- `{ver}`: {st} ×{n} — `{err2}`\n")
             s1.append("\n")
 
-        s1.append("**Oportunidades identificadas / melhorias propostas (curto prazo)**\n\n")
+        s1.append("> **APÊNDICE DE PESQUISA — NÃO OPERACIONAL**\n\n")
+        s1.append("**Oportunidades identificadas (pesquisa — sem alteração de stake/threshold)**\n\n")
         s1.append(
-            "- **PMM/timeout**: se `No PMMs received` dominar, aumentar timeout efetivo e reduzir bursts (workers/queue) tende a elevar conversão sem mexer na estratégia.\n"
-            "- **Betslips abertos**: `too_many_open_betslips` é um gargalo de throughput; manter caps/janelas e garantir cleanup rápido evita bloqueio global.\n"
-            "- **Fila**: `STALE_QUEUE_WAIT` indica atraso interno; atacar latência/concorrência antes de aumentar volume/seleção.\n\n"
+            "- Observação: PMM/timeout / betslips / fila podem limitar conversão.\n"
+            "- Evidência: KPIs de audit/executor nas últimas 24h.\n"
+            "- Status: WATCH / diagnóstico.\n"
+            "- Limitação: este Daily **não** recomenda mudança de policy, stake ou caps.\n\n"
         )
 
     # Sensibilidade de banca (reusa tabela OOS existente)
@@ -6262,6 +6286,7 @@ async def run_daily_full(cfg: DailyReportCfg) -> Dict[str, Any]:
                 until_any=["### 1.2c Sensibilidade por banca", "### 1.3 ", "### 12.2c Sensibilidade por banca", "### 12.3 "],
             )
         if sens.strip():
+            s1.append("> **APÊNDICE DE PESQUISA — NÃO OPERACIONAL** (Kelly/sizing/sensibilidade)\n\n")
             s1.append("**Estudo de sensibilidade (banca × lucro)**\n\n")
             s1.append(
                 "_A tabela abaixo é reaproveitada do bloco OOS (mesmo layout). Ela responde “até onde a operação escala” antes de bater em caps/limites._\n\n"

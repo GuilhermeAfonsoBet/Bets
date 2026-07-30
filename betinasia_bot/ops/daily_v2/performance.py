@@ -159,6 +159,36 @@ def compute_settlement_and_performance(
             source="executor+accounting",
         )
 
+    stake_void = sum(float(r["stake"]) for r in void_push if r.get("stake") is not None)
+    stake_decided_ex_void = sum(float(r["stake"]) for r in settled if r.get("stake") is not None)
+    pnl_decided_ex_void = sum(float(r["pnl"]) for r in settled)
+    stake_open = sum(float(orders[oid]["stake"]) for oid in open_list if orders[oid].get("stake") is not None)
+    stake_placed = sum(float(o["stake"]) for o in orders.values() if o.get("stake") is not None)
+
+    roi_decided = None
+    if stake_decided_ex_void > 0:
+        roi_decided = metric_envelope(
+            value=pnl_decided_ex_void / stake_decided_ex_void,
+            unit="fraction",
+            n=len(settled),
+            numerator=pnl_decided_ex_void,
+            denominator=stake_decided_ex_void,
+            status="AVAILABLE" if not open_list and not missing else "PARTIAL",
+            metric_version="v2.0",
+            notes=["void excluded from numerator and denominator"],
+        )
+    else:
+        roi_decided = metric_envelope(status="MISSING" if settled_like or orders else "AVAILABLE", unit="fraction", n=0)
+
+    # alias: roi_resolved == roi including void in denominator (principal)
+    roi_resolved = roi
+    if isinstance(roi_resolved, dict):
+        roi_resolved = dict(roi_resolved)
+        roi_resolved["notes"] = list(roi_resolved.get("notes") or []) + [
+            "principal_metric=roi_resolved",
+            "void/push stake included in denominator; pnl≈0",
+        ]
+
     if not orders:
         maturity = "FULLY_SETTLED"
     elif open_list and settled_like:
@@ -178,13 +208,27 @@ def compute_settlement_and_performance(
         "n_missing_accounting": len(missing),
         "open_order_ids": open_list,
         "missing_order_ids": missing,
-        "stake_placed_sum": sum(float(o["stake"]) for o in orders.values() if o.get("stake") is not None),
-        "stake_settled_sum": stake_sum,
+        "stake_placed_sum": stake_placed,
+        "stake_settled_sum": stake_sum,  # legacy alias = stake_resolved_total
         "pnl_settled_sum": pnl_sum,
-        "roi_settled": roi,
+        "stake_placed": stake_placed,
+        "stake_resolved_total": stake_sum,
+        "stake_decided_ex_void": stake_decided_ex_void,
+        "stake_void": stake_void,
+        "stake_open": stake_open,
+        "pnl_resolved": pnl_sum,
+        "pnl_decided_ex_void": pnl_decided_ex_void,
+        "roi_settled": roi,  # legacy alias
+        "roi_resolved": roi_resolved,
+        "roi_decided_ex_void": roi_decided,
         "roiw_total_v1": roiw_v1,
         "roiw_total_v2": roiw_v2,
         "maturity_status": maturity,
-        "principal_metric": "roi_settled",
-        "complementary_metric": "roiw_total_v1",
+        "principal_metric": "roi_resolved",
+        "complementary_metric": "roi_decided_ex_void",
+        "parity_legacy_metric": "roiw_total_v1",
+        "formulas": {
+            "roi_resolved": "pnl_resolved / stake_resolved_total (void stake in denom)",
+            "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void",
+        },
     }

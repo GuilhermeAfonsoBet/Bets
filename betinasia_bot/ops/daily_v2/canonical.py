@@ -1,4 +1,4 @@
-"""Build canonical Daily V2 snapshot JSON."""
+"""Build canonical Daily V2 snapshot JSON (P0 enriched)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import SCHEMA_VERSION
+from .clv_section import build_clv_section
+from .diff_previous import diff_snapshots, find_previous_snapshot
+from .e2e_funnel import build_e2e_and_funnel
 from .extract import extract_source_manifest
+from .health_model import build_health_model, derive_alerts, evaluate_config_file
 from .performance import compute_settlement_and_performance
 from .statuses import metric_envelope
 from .time_windows import ReportWindow, resolve_window
@@ -52,6 +56,8 @@ def build_snapshot(
     report_date=None,
     require_h3bup: bool = True,
     run_id: Optional[str] = None,
+    previous_snapshot: Optional[Dict[str, Any]] = None,
+    out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     root = Path(root)
     win = window or resolve_window(report_type=report_type, report_date=report_date)
@@ -76,60 +82,34 @@ def build_snapshot(
     )
     fast = classify_fast_buckets(orders)
 
-    # Health aggregates
-    critical_sources = ["executor_live", "accounting_health"]
-    report_health = "HEALTHY"
-    for cs in critical_sources:
-        st = (manifest.get(cs) or {}).get("status")
-        if st in {"STALE", "FAILED"}:
-            report_health = "CRITICAL" if cs.startswith("accounting") and report_type else "PARTIAL"
-            if st == "FAILED":
-                report_health = "CRITICAL"
-        elif st in {"WATCH", "PARTIAL"} and report_health == "HEALTHY":
-            report_health = "WATCH"
-        elif st == "NOT_AVAILABLE" and cs == "executor_live":
-            report_health = "CRITICAL"
+    # Config fingerprint (NOT mtime STALE)
+    policy_path = Path((manifest.get("policy_current") or {}).get("path") or root / "logs/wf_policy_current.json")
+    risk_path = Path((manifest.get("risk_params") or {}).get("path") or root / "logs/bridge_risk_params.json")
+    config_eval = {
+        "policy": evaluate_config_file(policy_path),
+        "risk_params": evaluate_config_file(risk_path),
+    }
+    # Overlay config status onto manifest (replace age-based STALE)
+    for key, ce in (("policy_current", config_eval["policy"]), ("risk_params", config_eval["risk_params"])):
+        if key in manifest and isinstance(manifest[key], dict):
+            manifest[key] = dict(manifest[key])
+            manifest[key]["status"] = ce.get("drift") or "UNVERIFIED"
+            manifest[key]["config_eval"] = ce
+            manifest[key]["notes"] = ["mtime age ignored; fingerprint/content used"]
 
-    e2e_health = _load_json(Path((manifest.get("e2e_trace") or {}).get("path") or "missing"))
-    # e2e_trace is jsonl — health from existence/freshness
-    e2e_status = (manifest.get("e2e_trace") or {}).get("status") or "NOT_AVAILABLE"
-    clv = _load_json(Path((manifest.get("clv_health") or {}).get("path") or "missing"))
+    e2e_pack = build_e2e_and_funnel(root, window_label="all_traces_available")
+    clv_section = build_clv_section(root)
 
-    exceptions = []
-    for oid, o in orders.items():
-        if o.get("stake") is not None and abs(float(o["stake"]) - 10.0) > 1e-6:
-            # current H3BUP stake must be 10; flag mismatch (legacy 20 separated)
-            sev = "CRITICAL" if abs(float(o["stake"]) - 20.0) > 1e-6 else "WARNING"
-            exceptions.append(
-                {
-                    "alert_id": f"stake_mismatch:{oid}",
-                    "severity": sev,
-                    "evidence": {"order_id": oid, "stake": o.get("stake")},
-                    "affected_metrics": ["stake_placed_sum"],
-                    "status": "OPEN",
-                }
-            )
-        if o.get("policy_version") and "H3BUP_vNext" not in str(o.get("policy_version")):
-            exceptions.append(
-                {
-                    "alert_id": f"policy_mix:{oid}",
-                    "severity": "CRITICAL",
-                    "evidence": {"order_id": oid, "policy_version": o.get("policy_version")},
-                    "affected_metrics": ["live_ok_count"],
-                    "status": "OPEN",
-                }
-            )
-
-    # Latency section from fast buckets + E2E placeholder reading analyzer optionally
+    # Fast latency envelopes (speed buckets — separate from funnel)
+    n_orders = len(orders)
+    n_pre = int(fast.get("n_with_pre_submit_ms") or 0)
     latency = {
         "daily_fast_le_6s": metric_envelope(
             value=fast["DAILY_FAST_LE_6S"]["n"],
             unit="count",
             n=fast["DAILY_FAST_LE_6S"]["n"],
-            denominator=fast["n_with_pre_submit_ms"],
-            coverage_pct=(
-                100.0 * fast["n_with_pre_submit_ms"] / len(orders) if orders else None
-            ),
+            denominator=n_pre,
+            coverage_pct=(100.0 * n_pre / n_orders) if n_orders else None,
             status="AVAILABLE",
             metric_version="v2.0",
             source="executor_live.jsonl",
@@ -148,192 +128,256 @@ def build_snapshot(
             value=fast["PRE_SUBMIT_MS_NA"]["n"],
             unit="count",
             n=fast["PRE_SUBMIT_MS_NA"]["n"],
+            coverage_pct=(100.0 * fast["PRE_SUBMIT_MS_NA"]["n"] / n_orders) if n_orders else None,
             status="AVAILABLE",
-            notes=["missing not coerced to slow"],
+            notes=["missing not coerced to slow", f"coverage_missing={fast['PRE_SUBMIT_MS_NA']['n']}/{n_orders}"],
         ),
-        "e2e_source_status": e2e_status,
-        "detect_to_audit_overhead": metric_envelope(
-            value=None,
-            status="WATCH",
-            metric_version="v2.0",
-            source="h3bup_e2e_trace",
-            notes=["overhead remains WATCH until re-evaluation"],
-        ),
+        "e2e_source_status": (manifest.get("e2e_trace") or {}).get("status") or "NOT_AVAILABLE",
+        "segments": e2e_pack.get("segments") or {},
+        "n_traces": e2e_pack.get("n_traces"),
+        "n_live_ok_traces": e2e_pack.get("n_live_ok"),
+        "full_trace_coverage_pct": e2e_pack.get("full_trace_coverage_pct"),
+        "dominant_stage": e2e_pack.get("dominant_stage"),
+        "ordering_violations": e2e_pack.get("ordering_violations") or 0,
+        "clock_skew": e2e_pack.get("clock_skew") or 0,
+        "trace_events_dropped": e2e_pack.get("trace_events_dropped") or 0,
+        "detect_to_audit_overhead": e2e_pack.get("detect_to_audit_overhead")
+        or metric_envelope(status="WATCH", unit="ms", notes=["overhead remains WATCH"]),
     }
-
-    # Try E2E analyzer if available
-    try:
-        from ops.analyze_h3bup_e2e_latency import analyze_trace, group_traces, load_events, summarize
-
-        tpath = Path((manifest.get("e2e_trace") or {}).get("path") or "")
-        if tpath.exists():
-            evs = load_events(tpath)
-            trs = group_traces(evs)
-            rows = [analyze_trace(tid, evs2) for tid, evs2 in trs.items()]
-            summary, _by, cov = summarize(rows)
-            n_live = sum(1 for r in rows if r.get("status") == "LIVE_OK")
-            # pick ws_to_live_ok if present
-            med = None
-            p95 = None
-            nseg = 0
-            for s in summary or []:
-                if str(s.get("segment") or s.get("name") or "").lower() in {
-                    "ws_to_live_ok",
-                    "ws→live_ok",
-                    "e2e_total",
-                }:
-                    med = s.get("p50") or s.get("median")
-                    p95 = s.get("p95") or s.get("p90")
-                    nseg = int(s.get("n") or 0)
-            latency["e2e_ws_to_live_ok"] = metric_envelope(
-                value=med,
-                unit="ms",
-                n=nseg or n_live,
-                status="INSUFFICIENT_N" if (nseg or n_live) == 0 else "AVAILABLE",
-                metric_version="v2.0",
-                source="h3bup_e2e_trace.jsonl",
-                notes=[f"n_traces={len(rows)}", f"n_live={n_live}"],
-            )
-            latency["e2e_coverage"] = cov
-        else:
-            latency["e2e_ws_to_live_ok"] = metric_envelope(
-                status="MISSING", unit="ms", n=0, source="h3bup_e2e_trace.jsonl"
-            )
-    except Exception as e:
+    # Convenience top-level E2E metric
+    ws = (e2e_pack.get("segments") or {}).get("ws_to_live_ok")
+    if ws:
+        latency["e2e_ws_to_live_ok"] = ws
+    else:
         latency["e2e_ws_to_live_ok"] = metric_envelope(
-            status="FAILED", unit="ms", n=0, notes=[str(e)[:160]]
+            status="MISSING" if not e2e_pack.get("available") else "INSUFFICIENT_N",
+            unit="ms",
+            n=0,
+            source="h3bup_e2e_trace.jsonl",
         )
 
-    clv_section = {
-        "collection_status": clv.get("status") or (manifest.get("clv_health") or {}).get("status"),
-        "collection_started_at_utc": clv.get("collection_started_at_utc"),
-        "post_5m_valid_strict": metric_envelope(
-            value=clv.get("post_5m_valid_strict"),
-            unit="count",
-            n=int(clv.get("post_5m_valid_strict") or 0) if clv.get("post_5m_valid_strict") is not None else 0,
-            status=(
-                "INSUFFICIENT_N"
-                if int(clv.get("live_ok_after_activation") or 0) < 30
-                else ("AVAILABLE" if clv else "MISSING")
-            )
-            if clv
-            else "MISSING",
-            notes=["forward-only", "POST_5M"],
-        ),
-        "post_15m_valid_strict": metric_envelope(
-            value=clv.get("post_15m_valid_strict"),
-            unit="count",
-            status="INSUFFICIENT_N" if int(clv.get("live_ok_after_activation") or 0) < 30 else ("AVAILABLE" if clv else "MISSING"),
-            notes=["POST_15M"],
-        ),
-        "closing_valid_strict": metric_envelope(
-            value=clv.get("closing_valid_strict"),
-            unit="count",
-            status="INSUFFICIENT_N" if int(clv.get("live_ok_after_activation") or 0) < 30 else ("AVAILABLE" if clv else "MISSING"),
-            notes=["CLOSING", "requires pre-kickoff snapshot"],
-        ),
-        "fair_edge": metric_envelope(
-            value=None,
-            status="NOT_IMPLEMENTED",
-            metric_version="v2.0",
-            notes=["Phase 2D not started"],
-        ),
-        "funnel": {
-            "live_ok_after_activation": clv.get("live_ok_after_activation"),
-            "obligations_expected": clv.get("obligations_expected"),
-            "obligations_created": clv.get("obligations_created"),
-            "source_missing": clv.get("source_missing"),
-            "kickoff_missing": clv.get("kickoff_missing"),
-        },
+    settlement = {
+        "maturity_status": perf["maturity_status"],
+        "live_ok_total": perf.get("live_ok_total", n_orders),
+        "n_open": perf["n_open"],
+        "n_settled": perf["n_settled"],
+        "n_void_push": perf["n_void_push"],
+        "n_missing_accounting": perf["n_missing_accounting"],
+        "stake_placed_sum": perf["stake_placed_sum"],
+        "stake_settled_sum": perf.get("stake_settled_sum"),
+        "pnl_settled_sum": perf.get("pnl_settled_sum"),
+        "stake_placed": perf.get("stake_placed"),
+        "stake_resolved_total": perf.get("stake_resolved_total"),
+        "stake_decided_ex_void": perf.get("stake_decided_ex_void"),
+        "stake_void": perf.get("stake_void"),
+        "stake_open": perf.get("stake_open"),
+        "pnl_resolved": perf.get("pnl_resolved"),
+        "pnl_decided_ex_void": perf.get("pnl_decided_ex_void"),
     }
+
+    health = build_health_model(
+        manifest=manifest,
+        settlement=settlement,
+        clv=clv_section,
+        latency=latency,
+        config_eval=config_eval,
+        artifacts_ok=True,
+        schema_ok=True,
+    )
+
+    # Stake/policy mismatch exceptions (keep existing contract for tests)
+    exceptions = []
+    for oid, o in orders.items():
+        if o.get("stake") is not None and abs(float(o["stake"]) - 10.0) > 1e-6:
+            sev = "CRITICAL" if abs(float(o["stake"]) - 20.0) > 1e-6 else "WARNING"
+            exceptions.append(
+                {
+                    "alert_id": f"stake_mismatch:{oid}",
+                    "severity": sev,
+                    "evidence": {"order_id": oid, "stake": o.get("stake")},
+                    "affected_metrics": ["stake_placed_sum"],
+                    "status": "OPEN",
+                    "message": f"stake mismatch order {oid}",
+                    "first_seen_utc": generated_at.isoformat(),
+                    "last_seen_utc": generated_at.isoformat(),
+                    "resolution_hint": "legacy stake or misconfigured bridge",
+                }
+            )
+        if o.get("policy_version") and "H3BUP_vNext" not in str(o.get("policy_version")):
+            exceptions.append(
+                {
+                    "alert_id": f"policy_mix:{oid}",
+                    "severity": "CRITICAL",
+                    "evidence": {"order_id": oid, "policy_version": o.get("policy_version")},
+                    "affected_metrics": ["live_ok_count"],
+                    "status": "OPEN",
+                    "message": f"policy mix order {oid}",
+                    "first_seen_utc": generated_at.isoformat(),
+                    "last_seen_utc": generated_at.isoformat(),
+                    "resolution_hint": "exclude non-H3BUP from cohort",
+                }
+            )
+
+    health_alerts = derive_alerts(
+        health=health,
+        settlement=settlement,
+        clv=clv_section,
+        latency=latency,
+        parity_status=None,
+        now_iso=generated_at.isoformat(),
+    )
+    # Merge: stake/policy first, then health-derived (dedupe by alert_id)
+    seen = {e["alert_id"] for e in exceptions}
+    for a in health_alerts:
+        if a["alert_id"] in seen:
+            continue
+        exceptions.append(a)
+        seen.add(a["alert_id"])
+
+    # Execution funnel: E2E stages + LIVE_OK cohort count overlay
+    funnel_rows = list(e2e_pack.get("funnel") or [])
+    # Ensure LIVE_OK cohort count appears even if E2E missing
+    if not any(r.get("event") == "LIVE_OK" for r in funnel_rows):
+        funnel_rows.append(
+            {
+                "step": "LIVE_OK",
+                "event": "LIVE_OK",
+                "n": n_orders,
+                "pct_prev": None,
+                "pct_initial": None,
+                "status": "AVAILABLE",
+            }
+        )
+    else:
+        for r in funnel_rows:
+            if r.get("event") == "LIVE_OK" and n_orders:
+                # prefer cohort LIVE_OK for closed day when e2e is all-traces
+                r["cohort_live_ok"] = n_orders
 
     policy_id = "H3BUP_vNext"
     policy_version = os.getenv("H3BUP_POLICY_VERSION", "H3BUP_vNext_20260629")
 
-    snapshot = {
+    snapshot: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
+        "report_kind": "H3BUP_DAILY_V2",
+        "official_status": "PREVIEW_NOT_OFFICIAL",
         "report_type": win.report_type,
         "report_date_utc": win.report_date_utc.isoformat(),
         "window_start_utc": win.window_start_utc.isoformat(),
         "window_end_utc": win.window_end_utc.isoformat(),
         "report_cutoff_utc": win.report_cutoff_utc.isoformat(),
         "generated_at_utc": generated_at.isoformat(),
+        "cutoffs": {
+            "cohort_window_start_utc": win.window_start_utc.isoformat(),
+            "cohort_window_end_utc": win.window_end_utc.isoformat(),
+            "performance_as_of_utc": win.report_cutoff_utc.isoformat(),
+            "v1_report_cutoff_utc": None,  # filled by __main__ parity
+            "v2_comparison_cutoff_utc": None,
+            "v2_generated_at_utc": generated_at.isoformat(),
+        },
         "git_commit": _git_commit(root),
         "policy_id": policy_id,
         "policy_version": policy_version,
-        "policy_fingerprint": None,
+        "policy_fingerprint": (config_eval.get("policy") or {}).get("fingerprint"),
         "source_manifest": manifest,
-        "report_health": {
-            "status": report_health,
-            "notes": ["REPORT_HEALTH distinct from STRATEGY_OPERATIONS_HEALTH"],
-        },
-        "operations_health": {
-            "status": "WATCH",
-            "notes": ["derived from services externally; Daily V2 does not restart services"],
-        },
-        "data_quality": {
-            "accounting": acct_h,
-            "e2e": e2e_status,
-            "clv": clv_section["collection_status"],
-        },
-        "statistical_readiness": {
-            "roi": perf["roi_settled"]["status"],
-            "clv": clv_section["post_5m_valid_strict"]["status"],
-            "e2e": (latency.get("e2e_ws_to_live_ok") or {}).get("status"),
-        },
+        "report_health": health.get("report_health") or {"status": "HEALTHY"},
+        "operations_health": health.get("operations_health") or {"status": "WATCH"},
+        "data_quality": health.get("data_quality") or {"status": "WATCH"},
+        "statistical_readiness": health.get("statistical_readiness") or {"status": "INSUFFICIENT_N"},
+        "config": config_eval,
         "execution_funnel": {
+            "window_label": e2e_pack.get("window_label") or "cohort_created_at_utc",
             "live_ok": metric_envelope(
-                value=len(orders),
+                value=n_orders,
                 unit="count",
-                n=len(orders),
-                status="AVAILABLE" if (manifest.get("executor_live") or {}).get("status") not in {"FAILED", "NOT_AVAILABLE"} else "FAILED",
+                n=n_orders,
+                status=(
+                    "AVAILABLE"
+                    if (manifest.get("executor_live") or {}).get("status") not in {"FAILED", "NOT_AVAILABLE"}
+                    else "FAILED"
+                ),
                 source="executor_live.jsonl",
             ),
             "order_ids": sorted(orders.keys()),
+            "stages": funnel_rows,
+            "block_reasons": e2e_pack.get("block_reasons") or [],
             "fast_buckets": {
-                k: {kk: vv for kk, vv in v.items() if kk != "order_ids"} for k, v in fast.items() if isinstance(v, dict)
+                k: {kk: vv for kk, vv in v.items() if kk != "order_ids"}
+                for k, v in fast.items()
+                if isinstance(v, dict)
             },
         },
-        "settlement": {
-            "maturity_status": perf["maturity_status"],
-            "n_open": perf["n_open"],
-            "n_settled": perf["n_settled"],
-            "n_void_push": perf["n_void_push"],
-            "n_missing_accounting": perf["n_missing_accounting"],
-            "stake_placed_sum": perf["stake_placed_sum"],
-            "stake_settled_sum": perf["stake_settled_sum"],
-            "pnl_settled_sum": perf["pnl_settled_sum"],
-        },
+        "settlement": settlement,
         "performance": {
             "roi_settled": perf["roi_settled"],
+            "roi_resolved": perf.get("roi_resolved") or perf["roi_settled"],
+            "roi_decided_ex_void": perf.get("roi_decided_ex_void"),
             "roiw_total_v1": perf["roiw_total_v1"],
             "roiw_total_v2": perf["roiw_total_v2"],
-            "principal_metric": perf["principal_metric"],
-            "complementary_metric": perf["complementary_metric"],
+            "principal_metric": perf.get("principal_metric") or "roi_resolved",
+            "complementary_metric": perf.get("complementary_metric") or "roi_decided_ex_void",
+            "parity_legacy_metric": perf.get("parity_legacy_metric") or "roiw_total_v1",
+            "formulas": perf.get("formulas")
+            or {
+                "roi_resolved": "pnl_resolved / stake_resolved_total (void stake in denom)",
+                "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void",
+            },
         },
         "latency": latency,
+        "e2e": {
+            "available": e2e_pack.get("available"),
+            "n_traces": e2e_pack.get("n_traces"),
+            "n_live_ok": e2e_pack.get("n_live_ok"),
+            "segments": e2e_pack.get("segments") or {},
+            "dominant_stage": e2e_pack.get("dominant_stage"),
+            "full_trace_coverage_pct": e2e_pack.get("full_trace_coverage_pct"),
+            "ordering_violations": e2e_pack.get("ordering_violations") or 0,
+            "clock_skew": e2e_pack.get("clock_skew") or 0,
+            "trace_events_dropped": e2e_pack.get("trace_events_dropped") or 0,
+            "detect_to_audit_overhead": latency.get("detect_to_audit_overhead"),
+            "error": e2e_pack.get("error"),
+        },
         "clv": clv_section,
         "concentration": {
-            "status": "INSUFFICIENT_N" if len(orders) < 30 else "AVAILABLE",
+            "status": "INSUFFICIENT_N" if n_orders < 30 else "AVAILABLE",
             "notes": ["only emitted when N sufficient"],
         },
         "exceptions": exceptions,
+        "previous_diff": None,
         "methodology": {
             "cohort_timestamp": "created_at UTC",
             "post_date_usage": "accounting freshness / settlement metadata only",
             "daily_fast": "DAILY_FAST_LE_6S: pre_submit_ms <= 6000",
             "study_fast": "STUDY_FAST_LT_4S: pre_submit_ms < 4000 (exploratory)",
-            "roi_settled": "sum(pnl_confirmed_settled)/sum(stake_confirmed_settled)",
-            "roiw_total_v1": "(sum pnl / sum exposure)*100; may include open if in ledger",
+            "principal_metric": "roi_resolved = pnl_resolved / stake_resolved_total (void in denom)",
+            "roi_settled": "legacy alias of roi_resolved",
+            "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void",
+            "roiw_total_v1": "(sum pnl / sum exposure)*100; may include open if in ledger — appendix parity only",
+            "roiw_total_v2": "settled-aware percent complementary",
             "absence_policy": "missing/stale/not_calculable must not appear as zero",
             "fair_edge": "NOT_IMPLEMENTED",
+            "config_stale_policy": "static config uses fingerprint/drift, not mtime age",
+        },
+        "safety": {
+            "alters_execution": False,
+            "alters_policy": False,
+            "alters_stake": False,
+            "creates_orders": False,
+            "opens_betslips": False,
         },
     }
-    # Serialize orders without datetime objects
+
+    # Previous V2 diff
+    prev = previous_snapshot
+    if prev is None and out_dir is not None:
+        prev_path = find_previous_snapshot(Path(out_dir), report_date=snapshot["report_date_utc"], current_run_id=run_id)
+        if prev_path:
+            prev = _load_json(prev_path)
+    if prev and isinstance(prev, dict) and prev.get("run_id"):
+        snapshot["previous_diff"] = diff_snapshots(prev, snapshot)
+
     for oid in list(orders.keys()):
         orders[oid].pop("created_at_dt", None)
-    snapshot["execution_funnel"]["orders_sample"] = {
-        k: orders[k] for k in list(sorted(orders.keys()))[:50]
-    }
+    snapshot["execution_funnel"]["orders_sample"] = {k: orders[k] for k in list(sorted(orders.keys()))[:50]}
     return snapshot

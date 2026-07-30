@@ -126,7 +126,9 @@ def run(argv: Optional[list] = None) -> int:
     try:
         t_build = time.time()
         win = resolve_window(report_type=args.report_type, report_date=day)
-        snap = build_snapshot(root=root, window=win, require_h3bup=require_h3bup)
+        snap = build_snapshot(
+            root=root, window=win, require_h3bup=require_h3bup, out_dir=out_dir
+        )
         perf["sections"]["build_s"] = time.time() - t_build
 
         day_s = snap["report_date_utc"].replace("-", "")
@@ -149,6 +151,33 @@ def run(argv: Optional[list] = None) -> int:
         # Attach parity metadata (without huge md dump in snapshot file)
         v1_md_text = parity.pop("v1_md_text", None)
         snap["parity"] = {k: v for k, v in parity.items()}
+        cut = dict(snap.get("cutoffs") or {})
+        cut["v1_report_cutoff_utc"] = parity.get("v1_report_cutoff_utc")
+        cut["v2_comparison_cutoff_utc"] = parity.get("v2_comparison_cutoff_utc")
+        cut["parity_status"] = parity.get("parity_status")
+        snap["cutoffs"] = cut
+        # Re-derive parity alerts into exceptions if needed
+        from .health_model import derive_alerts
+
+        parity_alerts = derive_alerts(
+            health={
+                "report_health": snap.get("report_health"),
+                "operations_health": snap.get("operations_health"),
+                "data_quality": snap.get("data_quality"),
+                "statistical_readiness": snap.get("statistical_readiness"),
+                "config": snap.get("config") or {},
+            },
+            settlement=snap.get("settlement") or {},
+            clv=snap.get("clv") or {},
+            latency=snap.get("latency") or {},
+            parity_status=parity.get("parity_status"),
+            now_iso=str(snap.get("generated_at_utc")),
+        )
+        existing = {e.get("alert_id") for e in (snap.get("exceptions") or [])}
+        for al in parity_alerts:
+            if al.get("alert_id") not in existing:
+                snap.setdefault("exceptions", []).append(al)
+                existing.add(al.get("alert_id"))
         snap["shadow"] = {
             "official": False,
             "telegram_preview_enabled": bool(telegram_preview),
@@ -183,7 +212,9 @@ def run(argv: Optional[list] = None) -> int:
             "operations_health": snap.get("operations_health"),
             "data_quality": snap.get("data_quality"),
             "statistical_readiness": snap.get("statistical_readiness"),
+            "config": snap.get("config"),
             "parity": snap.get("parity"),
+            "cutoffs": snap.get("cutoffs"),
             "source_manifest": {
                 k: {"status": v.get("status"), "cutoff": v.get("source_cutoff_utc"), "age_seconds": v.get("age_seconds")}
                 for k, v in (snap.get("source_manifest") or {}).items()
@@ -198,7 +229,17 @@ def run(argv: Optional[list] = None) -> int:
         atomic_write_json(health_path, health)
 
         with exc_path.open("w", encoding="utf-8", newline="") as f:
-            fields = ["alert_id", "severity", "status", "evidence", "affected_metrics"]
+            fields = [
+                "alert_id",
+                "severity",
+                "status",
+                "first_seen_utc",
+                "last_seen_utc",
+                "message",
+                "affected_metrics",
+                "evidence",
+                "resolution_hint",
+            ]
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             for e in snap.get("exceptions") or []:
@@ -207,8 +248,12 @@ def run(argv: Optional[list] = None) -> int:
                         "alert_id": e.get("alert_id"),
                         "severity": e.get("severity"),
                         "status": e.get("status"),
-                        "evidence": json.dumps(e.get("evidence"), ensure_ascii=False),
+                        "first_seen_utc": e.get("first_seen_utc"),
+                        "last_seen_utc": e.get("last_seen_utc"),
+                        "message": e.get("message"),
                         "affected_metrics": ",".join(e.get("affected_metrics") or []),
+                        "evidence": json.dumps(e.get("evidence"), ensure_ascii=False),
+                        "resolution_hint": e.get("resolution_hint"),
                     }
                 )
 

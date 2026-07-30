@@ -207,8 +207,10 @@ def test_roiw_total_contract():
     pnl = {"1": 5.0, "2": -1.0}
     out = compute_settlement_and_performance(orders=orders, pnl_by_oid=pnl, open_oids=set())
     assert out["roiw_total_v1"]["value"] == pytest.approx(20.0)
-    assert out["principal_metric"] == "roi_settled"
-    assert out["complementary_metric"] == "roiw_total_v1"
+    assert out["principal_metric"] == "roi_resolved"
+    assert out["complementary_metric"] == "roi_decided_ex_void"
+    assert out["parity_legacy_metric"] == "roiw_total_v1"
+    assert out["roi_resolved"]["value"] == pytest.approx(0.2)
 
 
 def test_fair_edge_not_implemented():
