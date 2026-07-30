@@ -108,12 +108,26 @@ def build_e2e_and_funnel(root: Path, *, window_label: str = "all_traces_availabl
                 n += 1
         return n
 
-    # Prefer cov list order from analyzer
+    # Prefer cov list order from analyzer; always emit required P0 stages
     funnel_rows = []
     prev = None
     initial = None
-    # Use FUNNEL + LIVE_OK
-    steps = [(s, s) for s in FUNNEL] + [("LIVE_OK", "LIVE_OK")]
+    required = [
+        "H3B_AUDIT_PERSIST_FINISHED",
+        "H3B_BRIDGE_FETCHED",
+        "H3B_POLICY_EVAL_FINISHED",
+        "H3B_EXEC_REQUEST_CREATED",
+        "H3B_EXECUTOR_RECEIVED",
+        "H3B_DRYRUN_STARTED",
+        "H3B_DRYRUN_FINISHED",
+        "H3B_FINAL_GATE_DECIDED",
+        "H3B_PLACE_STARTED",
+        "H3B_PLACE_FINISHED",
+        "LIVE_OK",
+    ]
+    # Keep analyzer prefix stages (WS/detected) then required table
+    prefix = [s for s in FUNNEL if s not in required and s in {"H3B_WS_RECEIVED", "H3B_DETECTED"}]
+    steps = [(s, s) for s in prefix + required]
     # remap display names
     display = {
         "H3B_AUDIT_PERSIST_FINISHED": "audit persisted",
@@ -164,14 +178,24 @@ def build_e2e_and_funnel(root: Path, *, window_label: str = "all_traces_availabl
         # gate reason if present
         gr = r.get("final_gate_reason") or r.get("block_reason") or st
         reasons[str(gr)] = reasons.get(str(gr), 0) + 1
-    # also scan CAP etc in status
+    # also scan CAP etc in status — always emit canonical reason rows
     for key in ("CAP_BLOCKED", "API_FAILED", "NO_SESSION", "STALE", "LIVE_PRECHECK_FAILED", "LIVE_PLACE_FAILED"):
-        reasons.setdefault(key, sum(1 for r in rows if key in str(r.get("status") or "") or key in str(r.get("final_gate_reason") or "")))
+        n_key = sum(1 for r in rows if key in str(r.get("status") or "") or key in str(r.get("final_gate_reason") or ""))
+        reasons[key] = max(int(reasons.get(key) or 0), n_key)
     req_n = _count_for("H3B_EXEC_REQUEST_CREATED") or 1
+    # Prefer canonical order first, then OTHER
+    ordered = []
+    for key in ("CAP_BLOCKED", "API_FAILED", "NO_SESSION", "STALE", "LIVE_PRECHECK_FAILED", "LIVE_PLACE_FAILED"):
+        ordered.append((key, int(reasons.pop(key, 0))))
+    other_n = sum(v for k, v in reasons.items() if v > 0)
+    for k, v in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+        if v > 0 and k not in {"LIVE_OK", "OK", "SUCCESS"}:
+            ordered.append((k, v))
+    if other_n == 0:
+        ordered.append(("OTHER", 0))
     out["block_reasons"] = [
         {"reason": k, "n": v, "pct_requests": (100.0 * v / req_n) if req_n else None}
-        for k, v in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
-        if v > 0
+        for k, v in ordered
     ]
 
     # segments
