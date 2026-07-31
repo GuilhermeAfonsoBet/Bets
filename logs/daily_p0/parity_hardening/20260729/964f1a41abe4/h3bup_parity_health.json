@@ -1,0 +1,29 @@
+{
+  "status": "DAILY_PARITY_HARDENED_MATCH",
+  "report_health": {
+    "status": "HEALTHY",
+    "reasons": [
+      "artifacts written atomically to isolated dir"
+    ]
+  },
+  "operations_health": {
+    "status": "WATCH",
+    "reasons": [
+      "unchanged ops; reporting only"
+    ]
+  },
+  "data_quality": {
+    "status": "HEALTHY"
+  },
+  "statistical_readiness": {
+    "status": "INSUFFICIENT_N"
+  },
+  "order_set_match_parity": true,
+  "unknown_divergent": [],
+  "cutoffs": {
+    "parity_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+    "matured_as_of_utc": "2026-07-30T20:23:40.223866+00:00",
+    "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+    "cohort_window_end_utc": "2026-07-30T00:00:00+00:00"
+  }
+}

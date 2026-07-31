@@ -1,0 +1,7 @@
+metric,v1,v2,delta,cause,correct_version
+LIVE_OK,,3,,V2 filters H3BUP_vNext + created_at UTC closed cohort; V1 mixes windows,v2
+ROIw Total,86.2,-1.4333333333333385,-87.63333333333334,Same formula when universe matches; V2 also emits settled-aware roiw_total_v2,both_versioned
+ROI settled,,-0.014333333333333384,,V1 often omits explicit roi_settled in executive; V2 principal metric,v2
+DAILY_FAST_LE_6S,,3,,V1 uses dual 5s/6s thresholds by thesis day; V2 Daily fixed <=6s,v2_for_daily_contract
+fair_edge,omitted_or_zero_risk,NOT_IMPLEMENTED,,V2 explicit NOT_IMPLEMENTED,v2
+cohort_timestamp,mixed created_at + post date tables,created_at UTC only,,V1 dual attribution,v2

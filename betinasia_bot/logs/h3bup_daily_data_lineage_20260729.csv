@@ -1,0 +1,24 @@
+lineage_id,metric_or_artifact,stage,from_source,transform,to_sink,cohort_key,time_basis,known_bias_or_gap_pt
+L01,LIVE_OK_24h_count,extract→agg,executor_live.jsonl,filter status LIVE_OK in rolling 24h window,s0 KPI table + funnel,status+wall clock,rolling_24h_from_generation,Não é coorte dia civil UTC fechado
+L02,CAP_BLOCKED_24h,extract→agg,executor_live.jsonl,count status CAP_BLOCKED in accepted funnel 24h,s0 falhas pós-accepted,status,rolling_24h,Capacidade; amostra 20260728 mostrou CAP_BLOCKED
+L03,pnl_today,extract→agg,balance CSV via accounting_daily_report,sum P&L rows for civil today in REPORT_TZ,s0 banca/P&L,ledger post/local day,America/Sao_Paulo_civil,Pode divergir do dia UTC da pasta do relatório
+L04,pnl_week_month,extract→agg,balance CSV,aggregates by week start Mon / YYYY-MM in REPORT_TZ,s0,ledger,REPORT_TZ,Mesma mistura TZ
+L05,acct_pnl_by_post_date,extract→table,balance CSV,group by post date UTC,s1 dual cohort tables,post_date_utc,post_date_UTC,Segunda coorte; não usar como created_at
+L06,ROIw_Total_by_exec_day,join→agg,executor LIVE_OK Back + balance by order_id,ROIw=(sum pnl/sum exposure)*100 per created_at UTC day,s1 tabela ROIw Total,order_id,created_at_UTC,Pode incluir open se no ledger; void≈0 incluído; oid missing excluído; policy H3BUP não filtrada
+L07,roi_settled_fraction,reconcile→render,executor LIVE_OK + balance + open_stakes + health,sum pnl_settled/sum stake_settled; open excluded,Accounting Health H3BUP section,order_id,as_of_cutoff_UTC,Métrica principal de performance settled; V1 só via health module
+L08,coverage_oids_pct,join,executor day cohort ∩ ledger oids,covered/total,ROIw table column,order_id,created_at_UTC,Baixa cobertura → ROIw enviesado
+L09,void_like_count,agg,ledger pnl≈0 joined,count near-zero pnl,ROIw table column,order_id,created_at_UTC,Incluídos no ROIw Total; em ROI settled entram com pnl0 stake
+L10,pre_submit_fast_old,classify,validation_summary.pre_submit_ms,<=6000 pré-tese,tese Back Pre blocks,order_id,created_at_UTC,Conceito fast #1
+L11,pre_submit_fast_post_thesis,classify,pre_submit_ms,<=5000 via EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS pós 2026-04-20,tese Back Pre,order_id,created_at_UTC,Conceito fast #2 — não é DAILY_FAST_LE_6S formal
+L12,call_to_done_fast_cf,counterfactual,timing.call_to_done_ms,<=6000 filter ROIw contrafactual,s1 lat<=6s columns,order_id,post_date or exec depending block,Conceito fast #3 misturado com pre_submit
+L13,e2e_ws_to_live_ok,trace_analyze,h3bup_e2e_trace.jsonl,group trace_id analyze segments,s0 E2E section / V2 latency,trace_id,event_ts_UTC,Fail-open; ausente no sample 20260728
+L14,clv_post_5m_strict,health_read,h3bup_clv_health.json,read counters,s0 CLV table / V2 clv,obligation window,forward_from_activation,Fair edge não flui — NOT_IMPLEMENTED
+L15,oos_annex_text,subprocess→append,B808/OOS outputs,demote headers annex,report_daily.md Anexo A,n/a,lookback UTC,except pass pode omitir anexo
+L16,wf_policy_current,publish_guard,OOS candidate keys,atomic replace se guards OK,logs/wf_policy_current.json,policy keys,run day UTC,Side-effect de reporting legado; fora do perímetro shadow V2 publish
+L17,report_daily_md,render,s0+s1+extra+oos,string join write_text,logs/daily_reports/day/report_daily.md,n/a,generation_UTC_day,Sem atomic; overwrite same day
+L18,report_daily_pdf,render,report_daily.md,render_markdown_to_pdf subprocess,report_daily.pdf,n/a,generation_UTC_day,Sem atomic; input Telegram
+L19,telegram_pdf,publish,report_daily.pdf,sendDocument retries,Telegram chat,n/a,send time,Canal oficial; V2 não publica
+L20,v2_canonical_snapshot,extract→canonical,manifest sources,build_snapshot schema_version=2,logs/daily_v2/*snapshot*.json,run_id,execution_day_utc half-open + report_cutoff,Shadow only; compare CSV vs V1
+L21,v2_roi_settled,canonical,orders+pnl+open,compute_settlement_and_performance,snapshot.performance.roi_settled,order_id H3BUP filtered,created_at_UTC cohort,Principal V2; open excluded
+L22,v2_daily_fast_le_6s,canonical,pre_submit_ms,<=6000 bucket,snapshot.latency + funnel,order_id,created_at_UTC,Separado de STUDY_FAST_LT_4S
+L23,fair_edge,canonical,n/a,explicit NOT_IMPLEMENTED envelope,snapshot.clv.fair_edge,n/a,n/a,Evita zero falso / omissão ambígua

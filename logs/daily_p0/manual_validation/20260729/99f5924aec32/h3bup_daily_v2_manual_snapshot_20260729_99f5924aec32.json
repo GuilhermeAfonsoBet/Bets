@@ -1,0 +1,1657 @@
+{
+  "schema_version": 2,
+  "run_id": "99f5924aec32",
+  "report_kind": "H3BUP_DAILY_V2",
+  "official_status": "MANUAL_VALIDATION_PREVIEW_NOT_OFFICIAL",
+  "report_type": "DAILY_CLOSED",
+  "report_date_utc": "2026-07-29",
+  "window_start_utc": "2026-07-29T00:00:00+00:00",
+  "window_end_utc": "2026-07-30T00:00:00+00:00",
+  "report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+  "generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+  "cutoffs": {
+    "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+    "cohort_window_end_utc": "2026-07-30T00:00:00+00:00",
+    "parity_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "performance_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+    "generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+    "as_of_now_utc": "2026-07-30T19:47:33.593343+00:00",
+    "note": "Paridade congelada no cutoff do V1 oficial; as_of_now é diagnóstico separado"
+  },
+  "git_commit": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "policy_id": "H3BUP_vNext",
+  "policy_version": "H3BUP_vNext_20260629",
+  "policy_fingerprint": "8009c8fa4b67b75f",
+  "source_manifest": {
+    "executor_live": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:46:42.403913+00:00",
+      "size": 73252869,
+      "sha256_prefix": "33ed288e744855ac",
+      "source_cutoff_utc": "2026-07-30T19:46:42.403913+00:00",
+      "age_seconds": 43.488302,
+      "status": "HEALTHY"
+    },
+    "accounting_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/accounting_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:32.367145+00:00",
+      "size": 1004,
+      "sha256_prefix": "4bfbe8bb362ddce1",
+      "source_cutoff_utc": "2026-07-30T19:42:32.367145+00:00",
+      "health_json_status": "ACCOUNTING_OK",
+      "age_seconds": 293.52507,
+      "status": "HEALTHY"
+    },
+    "accounting_daily_report": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting_daily_report.json",
+      "exists": true,
+      "mtime_utc": "2026-07-29T22:02:45.837136+00:00",
+      "size": 1681,
+      "sha256_prefix": "dea9d95c61c391d4",
+      "source_cutoff_utc": "2026-07-29T22:02:45.837136+00:00",
+      "age_seconds": 78280.055079,
+      "status": "WATCH"
+    },
+    "e2e_trace": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_e2e_trace.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:47:13.391536+00:00",
+      "size": 21113051,
+      "sha256_prefix": "96ad79b4dff84e99",
+      "source_cutoff_utc": "2026-07-30T19:47:13.391536+00:00",
+      "age_seconds": 12.500679,
+      "status": "HEALTHY"
+    },
+    "clv_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:47:03.837727+00:00",
+      "size": 1034,
+      "sha256_prefix": "2e189679c863e487",
+      "source_cutoff_utc": "2026-07-30T19:47:03.837727+00:00",
+      "health_json_status": "WATCH",
+      "age_seconds": 22.054488,
+      "status": "WATCH"
+    },
+    "clv_obligations": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_obligations.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:45:32.799057+00:00",
+      "size": 457613,
+      "sha256_prefix": "e3d5cab3f863e0fc",
+      "source_cutoff_utc": "2026-07-30T19:45:32.799057+00:00",
+      "age_seconds": 113.093158,
+      "status": "HEALTHY"
+    },
+    "policy_current": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/wf_policy_current.json",
+      "exists": true,
+      "mtime_utc": "2026-06-29T13:15:03.295096+00:00",
+      "size": 9770,
+      "sha256_prefix": "8009c8fa4b67b75f",
+      "source_cutoff_utc": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2701942.597119,
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ],
+      "status": "CURRENT_UNCHANGED",
+      "config_eval": {
+        "file_status": "OK",
+        "runtime_status": "UNVERIFIED",
+        "fingerprint": "8009c8fa4b67b75f",
+        "drift": "CURRENT_UNCHANGED",
+        "notes": [
+          "mtime age ignored; fingerprint/content used"
+        ]
+      }
+    },
+    "risk_params": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/bridge_risk_params.json",
+      "exists": true,
+      "mtime_utc": "2026-07-20T15:16:08.267440+00:00",
+      "size": 580,
+      "sha256_prefix": "6a38c6ddd893a215",
+      "source_cutoff_utc": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 880277.624775,
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ],
+      "status": "CURRENT_UNCHANGED",
+      "config_eval": {
+        "file_status": "OK",
+        "runtime_status": "UNVERIFIED",
+        "fingerprint": "6a38c6ddd893a215",
+        "drift": "CURRENT_UNCHANGED",
+        "notes": [
+          "mtime age ignored; fingerprint/content used"
+        ]
+      }
+    },
+    "accounting_balance": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194227__balance.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:27.797773+00:00",
+      "size": 2986327,
+      "sha256_prefix": "33df7fb23b36d392",
+      "source_cutoff_utc": "2026-07-30T19:42:27.797773+00:00",
+      "age_seconds": 298.094442,
+      "status": "HEALTHY"
+    },
+    "accounting_open_stakes": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194232__open_stakes.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:32.344143+00:00",
+      "size": 34008,
+      "sha256_prefix": "a67caaac15206ad3",
+      "source_cutoff_utc": "2026-07-30T19:42:32.344143+00:00",
+      "age_seconds": 293.548072,
+      "status": "HEALTHY"
+    }
+  },
+  "report_health": {
+    "status": "HEALTHY"
+  },
+  "operations_health": {
+    "status": "WATCH"
+  },
+  "data_quality": {
+    "status": "WATCH"
+  },
+  "statistical_readiness": {
+    "status": "INSUFFICIENT_N"
+  },
+  "config": {
+    "policy": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "8009c8fa4b67b75f",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    },
+    "risk_params": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "6a38c6ddd893a215",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    }
+  },
+  "execution_funnel": {
+    "window_label": "all_traces_available",
+    "live_ok": {
+      "value": 24,
+      "unit": "count",
+      "n": 24,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": []
+    },
+    "order_ids": [
+      "1934662052",
+      "1934994839",
+      "1935045057",
+      "1935402833",
+      "1935460146",
+      "1935475500",
+      "1935568718",
+      "1935642980",
+      "1935703108",
+      "1936401912",
+      "1936596042",
+      "1936637320",
+      "1936724778",
+      "1936750483",
+      "1936946893",
+      "1936956073",
+      "1936961828",
+      "1936963700",
+      "1937013393",
+      "1937095091",
+      "1937669560",
+      "1937747430",
+      "1938082582",
+      "1938105954"
+    ],
+    "stages": [
+      {
+        "step": "WS received",
+        "event": "H3B_WS_RECEIVED",
+        "n": 5549,
+        "pct_prev": null,
+        "pct_initial": 100.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "detected",
+        "event": "H3B_DETECTED",
+        "n": 5549,
+        "pct_prev": 100.0,
+        "pct_initial": 100.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "audit persisted",
+        "event": "H3B_AUDIT_PERSIST_FINISHED",
+        "n": 5549,
+        "pct_prev": 100.0,
+        "pct_initial": 100.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "bridge fetched",
+        "event": "H3B_BRIDGE_FETCHED",
+        "n": 2670,
+        "pct_prev": 48.116777797801404,
+        "pct_initial": 48.116777797801404,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "policy evaluated",
+        "event": "H3B_POLICY_EVAL_FINISHED",
+        "n": 0,
+        "pct_prev": 0.0,
+        "pct_initial": 0.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "execution request created",
+        "event": "H3B_EXEC_REQUEST_CREATED",
+        "n": 186,
+        "pct_prev": 6.966292134831461,
+        "pct_initial": 3.35195530726257,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "executor received",
+        "event": "H3B_EXECUTOR_RECEIVED",
+        "n": 186,
+        "pct_prev": 100.0,
+        "pct_initial": 3.35195530726257,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "dry-run started",
+        "event": "H3B_DRYRUN_STARTED",
+        "n": 0,
+        "pct_prev": 0.0,
+        "pct_initial": 0.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "dry-run finished",
+        "event": "H3B_DRYRUN_FINISHED",
+        "n": 185,
+        "pct_prev": 99.46236559139786,
+        "pct_initial": 3.3339340421697603,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "final gate decided",
+        "event": "H3B_FINAL_GATE_DECIDED",
+        "n": 145,
+        "pct_prev": 78.37837837837837,
+        "pct_initial": 2.61308343845738,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "place started",
+        "event": "H3B_PLACE_STARTED",
+        "n": 0,
+        "pct_prev": 0.0,
+        "pct_initial": 0.0,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "place finished",
+        "event": "H3B_PLACE_FINISHED",
+        "n": 23,
+        "pct_prev": 15.862068965517242,
+        "pct_initial": 0.41448909713461884,
+        "status": "AVAILABLE"
+      },
+      {
+        "step": "LIVE_OK",
+        "event": "LIVE_OK",
+        "n": 23,
+        "pct_prev": 100.0,
+        "pct_initial": 0.41448909713461884,
+        "status": "AVAILABLE",
+        "cohort_live_ok": 24
+      }
+    ],
+    "block_reasons": [
+      {
+        "reason": "CAP_BLOCKED",
+        "n": 122,
+        "pct_requests": 65.59139784946237
+      },
+      {
+        "reason": "API_FAILED",
+        "n": 37,
+        "pct_requests": 19.892473118279568
+      },
+      {
+        "reason": "NO_SESSION",
+        "n": 0,
+        "pct_requests": 0.0
+      },
+      {
+        "reason": "STALE",
+        "n": 3,
+        "pct_requests": 1.6129032258064515
+      },
+      {
+        "reason": "LIVE_PRECHECK_FAILED",
+        "n": 0,
+        "pct_requests": 0.0
+      },
+      {
+        "reason": "LIVE_PLACE_FAILED",
+        "n": 0,
+        "pct_requests": 0.0
+      },
+      {
+        "reason": "UNKNOWN",
+        "n": 5364,
+        "pct_requests": 2883.8709677419356
+      }
+    ],
+    "fast_buckets": {
+      "DAILY_FAST_LE_6S": {
+        "n": 24,
+        "threshold_ms": 6000,
+        "op": "<="
+      },
+      "STUDY_FAST_LT_4S": {
+        "n": 23,
+        "threshold_ms": 4000,
+        "op": "<",
+        "label": "exploratory_only"
+      },
+      "DAILY_SLOW_GT_6S": {
+        "n": 0
+      },
+      "PRE_SUBMIT_MS_NA": {
+        "n": 0
+      }
+    },
+    "orders_sample": {
+      "1934662052": {
+        "order_id": "1934662052",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T04:00:51.513933+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1261,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 420839,
+        "slippage_pre_pct": -1.9467213114754116,
+        "is_h3bup": true
+      },
+      "1934994839": {
+        "order_id": "1934994839",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T07:51:53.000127+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1115,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421000,
+        "slippage_pre_pct": -1.3768485466598743,
+        "is_h3bup": true
+      },
+      "1935045057": {
+        "order_id": "1935045057",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T08:28:28.900981+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1155,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421030,
+        "slippage_pre_pct": -0.39254170755642825,
+        "is_h3bup": true
+      },
+      "1935402833": {
+        "order_id": "1935402833",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T10:42:41.730156+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 4785,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421392,
+        "slippage_pre_pct": -6.189555125725344,
+        "is_h3bup": true
+      },
+      "1935460146": {
+        "order_id": "1935460146",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T10:59:25.391071+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1223,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421512,
+        "slippage_pre_pct": -1.9221291276490846,
+        "is_h3bup": true
+      },
+      "1935475500": {
+        "order_id": "1935475500",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T11:04:26.200252+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1113,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421546,
+        "slippage_pre_pct": -3.7526427061310756,
+        "is_h3bup": true
+      },
+      "1935568718": {
+        "order_id": "1935568718",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T11:28:10.704022+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 2214,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421737,
+        "slippage_pre_pct": -3.951975987994006,
+        "is_h3bup": true
+      },
+      "1935642980": {
+        "order_id": "1935642980",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T11:49:35.133640+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1679,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421892,
+        "slippage_pre_pct": -3.118393234672302,
+        "is_h3bup": true
+      },
+      "1935703108": {
+        "order_id": "1935703108",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T12:11:53.027523+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1169,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 421992,
+        "slippage_pre_pct": -5.4468535166578524,
+        "is_h3bup": true
+      },
+      "1936401912": {
+        "order_id": "1936401912",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T15:42:32.181242+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1741,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 422603,
+        "slippage_pre_pct": -6.771344455348377,
+        "is_h3bup": true
+      },
+      "1936596042": {
+        "order_id": "1936596042",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T16:23:30.244911+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1806,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423006,
+        "slippage_pre_pct": -1.6111707841031164,
+        "is_h3bup": true
+      },
+      "1936637320": {
+        "order_id": "1936637320",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T16:31:36.841850+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 2010,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423077,
+        "slippage_pre_pct": -0.09319664492077259,
+        "is_h3bup": true
+      },
+      "1936724778": {
+        "order_id": "1936724778",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T16:48:59.271257+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1974,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423232,
+        "slippage_pre_pct": -3.2852165256346364,
+        "is_h3bup": true
+      },
+      "1936750483": {
+        "order_id": "1936750483",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T16:54:59.145778+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1496,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423278,
+        "slippage_pre_pct": -0.23299161230195217,
+        "is_h3bup": true
+      },
+      "1936946893": {
+        "order_id": "1936946893",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T17:36:56.610918+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1287,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423687,
+        "slippage_pre_pct": -2.603613177470772,
+        "is_h3bup": true
+      },
+      "1936956073": {
+        "order_id": "1936956073",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T17:39:07.730646+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1211,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423707,
+        "slippage_pre_pct": -3.2035485460818114,
+        "is_h3bup": true
+      },
+      "1936961828": {
+        "order_id": "1936961828",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T17:40:31.004337+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 3237,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423720,
+        "slippage_pre_pct": -2.4197790636507124,
+        "is_h3bup": true
+      },
+      "1936963700": {
+        "order_id": "1936963700",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T17:41:00.541683+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1365,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423728,
+        "slippage_pre_pct": -2.731193100143765,
+        "is_h3bup": true
+      },
+      "1937013393": {
+        "order_id": "1937013393",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T17:53:08.164033+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1851,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 423845,
+        "slippage_pre_pct": -1.1634056054997366,
+        "is_h3bup": true
+      },
+      "1937095091": {
+        "order_id": "1937095091",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T18:11:51.576684+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1107,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 424019,
+        "slippage_pre_pct": -0.9504752376188157,
+        "is_h3bup": true
+      },
+      "1937669560": {
+        "order_id": "1937669560",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T20:18:14.945998+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 2036,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 424968,
+        "slippage_pre_pct": -0.6391347099311653,
+        "is_h3bup": true
+      },
+      "1937747430": {
+        "order_id": "1937747430",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T20:37:51.486287+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1255,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 425031,
+        "slippage_pre_pct": -0.5050505050505055,
+        "is_h3bup": true
+      },
+      "1938082582": {
+        "order_id": "1938082582",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T22:21:51.539665+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1602,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 425230,
+        "slippage_pre_pct": -1.8274111675126918,
+        "is_h3bup": true
+      },
+      "1938105954": {
+        "order_id": "1938105954",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-29T22:30:18.859170+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 2283,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 425247,
+        "slippage_pre_pct": -3.136704119850195,
+        "is_h3bup": true
+      }
+    }
+  },
+  "settlement": {
+    "maturity_status": "PARTIALLY_SETTLED",
+    "live_ok_total": 24,
+    "n_open": 1,
+    "n_settled": 21,
+    "n_void_push": 2,
+    "n_missing_accounting": 0,
+    "stake_placed_sum": 240.0,
+    "stake_settled_sum": 230.0,
+    "pnl_settled_sum": 6.600000000000001,
+    "stake_placed": 240.0,
+    "stake_resolved_total": 230.0,
+    "stake_decided_ex_void": 210.0,
+    "stake_void": 20.0,
+    "stake_open": 10.0,
+    "pnl_resolved": 6.600000000000001,
+    "pnl_decided_ex_void": 6.599999999999996
+  },
+  "performance": {
+    "roi_settled": {
+      "value": 0.02869565217391305,
+      "unit": "fraction",
+      "n": 23,
+      "numerator": 6.600000000000001,
+      "denominator": 230.0,
+      "coverage_pct": 95.83333333333333,
+      "status": "PARTIAL",
+      "metric_version": "v2.0",
+      "source": "executor+accounting",
+      "notes": [
+        "open excluded from denominator",
+        "void/push: pnl~0 stake included"
+      ]
+    },
+    "roi_resolved": {
+      "value": 0.02869565217391305,
+      "unit": "fraction",
+      "n": 23,
+      "numerator": 6.600000000000001,
+      "denominator": 230.0,
+      "coverage_pct": 95.83333333333333,
+      "status": "PARTIAL",
+      "metric_version": "v2.0",
+      "source": "executor+accounting",
+      "notes": [
+        "open excluded from denominator",
+        "void/push: pnl~0 stake included",
+        "principal_metric=roi_resolved",
+        "void/push stake included in denominator; pnl≈0"
+      ]
+    },
+    "roi_decided_ex_void": {
+      "value": 0.03142857142857141,
+      "unit": "fraction",
+      "n": 21,
+      "numerator": 6.599999999999996,
+      "denominator": 210.0,
+      "coverage_pct": null,
+      "status": "PARTIAL",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "void excluded from numerator and denominator"
+      ]
+    },
+    "roiw_total_v1": {
+      "value": 2.869565217391305,
+      "unit": "percent",
+      "n": 23,
+      "numerator": 6.600000000000001,
+      "denominator": 230.0,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v1.0",
+      "source": "daily_v1_contract",
+      "notes": [
+        "legacy: may include open if present in ledger",
+        "w = exposure-weighted"
+      ]
+    },
+    "roiw_total_v2": {
+      "value": 2.869565217391305,
+      "unit": "percent",
+      "n": 23,
+      "numerator": 6.600000000000001,
+      "denominator": 230.0,
+      "coverage_pct": null,
+      "status": "PARTIAL",
+      "metric_version": "v2.0",
+      "source": "executor+accounting",
+      "notes": [
+        "principal complementary to roi_settled",
+        "open excluded"
+      ]
+    },
+    "principal_metric": "roi_resolved",
+    "complementary_metric": "roi_decided_ex_void",
+    "parity_legacy_metric": "roiw_total_v1",
+    "formulas": {
+      "roi_resolved": "pnl_resolved / stake_resolved_total (void stake in denom)",
+      "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void"
+    }
+  },
+  "latency": {
+    "daily_fast_le_6s": {
+      "value": 24,
+      "unit": "count",
+      "n": 24,
+      "numerator": null,
+      "denominator": 24,
+      "coverage_pct": 100.0,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": [
+        "threshold pre_submit_ms <= 6000",
+        "DAILY_FAST_LE_6S"
+      ]
+    },
+    "study_fast_lt_4s": {
+      "value": 23,
+      "unit": "count",
+      "n": 23,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": [
+        "exploratory only",
+        "STUDY_FAST_LT_4S pre_submit_ms < 4000"
+      ]
+    },
+    "pre_submit_ms_na": {
+      "value": 0,
+      "unit": "count",
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": 0.0,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "missing not coerced to slow",
+        "coverage_missing=0/24"
+      ]
+    },
+    "e2e_source_status": "HEALTHY",
+    "segments": {
+      "ws_to_detect": {
+        "value": 0.088586,
+        "unit": "ms",
+        "n": 5549,
+        "numerator": 0.088586,
+        "denominator": null,
+        "coverage_pct": 100.0,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=0.19198459999999995",
+          "metric=ws_to_detect_ms"
+        ],
+        "p95": 0.19198459999999995
+      },
+      "detect_to_audit": {
+        "value": 14.097597,
+        "unit": "ms",
+        "n": 5549,
+        "numerator": 14.097597,
+        "denominator": null,
+        "coverage_pct": 100.0,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=145.31805819999997",
+          "metric=detected_to_audited"
+        ],
+        "p95": 145.31805819999997
+      },
+      "audit_to_bridge": {
+        "value": 173.77400398254395,
+        "unit": "ms",
+        "n": 2670,
+        "numerator": 173.77400398254395,
+        "denominator": null,
+        "coverage_pct": 48.116777797801404,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=405.1263451576233",
+          "metric=audit_persist_to_bridge_fetch_ms"
+        ],
+        "p95": 405.1263451576233
+      },
+      "bridge_to_request": {
+        "value": 3187.481164932251,
+        "unit": "ms",
+        "n": 186,
+        "numerator": 3187.481164932251,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=3419.306516647339",
+          "metric=audit_to_request"
+        ],
+        "p95": 3419.306516647339
+      },
+      "request_to_executor": {
+        "value": null,
+        "unit": "ms",
+        "n": 186,
+        "numerator": null,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "MISSING",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=None",
+          "metric=request_send_to_executor_receive_ms"
+        ],
+        "p95": null
+      },
+      "executor_to_dryrun": {
+        "value": 0.566798,
+        "unit": "ms",
+        "n": 186,
+        "numerator": 0.566798,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=6.678248750000001",
+          "metric=executor_receive_to_dryrun_start_ms"
+        ],
+        "p95": 6.678248750000001
+      },
+      "dryrun_duration": {
+        "value": 1365.391239,
+        "unit": "ms",
+        "n": 185,
+        "numerator": 1365.391239,
+        "denominator": null,
+        "coverage_pct": 3.3339340421697603,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=9582.617525599991",
+          "metric=dryrun_duration_ms"
+        ],
+        "p95": 9582.617525599991
+      },
+      "dryrun_to_gate": {
+        "value": 1202.535312,
+        "unit": "ms",
+        "n": 145,
+        "numerator": 1202.535312,
+        "denominator": null,
+        "coverage_pct": 2.61308343845738,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=1249.787789",
+          "metric=dryrun_to_final_gate_ms"
+        ],
+        "p95": 1249.787789
+      },
+      "gate_to_place": {
+        "value": 0.080449,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 0.080449,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=40.92349679999994",
+          "metric=final_gate_to_place_start_ms"
+        ],
+        "p95": 40.92349679999994
+      },
+      "place_duration": {
+        "value": 3998.096642,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 3998.096642,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=7172.137731399999",
+          "metric=place_duration_ms"
+        ],
+        "p95": 7172.137731399999
+      },
+      "ws_to_live_ok": {
+        "value": 8686.224937438965,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 8686.224937438965,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=13384.18283462524",
+          "metric=ws_to_live_ok_ms"
+        ],
+        "p95": 13384.18283462524
+      }
+    },
+    "n_traces": 5549,
+    "n_live_ok_traces": 23,
+    "full_trace_coverage_pct": 0.41448909713461884,
+    "dominant_stage": "place_duration",
+    "ordering_violations": 187,
+    "clock_skew": 187,
+    "trace_events_dropped": 0,
+    "detect_to_audit_overhead": {
+      "value": 14.097597,
+      "unit": "ms",
+      "n": 5549,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "WATCH",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "overhead remains WATCH until re-evaluation",
+        "median=14.097597"
+      ]
+    },
+    "e2e_ws_to_live_ok": {
+      "value": 8686.224937438965,
+      "unit": "ms",
+      "n": 23,
+      "numerator": 8686.224937438965,
+      "denominator": null,
+      "coverage_pct": 0.41448909713461884,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "p95=13384.18283462524",
+        "metric=ws_to_live_ok_ms"
+      ],
+      "p95": 13384.18283462524
+    }
+  },
+  "e2e": {
+    "available": true,
+    "n_traces": 5549,
+    "n_live_ok": 23,
+    "segments": {
+      "ws_to_detect": {
+        "value": 0.088586,
+        "unit": "ms",
+        "n": 5549,
+        "numerator": 0.088586,
+        "denominator": null,
+        "coverage_pct": 100.0,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=0.19198459999999995",
+          "metric=ws_to_detect_ms"
+        ],
+        "p95": 0.19198459999999995
+      },
+      "detect_to_audit": {
+        "value": 14.097597,
+        "unit": "ms",
+        "n": 5549,
+        "numerator": 14.097597,
+        "denominator": null,
+        "coverage_pct": 100.0,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=145.31805819999997",
+          "metric=detected_to_audited"
+        ],
+        "p95": 145.31805819999997
+      },
+      "audit_to_bridge": {
+        "value": 173.77400398254395,
+        "unit": "ms",
+        "n": 2670,
+        "numerator": 173.77400398254395,
+        "denominator": null,
+        "coverage_pct": 48.116777797801404,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=405.1263451576233",
+          "metric=audit_persist_to_bridge_fetch_ms"
+        ],
+        "p95": 405.1263451576233
+      },
+      "bridge_to_request": {
+        "value": 3187.481164932251,
+        "unit": "ms",
+        "n": 186,
+        "numerator": 3187.481164932251,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=3419.306516647339",
+          "metric=audit_to_request"
+        ],
+        "p95": 3419.306516647339
+      },
+      "request_to_executor": {
+        "value": null,
+        "unit": "ms",
+        "n": 186,
+        "numerator": null,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "MISSING",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=None",
+          "metric=request_send_to_executor_receive_ms"
+        ],
+        "p95": null
+      },
+      "executor_to_dryrun": {
+        "value": 0.566798,
+        "unit": "ms",
+        "n": 186,
+        "numerator": 0.566798,
+        "denominator": null,
+        "coverage_pct": 3.35195530726257,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=6.678248750000001",
+          "metric=executor_receive_to_dryrun_start_ms"
+        ],
+        "p95": 6.678248750000001
+      },
+      "dryrun_duration": {
+        "value": 1365.391239,
+        "unit": "ms",
+        "n": 185,
+        "numerator": 1365.391239,
+        "denominator": null,
+        "coverage_pct": 3.3339340421697603,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=9582.617525599991",
+          "metric=dryrun_duration_ms"
+        ],
+        "p95": 9582.617525599991
+      },
+      "dryrun_to_gate": {
+        "value": 1202.535312,
+        "unit": "ms",
+        "n": 145,
+        "numerator": 1202.535312,
+        "denominator": null,
+        "coverage_pct": 2.61308343845738,
+        "status": "AVAILABLE",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=1249.787789",
+          "metric=dryrun_to_final_gate_ms"
+        ],
+        "p95": 1249.787789
+      },
+      "gate_to_place": {
+        "value": 0.080449,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 0.080449,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=40.92349679999994",
+          "metric=final_gate_to_place_start_ms"
+        ],
+        "p95": 40.92349679999994
+      },
+      "place_duration": {
+        "value": 3998.096642,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 3998.096642,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=7172.137731399999",
+          "metric=place_duration_ms"
+        ],
+        "p95": 7172.137731399999
+      },
+      "ws_to_live_ok": {
+        "value": 8686.224937438965,
+        "unit": "ms",
+        "n": 23,
+        "numerator": 8686.224937438965,
+        "denominator": null,
+        "coverage_pct": 0.41448909713461884,
+        "status": "INSUFFICIENT_N",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "p95=13384.18283462524",
+          "metric=ws_to_live_ok_ms"
+        ],
+        "p95": 13384.18283462524
+      }
+    },
+    "dominant_stage": "place_duration",
+    "full_trace_coverage_pct": 0.41448909713461884,
+    "ordering_violations": 187,
+    "clock_skew": 187,
+    "trace_events_dropped": 0,
+    "detect_to_audit_overhead": {
+      "value": 14.097597,
+      "unit": "ms",
+      "n": 5549,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "WATCH",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "overhead remains WATCH until re-evaluation",
+        "median=14.097597"
+      ]
+    },
+    "error": null
+  },
+  "clv": {
+    "collection_status": "WATCH",
+    "collection_started_at_utc": "2026-07-29T20:07:50+00:00",
+    "source_priority": [
+      "best_odds_history",
+      "passive_collector"
+    ],
+    "collector_status": "ENABLED",
+    "fair_edge": {
+      "value": null,
+      "unit": null,
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "NOT_IMPLEMENTED",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "Phase 2D not started"
+      ]
+    },
+    "funnel": {
+      "live_ok_after_activation": 13,
+      "obligations_expected": 39,
+      "obligations_created": 39,
+      "source_missing": 0,
+      "line_mismatch": 0,
+      "side_mismatch": 0,
+      "period_mismatch": 0,
+      "kickoff_missing": 0,
+      "kickoff_conflict": 0,
+      "snapshot_after_kickoff": 0,
+      "snapshot_too_far": 0,
+      "retry_backlog": 2
+    },
+    "windows": [
+      {
+        "window": "POST_5M",
+        "expected": 13,
+        "due": 13,
+        "attempted": 13,
+        "strict_valid": 7,
+        "coverage_pct": 53.84615384615385
+      },
+      {
+        "window": "POST_15M",
+        "expected": 13,
+        "due": 13,
+        "attempted": 12,
+        "strict_valid": 6,
+        "coverage_pct": 46.15384615384615
+      },
+      {
+        "window": "CLOSING",
+        "expected": 13,
+        "due": 13,
+        "attempted": 11,
+        "strict_valid": 8,
+        "coverage_pct": 61.53846153846154
+      }
+    ],
+    "performance": {
+      "POST_5M": {
+        "window": "POST_5M",
+        "n": 7,
+        "clv_mean_pct": -1.778146117586104,
+        "clv_median_pct": -0.6391347099311662,
+        "positive_pct": 28.571428571428573,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 9.576570987701416,
+        "snapshot_distance_p95_sec": 38.1411919593811
+      },
+      "POST_15M": {
+        "window": "POST_15M",
+        "n": 6,
+        "clv_mean_pct": -2.3178747781471407,
+        "clv_median_pct": -0.426978740572459,
+        "positive_pct": 33.333333333333336,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 19.39704442024231,
+        "snapshot_distance_p95_sec": 29.836637020111084
+      },
+      "CLOSING": {
+        "window": "CLOSING",
+        "n": 8,
+        "clv_mean_pct": -2.8162319751982077,
+        "clv_median_pct": -1.6767700737800428,
+        "positive_pct": 25.0,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 46.32101047039032,
+        "snapshot_distance_p95_sec": 2118.697228908539
+      }
+    },
+    "performance_rows": [
+      {
+        "window": "POST_5M",
+        "n": 7,
+        "clv_mean_pct": -1.778146117586104,
+        "clv_median_pct": -0.6391347099311662,
+        "positive_pct": 28.571428571428573,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 9.576570987701416,
+        "snapshot_distance_p95_sec": 38.1411919593811
+      },
+      {
+        "window": "POST_15M",
+        "n": 6,
+        "clv_mean_pct": -2.3178747781471407,
+        "clv_median_pct": -0.426978740572459,
+        "positive_pct": 33.333333333333336,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 19.39704442024231,
+        "snapshot_distance_p95_sec": 29.836637020111084
+      },
+      {
+        "window": "CLOSING",
+        "n": 8,
+        "clv_mean_pct": -2.8162319751982077,
+        "clv_median_pct": -1.6767700737800428,
+        "positive_pct": 25.0,
+        "status": "INSUFFICIENT_N",
+        "snapshot_distance_median_sec": 46.32101047039032,
+        "snapshot_distance_p95_sec": 2118.697228908539
+      }
+    ],
+    "post_5m_valid_strict": {
+      "value": 7,
+      "unit": "count",
+      "n": 7,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": []
+    },
+    "post_15m_valid_strict": {
+      "value": 6,
+      "unit": "count",
+      "n": 6,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": []
+    },
+    "closing_valid_strict": {
+      "value": 8,
+      "unit": "count",
+      "n": 8,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": []
+    }
+  },
+  "concentration": {
+    "status": "INSUFFICIENT_N",
+    "notes": [
+      "only emitted when N sufficient"
+    ]
+  },
+  "exceptions": [
+    {
+      "alert_id": "CLV_INSUFFICIENT_N",
+      "severity": "INFO",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "N estatístico insuficiente para inferência",
+      "affected_metrics": [
+        "clv",
+        "roi"
+      ],
+      "evidence": {},
+      "resolution_hint": "aguardar amostra"
+    },
+    {
+      "alert_id": "E2E_OVERHEAD_WATCH",
+      "severity": "WATCH",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "Overhead detect→audit acima da baseline / em observação",
+      "affected_metrics": [
+        "e2e"
+      ],
+      "evidence": {
+        "value": 14.097597,
+        "unit": "ms",
+        "n": 5549,
+        "numerator": null,
+        "denominator": null,
+        "coverage_pct": null,
+        "status": "WATCH",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "overhead remains WATCH until re-evaluation",
+          "median=14.097597"
+        ]
+      },
+      "resolution_hint": ""
+    },
+    {
+      "alert_id": "SETTLEMENT_PARTIAL",
+      "severity": "INFO",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "Coorte parcialmente liquidada",
+      "affected_metrics": [
+        "roi",
+        "maturity"
+      ],
+      "evidence": {
+        "n_open": 1
+      },
+      "resolution_hint": ""
+    },
+    {
+      "alert_id": "CLV_BACKLOG",
+      "severity": "WATCH",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "Retry backlog CLV > 0",
+      "affected_metrics": [
+        "clv"
+      ],
+      "evidence": {
+        "retry_backlog": 2
+      },
+      "resolution_hint": ""
+    },
+    {
+      "alert_id": "TRACE_ORDERING_VIOLATIONS",
+      "severity": "WATCH",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "Ordering violations no E2E",
+      "affected_metrics": [
+        "e2e"
+      ],
+      "evidence": {
+        "n": 187
+      },
+      "resolution_hint": ""
+    },
+    {
+      "alert_id": "TRACE_CLOCK_SKEW",
+      "severity": "WATCH",
+      "status": "OPEN",
+      "first_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "last_seen_utc": "2026-07-30T19:47:25.892272+00:00",
+      "message": "Clock skew / negative durations no E2E",
+      "affected_metrics": [
+        "e2e"
+      ],
+      "evidence": {
+        "n": 187
+      },
+      "resolution_hint": ""
+    }
+  ],
+  "previous_diff": {
+    "previous_run_id": "c80914813bbe",
+    "current_run_id": "99f5924aec32",
+    "rows": [
+      {
+        "metric": "LIVE_OK",
+        "anterior": 22,
+        "atual": 24,
+        "delta": 2.0
+      },
+      {
+        "metric": "open",
+        "anterior": 6,
+        "atual": 1,
+        "delta": -5.0
+      },
+      {
+        "metric": "settled",
+        "anterior": 15,
+        "atual": 21,
+        "delta": 6.0
+      },
+      {
+        "metric": "void",
+        "anterior": 1,
+        "atual": 2,
+        "delta": 1.0
+      },
+      {
+        "metric": "missing",
+        "anterior": 0,
+        "atual": 0,
+        "delta": 0.0
+      },
+      {
+        "metric": "stake resolved",
+        "anterior": null,
+        "atual": 230.0,
+        "delta": null
+      },
+      {
+        "metric": "P&L resolved",
+        "anterior": null,
+        "atual": 6.600000000000001,
+        "delta": null
+      },
+      {
+        "metric": "ROI resolved",
+        "anterior": -0.0406875,
+        "atual": 0.02869565217391305,
+        "delta": 0.06938315217391305
+      },
+      {
+        "metric": "POST_5M valid",
+        "anterior": null,
+        "atual": 7,
+        "delta": null
+      },
+      {
+        "metric": "POST_15M valid",
+        "anterior": null,
+        "atual": 6,
+        "delta": null
+      },
+      {
+        "metric": "CLOSING valid",
+        "anterior": null,
+        "atual": 8,
+        "delta": null
+      },
+      {
+        "metric": "CLV backlog",
+        "anterior": null,
+        "atual": 2,
+        "delta": null
+      },
+      {
+        "metric": "alertas ativos",
+        "anterior": 0,
+        "atual": 6,
+        "delta": 6.0
+      }
+    ],
+    "new_alerts": [
+      "CLV_BACKLOG",
+      "CLV_INSUFFICIENT_N",
+      "E2E_OVERHEAD_WATCH",
+      "SETTLEMENT_PARTIAL",
+      "TRACE_CLOCK_SKEW",
+      "TRACE_ORDERING_VIOLATIONS"
+    ],
+    "resolved_alerts": []
+  },
+  "methodology": {
+    "cohort_timestamp": "created_at UTC",
+    "post_date_usage": "accounting freshness / settlement metadata only",
+    "daily_fast": "DAILY_FAST_LE_6S: pre_submit_ms <= 6000",
+    "study_fast": "STUDY_FAST_LT_4S: pre_submit_ms < 4000 (exploratory)",
+    "principal_metric": "roi_resolved = pnl_resolved / stake_resolved_total (void in denom)",
+    "roi_settled": "legacy alias of roi_resolved",
+    "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void",
+    "roiw_total_v1": "(sum pnl / sum exposure)*100; may include open if in ledger — appendix parity only",
+    "roiw_total_v2": "settled-aware percent complementary",
+    "absence_policy": "missing/stale/not_calculable must not appear as zero",
+    "fair_edge": "NOT_IMPLEMENTED",
+    "config_stale_policy": "static config uses fingerprint/drift, not mtime age"
+  },
+  "safety": {
+    "alters_execution": false,
+    "alters_policy": false,
+    "alters_stake": false,
+    "creates_orders": false,
+    "opens_betslips": false
+  },
+  "manual_validation": true,
+  "parity": {
+    "v1_report_path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.md",
+    "v1_report_day_folder": "20260729",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Comparação de paridade usa o cutoff lógico do V1. Eventos após v1_report_cutoff_utc até v2_generated_at_utc são apenas diagnóstico intraday e não entram na paridade.",
+    "parity_cutoff_utc": "2026-07-29T22:01:54.606850+00:00"
+  },
+  "shadow": {
+    "official": false,
+    "manual_validation": true,
+    "telegram_preview_enabled": false,
+    "label": "DAILY V2 — MANUAL VALIDATION / PREVIEW / NÃO OFICIAL"
+  }
+}

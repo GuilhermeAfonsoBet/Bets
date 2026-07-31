@@ -1,0 +1,41 @@
+metric,value
+LIVE_OK,24
+stake_placed,240.0
+stake_open,10.0
+stake_resolved_total,230.0
+stake_decided_ex_void,210.0
+stake_void,20.0
+open,1
+settled_decided,21
+void_push,2
+missing_accounting,0
+pnl_resolved,6.600000000000001
+pnl_decided_ex_void,6.599999999999996
+roi_resolved,0.02869565217391305
+roi_decided_ex_void,0.03142857142857141
+maturity,PARTIALLY_SETTLED
+roi_resolved_formula,pnl_resolved / stake_resolved_total (void in denominator)
+order:1934662052,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1261}"
+order:1934994839,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1115}"
+order:1935045057,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1155}"
+order:1935402833,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 4785}"
+order:1935460146,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1223}"
+order:1935475500,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1113}"
+order:1935568718,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 2214}"
+order:1935642980,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1679}"
+order:1935703108,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1169}"
+order:1936401912,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1741}"
+order:1936596042,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1806}"
+order:1936637320,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 2010}"
+order:1936724778,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1974}"
+order:1936750483,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1496}"
+order:1936946893,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1287}"
+order:1936956073,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1211}"
+order:1936961828,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 3237}"
+order:1936963700,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1365}"
+order:1937013393,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1851}"
+order:1937095091,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1107}"
+order:1937669560,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 2036}"
+order:1937747430,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1255}"
+order:1938082582,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 1602}"
+order:1938105954,"{""stake"": 10.0, ""policy_version"": ""H3BUP_vNext_20260629"", ""pre_submit_ms"": 2283}"
