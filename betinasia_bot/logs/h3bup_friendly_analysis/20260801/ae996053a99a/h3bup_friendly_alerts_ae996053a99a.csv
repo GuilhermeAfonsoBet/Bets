@@ -1,0 +1,3 @@
+alert,severity,detail
+ACCOUNTING_COVERAGE_DIFFERENCE,medium,friendly=0.9743589743589743 non_friendly=0.5142857142857142
+INSUFFICIENT_N,medium,n_resolved=56

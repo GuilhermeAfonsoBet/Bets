@@ -1,0 +1,9 @@
+[Unit]
+Description=Run H3BUP Daily V2 shadow after V1 window (22:10 UTC)
+[Timer]
+OnCalendar=*-*-* 22:10:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=betinasia-daily-v2-shadow.service
+[Install]
+WantedBy=timers.target

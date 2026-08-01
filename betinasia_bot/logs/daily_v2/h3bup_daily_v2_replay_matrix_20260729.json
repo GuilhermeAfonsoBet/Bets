@@ -1,0 +1,103 @@
+{
+  "live_ok_days": {
+    "2026-07-01": 1,
+    "2026-07-02": 4,
+    "2026-07-03": 9,
+    "2026-07-04": 2,
+    "2026-07-05": 1,
+    "2026-07-06": 27,
+    "2026-07-07": 41,
+    "2026-07-08": 11,
+    "2026-07-09": 3,
+    "2026-07-10": 1,
+    "2026-07-20": 12,
+    "2026-07-28": 3,
+    "2026-07-29": 22
+  },
+  "matrix": [
+    {
+      "day": "2026-06-29",
+      "live_ok": 0,
+      "stake": 0,
+      "n_open": 0,
+      "n_settled": 0,
+      "n_void": 0,
+      "n_missing": 0,
+      "roi_settled_status": "AVAILABLE",
+      "roi_settled_value": null,
+      "fast_le6": 0,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    },
+    {
+      "day": "2026-07-19",
+      "live_ok": 0,
+      "stake": 0,
+      "n_open": 0,
+      "n_settled": 0,
+      "n_void": 0,
+      "n_missing": 0,
+      "roi_settled_status": "AVAILABLE",
+      "roi_settled_value": null,
+      "fast_le6": 0,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    },
+    {
+      "day": "2026-07-20",
+      "live_ok": 0,
+      "stake": 0,
+      "n_open": 0,
+      "n_settled": 0,
+      "n_void": 0,
+      "n_missing": 0,
+      "roi_settled_status": "AVAILABLE",
+      "roi_settled_value": null,
+      "fast_le6": 0,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    },
+    {
+      "day": "2026-07-27",
+      "live_ok": 0,
+      "stake": 0,
+      "n_open": 0,
+      "n_settled": 0,
+      "n_void": 0,
+      "n_missing": 0,
+      "roi_settled_status": "AVAILABLE",
+      "roi_settled_value": null,
+      "fast_le6": 0,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    },
+    {
+      "day": "2026-07-28",
+      "live_ok": 3,
+      "stake": 30.0,
+      "n_open": 0,
+      "n_settled": 2,
+      "n_void": 1,
+      "n_missing": 0,
+      "roi_settled_status": "AVAILABLE",
+      "roi_settled_value": -0.014333333333333384,
+      "fast_le6": 3,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    },
+    {
+      "day": "2026-07-29",
+      "live_ok": 22,
+      "stake": 220.0,
+      "n_open": 6,
+      "n_settled": 15,
+      "n_void": 1,
+      "n_missing": 0,
+      "roi_settled_status": "PARTIAL",
+      "roi_settled_value": -0.0406875,
+      "fast_le6": 22,
+      "fair_edge": "NOT_IMPLEMENTED",
+      "report_health": "HEALTHY"
+    }
+  ]
+}

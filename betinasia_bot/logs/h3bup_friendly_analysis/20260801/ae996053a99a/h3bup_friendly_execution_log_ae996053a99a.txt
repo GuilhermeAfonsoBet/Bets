@@ -1,0 +1,6 @@
+2026-08-01T01:22:38.192258+00:00 START friendly analysis read-only
+2026-08-01T01:22:55.901718+00:00 primary universe n=74
+2026-08-01T01:22:58.241778+00:00 league map keys=23476
+2026-08-01T01:22:58.259380+00:00 classification frozen sha256=1a9706023c55df4244dd2d15a1593137aae073339d2e612728c85972c2df0d8e
+2026-08-01T01:23:18.135973+00:00 final_status=NON_FRIENDLY_WORSE_PRELIMINARY
+2026-08-01T01:23:18.136000+00:00 outputs=/home/betbot/Bets/betinasia_bot/logs/h3bup_friendly_analysis/20260801/ae996053a99a

@@ -1,0 +1,12 @@
+{
+  "v1_order_set_hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb",
+  "v2_parity_order_set_hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb",
+  "v2_full_day_order_set_hash": "50d209a999f8c4a8759e3fd732ce9acc2fba6ada63c34f50847c326a7a3caf52",
+  "order_set_match_parity": true,
+  "only_in_v1_count": 0,
+  "only_in_v2_count": 2,
+  "only_in_v2": [
+    "1938082582",
+    "1938105954"
+  ]
+}

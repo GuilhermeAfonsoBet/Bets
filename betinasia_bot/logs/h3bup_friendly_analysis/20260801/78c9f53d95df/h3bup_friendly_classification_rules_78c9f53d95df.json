@@ -1,0 +1,79 @@
+{
+  "friendly_classification_version": "FRIENDLY_CLASS_V1_20260731",
+  "classes": [
+    "FRIENDLY",
+    "NON_FRIENDLY",
+    "UNCLASSIFIED",
+    "CONFLICT"
+  ],
+  "source_priority": [
+    "structured_flag",
+    "competition_type/league_type",
+    "league_name/competition_name",
+    "tournament_name",
+    "event_name",
+    "UNCLASSIFIED"
+  ],
+  "name_rules": [
+    {
+      "rule_id": "R_CLUB_FRIENDLY",
+      "pattern": "\\bclub\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_INTL_FRIENDLY",
+      "pattern": "\\binternational\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_WOMEN_INTL_FRIENDLY",
+      "pattern": "\\bwomen(?:'s)?\\s+international\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_YOUTH_INTL_FRIENDLY",
+      "pattern": "\\byouth\\s+international\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_U19_FRIENDLY",
+      "pattern": "\\bu-?19\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_U21_FRIENDLY",
+      "pattern": "\\bu-?21\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_OLYMPIC_FRIENDLY",
+      "pattern": "\\bolympic\\s+friendl(y|ies)\\b"
+    },
+    {
+      "rule_id": "R_FRIENDLY_MATCH",
+      "pattern": "\\bfriendly\\s+match(es)?\\b"
+    },
+    {
+      "rule_id": "R_FRIENDLIES",
+      "pattern": "\\bfriendlies\\b"
+    },
+    {
+      "rule_id": "R_FRIENDLY",
+      "pattern": "\\bfriendly\\b"
+    },
+    {
+      "rule_id": "R_AMISTOSO",
+      "pattern": "\\bamistos[oa]s?\\b"
+    }
+  ],
+  "notes": [
+    "Classification must be frozen (checksum) before joining P&L/settlement/CLV.",
+    "UNCLASSIFIED is never treated as NON_FRIENDLY.",
+    "Word-boundary regex; original text preserved in friendly_raw_value.",
+    "Event name alone without Friendly pattern does not imply NON_FRIENDLY."
+  ],
+  "freeze_contract": {
+    "forbidden_inputs": [
+      "pnl",
+      "settlement",
+      "clv",
+      "roi",
+      "odd_final",
+      "result"
+    ]
+  }
+}
