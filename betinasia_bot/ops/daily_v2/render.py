@@ -147,6 +147,13 @@ def render_markdown(snapshot: Dict[str, Any]) -> str:
     a("> Fórmulas: `roi_resolved = pnl_resolved / stake_resolved_total` (void no denominador); "
       "`roi_decided_ex_void = pnl_decided_ex_void / stake_decided_ex_void`.\n\n")
 
+    # Friendly vs Non-Friendly (shadow diagnostic)
+    from .friendly_section import render_friendly_markdown
+
+    friendly = snapshot.get("friendly_breakdown") or {}
+    if friendly:
+        a(render_friendly_markdown(friendly))
+
     a("## 7) Qualidade de preço / CLV forward\n")
     clv = snapshot.get("clv") or {}
     a(f"- collection: `{clv.get('collection_status')}` started `{fmt_ts(clv.get('collection_started_at_utc'))}`\n")

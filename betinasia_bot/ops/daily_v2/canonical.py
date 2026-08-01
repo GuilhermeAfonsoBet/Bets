@@ -14,6 +14,7 @@ from .clv_section import build_clv_section
 from .diff_previous import diff_snapshots, find_previous_snapshot
 from .e2e_funnel import build_e2e_and_funnel
 from .extract import extract_source_manifest
+from .friendly_section import build_friendly_section
 from .health_model import build_health_model, derive_alerts, evaluate_config_file
 from .performance import compute_settlement_and_performance
 from .statuses import metric_envelope
@@ -81,6 +82,13 @@ def build_snapshot(
         accounting_health_status=acct_h,
     )
     fast = classify_fast_buckets(orders)
+    friendly_section = build_friendly_section(
+        root=root,
+        orders=orders,
+        pnl_by_oid=pnl_by_oid,
+        open_oids=open_oids,
+        accounting_health_status=acct_h,
+    )
 
     # Config fingerprint (NOT mtime STALE)
     policy_path = Path((manifest.get("policy_current") or {}).get("path") or root / "logs/wf_policy_current.json")
@@ -339,6 +347,7 @@ def build_snapshot(
             "error": e2e_pack.get("error"),
         },
         "clv": clv_section,
+        "friendly_breakdown": friendly_section,
         "concentration": {
             "status": "INSUFFICIENT_N" if n_orders < 30 else "AVAILABLE",
             "notes": ["only emitted when N sufficient"],
@@ -358,6 +367,10 @@ def build_snapshot(
             "absence_policy": "missing/stale/not_calculable must not appear as zero",
             "fair_edge": "NOT_IMPLEMENTED",
             "config_stale_policy": "static config uses fingerprint/drift, not mtime age",
+            "friendly_breakdown": (
+                "shadow diagnostic FRIENDLY_CLASS_V1 — not an operational filter; "
+                "UNCLASSIFIED != NON_FRIENDLY"
+            ),
         },
         "safety": {
             "alters_execution": False,
@@ -365,6 +378,7 @@ def build_snapshot(
             "alters_stake": False,
             "creates_orders": False,
             "opens_betslips": False,
+            "alters_friendly_filter": False,
         },
     }
 

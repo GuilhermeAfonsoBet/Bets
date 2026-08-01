@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from .clv_section import build_clv_section
 from .formatters import fmt_money, fmt_pct, fmt_ts
+from .friendly_section import build_friendly_section, render_friendly_markdown
 from .performance import compute_settlement_and_performance
 from .time_windows import resolve_window
 from .universes import load_executor_orders, load_open_order_ids, load_pnl_by_order_from_balance_csv
@@ -128,6 +129,18 @@ def render_h3bup_vnext_official_summary(root: Path | None = None) -> str:
     a("\n")
     a(f"- fair edge: `NOT_IMPLEMENTED`\n")
     a(f"- coorte: `{fmt_ts(win.window_start_utc.isoformat())}` → `{fmt_ts(win.window_end_utc.isoformat())}` (created_at UTC)\n\n")
+
+    try:
+        friendly = build_friendly_section(
+            root=root,
+            orders=orders,
+            pnl_by_oid=pnl,
+            open_oids=open_oids,
+            accounting_health_status=str(acct_h.get("status") or "NOT_AVAILABLE"),
+        )
+        a(render_friendly_markdown(friendly))
+    except Exception as e:
+        a(f"### Friendly vs Non-Friendly (diagnóstico / shadow)\n\n> indisponível: `{type(e).__name__}`\n\n")
 
     a("---\n\n")
     a("### Separação visual de universos\n\n")

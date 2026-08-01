@@ -149,6 +149,14 @@ def load_executor_orders(
             pre_submit_ms = None
 
         audit_id = res.get("audit_id") if res.get("audit_id") is not None else req.get("audit_id")
+        event_id = res.get("event_id") if res.get("event_id") is not None else req.get("event_id")
+        event_name = res.get("event_name") or req.get("event_name") or req.get("match_name")
+        league_name = (
+            res.get("league_name")
+            or req.get("league_name")
+            or res.get("league")
+            or req.get("league")
+        )
         rec = {
             "order_id": str(oid),
             "status": st,
@@ -159,6 +167,9 @@ def load_executor_orders(
             "policy_version": policy_version,
             "exec_side": exec_side,
             "audit_id": audit_id,
+            "event_id": str(event_id).strip() if event_id not in (None, "") else "",
+            "event_name": str(event_name).strip() if event_name not in (None, "") else "",
+            "league_name": str(league_name).strip() if league_name not in (None, "") else "",
             "slippage_pre_pct": vs.get("slippage_pre_pct"),
             "is_h3bup": is_h3bup,
         }
