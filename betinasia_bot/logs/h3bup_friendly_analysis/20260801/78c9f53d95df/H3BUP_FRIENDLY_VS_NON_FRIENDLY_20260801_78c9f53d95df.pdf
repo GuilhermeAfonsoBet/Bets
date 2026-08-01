@@ -1,0 +1,47 @@
+%PDF-1.4
+1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj
+2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj
+3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>endobj
+4 0 obj<< /Length 1580 >>stream
+BT /F1 10 Tf 40 800 Td
+0 -12 Td (H3BUP Friendly vs Non-Friendly 20260801) Tj
+0 -12 Td () Tj
+0 -12 Td (# H3BUP Friendly vs Non-Friendly ? Executive Summary) Tj
+0 -12 Td (- **Status final:** `NON_FRIENDLY_WORSE_PRELIMINARY`) Tj
+0 -12 Td (- **Run id:** `78c9f53d95df`) Tj
+0 -12 Td (- **Cutoff:** `2026-08-01T01:31:39.129924+00:00`) Tj
+0 -12 Td (- **Classification version:** `FRIENDLY_CLASS_V1_20260731`) Tj
+0 -12 Td () Tj
+0 -12 Td (## Respostas executivas) Tj
+0 -12 Td () Tj
+0 -12 Td (1. Friendly positivo/negativo: **negativo/nulo** \(P&L=-12.5400, ROI=-0.0330\)) Tj
+0 -12 Td (2. Non-Friendly positivo/negativo: **negativo/nulo** \(P&L=-42.8800, ROI=-0.2382\)) Tj
+0 -12 Td (3. Grupo que explica maior parte da perda \(P&L resolved mais baixo\): **NON_FRIENDLY**) Tj
+0 -12 Td (4. Diferença também no CLV: ver tabela CLV \(N=12 linhas\)) Tj
+0 -12 Td (5. Closing vs P&L: ver secção CLV CLOSING no relatório completo) Tj
+0 -12 Td (6. Sobrevive remoção top eventos/ligas: ver robustez \(13 cenários\)) Tj
+0 -12 Td (7. Latência/slippage: ver execution_summary) Tj
+0 -12 Td (8. Cobertura comparável: ver data_quality / alerts) Tj
+0 -12 Td (9. Evidência estatística: sample_gate total=`INSUFFICIENT_N`) Tj
+0 -12 Td (10. Limitação principal: sample size / classification coverage / concentração \(ver alerts\)) Tj
+0 -12 Td () Tj
+0 -12 Td (## Contagens) Tj
+0 -12 Td (- Primário N=74 | Friendly=39 | Non-Friendly=35 | Unclassified=0 | Conflict=0) Tj
+0 -12 Td () Tj
+0 -12 Td (> Análise histórica read-only. Não altera policy/stake/filtros. Não é recomendação operacional.) Tj
+0 -12 Td () Tj
+ET
+endstream endobj
+5 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000056 00000 n 
+0000000111 00000 n 
+0000000235 00000 n 
+0000001865 00000 n 
+trailer<< /Size 6 /Root 1 0 R >>
+startxref
+1933
+%%EOF

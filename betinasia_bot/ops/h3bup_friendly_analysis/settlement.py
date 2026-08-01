@@ -32,23 +32,37 @@ def safe_float(x: Any) -> Optional[float]:
 
 
 def load_pnl_by_order(balance_paths: Iterable[Path]) -> Dict[str, float]:
-    """Aggregate amount by order_id across one or more balance CSVs. Missing ≠ 0."""
+    """Aggregate amount by order_id from balance ledger snapshot(s).
+
+    Accounting dumps are full snapshots. Summing several files without
+    dedupe multiplies P&L (e.g. 5× → ROI ≈ -500% on a full loss). Prefer a
+    single latest path from the runner; if multiple are passed, dedupe by
+    transaction_id (else keep only the newest file's rows).
+    Missing ≠ 0.
+    """
     out: Dict[str, float] = {}
-    for path in balance_paths:
-        if not path or not Path(path).exists():
-            continue
-        with Path(path).open("r", encoding="utf-8", errors="replace", newline="") as f:
+    seen_tx: set[str] = set()
+    paths = [Path(p) for p in balance_paths if p and Path(p).exists()]
+    paths = sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 oid = order_id_key(row.get("order id") or row.get("order_id") or row.get("orderid"))
                 if not oid:
                     continue
-                # Exclude deposits/withdrawals heuristics
                 typ = str(row.get("type") or "").strip().lower()
                 note = str(row.get("note") or "").lower()
                 if typ in {"deposit", "withdrawal", "withdraw"}:
                     continue
                 if "deposit" in note and "order" not in note:
+                    continue
+                tx = str(row.get("transaction_id") or row.get("transaction id") or "").strip()
+                if tx:
+                    if tx in seen_tx:
+                        continue
+                    seen_tx.add(tx)
+                elif len(paths) > 1 and path != paths[0]:
                     continue
                 amt = safe_float(row.get("amount"))
                 if amt is None:

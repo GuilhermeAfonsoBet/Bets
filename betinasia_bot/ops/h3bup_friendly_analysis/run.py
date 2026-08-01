@@ -155,8 +155,12 @@ def run_analysis(
         if alt.exists():
             executor = alt
 
-    balance_paths = _latest_glob(root / "logs" / "accounting", "*__balance.csv")[-5:]
-    open_paths = _latest_glob(root / "logs" / "accounting", "*__open_stakes.csv")[-5:]
+    # Use LATEST ledger snapshot only (full dumps — summing multiple files
+    # multiplies P&L ~Nx and can produce ROI << -100% on Back stakes).
+    bal_all = _latest_glob(root / "logs" / "accounting", "*__balance.csv")
+    open_all = _latest_glob(root / "logs" / "accounting", "*__open_stakes.csv")
+    balance_paths = bal_all[-1:] if bal_all else []
+    open_paths = open_all[-1:] if open_all else []
     clv_snaps = root / "logs" / "h3bup_clv_snapshots.jsonl"
 
     # 1) Universe (identity only)

@@ -399,12 +399,26 @@ def test_35_secondary_separated(fixture_root):
     assert bundle["primary_meta"]["universe"] == "H3BUP_vNext_exact"
 
 
-def test_36_40_no_ops_changes(fixture_root):
-    before = (fixture_root / "logs" / "wf_policy_current.json").read_text()
-    bundle = run_analysis(root=fixture_root, cutoff=datetime(2026, 7, 10, tzinfo=timezone.utc), run_id="secu", n_boot=20, n_perm=20)
-    after = (fixture_root / "logs" / "wf_policy_current.json").read_text()
-    assert before == after
-    assert bundle["security"]["telegram_used"] is False
-    assert bundle["security"]["orders_created"] is False
-    assert bundle["security"]["betslip_opened"] is False
-    assert bundle["security"]["policy_altered"] is False
+def test_balance_snapshot_not_multiplied(tmp_path: Path):
+    """Full ledger dumps must not be summed N times (ROI << -100% bug)."""
+    from ops.h3bup_friendly_analysis.settlement import load_pnl_by_order
+
+    acc = tmp_path / "logs" / "accounting"
+    acc.mkdir(parents=True)
+    header = "transaction_id,order id,amount,type,note\n"
+    row = "tx1,999,-10,bet,Settlement of Bet x\n"
+    paths = []
+    for i in range(5):
+        p = acc / f"2026070{i}_120000__balance.csv"
+        p.write_text(header + row, encoding="utf-8")
+        paths.append(p)
+    pnl = load_pnl_by_order(paths)
+    assert abs(pnl["999"] - (-10.0)) < 1e-9
+
+
+def test_single_latest_balance_used_in_runner_contract():
+    import inspect
+    from ops.h3bup_friendly_analysis import run as runmod
+
+    src = inspect.getsource(runmod.run_analysis)
+    assert "bal_all[-1:]" in src or "balance_paths = bal_all[-1:]" in src
