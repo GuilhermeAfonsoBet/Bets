@@ -196,17 +196,31 @@ def parse_live_record(obj: dict) -> Optional[Dict[str, Any]]:
         stake = safe_float(pol.get("stake_requested") if isinstance(pol, dict) else None)
     exec_side = str(res.get("exec_side") or req.get("exec_side") or "").strip().lower()
     side = str(res.get("side") or req.get("side") or "").strip()
-    is_live = res.get("is_live") if res.get("is_live") is not None else req.get("is_live")
-    period = "In" if is_live in (True, 1, "1", "true", "True") else "Pre"
-    # Explicit period fields override
-    for p in (res.get("period"), req.get("period"), res.get("regime"), req.get("regime")):
+    # IMPORTANT: executor `is_live` means LIVE betting mode (vs dry), NOT in-play.
+    # Period/regime must come from market_regime / period / regime / market_period.
+    period = "Pre"
+    vs = raw.get("value_sizing") if isinstance(raw.get("value_sizing"), dict) else {}
+    for p in (
+        res.get("period"),
+        req.get("period"),
+        res.get("regime"),
+        req.get("regime"),
+        res.get("market_regime"),
+        req.get("market_regime"),
+        vs.get("market_regime"),
+        res.get("market_period"),
+        req.get("market_period"),
+    ):
         if p is None:
             continue
         ps = str(p).strip().lower()
-        if ps in {"pre", "prematch", "pre-match"}:
+        if ps in {"pre", "prematch", "pre-match", "full_time", "ft"}:
             period = "Pre"
-        elif ps in {"in", "inplay", "in-play", "live"}:
+        elif ps in {"in", "inplay", "in-play", "in_play", "live_match"}:
             period = "In"
+    # H3BUP_vNext is an operational Back-Pre policy; keep Pre unless explicit in-play regime.
+    if "H3BUP_vNext" in pv and period != "In":
+        period = "Pre"
 
     return {
         "order_id": oid or "",

@@ -105,7 +105,18 @@ def fixture_root(tmp_path: Path) -> Path:
         # exclusions
         _live_ok(order_id="2001", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex1", status="DRY_OK"),
         _live_ok(order_id="2002", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex2", exec_side="lay"),
-        _live_ok(order_id="2003", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex3", is_live=True),
+        # Back In via explicit market_regime (executor is_live means LIVE mode, not in-play)
+        {
+            **_live_ok(order_id="2003", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex3"),
+            "request": {
+                **_live_ok(order_id="2003", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex3")["request"],
+                "market_regime": "inplay",
+            },
+            "result": {
+                **_live_ok(order_id="2003", created="2026-07-01T10:00:00+00:00", league="X", event_id="ex3")["result"],
+                "market_regime": "inplay",
+            },
+        },
         _live_ok(
             order_id="2004",
             created="2026-07-01T10:00:00+00:00",

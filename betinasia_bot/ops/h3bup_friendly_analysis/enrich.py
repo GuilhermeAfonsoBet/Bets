@@ -86,14 +86,16 @@ def try_sql_league_map(database_url: Optional[str] = None) -> Dict[str, Dict[str
         try:
             cur.execute(
                 """
-                SELECT event_id::text, league, status
+                SELECT event_id::text, league, home_team, away_team
                 FROM betslip_audit_results
                 WHERE event_id IS NOT NULL
+                  AND league IS NOT NULL
+                  AND btrim(league) <> ''
                 ORDER BY audited_at DESC NULLS LAST
                 LIMIT 200000
                 """
             )
-            for event_id, league, _status in cur.fetchall():
+            for event_id, league, home, away in cur.fetchall():
                 eid = str(event_id or "").strip()
                 if not eid or f"event_id:{eid}" in out:
                     continue
@@ -105,7 +107,7 @@ def try_sql_league_map(database_url: Optional[str] = None) -> Dict[str, Dict[str
                     "is_friendly": "",
                     "tournament_name": "",
                     "country": "",
-                    "event_name": "",
+                    "event_name": f"{home} vs {away}" if home and away else "",
                 }
         except Exception:
             pass
