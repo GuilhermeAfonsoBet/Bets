@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 EXPECTED_H3BUP = {
     "policy_id": "H3BUP_vNext",
     "policy_version_prefix": "H3BUP_vNext",
-    "stake": 10.0,
+    "stake": 2.0,
     "odd_lo": 1.85,
     "odd_hi": 2.15,
 }

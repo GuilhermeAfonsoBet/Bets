@@ -15,7 +15,7 @@ from .diff_previous import diff_snapshots, find_previous_snapshot
 from .e2e_funnel import build_e2e_and_funnel
 from .extract import extract_source_manifest
 from .friendly_section import build_friendly_section
-from .health_model import build_health_model, derive_alerts, evaluate_config_file
+from .health_model import EXPECTED_H3BUP, build_health_model, derive_alerts, evaluate_config_file
 from .performance import compute_settlement_and_performance
 from .statuses import metric_envelope
 from .time_windows import ReportWindow, resolve_window
@@ -194,15 +194,19 @@ def build_snapshot(
     )
 
     # Stake/policy mismatch exceptions (keep existing contract for tests)
+    # Expected live stake = 2; legacy 10/20 flagged as WARNING during transition.
     exceptions = []
+    expected_stake = float(EXPECTED_H3BUP.get("stake") or 2.0)
     for oid, o in orders.items():
-        if o.get("stake") is not None and abs(float(o["stake"]) - 10.0) > 1e-6:
-            sev = "CRITICAL" if abs(float(o["stake"]) - 20.0) > 1e-6 else "WARNING"
+        if o.get("stake") is not None and abs(float(o["stake"]) - expected_stake) > 1e-6:
+            s = float(o["stake"])
+            legacy = abs(s - 10.0) < 1e-6 or abs(s - 20.0) < 1e-6
+            sev = "WARNING" if legacy else "CRITICAL"
             exceptions.append(
                 {
                     "alert_id": f"stake_mismatch:{oid}",
                     "severity": sev,
-                    "evidence": {"order_id": oid, "stake": o.get("stake")},
+                    "evidence": {"order_id": oid, "stake": o.get("stake"), "expected_stake": expected_stake},
                     "affected_metrics": ["stake_placed_sum"],
                     "status": "OPEN",
                     "message": f"stake mismatch order {oid}",

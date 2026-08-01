@@ -259,7 +259,7 @@ def test_policy_constants_unchanged():
     bridge = (ROOT / "ops" / "executor_bridge_audit.py").read_text(encoding="utf-8")
     assert 'POLICY_VERSION_H3BUP_VNEXT = "H3BUP_vNext_20260629"' in bridge
     assert "1.85 <= float(odd) <= 2.15" in bridge
-    assert "req.policy.stake_requested = 10.0" in bridge
+    assert "req.policy.stake_requested = 2.0" in bridge
     assert "pre_exec_ok = bool(is_backpre and is_odd)" in bridge
     assert "float(cap) > 100.0" in bridge
     assert "float(slip) < 0.0" in bridge
@@ -336,7 +336,8 @@ def test_gate_logic_unchanged_by_import():
     assert "1.85 <= float(odd_val) <= 2.15" in src
     assert "float(cap_val) <= 100.0" in src
     assert "float(slip_val) >= 0.0" in src
-    assert "abs(float(stake) - 10.0) > 1e-6" in src
+    assert "abs(float(stake) - hard_stake) > 1e-6" in src
+    assert '"required_stake": 2.0' in src or "'required_stake': 2.0" in src
     bridge = (ROOT / "ops" / "executor_bridge_audit.py").read_text(encoding="utf-8")
-    assert 'req.policy.stake_requested = 10.0' in bridge
+    assert "req.policy.stake_requested = 2.0" in bridge
     assert "H3BUP_vNext_20260629" in bridge
