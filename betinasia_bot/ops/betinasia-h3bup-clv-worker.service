@@ -1,0 +1,26 @@
+[Unit]
+Description=BetinAsia H3BUP CLV Forward Worker (analytics-only)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betbot
+Group=betbot
+WorkingDirectory=/home/betbot/Bets/betinasia_bot
+EnvironmentFile=/home/betbot/Bets/betinasia_bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=H3BUP_CLV_ENABLED=0
+Environment=H3BUP_CLV_CREATE_OBLIGATIONS=0
+Environment=H3BUP_CLV_WORKER_ENABLED=0
+Environment=H3BUP_CLV_PASSIVE_COLLECTOR_ENABLED=0
+Environment=H3BUP_CLV_ALLOW_BETSLIP_SOURCE=0
+Environment=H3BUP_CLV_FAIR_EDGE_ENABLED=0
+ExecStart=/bin/bash -lc 'cd /home/betbot/Bets/betinasia_bot && ./venv/bin/python -m ops.h3bup_clv_worker'
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_worker.log
+StandardError=append:/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_worker_error.log
+
+[Install]
+WantedBy=multi-user.target

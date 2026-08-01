@@ -1,0 +1,21 @@
+issue_id,severity,status_20260729,component,title_pt,evidence_pt,impact_pt,remediation_pt,blocks_v2_publish
+ISS-001,P0,FIXED_PHASE_2R,patch_sections,NameError out_lines vs s0 nas secções H3BUP,Patches usavam out_lines; builder usa s0; agora s0.append em daily_full_report e patch scripts,Crash / secções ausentes no PDF,Manter markers; evitar reintroduzir out_lines,no
+ISS-002,P0,OPEN,daily_full_report,Swallow massivo except pass,~271 except Exception e dezenas de pass silenciosos,Falhas de secção sem report_health; PDF incompleto “parece OK”,V2 status envelopes + exceptions CSV; reduzir pass em V1 gradualmente,partial
+ISS-003,P0,OPEN,daily_full_report IO,Escrita não atómica md/pdf,combined_md.write_text directo; pdf overwrite,Corrupção parcial se kill mid-write; leitores vêem ficheiro a meio,Adoptar io_atomic V2; staging+replace,yes_until_parity_ops
+ISS-004,P1,OPEN,persistence,Sem latest symlink / sem LKG,Histórico só pastas YYYYMMDD,Ops não tem pointer estável nem rollback de relatório,V2 latest_* + lkg/; não ligar a Telegram até gate,yes
+ISS-005,P0,OPEN,time_semantics,Dia do relatório = UTC de geração ≠ closed day,day=ts.strftime UTC now,Confusão “ontem fechado” vs pasta do dia; misturas com pnl_today BRT,V2 DAILY_CLOSED = last complete UTC day,yes
+ISS-006,P0,OPEN,time_semantics,Dual cohort post_date vs created_at,Tabelas P&L post date + ROIw created_at no mesmo PDF,Leitura incorrecta de performance diária,Contratos explícitos + V2 methodology section,yes
+ISS-007,P0,OPEN,time_semantics,pnl_today em America/Sao_Paulo vs pasta UTC,REPORT_TZ default America/Sao_Paulo,P&L “hoje” desalinhado do day_dir UTC,Separar labels; V2 não usa post date como cohort key,yes
+ISS-008,P0,OPEN,fast_latency,Três conceitos fast misturados,pre_submit<=6s old; <=5s post-tese; call_to_done<=6s CF,Contrato utilizador DAILY_FAST_LE_6S / STUDY_FAST_LT_4S violado semanticamente,V2 buckets formais; anotar V1 como legado,yes
+ISS-009,P1,OPEN,roiw,Policy H3BUP não filtrada na tabela ROIw principal,Universo Back LIVE_OK sem needle H3BUP_vNext obrigatório,Contaminação por outras policies/hypotheses,V2 require_h3bup=True default,yes
+ISS-010,P1,OPEN,roiw,ROIw Total pode incluir open,Join ledger sem exclusão open na métrica Total,ROIw ≠ ROI settled; interpretações erradas,Mostrar side-by-side; principal=roi_settled,partial
+ISS-011,P1,OPEN,envelope,V1 sem schema_version/run_id/report_health/report_cutoff,JSON de retorno parcial sem envelope canónico,Impossível auditar as-of / reprodutibilidade,V2 schema obrigatório,yes
+ISS-012,P2,OPEN,fair_edge,Fair edge não implementado,Sem métrica nem status NOT_IMPLEMENTED no V1,Risco de parecer omitido / zero implícito,V2 fair_edge NOT_IMPLEMENTED explícito,no
+ISS-013,P1,OPEN,patches,Secções H3BUP via string patch,Dependência de markers/anchors frágeis,Drift em refactors do monólito,Migrar para módulos V2; patches só legado,partial
+ISS-014,P2,OPEN,scheduler,Overlap accounting-daily timer vs full report,Ambos ~22:00 UTC,Race no CSV latest,Freeze paths no report_cutoff V2,partial
+ISS-015,P2,OPEN,scope,DT daily report existe em separado,betinasia-daily-dt-report,Risco de misturar artefactos/métricas,Isolar docs/paths; não partilhar envelope,no
+ISS-016,P1,OPEN,v2_gate,Paridade V1↔V2 pendente,COMPARE=1 mas publish gates abertos,V2 não pode ser oficial,Correr compare soak; checklist migração,yes
+ISS-017,P1,MITIGATED_SHADOW,v2,V2 shadow fail-open,H3BUP_DAILY_V2_FAIL_OPEN=1 PUBLISH=0,Erros V2 não derrubam V1,Manter até soak completo,n/a
+ISS-018,P2,OPEN,sample_20260728,Sample sem secções health/E2E/CLV,Relatório 20260728 sem essas secções visíveis,Observabilidade H3BUP incompleta naquele dia,Verificar patch deploy + fontes presentes,partial
+ISS-019,P1,OPEN,null_policy,Zeros vs missing ambíguos no V1,Contagens/ausências sem status enum,0 falso em falha de fonte,metric_envelope V2 coerção,yes
+ISS-020,P2,OPEN,telegram,Publicação só PDF V1,DAILY_REPORT_TELEGRAM → PDF,Utilizador não vê envelope health,Após cutover: publicar md/pdf V2 versionado,after_cutover

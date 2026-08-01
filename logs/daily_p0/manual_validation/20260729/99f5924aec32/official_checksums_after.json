@@ -1,0 +1,27 @@
+{
+  "v1_md": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.md",
+    "sha256": "3a1e58b7b2e01519cdf6b60dd8685324bcd6bc1675525c846c773634a23b8d7c",
+    "mtime": 1785362755.4512737
+  },
+  "v1_pdf": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.pdf",
+    "sha256": "7aadcd3caf3bffceb8bc79fa62f2d924b7f6b9cda3c361b483e0f05403c78bf0",
+    "mtime": 1785362758.3615367
+  },
+  "v2_latest_snap": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/daily_v2/latest_snapshot.json",
+    "sha256": "3c63c07567bac89f4647a286ff8e277f4ecfe61dc29c85a8907acc0af3533927",
+    "mtime": 1785436964.6430883
+  },
+  "v2_latest_md": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/daily_v2/latest_report.md",
+    "sha256": "ecc39c239797ad9476f8e7619d23020ecabffde333e35d0bbb145e537b9a1a94",
+    "mtime": 1785436964.6450887
+  },
+  "v2_latest_pdf": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/daily_v2/latest_preview.pdf",
+    "sha256": "333ce2247ef2aaea366448dba9c24092a1e22733ba512670e3d69c35c094be6e",
+    "mtime": 1785436964.994119
+  }
+}

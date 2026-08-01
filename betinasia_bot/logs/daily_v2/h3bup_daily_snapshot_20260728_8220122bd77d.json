@@ -1,0 +1,504 @@
+{
+  "schema_version": 2,
+  "run_id": "8220122bd77d",
+  "report_type": "DAILY_CLOSED",
+  "report_date_utc": "2026-07-28",
+  "window_start_utc": "2026-07-28T00:00:00+00:00",
+  "window_end_utc": "2026-07-29T00:00:00+00:00",
+  "report_cutoff_utc": "2026-07-29T21:36:39.985023+00:00",
+  "generated_at_utc": "2026-07-29T21:36:39.985105+00:00",
+  "git_commit": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "policy_id": "H3BUP_vNext",
+  "policy_version": "H3BUP_vNext_20260629",
+  "policy_fingerprint": null,
+  "source_manifest": {
+    "executor_live": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:36:23.071918+00:00",
+      "size": 72553862,
+      "sha256_prefix": "33ed288e744855ac",
+      "source_cutoff_utc": "2026-07-29T21:36:23.071918+00:00",
+      "age_seconds": 16.913105,
+      "status": "HEALTHY"
+    },
+    "accounting_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/accounting_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:32:24.153513+00:00",
+      "size": 1003,
+      "sha256_prefix": "be4605f9c1c9c4cd",
+      "source_cutoff_utc": "2026-07-29T21:32:24.153513+00:00",
+      "health_json_status": "ACCOUNTING_OK",
+      "age_seconds": 255.83151,
+      "status": "HEALTHY"
+    },
+    "accounting_daily_report": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting_daily_report.json",
+      "exists": true,
+      "mtime_utc": "2026-07-28T22:02:42.108069+00:00",
+      "size": 1576,
+      "sha256_prefix": "a44f909b01d47e00",
+      "source_cutoff_utc": "2026-07-28T22:02:42.108069+00:00",
+      "age_seconds": 84837.876954,
+      "status": "WATCH"
+    },
+    "e2e_trace": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_e2e_trace.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:36:36.677140+00:00",
+      "size": 7914704,
+      "sha256_prefix": "96ad79b4dff84e99",
+      "source_cutoff_utc": "2026-07-29T21:36:36.677140+00:00",
+      "age_seconds": 3.307883,
+      "status": "HEALTHY"
+    },
+    "clv_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:36:27.979359+00:00",
+      "size": 1024,
+      "sha256_prefix": "0217f87cd2963162",
+      "source_cutoff_utc": "2026-07-29T21:36:27.979359+00:00",
+      "health_json_status": "WATCH",
+      "age_seconds": 12.005664,
+      "status": "WATCH"
+    },
+    "clv_obligations": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_obligations.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:29:54.266169+00:00",
+      "size": 28349,
+      "sha256_prefix": "2b14f0ca208a9d94",
+      "source_cutoff_utc": "2026-07-29T21:29:54.266169+00:00",
+      "age_seconds": 405.718854,
+      "status": "HEALTHY"
+    },
+    "policy_current": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/wf_policy_current.json",
+      "exists": true,
+      "mtime_utc": "2026-06-29T13:15:03.295096+00:00",
+      "size": 9770,
+      "sha256_prefix": "8009c8fa4b67b75f",
+      "source_cutoff_utc": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2622096.689927,
+      "status": "STALE"
+    },
+    "risk_params": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/bridge_risk_params.json",
+      "exists": true,
+      "mtime_utc": "2026-07-20T15:16:08.267440+00:00",
+      "size": 580,
+      "sha256_prefix": "6a38c6ddd893a215",
+      "source_cutoff_utc": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 800431.717583,
+      "status": "STALE"
+    },
+    "accounting_balance": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_213220__balance.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:32:20.922225+00:00",
+      "size": 2981343,
+      "sha256_prefix": "72828baa1ea7a980",
+      "source_cutoff_utc": "2026-07-29T21:32:20.922225+00:00",
+      "age_seconds": 259.062798,
+      "status": "HEALTHY"
+    },
+    "accounting_open_stakes": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_213224__open_stakes.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-29T21:32:24.134511+00:00",
+      "size": 33224,
+      "sha256_prefix": "aff5fbc014b4e748",
+      "source_cutoff_utc": "2026-07-29T21:32:24.134511+00:00",
+      "age_seconds": 255.850512,
+      "status": "HEALTHY"
+    }
+  },
+  "report_health": {
+    "status": "HEALTHY",
+    "notes": [
+      "REPORT_HEALTH distinct from STRATEGY_OPERATIONS_HEALTH"
+    ]
+  },
+  "operations_health": {
+    "status": "WATCH",
+    "notes": [
+      "derived from services externally; Daily V2 does not restart services"
+    ]
+  },
+  "data_quality": {
+    "accounting": "HEALTHY",
+    "e2e": "HEALTHY",
+    "clv": "WATCH"
+  },
+  "statistical_readiness": {
+    "roi": "AVAILABLE",
+    "clv": "INSUFFICIENT_N",
+    "e2e": "AVAILABLE"
+  },
+  "execution_funnel": {
+    "live_ok": {
+      "value": 3,
+      "unit": "count",
+      "n": 3,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": []
+    },
+    "order_ids": [
+      "1931674091",
+      "1932353274",
+      "1933822208"
+    ],
+    "fast_buckets": {
+      "DAILY_FAST_LE_6S": {
+        "n": 3,
+        "threshold_ms": 6000,
+        "op": "<="
+      },
+      "STUDY_FAST_LT_4S": {
+        "n": 3,
+        "threshold_ms": 4000,
+        "op": "<",
+        "label": "exploratory_only"
+      },
+      "DAILY_SLOW_GT_6S": {
+        "n": 0
+      },
+      "PRE_SUBMIT_MS_NA": {
+        "n": 0
+      }
+    },
+    "orders_sample": {
+      "1931674091": {
+        "order_id": "1931674091",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-28T15:30:25.309321+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1222,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 419662,
+        "slippage_pre_pct": -1.06269925611051,
+        "is_h3bup": true
+      },
+      "1932353274": {
+        "order_id": "1932353274",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-28T17:58:41.861191+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1129,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 419935,
+        "slippage_pre_pct": -0.7928118393234621,
+        "is_h3bup": true
+      },
+      "1933822208": {
+        "order_id": "1933822208",
+        "status": "LIVE_OK",
+        "created_at": "2026-07-28T23:58:59.009030+00:00",
+        "stake": 10.0,
+        "pre_submit_ms": 1105,
+        "policy_version": "H3BUP_vNext_20260629",
+        "exec_side": "back",
+        "audit_id": 420463,
+        "slippage_pre_pct": -1.7676767676767637,
+        "is_h3bup": true
+      }
+    }
+  },
+  "settlement": {
+    "maturity_status": "FULLY_SETTLED",
+    "n_open": 0,
+    "n_settled": 2,
+    "n_void_push": 1,
+    "n_missing_accounting": 0,
+    "stake_placed_sum": 30.0,
+    "stake_settled_sum": 30.0,
+    "pnl_settled_sum": -0.4300000000000015
+  },
+  "performance": {
+    "roi_settled": {
+      "value": -0.014333333333333384,
+      "unit": "fraction",
+      "n": 3,
+      "numerator": -0.4300000000000015,
+      "denominator": 30.0,
+      "coverage_pct": 100.0,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor+accounting",
+      "notes": [
+        "open excluded from denominator",
+        "void/push: pnl~0 stake included"
+      ]
+    },
+    "roiw_total_v1": {
+      "value": -1.4333333333333385,
+      "unit": "percent",
+      "n": 3,
+      "numerator": -0.4300000000000015,
+      "denominator": 30.0,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v1.0",
+      "source": "daily_v1_contract",
+      "notes": [
+        "legacy: may include open if present in ledger",
+        "w = exposure-weighted"
+      ]
+    },
+    "roiw_total_v2": {
+      "value": -1.4333333333333385,
+      "unit": "percent",
+      "n": 3,
+      "numerator": -0.4300000000000015,
+      "denominator": 30.0,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor+accounting",
+      "notes": [
+        "principal complementary to roi_settled",
+        "open excluded"
+      ]
+    },
+    "principal_metric": "roi_settled",
+    "complementary_metric": "roiw_total_v1"
+  },
+  "latency": {
+    "daily_fast_le_6s": {
+      "value": 3,
+      "unit": "count",
+      "n": 3,
+      "numerator": null,
+      "denominator": 3,
+      "coverage_pct": 100.0,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": [
+        "threshold pre_submit_ms <= 6000",
+        "DAILY_FAST_LE_6S"
+      ]
+    },
+    "study_fast_lt_4s": {
+      "value": 3,
+      "unit": "count",
+      "n": 3,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "executor_live.jsonl",
+      "notes": [
+        "exploratory only",
+        "STUDY_FAST_LT_4S pre_submit_ms < 4000"
+      ]
+    },
+    "pre_submit_ms_na": {
+      "value": 0,
+      "unit": "count",
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "missing not coerced to slow"
+      ]
+    },
+    "e2e_source_status": "HEALTHY",
+    "detect_to_audit_overhead": {
+      "value": null,
+      "unit": null,
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "WATCH",
+      "metric_version": "v2.0",
+      "source": "h3bup_e2e_trace",
+      "notes": [
+        "overhead remains WATCH until re-evaluation"
+      ]
+    },
+    "e2e_ws_to_live_ok": {
+      "value": null,
+      "unit": "ms",
+      "n": 12,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "AVAILABLE",
+      "metric_version": "v2.0",
+      "source": "h3bup_e2e_trace.jsonl",
+      "notes": [
+        "n_traces=2239",
+        "n_live=12"
+      ]
+    },
+    "e2e_coverage": [
+      {
+        "stage": "H3B_WS_RECEIVED",
+        "n": 2239,
+        "pct": 100.0
+      },
+      {
+        "stage": "H3B_DETECTED",
+        "n": 2239,
+        "pct": 100.0
+      },
+      {
+        "stage": "H3B_AUDIT_PERSIST_FINISHED",
+        "n": 2239,
+        "pct": 100.0
+      },
+      {
+        "stage": "H3B_BRIDGE_FETCHED",
+        "n": 683,
+        "pct": 30.504689593568557
+      },
+      {
+        "stage": "H3B_EXEC_REQUEST_CREATED",
+        "n": 76,
+        "pct": 3.3943724877177313
+      },
+      {
+        "stage": "H3B_EXECUTOR_RECEIVED",
+        "n": 76,
+        "pct": 3.3943724877177313
+      },
+      {
+        "stage": "H3B_DRYRUN_FINISHED",
+        "n": 76,
+        "pct": 3.3943724877177313
+      },
+      {
+        "stage": "H3B_FINAL_GATE_DECIDED",
+        "n": 69,
+        "pct": 3.0817329164805716
+      },
+      {
+        "stage": "H3B_PLACE_FINISHED",
+        "n": 12,
+        "pct": 0.5359535506922734
+      },
+      {
+        "stage": "LIVE_OK",
+        "n": 12,
+        "pct": 0.5359535506922734
+      }
+    ]
+  },
+  "clv": {
+    "collection_status": "WATCH",
+    "collection_started_at_utc": "2026-07-29T20:07:50+00:00",
+    "post_5m_valid_strict": {
+      "value": 2,
+      "unit": "count",
+      "n": 2,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "forward-only",
+        "POST_5M"
+      ]
+    },
+    "post_15m_valid_strict": {
+      "value": 2,
+      "unit": "count",
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "POST_15M"
+      ]
+    },
+    "closing_valid_strict": {
+      "value": 1,
+      "unit": "count",
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "INSUFFICIENT_N",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "CLOSING",
+        "requires pre-kickoff snapshot"
+      ]
+    },
+    "fair_edge": {
+      "value": null,
+      "unit": null,
+      "n": 0,
+      "numerator": null,
+      "denominator": null,
+      "coverage_pct": null,
+      "status": "NOT_IMPLEMENTED",
+      "metric_version": "v2.0",
+      "source": null,
+      "notes": [
+        "Phase 2D not started"
+      ]
+    },
+    "funnel": {
+      "live_ok_after_activation": 2,
+      "obligations_expected": 6,
+      "obligations_created": 6,
+      "source_missing": 0,
+      "kickoff_missing": 0
+    }
+  },
+  "concentration": {
+    "status": "INSUFFICIENT_N",
+    "notes": [
+      "only emitted when N sufficient"
+    ]
+  },
+  "exceptions": [],
+  "methodology": {
+    "cohort_timestamp": "created_at UTC",
+    "post_date_usage": "accounting freshness / settlement metadata only",
+    "daily_fast": "DAILY_FAST_LE_6S: pre_submit_ms <= 6000",
+    "study_fast": "STUDY_FAST_LT_4S: pre_submit_ms < 4000 (exploratory)",
+    "roi_settled": "sum(pnl_confirmed_settled)/sum(stake_confirmed_settled)",
+    "roiw_total_v1": "(sum pnl / sum exposure)*100; may include open if in ledger",
+    "absence_policy": "missing/stale/not_calculable must not appear as zero",
+    "fair_edge": "NOT_IMPLEMENTED"
+  },
+  "parity": {
+    "v1_report_path": "logs/daily_reports/20260728/report_daily.md",
+    "v1_report_day_folder": "20260728",
+    "v1_report_cutoff_utc": "2026-07-28T22:01:08.644407+00:00",
+    "v2_generated_at_utc": "2026-07-29T21:36:39.985105+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-28T22:01:08.644407+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Comparação de paridade usa o cutoff lógico do V1. Eventos após v1_report_cutoff_utc até v2_generated_at_utc são apenas diagnóstico intraday e não entram na paridade."
+  },
+  "shadow": {
+    "official": false,
+    "telegram_preview_enabled": true,
+    "label": "DAILY V2 — PREVIEW / NÃO OFICIAL"
+  }
+}

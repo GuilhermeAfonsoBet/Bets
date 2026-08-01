@@ -1,0 +1,6 @@
+scenario,n,stake,pnl,roi,open,maturity,clv_closing_median,clv_coverage,disclaimer
+A_H3BUP_completa,74,740.0,-55.42000000000001,-0.09896428571428573,18,PARTIALLY_SETTLED,-1.6767700737800428,0.16216216216216217,Cenários históricos não representam resultado out-of-sample e não devem ser interpretados como recomendação operacional.
+B_apenas_Friendly,39,390.0,-12.540000000000003,-0.03300000000000001,1,PARTIALLY_SETTLED,-2.700387843989599,0.15384615384615385,Cenários históricos não representam resultado out-of-sample e não devem ser interpretados como recomendação operacional.
+C_apenas_non_Friendly,35,350.0,-42.88,-0.23822222222222222,17,PARTIALLY_SETTLED,-1.6767700737800428,0.17142857142857143,Cenários históricos não representam resultado out-of-sample e não devem ser interpretados como recomendação operacional.
+D_non_Friendly_plus_Unclassified,35,350.0,-42.88,-0.23822222222222222,17,PARTIALLY_SETTLED,-1.6767700737800428,0.17142857142857143,Cenários históricos não representam resultado out-of-sample e não devem ser interpretados como recomendação operacional.
+E_confirmed_classes_only,74,740.0,-55.42000000000001,-0.09896428571428573,18,PARTIALLY_SETTLED,-1.6767700737800428,0.16216216216216217,Cenários históricos não representam resultado out-of-sample e não devem ser interpretados como recomendação operacional.

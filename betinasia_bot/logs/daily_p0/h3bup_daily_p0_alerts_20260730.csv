@@ -1,0 +1,7 @@
+alert_id,severity,status,first_seen_utc,last_seen_utc,message,affected_metrics,evidence,resolution_hint
+CLV_INSUFFICIENT_N,INFO,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,N estatístico insuficiente para inferência,"clv,roi",{},aguardar amostra
+E2E_OVERHEAD_WATCH,WATCH,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,Overhead detect→audit acima da baseline / em observação,e2e,"{""value"": 14.191625, ""unit"": ""ms"", ""n"": 5327, ""numerator"": null, ""denominator"": null, ""coverage_pct"": null, ""status"": ""WATCH"", ""metric_version"": ""v2.0"", ""source"": null, ""notes"": [""overhead remains WATCH until re-evaluation"", ""median=14.191625""]}",
+SETTLEMENT_PARTIAL,INFO,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,Coorte parcialmente liquidada,"roi,maturity","{""n_open"": 1}",
+CLV_BACKLOG,WATCH,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,Retry backlog CLV > 0,clv,"{""retry_backlog"": 3}",
+TRACE_ORDERING_VIOLATIONS,WATCH,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,Ordering violations no E2E,e2e,"{""n"": 182}",
+TRACE_CLOCK_SKEW,WATCH,OPEN,2026-07-30T18:42:37.230518+00:00,2026-07-30T18:42:37.230518+00:00,Clock skew / negative durations no E2E,e2e,"{""n"": 182}",

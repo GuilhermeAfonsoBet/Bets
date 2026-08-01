@@ -1,0 +1,957 @@
+{
+  "status": "DAILY_PARITY_HARDENED_MATCH",
+  "report_date_utc": "2026-07-29",
+  "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+  "cohort_window_end_utc": "2026-07-30T00:00:00+00:00",
+  "parity_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+  "matured_as_of_utc": "2026-07-30T20:23:40.223866+00:00",
+  "historical_asof_status": "AVAILABLE",
+  "sources": {
+    "balance_parity": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_215724__balance.csv",
+    "open_parity": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260729_215727__open_stakes.csv",
+    "balance_matured": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_202230__balance.csv",
+    "open_matured": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_202234__open_stakes.csv"
+  },
+  "universe": {
+    "v1_parity": {
+      "count": 22,
+      "stake_placed": 220.0,
+      "order_ids": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935402833",
+        "1935460146",
+        "1935475500",
+        "1935568718",
+        "1935642980",
+        "1935703108",
+        "1936401912",
+        "1936596042",
+        "1936637320",
+        "1936724778",
+        "1936750483",
+        "1936946893",
+        "1936956073",
+        "1936961828",
+        "1936963700",
+        "1937013393",
+        "1937095091",
+        "1937669560",
+        "1937747430"
+      ],
+      "hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb"
+    },
+    "v2_full_day": {
+      "count": 24,
+      "stake_placed": 240.0,
+      "order_ids": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935402833",
+        "1935460146",
+        "1935475500",
+        "1935568718",
+        "1935642980",
+        "1935703108",
+        "1936401912",
+        "1936596042",
+        "1936637320",
+        "1936724778",
+        "1936750483",
+        "1936946893",
+        "1936956073",
+        "1936961828",
+        "1936963700",
+        "1937013393",
+        "1937095091",
+        "1937669560",
+        "1937747430",
+        "1938082582",
+        "1938105954"
+      ],
+      "hash": "50d209a999f8c4a8759e3fd732ce9acc2fba6ada63c34f50847c326a7a3caf52"
+    },
+    "v2_parity": {
+      "count": 22,
+      "stake_placed": 220.0,
+      "order_ids": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935402833",
+        "1935460146",
+        "1935475500",
+        "1935568718",
+        "1935642980",
+        "1935703108",
+        "1936401912",
+        "1936596042",
+        "1936637320",
+        "1936724778",
+        "1936750483",
+        "1936946893",
+        "1936956073",
+        "1936961828",
+        "1936963700",
+        "1937013393",
+        "1937095091",
+        "1937669560",
+        "1937747430"
+      ],
+      "hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb"
+    },
+    "diff_full_day_vs_v1": {
+      "v1_count": 22,
+      "v2_count": 24,
+      "v1_order_set_hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb",
+      "v2_order_set_hash": "50d209a999f8c4a8759e3fd732ce9acc2fba6ada63c34f50847c326a7a3caf52",
+      "order_set_match": false,
+      "only_in_v1": [],
+      "only_in_v2": [
+        "1938082582",
+        "1938105954"
+      ],
+      "only_in_v1_count": 0,
+      "only_in_v2_count": 2,
+      "in_both_count": 22,
+      "in_both": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935402833",
+        "1935460146",
+        "1935475500",
+        "1935568718",
+        "1935642980",
+        "1935703108",
+        "1936401912",
+        "1936596042",
+        "1936637320",
+        "1936724778",
+        "1936750483",
+        "1936946893",
+        "1936956073",
+        "1936961828",
+        "1936963700",
+        "1937013393",
+        "1937095091",
+        "1937669560",
+        "1937747430"
+      ]
+    },
+    "diff_parity_vs_v1": {
+      "v1_count": 22,
+      "v2_count": 22,
+      "v1_order_set_hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb",
+      "v2_order_set_hash": "ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb",
+      "order_set_match": true,
+      "only_in_v1": [],
+      "only_in_v2": [],
+      "only_in_v1_count": 0,
+      "only_in_v2_count": 0,
+      "in_both_count": 22,
+      "in_both": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935402833",
+        "1935460146",
+        "1935475500",
+        "1935568718",
+        "1935642980",
+        "1935703108",
+        "1936401912",
+        "1936596042",
+        "1936637320",
+        "1936724778",
+        "1936750483",
+        "1936946893",
+        "1936956073",
+        "1936961828",
+        "1936963700",
+        "1937013393",
+        "1937095091",
+        "1937669560",
+        "1937747430"
+      ]
+    },
+    "divergent_orders": [
+      {
+        "order_id": "1938082582",
+        "created_at_utc": "2026-07-29T22:21:51.539665+00:00",
+        "live_ok_ts_utc": "2026-07-29T22:21:51.539665+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "side": "back",
+        "status": "LIVE_OK",
+        "audit_id": 425230,
+        "V1_included": false,
+        "V2_full_day_included": true,
+        "V2_parity_included": false,
+        "filtro_V1": "created_at > V1 report generation cutoff (order not yet existent at V1 freeze)",
+        "filtro_V2": "DAILY_CLOSED full UTC day includes post-cutoff LIVE_OK",
+        "classification": "EXPECTED_SCOPE_DIFFERENCE",
+        "root_cause": "V1 frozen at 22:01:54; order created after freeze; V2 closed-day includes it",
+        "after_parity_cutoff": true
+      },
+      {
+        "order_id": "1938105954",
+        "created_at_utc": "2026-07-29T22:30:18.859170+00:00",
+        "live_ok_ts_utc": "2026-07-29T22:30:18.859170+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "side": "back",
+        "status": "LIVE_OK",
+        "audit_id": 425247,
+        "V1_included": false,
+        "V2_full_day_included": true,
+        "V2_parity_included": false,
+        "filtro_V1": "created_at > V1 report generation cutoff (order not yet existent at V1 freeze)",
+        "filtro_V2": "DAILY_CLOSED full UTC day includes post-cutoff LIVE_OK",
+        "classification": "EXPECTED_SCOPE_DIFFERENCE",
+        "root_cause": "V1 frozen at 22:01:54; order created after freeze; V2 closed-day includes it",
+        "after_parity_cutoff": true
+      }
+    ]
+  },
+  "parity_view": {
+    "title": "Paridade com Daily V1 — visão congelada",
+    "as_of": "2026-07-29T22:01:54.606850+00:00",
+    "counts": {
+      "open": 6,
+      "settled": 15,
+      "void": 1,
+      "missing": 0,
+      "live_ok": 22
+    },
+    "performance": {
+      "live_ok_total": 22,
+      "n_open": 6,
+      "n_settled": 15,
+      "n_void_push": 1,
+      "n_missing_accounting": 0,
+      "open_order_ids": [
+        "1934662052",
+        "1934994839",
+        "1935045057",
+        "1935568718",
+        "1937669560",
+        "1937747430"
+      ],
+      "missing_order_ids": [],
+      "stake_placed_sum": 220.0,
+      "stake_settled_sum": 160.0,
+      "pnl_settled_sum": -6.51,
+      "stake_placed": 220.0,
+      "stake_resolved_total": 160.0,
+      "stake_decided_ex_void": 150.0,
+      "stake_void": 10.0,
+      "stake_open": 60.0,
+      "pnl_resolved": -6.51,
+      "pnl_decided_ex_void": -6.510000000000002,
+      "roi_settled": {
+        "value": -0.0406875,
+        "unit": "fraction",
+        "n": 16,
+        "numerator": -6.51,
+        "denominator": 160.0,
+        "coverage_pct": 72.72727272727273,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "open excluded from denominator",
+          "void/push: pnl~0 stake included"
+        ]
+      },
+      "roi_resolved": {
+        "value": -0.0406875,
+        "unit": "fraction",
+        "n": 16,
+        "numerator": -6.51,
+        "denominator": 160.0,
+        "coverage_pct": 72.72727272727273,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "open excluded from denominator",
+          "void/push: pnl~0 stake included",
+          "principal_metric=roi_resolved",
+          "void/push stake included in denominator; pnl≈0"
+        ]
+      },
+      "roi_decided_ex_void": {
+        "value": -0.04340000000000001,
+        "unit": "fraction",
+        "n": 15,
+        "numerator": -6.510000000000002,
+        "denominator": 150.0,
+        "coverage_pct": null,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "void excluded from numerator and denominator"
+        ]
+      },
+      "roiw_total_v1": {
+        "value": -4.0687500000000005,
+        "unit": "percent",
+        "n": 16,
+        "numerator": -6.51,
+        "denominator": 160.0,
+        "coverage_pct": null,
+        "status": "AVAILABLE",
+        "metric_version": "v1.0",
+        "source": "daily_v1_contract",
+        "notes": [
+          "legacy: may include open if present in ledger",
+          "w = exposure-weighted"
+        ]
+      },
+      "roiw_total_v2": {
+        "value": -4.0687500000000005,
+        "unit": "percent",
+        "n": 16,
+        "numerator": -6.51,
+        "denominator": 160.0,
+        "coverage_pct": null,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "principal complementary to roi_settled",
+          "open excluded"
+        ]
+      },
+      "maturity_status": "PARTIALLY_SETTLED",
+      "principal_metric": "roi_resolved",
+      "complementary_metric": "roi_decided_ex_void",
+      "parity_legacy_metric": "roiw_total_v1",
+      "formulas": {
+        "roi_resolved": "pnl_resolved / stake_resolved_total (void stake in denom)",
+        "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void"
+      }
+    },
+    "orders": [
+      {
+        "order_id": "1934662052",
+        "created_at_utc": "2026-07-29T04:00:51.513933+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 420839
+      },
+      {
+        "order_id": "1934994839",
+        "created_at_utc": "2026-07-29T07:51:53.000127+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 421000
+      },
+      {
+        "order_id": "1935045057",
+        "created_at_utc": "2026-07-29T08:28:28.900981+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 421030
+      },
+      {
+        "order_id": "1935402833",
+        "created_at_utc": "2026-07-29T10:42:41.730156+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 421392
+      },
+      {
+        "order_id": "1935460146",
+        "created_at_utc": "2026-07-29T10:59:25.391071+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 421512
+      },
+      {
+        "order_id": "1935475500",
+        "created_at_utc": "2026-07-29T11:04:26.200252+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.11,
+        "audit_id": 421546
+      },
+      {
+        "order_id": "1935568718",
+        "created_at_utc": "2026-07-29T11:28:10.704022+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 421737
+      },
+      {
+        "order_id": "1935642980",
+        "created_at_utc": "2026-07-29T11:49:35.133640+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -10.0,
+        "audit_id": 421892
+      },
+      {
+        "order_id": "1935703108",
+        "created_at_utc": "2026-07-29T12:11:53.027523+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.5,
+        "audit_id": 421992
+      },
+      {
+        "order_id": "1936401912",
+        "created_at_utc": "2026-07-29T15:42:32.181242+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.99,
+        "audit_id": 422603
+      },
+      {
+        "order_id": "1936596042",
+        "created_at_utc": "2026-07-29T16:23:30.244911+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 7.62,
+        "audit_id": 423006
+      },
+      {
+        "order_id": "1936637320",
+        "created_at_utc": "2026-07-29T16:31:36.841850+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 5.65,
+        "audit_id": 423077
+      },
+      {
+        "order_id": "1936724778",
+        "created_at_utc": "2026-07-29T16:48:59.271257+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 4.71,
+        "audit_id": 423232
+      },
+      {
+        "order_id": "1936750483",
+        "created_at_utc": "2026-07-29T16:54:59.145778+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.97,
+        "audit_id": 423278
+      },
+      {
+        "order_id": "1936946893",
+        "created_at_utc": "2026-07-29T17:36:56.610918+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "VOID",
+        "pnl_as_of": 0.0,
+        "audit_id": 423687
+      },
+      {
+        "order_id": "1936956073",
+        "created_at_utc": "2026-07-29T17:39:07.730646+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.42,
+        "audit_id": 423707
+      },
+      {
+        "order_id": "1936961828",
+        "created_at_utc": "2026-07-29T17:40:31.004337+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.3,
+        "audit_id": 423720
+      },
+      {
+        "order_id": "1936963700",
+        "created_at_utc": "2026-07-29T17:41:00.541683+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 10.29,
+        "audit_id": 423728
+      },
+      {
+        "order_id": "1937013393",
+        "created_at_utc": "2026-07-29T17:53:08.164033+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.68,
+        "audit_id": 423845
+      },
+      {
+        "order_id": "1937095091",
+        "created_at_utc": "2026-07-29T18:11:51.576684+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 424019
+      },
+      {
+        "order_id": "1937669560",
+        "created_at_utc": "2026-07-29T20:18:14.945998+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 424968
+      },
+      {
+        "order_id": "1937747430",
+        "created_at_utc": "2026-07-29T20:37:51.486287+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 425031
+      }
+    ],
+    "void_in_denominator": true,
+    "roi_formula": "pnl_resolved / stake_resolved_total"
+  },
+  "matured_view": {
+    "title": "Atualização de maturity da coorte",
+    "as_of": "2026-07-30T20:23:40.223866+00:00",
+    "warning": "Esta secção utiliza dados posteriores ao cutoff histórico e não participa da paridade V1 × V2.",
+    "counts": {
+      "open": 1,
+      "settled": 21,
+      "void": 2,
+      "missing": 0,
+      "live_ok": 24
+    },
+    "performance": {
+      "live_ok_total": 24,
+      "n_open": 1,
+      "n_settled": 21,
+      "n_void_push": 2,
+      "n_missing_accounting": 0,
+      "open_order_ids": [
+        "1937669560"
+      ],
+      "missing_order_ids": [],
+      "stake_placed_sum": 240.0,
+      "stake_settled_sum": 230.0,
+      "pnl_settled_sum": 6.600000000000001,
+      "stake_placed": 240.0,
+      "stake_resolved_total": 230.0,
+      "stake_decided_ex_void": 210.0,
+      "stake_void": 20.0,
+      "stake_open": 10.0,
+      "pnl_resolved": 6.600000000000001,
+      "pnl_decided_ex_void": 6.599999999999996,
+      "roi_settled": {
+        "value": 0.02869565217391305,
+        "unit": "fraction",
+        "n": 23,
+        "numerator": 6.600000000000001,
+        "denominator": 230.0,
+        "coverage_pct": 95.83333333333333,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "open excluded from denominator",
+          "void/push: pnl~0 stake included"
+        ]
+      },
+      "roi_resolved": {
+        "value": 0.02869565217391305,
+        "unit": "fraction",
+        "n": 23,
+        "numerator": 6.600000000000001,
+        "denominator": 230.0,
+        "coverage_pct": 95.83333333333333,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "open excluded from denominator",
+          "void/push: pnl~0 stake included",
+          "principal_metric=roi_resolved",
+          "void/push stake included in denominator; pnl≈0"
+        ]
+      },
+      "roi_decided_ex_void": {
+        "value": 0.03142857142857141,
+        "unit": "fraction",
+        "n": 21,
+        "numerator": 6.599999999999996,
+        "denominator": 210.0,
+        "coverage_pct": null,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": null,
+        "notes": [
+          "void excluded from numerator and denominator"
+        ]
+      },
+      "roiw_total_v1": {
+        "value": 2.869565217391305,
+        "unit": "percent",
+        "n": 23,
+        "numerator": 6.600000000000001,
+        "denominator": 230.0,
+        "coverage_pct": null,
+        "status": "AVAILABLE",
+        "metric_version": "v1.0",
+        "source": "daily_v1_contract",
+        "notes": [
+          "legacy: may include open if present in ledger",
+          "w = exposure-weighted"
+        ]
+      },
+      "roiw_total_v2": {
+        "value": 2.869565217391305,
+        "unit": "percent",
+        "n": 23,
+        "numerator": 6.600000000000001,
+        "denominator": 230.0,
+        "coverage_pct": null,
+        "status": "PARTIAL",
+        "metric_version": "v2.0",
+        "source": "executor+accounting",
+        "notes": [
+          "principal complementary to roi_settled",
+          "open excluded"
+        ]
+      },
+      "maturity_status": "PARTIALLY_SETTLED",
+      "principal_metric": "roi_resolved",
+      "complementary_metric": "roi_decided_ex_void",
+      "parity_legacy_metric": "roiw_total_v1",
+      "formulas": {
+        "roi_resolved": "pnl_resolved / stake_resolved_total (void stake in denom)",
+        "roi_decided_ex_void": "pnl_decided_ex_void / stake_decided_ex_void"
+      }
+    },
+    "orders": [
+      {
+        "order_id": "1934662052",
+        "created_at_utc": "2026-07-29T04:00:51.513933+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 420839
+      },
+      {
+        "order_id": "1934994839",
+        "created_at_utc": "2026-07-29T07:51:53.000127+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 9.29,
+        "audit_id": 421000
+      },
+      {
+        "order_id": "1935045057",
+        "created_at_utc": "2026-07-29T08:28:28.900981+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.97,
+        "audit_id": 421030
+      },
+      {
+        "order_id": "1935402833",
+        "created_at_utc": "2026-07-29T10:42:41.730156+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 421392
+      },
+      {
+        "order_id": "1935460146",
+        "created_at_utc": "2026-07-29T10:59:25.391071+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 421512
+      },
+      {
+        "order_id": "1935475500",
+        "created_at_utc": "2026-07-29T11:04:26.200252+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.11,
+        "audit_id": 421546
+      },
+      {
+        "order_id": "1935568718",
+        "created_at_utc": "2026-07-29T11:28:10.704022+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 9.45,
+        "audit_id": 421737
+      },
+      {
+        "order_id": "1935642980",
+        "created_at_utc": "2026-07-29T11:49:35.133640+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -10.0,
+        "audit_id": 421892
+      },
+      {
+        "order_id": "1935703108",
+        "created_at_utc": "2026-07-29T12:11:53.027523+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.5,
+        "audit_id": 421992
+      },
+      {
+        "order_id": "1936401912",
+        "created_at_utc": "2026-07-29T15:42:32.181242+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.99,
+        "audit_id": 422603
+      },
+      {
+        "order_id": "1936596042",
+        "created_at_utc": "2026-07-29T16:23:30.244911+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 7.62,
+        "audit_id": 423006
+      },
+      {
+        "order_id": "1936637320",
+        "created_at_utc": "2026-07-29T16:31:36.841850+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 5.65,
+        "audit_id": 423077
+      },
+      {
+        "order_id": "1936724778",
+        "created_at_utc": "2026-07-29T16:48:59.271257+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 4.71,
+        "audit_id": 423232
+      },
+      {
+        "order_id": "1936750483",
+        "created_at_utc": "2026-07-29T16:54:59.145778+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.97,
+        "audit_id": 423278
+      },
+      {
+        "order_id": "1936946893",
+        "created_at_utc": "2026-07-29T17:36:56.610918+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "VOID",
+        "pnl_as_of": 0.0,
+        "audit_id": 423687
+      },
+      {
+        "order_id": "1936956073",
+        "created_at_utc": "2026-07-29T17:39:07.730646+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.42,
+        "audit_id": 423707
+      },
+      {
+        "order_id": "1936961828",
+        "created_at_utc": "2026-07-29T17:40:31.004337+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.3,
+        "audit_id": 423720
+      },
+      {
+        "order_id": "1936963700",
+        "created_at_utc": "2026-07-29T17:41:00.541683+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 10.29,
+        "audit_id": 423728
+      },
+      {
+        "order_id": "1937013393",
+        "created_at_utc": "2026-07-29T17:53:08.164033+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 8.68,
+        "audit_id": 423845
+      },
+      {
+        "order_id": "1937095091",
+        "created_at_utc": "2026-07-29T18:11:51.576684+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": -9.99,
+        "audit_id": 424019
+      },
+      {
+        "order_id": "1937669560",
+        "created_at_utc": "2026-07-29T20:18:14.945998+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "OPEN",
+        "pnl_as_of": null,
+        "audit_id": 424968
+      },
+      {
+        "order_id": "1937747430",
+        "created_at_utc": "2026-07-29T20:37:51.486287+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 9.67,
+        "audit_id": 425031
+      },
+      {
+        "order_id": "1938082582",
+        "created_at_utc": "2026-07-29T22:21:51.539665+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "SETTLED",
+        "pnl_as_of": 4.66,
+        "audit_id": 425230
+      },
+      {
+        "order_id": "1938105954",
+        "created_at_utc": "2026-07-29T22:30:18.859170+00:00",
+        "policy_version": "H3BUP_vNext_20260629",
+        "stake": 10.0,
+        "status_as_of": "VOID",
+        "pnl_as_of": 0.0,
+        "audit_id": 425247
+      }
+    ],
+    "void_in_denominator": true
+  },
+  "root_causes": [
+    {
+      "ID": "PAR-001",
+      "metric": "LIVE_OK 22×24",
+      "symptom": "V1=22 V2_full=24",
+      "affected_order_ids": "1938082582,1938105954",
+      "root_cause": "2 LIVE_OK after V1 cutoff included in V2 DAILY_CLOSED full day",
+      "correct_behaviour": "parity view filters created_at<=parity_as_of → MATCH 22",
+      "classification": "EXPECTED_SCOPE_DIFFERENCE",
+      "patch_applied": "filter_orders_as_of + dual views",
+      "publication_blocker": "no",
+      "owner": "reporting"
+    },
+    {
+      "ID": "PAR-002",
+      "metric": "stake 220×240",
+      "symptom": "same two post-cutoff orders × stake 10",
+      "affected_order_ids": "1938082582,1938105954",
+      "root_cause": "consequence of PAR-001",
+      "correct_behaviour": "parity stake 220",
+      "classification": "EXPECTED_SCOPE_DIFFERENCE",
+      "patch_applied": "parity as-of universe",
+      "publication_blocker": "no",
+      "owner": "reporting"
+    },
+    {
+      "ID": "PAR-003",
+      "metric": "open 9×1",
+      "symptom": "V1 accounting-health open=9; matured open=1",
+      "affected_order_ids": "",
+      "root_cause": "AS_OF_MATURITY_DIFFERENCE + V1 health block used activation subset (n=12) not day universe (n=22)",
+      "correct_behaviour": "compare open only under same as_of and same order set",
+      "classification": "AS_OF_MATURITY_DIFFERENCE",
+      "patch_applied": "parity_as_of vs matured_as_of sections",
+      "publication_blocker": "no",
+      "owner": "reporting"
+    },
+    {
+      "ID": "PAR-004",
+      "metric": "settled 3×21",
+      "symptom": "V1 health settled=3; matured settled=21",
+      "affected_order_ids": "",
+      "root_cause": "settlements posted after V1 cutoff; plus V1 health subset",
+      "correct_behaviour": "parity uses snapshot/post-date<=cutoff; matured shows later settlements",
+      "classification": "AS_OF_MATURITY_DIFFERENCE",
+      "patch_applied": "dual settlement views",
+      "publication_blocker": "no",
+      "owner": "reporting"
+    },
+    {
+      "ID": "PAR-005",
+      "metric": "ROI definition",
+      "symptom": "V1 health ROI settled partial vs V2 roi_resolved",
+      "affected_order_ids": "",
+      "root_cause": "EXPECTED_DEFINITION_CHANGE: V2 principal=roi_resolved (void in denom)",
+      "correct_behaviour": "keep roi_resolved; document void; show roi_decided_ex_void",
+      "classification": "EXPECTED_DEFINITION_CHANGE",
+      "patch_applied": "documented in methodology",
+      "publication_blocker": "no",
+      "owner": "reporting"
+    }
+  ],
+  "unknown_divergent": [],
+  "publication_blockers": [],
+  "safety": {
+    "alters_execution": false,
+    "alters_policy": false,
+    "alters_stake": false,
+    "creates_orders": false,
+    "opens_betslips": false,
+    "v2_official": false
+  },
+  "generated_at_utc": "2026-07-30T20:23:40.223866+00:00",
+  "run_id": "964f1a41abe4",
+  "git_commit": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "hostname": "ubuntu-s-2vcpu-4gb-120gb-intel-sgp1-01",
+  "official_status": "PREVIEW_NOT_OFFICIAL",
+  "manual_validation": false,
+  "parity_hardening": true
+}
