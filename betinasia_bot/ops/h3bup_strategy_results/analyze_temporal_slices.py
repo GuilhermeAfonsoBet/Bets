@@ -103,23 +103,26 @@ def metrics(rs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "ci95": [vals_b[int(0.025 * len(vals_b))], vals_b[int(0.975 * len(vals_b)) - 1]],
             "p_pos": sum(1 for v in vals_b if v > 0) / len(vals_b),
         }
-    # CLV5 boot
-    clv5_vals = [
-        fnum(r.get("clv_post_5m"))
-        for r in rs
-        if fbool(r.get("clv_post_5m_valid_strict")) and fnum(r.get("clv_post_5m")) is not None
-    ]
-    clv5_vals = [v for v in clv5_vals if v is not None]
-    clv5_boot = None
-    if clv5_vals:
-        rng = random.Random(77 + len(clv5_vals))
-        out = [statistics.mean(rng.choices(clv5_vals, k=len(clv5_vals))) for _ in range(3000)]
+    def _boot_clv(field: str, validf: str, seed: int) -> Optional[Dict[str, Any]]:
+        vals = [
+            fnum(r.get(field))
+            for r in rs
+            if fbool(r.get(validf)) and fnum(r.get(field)) is not None
+        ]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        rng = random.Random(seed + len(vals))
+        out = [statistics.mean(rng.choices(vals, k=len(vals))) for _ in range(3000)]
         out.sort()
-        clv5_boot = {
+        return {
             "mean": statistics.mean(out),
             "ci95": [out[int(0.025 * len(out))], out[int(0.975 * len(out)) - 1]],
             "p_pos": sum(1 for v in out if v > 0) / len(out),
         }
+
+    clv5_boot = _boot_clv("clv_post_5m", "clv_post_5m_valid_strict", 77)
+    clvC_boot = _boot_clv("clv_closing", "clv_closing_valid_strict", 91)
     return {
         "n": len(rs),
         "events": len({r.get("event_id") for r in rs}),
@@ -137,6 +140,7 @@ def metrics(rs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "clv": clv,
         "roi_boot": roi_boot,
         "clv5_boot": clv5_boot,
+        "clvC_boot": clvC_boot,
     }
 
 
@@ -253,7 +257,10 @@ def main() -> int:
                 "pnl": m["pnl"],
                 "clv5_mean": m["clv"]["POST_5M"]["mean"],
                 "clv5_n": m["clv"]["POST_5M"]["n"],
+                "clv5_pos": m["clv"]["POST_5M"]["p_positive"],
                 "clvC_mean": m["clv"]["CLOSING"]["mean"],
+                "clvC_n": m["clv"]["CLOSING"]["n"],
+                "clvC_pos": m["clv"]["CLOSING"]["p_positive"],
                 "wr": m["wr"],
             }
         )
@@ -265,6 +272,7 @@ def main() -> int:
             "stake2_start_utc": STAKE2_START.isoformat(),
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "n_total": len(rows),
+            "clv_windows": ["POST_5M", "POST_15M", "CLOSING"],
         },
         "slices": [
             {
@@ -277,9 +285,11 @@ def main() -> int:
                 "roi": r["roi"],
                 "wr": r["wr"],
                 "clv5": r["clv"]["POST_5M"],
+                "clv15": r["clv"]["POST_15M"],
                 "clvC": r["clv"]["CLOSING"],
                 "roi_boot": r["roi_boot"],
                 "clv5_boot": r["clv5_boot"],
+                "clvC_boot": r["clvC_boot"],
                 "friendly_n": r["friendly_n"],
                 "nf_n": r["nf_n"],
                 "stake_placed": r["stake_placed"],
@@ -292,7 +302,6 @@ def main() -> int:
     }
     (out / f"h3bup_temporal_bundle_{run}.json").write_text(json.dumps(bundle, indent=2, default=str), encoding="utf-8")
 
-    # CSV main slices (exclude day_* from primary table? include all in one csv)
     flat = []
     for r in results:
         flat.append(
@@ -317,11 +326,14 @@ def main() -> int:
                 "clvC_n": r["clv"]["CLOSING"]["n"],
                 "clvC_mean": r["clv"]["CLOSING"]["mean"],
                 "clvC_pos": r["clv"]["CLOSING"]["p_positive"],
+                "clvC_cov": r["clv"]["CLOSING"]["coverage"],
                 "roi_ci95_lo": (r["roi_boot"]["ci95"][0] if r["roi_boot"] else None),
                 "roi_ci95_hi": (r["roi_boot"]["ci95"][1] if r["roi_boot"] else None),
                 "roi_p_pos": (r["roi_boot"]["p_pos"] if r["roi_boot"] else None),
                 "clv5_ci95_lo": (r["clv5_boot"]["ci95"][0] if r["clv5_boot"] else None),
                 "clv5_ci95_hi": (r["clv5_boot"]["ci95"][1] if r["clv5_boot"] else None),
+                "clvC_ci95_lo": (r["clvC_boot"]["ci95"][0] if r["clvC_boot"] else None),
+                "clvC_ci95_hi": (r["clvC_boot"]["ci95"][1] if r["clvC_boot"] else None),
             }
         )
     with (out / f"h3bup_temporal_slices_{run}.csv").open("w", newline="", encoding="utf-8") as f:
@@ -340,17 +352,42 @@ def main() -> int:
     def row_by_id(sid: str) -> Dict[str, Any]:
         return next(r for r in results if r["id"] == sid)
 
-    # Report
+    full = row_by_id("full")
+    s10 = row_by_id("era_stake10")
+    s2 = row_by_id("era_stake2")
+    l3 = row_by_id("last_3d")
+    l5 = row_by_id("last_5d")
+    l7 = row_by_id("last_7d")
+    s2e = row_by_id("stake2_early")
+    s2l = row_by_id("stake2_late")
+    l1 = row_by_id("last_1d")
+
+    def d_roi(r: Dict[str, Any]) -> str:
+        if r["roi"] is None or full["roi"] is None:
+            return "—"
+        return f"{(r['roi'] - full['roi']) * 100:+.1f} pp"
+
+    def d_clv(r: Dict[str, Any], window: str) -> str:
+        a_ = r["clv"][window]["mean"]
+        b = full["clv"][window]["mean"]
+        if a_ is None or b is None:
+            return "—"
+        return f"{a_ - b:+.2f}"
+
+    def clv_cell(r: Dict[str, Any], window: str) -> str:
+        c = r["clv"][window]
+        return f"{fmt_clv(c['mean'])} (n={c['n']}, pos={pct(c['p_positive'])})"
+
     lines: List[str] = []
     a = lines.append
-    a("# H3BUP_vNext — Recortes temporais (CLV + ROI)\n")
+    a("# H3BUP_vNext — Recortes temporais (CLV 5m + Closing + ROI)\n")
     a(f"- **Freeze:** `{run}` · as-of `2026-08-07T14:25:06Z`")
     a(f"- **N total:** {len(rows)} · stake2 desde `{STAKE2_START.isoformat()}`")
-    a("- **Foco:** comparar se os últimos dias melhoraram em **ROI e CLV**\n")
-    a("> Read-only. CLV = VALID_STRICT. ROI = P&L settled / stake resolved.\n")
+    a("- **Foco:** ROI + **CLV POST_5M** + **CLV CLOSING** (VALID_STRICT)\n")
+    a("> Read-only. ROI = P&L settled / stake resolved (void no denominador).\n")
 
     a("## 1) Recortes principais\n")
-    a("| Recorte | N | Settled/Open | P&L | ROI | IC95 ROI | CLV5 mean (n) | CLV Close | WR |")
+    a("| Recorte | N | Settled/Open | P&L | ROI | IC95 ROI | CLV5 mean (n/%pos) | CLV Closing mean (n/%pos) | WR |")
     a("|---|---:|---:|---:|---:|---|---:|---:|---:|")
     main_ids = [
         "full",
@@ -375,31 +412,17 @@ def main() -> int:
         ci = "—"
         if r["roi_boot"]:
             ci = f"[{pct(r['roi_boot']['ci95'][0])}, {pct(r['roi_boot']['ci95'][1])}]"
-        c5 = f"{fmt_clv(r['clv']['POST_5M']['mean'])} ({r['clv']['POST_5M']['n']})"
+        c5 = clv_cell(r, "POST_5M")
+        cc = clv_cell(r, "CLOSING")
         a(
             f"| {r['label']} | {r['n']} | {r['settled']}/{r['open']} | {money(r['pnl'])} | "
-            f"**{pct(r['roi'])}** | {ci} | {c5} | {fmt_clv(r['clv']['CLOSING']['mean'])} | {pct(r['wr'])} |"
+            f"**{pct(r['roi'])}** | {ci} | {c5} | {cc} | {pct(r['wr'])} |"
         )
     a("")
 
-    # Highlight comparison
-    full = row_by_id("full")
-    s10 = row_by_id("era_stake10")
-    s2 = row_by_id("era_stake2")
-    l3 = row_by_id("last_3d")
-    l7 = row_by_id("last_7d")
-    s2e = row_by_id("stake2_early")
-    s2l = row_by_id("stake2_late")
-
     a("## 2) A estratégia melhorou nos últimos dias?\n")
-    a("| Comparação | ROI | Δ vs full | CLV5 | Δ CLV5 vs full |")
-    a("|---|---:|---:|---:|---:|")
-
-    def delta(a_: Optional[float], b: Optional[float]) -> str:
-        if a_ is None or b is None:
-            return "—"
-        return f"{(a_ - b) * 100:+.1f} pp"
-
+    a("| Comparação | N | ROI | Δ ROI vs full | CLV5 | Δ CLV5 | CLV Closing | Δ Closing |")
+    a("|---|---:|---:|---:|---:|---:|---:|---:|")
     for label, r in [
         ("Full período", full),
         ("Era stake10", s10),
@@ -407,19 +430,15 @@ def main() -> int:
         ("stake2 1ª metade", s2e),
         ("stake2 2ª metade", s2l),
         ("Últimos 7d", l7),
+        ("Últimos 5d", l5),
         ("Últimos 3d", l3),
-        ("Últimos 1d", row_by_id("last_1d")),
+        ("Últimos 1d", l1),
     ]:
         a(
-            f"| {label} | {pct(r['roi'])} | {delta(r['roi'], full['roi'])} | "
-            f"{fmt_clv(r['clv']['POST_5M']['mean'])} | "
-            f"{delta((r['clv']['POST_5M']['mean'] or 0)/100 if r['clv']['POST_5M']['mean'] is not None else None, (full['clv']['POST_5M']['mean'] or 0)/100 if full['clv']['POST_5M']['mean'] is not None else None)} |"
+            f"| {label} | {r['n']} | {pct(r['roi'])} | {d_roi(r)} | "
+            f"{fmt_clv(r['clv']['POST_5M']['mean'])} | {d_clv(r, 'POST_5M')} | "
+            f"{fmt_clv(r['clv']['CLOSING']['mean'])} | {d_clv(r, 'CLOSING')} |"
         )
-    # Fix delta for CLV - they're already in percent units (e.g. -1.35 meaning -1.35%), not fractions
-    # Actually in metrics clv mean is like -1.35 (percent points already from clv_raw_pct).
-    # delta() multiplies by 100 assuming fraction - WRONG for CLV.
-    # I'll fix the comparison table below by rewriting CLV delta properly in a cleaner section.
-
     a("")
     a("### Leitura objetiva\n")
     a(
@@ -427,157 +446,168 @@ def main() -> int:
         f"vs stake10 **{pct(s10['roi'])}**."
     )
     a(
-        f"2. **stake2 late vs early:** {pct(s2l['roi'])} vs {pct(s2e['roi'])} "
+        f"2. **stake2 late vs early:** ROI {pct(s2l['roi'])} vs {pct(s2e['roi'])} "
         f"(P&L late {money(s2l['pnl'])}, early {money(s2e['pnl'])})."
     )
     a(
-        f"3. **CLV5 recente:** últimos 3d {fmt_clv(l3['clv']['POST_5M']['mean'])} (n={l3['clv']['POST_5M']['n']}) "
-        f"vs full {fmt_clv(full['clv']['POST_5M']['mean'])} — "
-        + (
-            "CLV também melhorou (menos negativo / positivo)."
-            if (l3["clv"]["POST_5M"]["mean"] is not None and full["clv"]["POST_5M"]["mean"] is not None and l3["clv"]["POST_5M"]["mean"] > full["clv"]["POST_5M"]["mean"])
-            else "CLV **não** confirma melhoria de preço (igual ou pior)."
-        )
+        f"3. **CLV POST_5M:** últimos 3d {fmt_clv(l3['clv']['POST_5M']['mean'])} "
+        f"(n={l3['clv']['POST_5M']['n']}, pos={pct(l3['clv']['POST_5M']['p_positive'])}) "
+        f"vs full {fmt_clv(full['clv']['POST_5M']['mean'])}."
     )
-    a("4. Melhoria só em ROI sem CLV positivo = possível **sorte de settlement / sample curto**, não edge estrutural.")
-    a("5. N dos recortes curtos é pequeno — IC95 largos; não fechar decisão operacional só com 1–3 dias.\n")
+    a(
+        f"4. **CLV CLOSING:** últimos 3d {fmt_clv(l3['clv']['CLOSING']['mean'])} "
+        f"(n={l3['clv']['CLOSING']['n']}, pos={pct(l3['clv']['CLOSING']['p_positive'])}) "
+        f"vs full {fmt_clv(full['clv']['CLOSING']['mean'])} "
+        f"(Δ {d_clv(l3, 'CLOSING')} pp)."
+    )
+    clv5_worse = (
+        l3["clv"]["POST_5M"]["mean"] is not None
+        and full["clv"]["POST_5M"]["mean"] is not None
+        and l3["clv"]["POST_5M"]["mean"] <= full["clv"]["POST_5M"]["mean"]
+    )
+    clvC_worse = (
+        l3["clv"]["CLOSING"]["mean"] is not None
+        and full["clv"]["CLOSING"]["mean"] is not None
+        and l3["clv"]["CLOSING"]["mean"] <= full["clv"]["CLOSING"]["mean"]
+    )
+    if clv5_worse and clvC_worse:
+        a("5. **CLV 5m e Closing** nos últimos 3d estão **iguais ou piores** que o full → ROI recente **não** é confirmado por preço.")
+    elif clv5_worse or clvC_worse:
+        a("5. Um dos CLVs (5m ou Closing) não confirma a melhoria de ROI; ler as duas janelas em conjunto.")
+    else:
+        a("5. CLV 5m e Closing recentes melhoram vs full — evidência preliminar de preço também melhor.")
+    a("6. N dos recortes curtos é pequeno — IC95 largos; não fechar decisão operacional só com 1–3 dias.\n")
 
-    a("## 3) Dia a dia\n")
-    a("| Dia | N | F/NF | Era dom. | P&L | ROI | CLV5 (n) | CLV Close (n) | WR |")
+    a("## 3) Dia a dia (ROI + CLV5 + Closing)\n")
+    a("| Dia | N | F/NF | Era | P&L | ROI | CLV5 (n/%pos) | CLV Closing (n/%pos) | WR |")
     a("|---|---:|---:|---|---:|---:|---:|---:|---:|")
     for r in results:
         if not r["id"].startswith("day_"):
             continue
-        eras = {}
+        eras: Dict[str, int] = {}
         day = r["id"].replace("day_", "")
         for x in by_day[day]:
             eras[x["_era"]] = eras.get(x["_era"], 0) + 1
         era_dom = max(eras, key=eras.get) if eras else "—"
-        c5 = f"{fmt_clv(r['clv']['POST_5M']['mean'])} ({r['clv']['POST_5M']['n']})"
-        cc = f"{fmt_clv(r['clv']['CLOSING']['mean'])} ({r['clv']['CLOSING']['n']})"
         a(
             f"| {day} | {r['n']} | {r['friendly_n']}/{r['nf_n']} | {era_dom} | "
-            f"{money(r['pnl'])} | {pct(r['roi'])} | {c5} | {cc} | {pct(r['wr'])} |"
+            f"{money(r['pnl'])} | {pct(r['roi'])} | {clv_cell(r, 'POST_5M')} | "
+            f"{clv_cell(r, 'CLOSING')} | {pct(r['wr'])} |"
         )
     a("")
 
-    a("## 4) Rolling 7 dias (série)\n")
-    a("| Fim (UTC) | N | ROI | P&L | CLV5 mean (n) | CLV Close | WR |")
+    a("## 4) Rolling 7 dias (ROI + CLV5 + Closing)\n")
+    a("| Fim (UTC) | N | ROI | P&L | CLV5 mean (n/%pos) | CLV Closing mean (n/%pos) | WR |")
     a("|---|---:|---:|---:|---:|---:|---:|")
     for r in rolling:
-        c5 = f"{fmt_clv(r['clv5_mean'])} ({r['clv5_n']})"
+        c5 = f"{fmt_clv(r['clv5_mean'])} ({r['clv5_n']}/{pct(r['clv5_pos'])})"
+        cc = f"{fmt_clv(r['clvC_mean'])} ({r['clvC_n']}/{pct(r['clvC_pos'])})"
         a(
             f"| {r['end_day']} | {r['n']} | {pct(r['roi'])} | {money(r['pnl'])} | "
-            f"{c5} | {fmt_clv(r['clvC_mean'])} | {pct(r['wr'])} |"
+            f"{c5} | {cc} | {pct(r['wr'])} |"
         )
     a("")
-    a("Se a curva rolling 7d de ROI sobe mas CLV5 rolling continua ≤0, a melhoria é **frágil**.\n")
+    a("Se ROI rolling sobe mas **CLV5 e/ou Closing** continuam ≤0, a melhoria é **frágil**.\n")
 
     a("## 5) Semanas ISO\n")
-    a("| Semana | N | ROI | CLV5 | CLV Close | P&L |")
+    a("| Semana | N | ROI | CLV5 (n/%pos) | CLV Closing (n/%pos) | P&L |")
     a("|---|---:|---:|---:|---:|---:|")
     for r in results:
         if not r["id"].startswith("week_"):
             continue
         a(
-            f"| {r['label']} | {r['n']} | {pct(r['roi'])} | {fmt_clv(r['clv']['POST_5M']['mean'])} | "
-            f"{fmt_clv(r['clv']['CLOSING']['mean'])} | {money(r['pnl'])} |"
+            f"| {r['label']} | {r['n']} | {pct(r['roi'])} | {clv_cell(r, 'POST_5M')} | "
+            f"{clv_cell(r, 'CLOSING')} | {money(r['pnl'])} |"
         )
     a("")
 
-    # Verdict banner
-    improved_roi = (l3["roi"] is not None and full["roi"] is not None and l3["roi"] > full["roi"] + 0.02)
-    improved_clv = (
+    a("## 6) Bootstrap CLV Closing (recortes-chave)\n")
+    a("| Recorte | N valid Closing | Mean | IC95 | P(CLV>0) |")
+    a("|---|---:|---:|---|---:|")
+    for label, r in [
+        ("Full", full),
+        ("stake10", s10),
+        ("stake2", s2),
+        ("Últimos 7d", l7),
+        ("Últimos 5d", l5),
+        ("Últimos 3d", l3),
+    ]:
+        b = r.get("clvC_boot")
+        n_v = r["clv"]["CLOSING"]["n"]
+        if not b:
+            a(f"| {label} | {n_v} | — | — | — |")
+            continue
+        a(
+            f"| {label} | {n_v} | {b['mean']:.2f}% | "
+            f"[{b['ci95'][0]:.2f}%, {b['ci95'][1]:.2f}%] | {pct(b['p_pos'])} |"
+        )
+    a("")
+
+    improved_roi = l3["roi"] is not None and full["roi"] is not None and l3["roi"] > full["roi"] + 0.02
+    improved_clv5 = (
         l3["clv"]["POST_5M"]["mean"] is not None
         and full["clv"]["POST_5M"]["mean"] is not None
         and l3["clv"]["POST_5M"]["mean"] > full["clv"]["POST_5M"]["mean"] + 0.5
     )
+    improved_clvC = (
+        l3["clv"]["CLOSING"]["mean"] is not None
+        and full["clv"]["CLOSING"]["mean"] is not None
+        and l3["clv"]["CLOSING"]["mean"] > full["clv"]["CLOSING"]["mean"] + 0.5
+    )
+    improved_clv = improved_clv5 and improved_clvC
     if improved_roi and improved_clv:
         verdict = "RECENT_IMPROVEMENT_ROI_AND_CLV_PRELIMINARY"
-    elif improved_roi and not improved_clv:
+    elif improved_roi and (improved_clv5 or improved_clvC):
+        verdict = "RECENT_ROI_UP_CLV_MIXED"
+    elif improved_roi and not improved_clv5 and not improved_clvC:
         verdict = "RECENT_ROI_UP_BUT_CLV_NOT_CONFIRMED"
     elif not improved_roi and improved_clv:
         verdict = "RECENT_CLV_UP_BUT_ROI_LAGS"
     else:
         verdict = "NO_CLEAR_RECENT_IMPROVEMENT"
 
-    a("## 6) Veredicto do recorte\n")
+    a("## 7) Veredicto do recorte\n")
     a(f"**`{verdict}`**\n")
     a(f"- Últimos 3d ROI={pct(l3['roi'])} (n={l3['n']}, settled={l3['settled']})")
-    a(f"- Últimos 3d CLV5={fmt_clv(l3['clv']['POST_5M']['mean'])} (n_valid={l3['clv']['POST_5M']['n']})")
-    a(f"- Full ROI={pct(full['roi'])} · Full CLV5={fmt_clv(full['clv']['POST_5M']['mean'])}")
+    a(
+        f"- Últimos 3d CLV5={fmt_clv(l3['clv']['POST_5M']['mean'])} "
+        f"(n={l3['clv']['POST_5M']['n']}, pos={pct(l3['clv']['POST_5M']['p_positive'])})"
+    )
+    a(
+        f"- Últimos 3d CLV Closing={fmt_clv(l3['clv']['CLOSING']['mean'])} "
+        f"(n={l3['clv']['CLOSING']['n']}, pos={pct(l3['clv']['CLOSING']['p_positive'])})"
+    )
+    a(
+        f"- Full: ROI={pct(full['roi'])} · CLV5={fmt_clv(full['clv']['POST_5M']['mean'])} · "
+        f"Closing={fmt_clv(full['clv']['CLOSING']['mean'])}"
+    )
     a(f"- stake2 ROI={pct(s2['roi'])} · stake10 ROI={pct(s10['roi'])}\n")
 
-    a("## 7) Artefactos\n")
+    a("## 8) Artefactos\n")
     a(f"- `logs/h3bup_strategy_results/20260807/temporal_{run}/`")
     a(f"- Freeze base: `logs/h3bup_friendly_analysis/20260807/{run}/`\n")
 
     text = "\n".join(lines) + "\n"
-    # Fix the broken CLV delta table section - replace section 2 comparison table with clean one
-    # Actually rebuild section 2 comparison more cleanly by rewriting file content for that part
-    text_lines = text.splitlines()
-    out_lines: List[str] = []
-    skip = False
-    for i, line in enumerate(text_lines):
-        if line.startswith("## 2) A estratégia melhorou"):
-            out_lines.append(line)
-            out_lines.append("")
-            out_lines.append("| Comparação | N | ROI | Δ ROI vs full | CLV5 | Δ CLV5 vs full (pp) |")
-            out_lines.append("|---|---:|---:|---:|---:|---:|")
-            for label, r in [
-                ("Full período", full),
-                ("Era stake10", s10),
-                ("Era stake2", s2),
-                ("stake2 1ª metade", s2e),
-                ("stake2 2ª metade", s2l),
-                ("Últimos 7d", l7),
-                ("Últimos 3d", l3),
-                ("Últimos 1d", row_by_id("last_1d")),
-            ]:
-                d_roi = "—"
-                if r["roi"] is not None and full["roi"] is not None:
-                    d_roi = f"{(r['roi'] - full['roi']) * 100:+.1f} pp"
-                d_clv = "—"
-                if r["clv"]["POST_5M"]["mean"] is not None and full["clv"]["POST_5M"]["mean"] is not None:
-                    d_clv = f"{r['clv']['POST_5M']['mean'] - full['clv']['POST_5M']['mean']:+.2f}"
-                out_lines.append(
-                    f"| {label} | {r['n']} | {pct(r['roi'])} | {d_roi} | "
-                    f"{fmt_clv(r['clv']['POST_5M']['mean'])} | {d_clv} |"
-                )
-            skip = True
-            continue
-        if skip:
-            if line.startswith("### Leitura objetiva"):
-                skip = False
-                out_lines.append("")
-                out_lines.append(line)
-            continue
-        out_lines.append(line)
-    text = "\n".join(out_lines) + "\n"
-
     (out / f"h3bup_temporal_report_{run}.md").write_text(text, encoding="utf-8")
     (docs / "h3bup_temporal_slices_20260807.md").write_text(text, encoding="utf-8")
 
-    exec_sum = f"""# Executive — Recortes temporais H3BUP (2026-08-07)
+    exec_sum = f"""# Executive — Recortes temporais H3BUP (CLV5 + Closing + ROI)
 
 - **Veredicto:** `{verdict}`
-- Full ROI {pct(full['roi'])} · CLV5 {fmt_clv(full['clv']['POST_5M']['mean'])}
-- stake10 ROI {pct(s10['roi'])} → stake2 ROI {pct(s2['roi'])}
-- Últimos 7d ROI {pct(l7['roi'])} · CLV5 {fmt_clv(l7['clv']['POST_5M']['mean'])}
-- Últimos 3d ROI {pct(l3['roi'])} · CLV5 {fmt_clv(l3['clv']['POST_5M']['mean'])} (n={l3['n']})
-- stake2 late ROI {pct(s2l['roi'])} vs early {pct(s2e['roi'])}
+- Full: ROI {pct(full['roi'])} · CLV5 {fmt_clv(full['clv']['POST_5M']['mean'])} · **Closing {fmt_clv(full['clv']['CLOSING']['mean'])}**
+- stake10 → stake2: ROI {pct(s10['roi'])} → {pct(s2['roi'])} · Closing {fmt_clv(s10['clv']['CLOSING']['mean'])} → {fmt_clv(s2['clv']['CLOSING']['mean'])}
+- Últimos 7d: ROI {pct(l7['roi'])} · CLV5 {fmt_clv(l7['clv']['POST_5M']['mean'])} · Closing {fmt_clv(l7['clv']['CLOSING']['mean'])}
+- Últimos 3d: ROI {pct(l3['roi'])} · CLV5 {fmt_clv(l3['clv']['POST_5M']['mean'])} · **Closing {fmt_clv(l3['clv']['CLOSING']['mean'])}** (n={l3['n']})
+- stake2 late vs early: ROI {pct(s2l['roi'])} vs {pct(s2e['roi'])} · Closing {fmt_clv(s2l['clv']['CLOSING']['mean'])} vs {fmt_clv(s2e['clv']['CLOSING']['mean'])}
 
-ROI recente pode parecer melhor; validar sempre contra CLV. N curto ⇒ preliminar.
+ROI recente pode parecer melhor; **CLV Closing** precisa confirmar. N curto ⇒ preliminar.
 """
     (out / f"h3bup_temporal_executive_{run}.md").write_text(exec_sum, encoding="utf-8")
     (docs / "h3bup_temporal_slices_executive_20260807.md").write_text(exec_sum, encoding="utf-8")
 
     print("VERDICT", verdict)
-    print("full", full["roi"], full["clv"]["POST_5M"]["mean"])
-    print("last3", l3["roi"], l3["clv"]["POST_5M"]["mean"], "n", l3["n"])
-    print("last7", l7["roi"], l7["clv"]["POST_5M"]["mean"])
-    print("s2", s2["roi"], "s10", s10["roi"])
-    print("s2e", s2e["roi"], "s2l", s2l["roi"])
+    print("full roi/clv5/close", full["roi"], full["clv"]["POST_5M"]["mean"], full["clv"]["CLOSING"]["mean"])
+    print("last3 roi/clv5/close", l3["roi"], l3["clv"]["POST_5M"]["mean"], l3["clv"]["CLOSING"]["mean"])
     print("WROTE", out)
     return 0
 
