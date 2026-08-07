@@ -1,0 +1,5 @@
+scenario,excluded_leagues,n_live_ok,stake_placed,pnl_resolved,roi_resolved
+total,,208,1104.0,-30.220000000000006,-0.029057692307692312
+without_top1_league,UEFA Europa League,196,1032.0,-6.570000000000006,-0.0067871900826446336
+without_top3_leagues,UEFA Europa League|CONMEBOL Copa Sudamericana|Scotland Premier League,182,956.0,-6.010000000000007,-0.006633554083885217
+without_top5_leagues,UEFA Europa League|CONMEBOL Copa Sudamericana|Scotland Premier League|Colombia Cup|Club Friendly,69,314.0,-9.040000000000001,-0.03138888888888889

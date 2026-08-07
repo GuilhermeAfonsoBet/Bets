@@ -1,0 +1,18 @@
+{
+  "run_id": "a27c1dc4ab52",
+  "root": "/home/betbot/Bets/betinasia_bot",
+  "executor_jsonl": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+  "executor_exists": true,
+  "balance_paths": [
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260807_142209__balance.csv"
+  ],
+  "open_paths": [
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260807_142212__open_stakes.csv"
+  ],
+  "clv_snapshots": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_snapshots.jsonl",
+  "clv_exists": true,
+  "cutoff_utc": "2026-08-07T14:25:06+00:00",
+  "outputs_dir": "/home/betbot/Bets/betinasia_bot/logs/h3bup_friendly_analysis/20260807/a27c1dc4ab52",
+  "read_only": true,
+  "operational_changes": false
+}

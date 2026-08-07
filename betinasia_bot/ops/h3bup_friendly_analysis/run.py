@@ -365,6 +365,27 @@ def run_analysis(
     return bundle
 
 
+def _load_dotenv(root: Path) -> None:
+    """Best-effort load of .env so DATABASE_URL is available for league enrich."""
+    env_path = root / ".env"
+    if not env_path.exists():
+        return
+    try:
+        import os
+
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="H3BUP Friendly analysis (read-only)")
     p.add_argument("--root", type=Path, default=Path("."))
@@ -375,6 +396,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--n-perm", type=int, default=500)
     p.add_argument("--no-secondary", action="store_true")
     args = p.parse_args(argv)
+    _load_dotenv(Path(args.root))
     cutoff = parse_dt(args.cutoff) if args.cutoff else datetime.now(timezone.utc)
     try:
         bundle = run_analysis(

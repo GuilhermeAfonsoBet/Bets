@@ -1,0 +1,146 @@
+{
+  "n_friendly": 109,
+  "n_non_friendly": 99,
+  "n_events_total": 158,
+  "tests": {
+    "roi_resolved_diff_friendly_minus_non": {
+      "estimate": 0.006797435551760819,
+      "ci90": [
+        -0.21527241527241528,
+        0.229011293970597
+      ],
+      "ci95": [
+        -0.2593421642282852,
+        0.2690385192885193
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.9585207396301849,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    },
+    "clv_5m_diff": {
+      "estimate": -1.9391863807628273,
+      "ci90": [
+        -3.076518985217252,
+        -0.7945309314177382
+      ],
+      "ci95": [
+        -3.3013762652472542,
+        -0.6184758074615613
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.0009995002498750624,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    },
+    "clv_15m_diff": {
+      "estimate": -2.4480513075934027,
+      "ci90": [
+        -4.102865362168129,
+        -0.967053627986332
+      ],
+      "ci95": [
+        -4.41589089264177,
+        -0.7586758864647096
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.0004997501249375312,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    },
+    "clv_closing_diff": {
+      "estimate": -0.9510844478351215,
+      "ci90": [
+        -2.6992303082432443,
+        0.8469718497879402
+      ],
+      "ci95": [
+        -3.0232018337110818,
+        1.1966364011637662
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.383808095952024,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    },
+    "slippage_median_diff": {
+      "estimate": -2.2108652900688317,
+      "ci90": [
+        -2.6801695039713715,
+        -1.5776738004928168
+      ],
+      "ci95": [
+        -2.7434522829629207,
+        -1.4269087788201178
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.0004997501249375312,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    },
+    "pre_submit_median_diff": {
+      "estimate": 115.0,
+      "ci90": [
+        -13.0,
+        269.5
+      ],
+      "ci95": [
+        -39.5,
+        340.0
+      ],
+      "n_boot_used": 2000,
+      "n_a": 109,
+      "n_b": 99,
+      "n_events_a": 82,
+      "n_events_b": 76,
+      "status": "INSUFFICIENT_N",
+      "permutation_p_value": 0.10344827586206896,
+      "permutation_status": "INSUFFICIENT_N",
+      "unit": "order_id",
+      "cluster": "event_id"
+    }
+  },
+  "exploratory_regression": {
+    "model": "pnl ~ friendly + odd_at_decision + slippage_pre_pct + pre_submit_ms + capacity_final",
+    "n": 158,
+    "n_events": 123,
+    "friendly_coef_proxy": 0.006797435551760819,
+    "notes": [
+      "Exploratory only; coefficient proxy = ROI_friendly - ROI_non_friendly",
+      "Clustered bootstrap ICs reported in roi_resolved_diff_*",
+      "Do not use p-value alone as approval"
+    ],
+    "status": "FIRST_READING"
+  },
+  "disclaimer": "p-values are exploratory; not operational approval gates."
+}
