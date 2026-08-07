@@ -1,0 +1,96 @@
+{
+  "captured_at_utc": "2026-07-30T18:40:54.729193+00:00",
+  "report_date_utc": "2026-07-29",
+  "run_id": "a053b4a189ca",
+  "parity": {
+    "v1_report_path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.md",
+    "v1_report_day_folder": "20260729",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_generated_at_utc": "2026-07-30T18:40:17.542602+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Compara\u00e7\u00e3o de paridade usa o cutoff l\u00f3gico do V1. Eventos ap\u00f3s v1_report_cutoff_utc at\u00e9 v2_generated_at_utc s\u00e3o apenas diagn\u00f3stico intraday e n\u00e3o entram na paridade."
+  },
+  "report_health": {
+    "status": "HEALTHY"
+  },
+  "operations_health": {
+    "status": "WATCH"
+  },
+  "data_quality": {
+    "status": "WATCH"
+  },
+  "statistical_readiness": {
+    "status": "INSUFFICIENT_N"
+  },
+  "principal_metric": "roi_resolved",
+  "live_ok": 24,
+  "alerts_n": 6,
+  "telegram": {
+    "status": "SENT",
+    "message_id": 78212
+  },
+  "official_status": "PREVIEW_NOT_OFFICIAL",
+  "safety": {
+    "alters_execution": false,
+    "alters_policy": false,
+    "alters_stake": false,
+    "creates_orders": false,
+    "opens_betslips": false
+  },
+  "artifacts": {
+    "h3bup_daily_p0_v2_smoke_20260730.json": {
+      "sha256": "2218ffc369e3e9943741359fdf090e5041df58746a1d1b71b00ae14dad1f1db5",
+      "size": 1148
+    },
+    "h3bup_daily_p0_clv_20260730.csv": {
+      "sha256": "ef107884619744767b06cae8b5a3490eddea8c92642110379df7d46e16892163",
+      "size": 420
+    },
+    "h3bup_daily_p0_tests_20260730.txt": {
+      "sha256": "45bf554f784d6d339f90bb6f2a54a178a124a80e047101d07fa0abca4896925b",
+      "size": 696
+    },
+    "h3bup_daily_p0_v2_preview_20260730.pdf": {
+      "sha256": "e6e3447e487e14a1f9507a1454991bffa26fbed6098356d83e72028e223509e6",
+      "size": 19026
+    },
+    "h3bup_daily_p0_e2e_20260730.csv": {
+      "sha256": "1cd0ff59545545cab3bc86d23a2b063a155e71eee2c699481c79d51d0b178113",
+      "size": 888
+    },
+    "h3bup_daily_p0_health_20260730.json": {
+      "sha256": "73253b13db1d06fcbf416943d9720283874b17bd261c0ea35af100fe62c51727",
+      "size": 3533
+    },
+    "h3bup_daily_p0_alerts_20260730.csv": {
+      "sha256": "05cf6017ae2125485c46ce2fb5c6b4e2c47973b970ac7abafd23fb44386fe226",
+      "size": 1325
+    },
+    "h3bup_daily_p0_canonical_20260730.json": {
+      "sha256": "7f5294eff21d0d30a21d58672b3dd2438ed00c2211cd50c25968965993a46308",
+      "size": 46077
+    },
+    "h3bup_daily_p0_execution_funnel_20260730.csv": {
+      "sha256": "af870a082285021011215090e0b9264818808cfc2c85b89819fd103a4526f71b",
+      "size": 789
+    },
+    "h3bup_daily_p0_v1_summary_20260730.md": {
+      "sha256": "c59fa0a594feecf45ecb22f051f5700c4a1101acdbf3d0f8911561e18ffdba1d",
+      "size": 2034
+    },
+    "h3bup_daily_p0_v1_vs_v2_20260730.csv": {
+      "sha256": "bdf546323b889130d06329cfc0770f5672ea714eb1c18211ddf4b1cba7e2a444",
+      "size": 1575
+    },
+    "h3bup_daily_p0_v1_20260730.pdf": {
+      "sha256": "7aadcd3caf3bffceb8bc79fa62f2d924b7f6b9cda3c361b483e0f05403c78bf0",
+      "size": 161436
+    },
+    "h3bup_daily_p0_before_state_20260730.json": {
+      "sha256": "f59c4cca6d469a27bbb6a1963b093bb6b900c583141a16b0d522cb4322743fc5",
+      "size": 1584
+    }
+  }
+}

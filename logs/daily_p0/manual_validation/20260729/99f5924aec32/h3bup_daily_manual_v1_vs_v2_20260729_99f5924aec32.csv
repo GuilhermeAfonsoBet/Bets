@@ -1,0 +1,19 @@
+metric,v1,v2,delta,status,cause,correct_version
+LIVE_OK,22,24,2.0,FILTER_DIFFERENCE,V2 filters H3BUP_vNext + created_at UTC closed cohort,v2
+stake placed,220.0,240.0,20.0,FILTER_DIFFERENCE,same universe when H3BUP filtered,v2
+open,9,1,-8.0,JOIN_DIFFERENCE,accounting join,v2
+settled,3,21,18.0,JOIN_DIFFERENCE,accounting join; V2 separates void,v2
+void,,2,,PARITY_UNAVAILABLE,V2 explicit void/push,v2
+missing,,0,,PARITY_UNAVAILABLE,join difference if ledger incomplete,v2
+P&L,,6.600000000000001,,PARITY_UNAVAILABLE,resolved vs mixed account,v2
+ROI,-0.014333333333333384,0.02869565217391305,0.04302898550724643,EXPECTED_DEFINITION_CHANGE,V2 principal=roi_resolved (void in denom) | definition/universe differ between V1 tables and V2 H3BUP filter,v2
+fast <=6s,,24,,PARITY_UNAVAILABLE,V1 dual 5s/6s; V2 Daily fixed <=6s — expected definition change,v2
+study fast <4s,,23,,PARITY_UNAVAILABLE,exploratory study contract,v2
+POST_5M strict,,7,,PARITY_UNAVAILABLE,VALID_STRICT only,v2
+POST_15M strict,,6,,PARITY_UNAVAILABLE,VALID_STRICT only,v2
+CLOSING strict,,8,,PARITY_UNAVAILABLE,VALID_STRICT only,v2
+E2E LIVE_OK,,23,,PARITY_UNAVAILABLE,E2E all-traces vs cohort window — source/window difference,v2
+ROIw Total,24.03,2.869565217391305,-21.160434782608696,FILTER_DIFFERENCE,Same formula when universe matches; V2 also emits settled-aware roiw_total_v2,both_versioned
+fair_edge,omitted_or_zero_risk,NOT_IMPLEMENTED,,UNKNOWN,V2 explicit NOT_IMPLEMENTED,v2
+cohort_timestamp,mixed created_at + post date tables,created_at UTC only,,EXPECTED_DEFINITION_CHANGE,V1 dual attribution — expected definition change,v2
+report_date,2026-07-29,2026-07-29,,MATCH,parity requires same report_date_utc,v2

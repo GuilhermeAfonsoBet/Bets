@@ -1,0 +1,10 @@
+metric,v1,v2,delta,cause,correct_version
+LIVE_OK_cohort,2_in_rolling_24h_at_2201Z_report,3_in_DAILY_CLOSED_2026-07-28,+1,V1 report gerado 22:01 UTC omite LIVE_OK 23:58Z; V2 coorte fechada UTC inclui dia completo,v2
+ROIw_Total_exec_day,present_in_v1_table_created_at,-1.43pct_on_n3_stake30,n/a,Universos diferentes (V1 Back all vs V2 H3BUP filter + closed day); parser md V1 não é fonte canónica,both_versioned_side_by_side
+ROI_settled,implicit_or_in_accounting_health,-0.0143_AVAILABLE,n/a,V2 torna roi_settled métrica principal explícita,v2
+DAILY_FAST_LE_6S,mixed_5s_or_6s_or_call_to_done,3_of_3_pre_submit_le_6000,n/a,V2 contrato único <=6s; study <4s separado (também 3/3),v2_for_daily
+fair_edge,omitted_in_sample_20260728,NOT_IMPLEMENTED,n/a,V2 nunca mostra 0,v2
+cohort_timestamp,mixed_created_at_and_post_date,created_at_UTC_only,n/a,Contrato utilizador,v2
+schema_run_id_cutoff,absent,schema2_run_id_cutoff_present,n/a,V2 envelope,v2
+atomic_lkg,absent,present_shadow,n/a,V2 io_atomic + lkg,v2
+publish,telegram_v1_official,shadow_PUBLISH=0,n/a,Gates de paridade ainda pendentes para publicação,v1_until_gates
