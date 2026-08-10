@@ -8,7 +8,7 @@
 ## Respostas (1–39)
 
 1. Ordens resolvidas: **244**
-2. Eventos únicos (LIVE_OK): **211**
+2. Eventos únicos: **211** LIVE_OK / **189** resolvidas
 3. Stake resolvida: **1176.00**
 4. P&L: **-18.24**
 5. ROI observado: **-1.55%**
