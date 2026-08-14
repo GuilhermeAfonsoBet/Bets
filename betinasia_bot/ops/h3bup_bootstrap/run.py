@@ -31,11 +31,12 @@ POLICY_ID = "H3BUP_vNext"
 POLICY_VERSION = "H3BUP_vNext_20260629"
 RESOLVED = {"SETTLED_DECIDED", "VOID_PUSH"}
 EXCLUDED_PNL = {"OPEN", "MISSING", "UNRECONCILED"}
-SEED = 20260810
+SEED = 20260814
 N_BOOT_DEFAULT = 100_000
 N_PERM_DEFAULT = 50_000
 RECON_TOL_ROI = 1e-9
 RECON_TOL_MONEY = 1e-6
+FRIENDLY_CLASS_VERSION = "FRIENDLY_CLASS_V1_20260731"
 
 CLV_WINDOWS = [
     ("POST_5M", "clv_post_5m", "clv_post_5m_valid_strict"),
@@ -43,7 +44,7 @@ CLV_WINDOWS = [
     ("CLOSING", "clv_closing", "clv_closing_valid_strict"),
 ]
 
-CUM_CHECKPOINTS = [25, 50, 75, 100, 150, 200]
+CUM_CHECKPOINTS = [25, 50, 75, 100, 150, 200, 250]
 ROLLING = [25, 50, 100]
 
 
@@ -260,17 +261,21 @@ def reconcile(all_rows: List[Dict[str, Any]], expected: Optional[Dict[str, Any]]
     resolved = settled + voids
     stake_placed = sum(r["_stake"] for r in all_rows)
     stake_resolved = sum(r["_stake"] for r in resolved)
+    stake_open = sum(r["_stake"] for r in opens)
     pnl_resolved = sum(float(r["_pnl"]) for r in settled)  # void pnl = 0; don't coerce missing
-    # include explicit void zeros
-    for r in voids:
-        if r["_pnl"] is not None:
-            # already 0 by contract; settled-only sum is fine
-            pass
+    stake_decided = sum(r["_stake"] for r in settled)
     roi = (pnl_resolved / stake_resolved) if stake_resolved else None
+    roi_ex_void = (pnl_resolved / stake_decided) if stake_decided else None
     n_events = len({str(r.get("event_id") or "") for r in all_rows if r.get("event_id")})
+    n_events_resolved = len({str(r.get("event_id") or "") for r in resolved if r.get("event_id")})
+    n_order_unique = len({str(r.get("order_id") or "") for r in all_rows if r.get("order_id")})
     coverage = (len(resolved) / len(all_rows)) if all_rows else None
+    created = sorted(str(r.get("created_at_utc") or "") for r in all_rows if r.get("created_at_utc"))
+    first_live_ok = created[0] if created else None
     block = {
+        "first_live_ok_utc": first_live_ok,
         "total_live_ok": len(all_rows),
+        "n_order_id_unique": n_order_unique,
         "total_resolved": len(resolved),
         "settled_decided": len(settled),
         "void": len(voids),
@@ -279,10 +284,13 @@ def reconcile(all_rows: List[Dict[str, Any]], expected: Optional[Dict[str, Any]]
         "unreconciled": len(unre),
         "stake_placed": stake_placed,
         "stake_resolved": stake_resolved,
+        "stake_open": stake_open,
         "pnl_resolved": pnl_resolved,
         "roi_resolved": roi,
+        "roi_ex_void": roi_ex_void,
         "accounting_coverage": coverage,
         "n_event_id_unique": n_events,
+        "n_event_id_resolved": n_events_resolved,
         "void_in_denominator": True,
         "formula": "roi_resolved = sum(pnl SETTLED_DECIDED) / sum(stake SETTLED_DECIDED + VOID_PUSH)",
         "status_counts": dict(st),
@@ -299,15 +307,102 @@ def reconcile(all_rows: List[Dict[str, Any]], expected: Optional[Dict[str, Any]]
                 if abs(float(block[key]) - float(expected[key])) > tol:
                     ok = False
                     reasons.append(f"{key}: got {block[key]} expected {expected[key]}")
-    # internal invariants
+    if n_order_unique != len(all_rows):
+        ok = False
+        reasons.append(f"order_id_dedupe_mismatch unique={n_order_unique} rows={len(all_rows)}")
     if len(settled) + len(voids) + len(opens) + len(missing) + len(unre) != len(all_rows):
-        # allow other statuses but flag
         other = len(all_rows) - (len(settled) + len(voids) + len(opens) + len(missing) + len(unre))
         if other:
             reasons.append(f"other_statuses={other}")
+            ok = False
     block["reconciliation_ok"] = ok and len(reasons) == 0
     block["reconciliation_reasons"] = reasons
     return block
+
+
+def period_slices(
+    resolved: List[Dict[str, Any]],
+    cutoff_utc: str,
+    n_boot: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Desde início / últimos 7d / últimas 50 / últimas 100 resolvidas."""
+    ordered = sorted(resolved, key=lambda r: str(r.get("created_at_utc") or ""))
+    try:
+        cut = datetime.fromisoformat(cutoff_utc.replace("Z", "+00:00"))
+    except Exception:
+        cut = datetime.now(timezone.utc)
+    from datetime import timedelta
+
+    t7 = cut - timedelta(days=7)
+    last7 = []
+    for r in ordered:
+        ts = str(r.get("created_at_utc") or "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt >= t7:
+            last7.append(r)
+
+    slices: List[Tuple[str, List[Dict[str, Any]]]] = [("desde_inicio", ordered)]
+    slices.append(("ultimos_7d", last7))
+    if len(ordered) >= 50:
+        slices.append(("ultimas_50_resolvidas", ordered[-50:]))
+    if len(ordered) >= 100:
+        slices.append(("ultimas_100_resolvidas", ordered[-100:]))
+
+    out = []
+    for i, (name, sub) in enumerate(slices):
+        perf = subset_perf(sub)
+        if not sub:
+            out.append({**perf, "period": name, "ci90": [None, None], "ci95": [None, None], "p_gt_0": None})
+            continue
+        keys, cs, cp, _ = aggregate_clusters(sub, lambda r: r.get("event_id") or r.get("order_id"))
+        boots = boot_roi_cluster(cs, cp, n_boot=min(n_boot, 50_000), seed=seed + 70 + i)
+        sm = summarize_boot(perf["roi"] if perf["roi"] is not None else float("nan"), boots)
+        out.append(
+            {
+                "period": name,
+                "n": perf["n"],
+                "events": perf["events"],
+                "stake": perf["stake"],
+                "pnl": perf["pnl"],
+                "roi": perf["roi"],
+                "ci90": sm["ci90"],
+                "ci95": sm["ci95"],
+                "p_gt_0": sm["p_gt_0"],
+            }
+        )
+    return out
+
+
+def concentration_shares(resolved: List[Dict[str, Any]]) -> Dict[str, Any]:
+    _, _, _, by_ev = aggregate_clusters(resolved, lambda r: r.get("event_id") or r.get("order_id"))
+    ev_pnl = sorted(
+        (sum(float(r["_pnl"] or 0) for r in rs) for rs in by_ev.values()),
+        reverse=True,
+    )
+    pos = [p for p in ev_pnl if p > 0]
+    abs_all = [abs(p) for p in ev_pnl]
+    sum_pos = sum(pos) or None
+    sum_abs = sum(abs_all) or None
+
+    def share(vals: List[float], k: int, total: Optional[float]) -> Optional[float]:
+        if not vals or not total:
+            return None
+        return sum(vals[:k]) / total
+
+    return {
+        "share_positive_pnl_top1_events": share(pos, 1, sum_pos),
+        "share_positive_pnl_top3_events": share(pos, 3, sum_pos),
+        "share_positive_pnl_top5_events": share(pos, 5, sum_pos),
+        "share_abs_pnl_top1_events": share(sorted(abs_all, reverse=True), 1, sum_abs),
+        "share_abs_pnl_top3_events": share(sorted(abs_all, reverse=True), 3, sum_abs),
+        "share_abs_pnl_top5_events": share(sorted(abs_all, reverse=True), 5, sum_abs),
+        "n_positive_events": len(pos),
+        "sum_positive_pnl": sum_pos,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -656,12 +751,6 @@ def robustness_scenarios(
     n_boot: int,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    # winners = settled with pnl > 0
-    winners = sorted(
-        [r for r in resolved if r.get("settlement_status") == "SETTLED_DECIDED" and float(r["_pnl"] or 0) > 0],
-        key=lambda r: float(r["_pnl"] or 0),
-        reverse=True,
-    )
     # event pnl
     _, _, _, by_ev = aggregate_clusters(resolved, lambda r: r.get("event_id") or r.get("order_id"))
     ev_pnl = sorted(
@@ -682,9 +771,6 @@ def robustness_scenarios(
 
     scenarios: List[Tuple[str, List[Dict[str, Any]]]] = []
 
-    def drop_oids(oids: set) -> List[Dict[str, Any]]:
-        return [r for r in resolved if str(r.get("order_id")) not in oids]
-
     def drop_events(eids: set) -> List[Dict[str, Any]]:
         return [r for r in resolved if str(r.get("event_id") or "") not in eids]
 
@@ -695,28 +781,24 @@ def robustness_scenarios(
             if str(r.get("league_name") or r.get("competition_name") or "UNKNOWN") not in lgs
         ]
 
-    if winners:
-        scenarios.append(("A_drop_top1_winning_order", drop_oids({str(winners[0]["order_id"])})))
-    if len(winners) >= 3:
-        scenarios.append(
-            ("B_drop_top3_winning_orders", drop_oids({str(w["order_id"]) for w in winners[:3]}))
-        )
     pos_ev = [e for e, p in ev_pnl if p > 0]
     if pos_ev:
-        scenarios.append(("C_drop_top1_winning_event", drop_events({pos_ev[0]})))
+        scenarios.append(("A_drop_top1_winning_event", drop_events({pos_ev[0]})))
     if len(pos_ev) >= 3:
-        scenarios.append(("D_drop_top3_winning_events", drop_events(set(pos_ev[:3]))))
+        scenarios.append(("B_drop_top3_winning_events", drop_events(set(pos_ev[:3]))))
+    if len(pos_ev) >= 5:
+        scenarios.append(("C_drop_top5_winning_events", drop_events(set(pos_ev[:5]))))
     pos_lg = [lg for lg, p in lg_pnl if p > 0]
     if pos_lg:
-        scenarios.append(("E_drop_top1_positive_league", drop_leagues({pos_lg[0]})))
+        scenarios.append(("D_drop_top1_positive_league", drop_leagues({pos_lg[0]})))
     if len(pos_lg) >= 3:
-        scenarios.append(("F_drop_top3_positive_leagues", drop_leagues(set(pos_lg[:3]))))
+        scenarios.append(("E_drop_top3_positive_leagues", drop_leagues(set(pos_lg[:3]))))
 
     out = []
     for name, sub in scenarios:
         perf = subset_perf(sub)
         keys, cs, cp, _ = aggregate_clusters(sub, lambda r: r.get("event_id") or r.get("order_id"))
-        boots = boot_roi_cluster(cs, cp, n_boot=n_boot, seed=seed + hash(name) % 10_000)
+        boots = boot_roi_cluster(cs, cp, n_boot=n_boot, seed=seed + abs(hash(name)) % 10_000)
         sm = summarize_boot(perf["roi"] if perf["roi"] is not None else float("nan"), boots)
         out.append(
             {
@@ -917,10 +999,13 @@ def write_executive(
     friendly: Dict[str, Any],
     clv_results: List[Dict[str, Any]],
     temporal: List[Dict[str, Any]],
+    periods: List[Dict[str, Any]],
+    concentration: Dict[str, Any],
     label: str,
     readiness: str,
     status: str,
     warnings: List[str],
+    cutoff_utc: str,
 ) -> None:
     def find_rob(prefix: str) -> Optional[Dict[str, Any]]:
         for r in robustness:
@@ -928,23 +1013,23 @@ def write_executive(
                 return r
         return None
 
-    rC = find_rob("C_")
-    rD = find_rob("D_")
-    clv_map = {c["window"]: c for c in clv_results}
-    # map field names
+    rA = find_rob("A_")
+    rB = find_rob("B_")
+    cc = next((c for c in clv_results if "closing" in c["window"]), None)
     c5 = next((c for c in clv_results if "5m" in c["window"]), None)
     c15 = next((c for c in clv_results if "15m" in c["window"]), None)
-    cc = next((c for c in clv_results if "closing" in c["window"]), None)
 
     roll = {t["n"]: t for t in temporal if t["kind"] == "rolling"}
-    # direction temporal: compare last rolling50 p_gt0 vs cumulative full
-    cum_full = next((t for t in temporal if t["kind"] == "cumulative" and t["n"] == recon["total_resolved"]), None)
-    evid = "indeterminada"
+    cum_full = next(
+        (t for t in temporal if t["kind"] == "cumulative" and t["n"] == recon["total_resolved"]),
+        None,
+    )
+    evid = "oscilando / indeterminada"
     if roll.get(50) and cum_full and roll[50]["p_gt_0"] is not None and cum_full["p_gt_0"] is not None:
         if roll[50]["p_gt_0"] > cum_full["p_gt_0"] + 0.05:
-            evid = "melhorando (rolling50 vs full)"
+            evid = "melhorando (rolling recente vs full)"
         elif roll[50]["p_gt_0"] < cum_full["p_gt_0"] - 0.05:
-            evid = "piorando (rolling50 vs full)"
+            evid = "piorando (rolling recente vs full)"
         else:
             evid = "estável / oscilante sem tendência clara"
 
@@ -953,67 +1038,213 @@ def write_executive(
     if roi_obs is not None and cc and cc.get("mean_obs") is not None:
         clv_same_dir = (roi_obs > 0 and cc["mean_obs"] > 0) or (roi_obs < 0 and cc["mean_obs"] < 0)
 
+    f_roi = friendly["FRIENDLY"].get("roi")
+    f_p = friendly["FRIENDLY"].get("bootstrap", {}).get("p_gt_0")
+    nf_roi = friendly["NON_FRIENDLY"].get("roi")
+    nf_p = friendly["NON_FRIENDLY"].get("bootstrap", {}).get("p_gt_0")
+
+    def ci_txt(ci):
+        if not ci or ci[0] is None:
+            return "—"
+        return f"[{pct(ci[0])}, {pct(ci[1])}]"
+
     lines = [
-        f"# Executive — FASE 2E-A Bootstrap H3BUP_vNext",
+        "# Executive — ROI acumulado + bootstrap H3BUP_vNext (policy-exact)",
         "",
         f"- **Status:** `{status}`",
         f"- **Classificação:** `{label}`",
         f"- **statistical_readiness:** `{readiness}`",
-        f"- Void no denominador: **sim**",
+        f"- Void/push no denominador do ROI resolved: **sim**",
+        f"- Friendly class: `{FRIENDLY_CLASS_VERSION}`",
+        f"- Universo: `{POLICY_ID}` / `{POLICY_VERSION}` / `LIVE_OK` only",
         "",
-        "## Respostas (1–39)",
+        "## Reconciliação",
         "",
-        f"1. Ordens resolvidas: **{recon['total_resolved']}**",
-        f"2. Eventos únicos (LIVE_OK): **{recon['n_event_id_unique']}**",
-        f"3. Stake resolvida: **{recon['stake_resolved']:.2f}**",
-        f"4. P&L: **{money(recon['pnl_resolved'])}**",
-        f"5. ROI observado: **{pct(recon['roi_resolved'])}**",
+        f"| # | Item | Valor |",
+        f"|---|---|---|",
+        f"| 1 | Primeiro LIVE_OK | {recon.get('first_live_ok_utc') or '—'} |",
+        f"| 2 | Cutoff | {cutoff_utc} |",
+        f"| 3 | LIVE_OK total | {recon['total_live_ok']} |",
+        f"| 4 | order_id únicos | {recon.get('n_order_id_unique')} |",
+        f"| 5 | event_id únicos | {recon['n_event_id_unique']} (resolvidos: {recon.get('n_event_id_resolved')}) |",
+        f"| 6a | settled decided | {recon['settled_decided']} |",
+        f"| 6b | void/push | {recon['void']} |",
+        f"| 6c | open | {recon['open']} |",
+        f"| 6d | missing | {recon['missing']} |",
+        f"| 6e | unreconciled | {recon['unreconciled']} |",
+        f"| 7 | Stake colocada | {recon['stake_placed']:.2f} |",
+        f"| 8 | Stake resolvida | {recon['stake_resolved']:.2f} |",
+        f"| 9 | Stake aberta | {recon.get('stake_open', 0):.2f} |",
+        f"| 10 | P&L resolvido | {money(recon['pnl_resolved'])} |",
+        f"| 11 | Accounting coverage | {pct(recon['accounting_coverage'])} |",
         "",
-        "### ORDER BOOTSTRAP",
-        f"6. Mean: **{pct(order_boot.get('mean'))}**",
-        f"7. Median: **{pct(order_boot.get('median'))}**",
-        f"8. IC90: **[{pct(order_boot['ci90'][0])}, {pct(order_boot['ci90'][1])}]**" if order_boot.get("ci90") else "8. IC90: —",
-        f"9. IC95: **[{pct(order_boot['ci95'][0])}, {pct(order_boot['ci95'][1])}]**" if order_boot.get("ci95") else "9. IC95: —",
-        f"10. P(ROI>0): **{pct(order_boot.get('p_gt_0'))}**",
-        f"11. P(ROI>2%): **{pct(order_boot.get('p_gt_0_02'))}**",
-        f"12. P(ROI>5%): **{pct(order_boot.get('p_gt_0_05'))}**",
-        f"13. P(ROI>10%): **{pct(order_boot.get('p_gt_0_10'))}**",
-        f"14. P(ROI<0): **{pct(order_boot.get('p_lt_0'))}**",
+        f"Reconciliação OK: **{recon.get('reconciliation_ok')}**",
         "",
-        "### CLUSTER EVENT BOOTSTRAP (preferencial)",
-        f"15. Mean: **{pct(event_boot.get('mean'))}**",
-        f"16. IC90: **[{pct(event_boot['ci90'][0])}, {pct(event_boot['ci90'][1])}]**" if event_boot.get("ci90") else "16. IC90: —",
-        f"17. IC95: **[{pct(event_boot['ci95'][0])}, {pct(event_boot['ci95'][1])}]**" if event_boot.get("ci95") else "17. IC95: —",
-        f"18. P(ROI>0): **{pct(event_boot.get('p_gt_0'))}**",
-        f"19. P(ROI>5%): **{pct(event_boot.get('p_gt_0_05'))}**",
-        f"20. P(ROI<0): **{pct(event_boot.get('p_lt_0'))}**",
+        "## ROI acumulado (desde o 1º LIVE_OK)",
         "",
-        "### ROBUSTEZ",
-        f"21. P(ROI>0) sem maior evento: **{pct((rC or {}).get('p_gt_0'))}**",
-        f"22. sem top 3 eventos: **{pct((rD or {}).get('p_gt_0'))}**",
-        f"23. ROI permanece positivo? **{('sim' if rD and (rD.get('roi') or 0) > 0 else 'não') if rD else '—'}**",
-        f"24. IC90 acima de zero? **{('sim' if rD and rD.get('ci90_lo') is not None and rD['ci90_lo'] > 0 else 'não') if rD else '—'}**",
-        f"25. IC95 acima de zero? **{('sim' if rD and rD.get('ci95_lo') is not None and rD['ci95_lo'] > 0 else 'não') if rD else '—'}**",
+        f"- N resolved: **{recon['total_resolved']}**",
+        f"- Eventos únicos (resolvidos): **{recon.get('n_event_id_resolved')}**",
+        f"- Stake resolved: **{recon['stake_resolved']:.2f}**",
+        f"- P&L resolved: **{money(recon['pnl_resolved'])}**",
+        f"- **ROI resolved acumulado: {pct(recon['roi_resolved'])}**",
+        f"- ROI decided ex-void: **{pct(recon.get('roi_ex_void'))}**",
         "",
-        "### FRIENDLY",
-        f"26. ROI Friendly: **{pct(friendly['FRIENDLY'].get('roi'))}**",
-        f"27. P(ROI>0) Friendly: **{pct(friendly['FRIENDLY'].get('bootstrap', {}).get('p_gt_0'))}**",
-        f"28. ROI Non-Friendly: **{pct(friendly['NON_FRIENDLY'].get('roi'))}**",
-        f"29. P(ROI>0) Non-Friendly: **{pct(friendly['NON_FRIENDLY'].get('bootstrap', {}).get('p_gt_0'))}**",
-        f"30. P(ROI_NF > ROI_Friendly): **{pct(friendly.get('p_delta_gt_0'))}**",
+        "| Período | N resolvido | Stake | P&L | ROI |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for p in periods:
+        lines.append(
+            f"| {p['period']} | {p['n']} | {p['stake']:.2f} | {money(p['pnl'])} | {pct(p['roi'])} |"
+        )
+
+    lines += [
         "",
-        "### CLV",
-        f"31. P(CLV 5m mean>0): **{pct((c5 or {}).get('p_mean_gt_0'))}**",
-        f"32. P(CLV 15m mean>0): **{pct((c15 or {}).get('p_mean_gt_0'))}**",
-        f"33. P(CLV closing mean>0): **{pct((cc or {}).get('p_mean_gt_0'))}**",
-        f"34. IC95 closing CLV: **[{fmt_clv((cc or {}).get('ci95_mean', [None, None])[0] if cc else None)}, {fmt_clv((cc or {}).get('ci95_mean', [None, None])[1] if cc else None)}]**",
-        f"35. CLV e ROI mesma direção? **{('sim' if clv_same_dir else 'não') if clv_same_dir is not None else '—'}**",
+        "## Bootstrap principal — cluster `event_id`",
         "",
-        "### TEMPORAL",
-        f"36. P(ROI>0) últimas 25: **{pct((roll.get(25) or {}).get('p_gt_0'))}**",
-        f"37. últimas 50: **{pct((roll.get(50) or {}).get('p_gt_0'))}**",
-        f"38. últimas 100: **{pct((roll.get(100) or {}).get('p_gt_0'))}**",
-        f"39. Evidência: **{evid}**",
+        "| Métrica | Resultado |",
+        "|---|---|",
+        f"| N ordens | {recon['total_resolved']} |",
+        f"| N eventos | {event_boot.get('n_clusters', recon.get('n_event_id_resolved'))} |",
+        f"| ROI observado | {pct(event_boot.get('observed'))} |",
+        f"| Bootstrap mean | {pct(event_boot.get('mean'))} |",
+        f"| Bootstrap median | {pct(event_boot.get('median'))} |",
+        f"| IC80 | {ci_txt(event_boot.get('ci80'))} |",
+        f"| IC90 | {ci_txt(event_boot.get('ci90'))} |",
+        f"| IC95 | {ci_txt(event_boot.get('ci95'))} |",
+        f"| IC99 | {ci_txt(event_boot.get('ci99'))} |",
+        f"| **P(ROI > 0%)** | **{pct(event_boot.get('p_gt_0'))}** |",
+        f"| P(ROI > 2%) | {pct(event_boot.get('p_gt_0_02'))} |",
+        f"| P(ROI > 5%) | {pct(event_boot.get('p_gt_0_05'))} |",
+        f"| P(ROI > 10%) | {pct(event_boot.get('p_gt_0_10'))} |",
+        f"| P(ROI < 0%) | {pct(event_boot.get('p_lt_0'))} |",
+        "",
+        "> `P(ROI>0)` é a massa bootstrap acima de zero — **não** é automaticamente um p-value frequentista clássico.",
+        "",
+        "### Order-level (secundário)",
+        f"P(ROI>0) ordem = **{pct(order_boot.get('p_gt_0'))}** · mean={pct(order_boot.get('mean'))} · IC95={ci_txt(order_boot.get('ci95'))}",
+        "",
+        "## Concentração / robustez",
+        "",
+        f"- Share P&L positivo top1/3/5 eventos: "
+        f"{pct(concentration.get('share_positive_pnl_top1_events'))} / "
+        f"{pct(concentration.get('share_positive_pnl_top3_events'))} / "
+        f"{pct(concentration.get('share_positive_pnl_top5_events'))}",
+        f"- Share |P&L| top1/3/5 eventos: "
+        f"{pct(concentration.get('share_abs_pnl_top1_events'))} / "
+        f"{pct(concentration.get('share_abs_pnl_top3_events'))} / "
+        f"{pct(concentration.get('share_abs_pnl_top5_events'))}",
+        "",
+        "| Cenário | N | Eventos | Stake | P&L | ROI | IC90 | IC95 | P(ROI>0) |",
+        "|---|---:|---:|---:|---:|---:|---|---|---:|",
+    ]
+    for r in robustness:
+        lines.append(
+            f"| {r['scenario']} | {r['n']} | {r['events']} | {r['stake']:.2f} | {money(r['pnl'])} | "
+            f"{pct(r['roi'])} | [{pct(r['ci90_lo'])}, {pct(r['ci90_hi'])}] | "
+            f"[{pct(r['ci95_lo'])}, {pct(r['ci95_hi'])}] | {pct(r['p_gt_0'])} |"
+        )
+
+    lines += [
+        "",
+        "## Evolução temporal",
+        "",
+        "| N | ROI | IC90 | IC95 | P(ROI>0) |",
+        "|---:|---:|---|---|---:|",
+    ]
+    for t in temporal:
+        if t["kind"] != "cumulative":
+            continue
+        lines.append(
+            f"| {t['n']} | {pct(t['roi'])} | {ci_txt(t['ci90'])} | {ci_txt(t['ci95'])} | {pct(t['p_gt_0'])} |"
+        )
+    lines += [
+        "",
+        "Rolling:",
+        f"- últimas 25: ROI {pct((roll.get(25) or {}).get('roi'))} · P(>0) {pct((roll.get(25) or {}).get('p_gt_0'))}",
+        f"- últimas 50: ROI {pct((roll.get(50) or {}).get('roi'))} · P(>0) {pct((roll.get(50) or {}).get('p_gt_0'))}",
+        f"- últimas 100: ROI {pct((roll.get(100) or {}).get('roi'))} · P(>0) {pct((roll.get(100) or {}).get('p_gt_0'))}",
+        f"- Leitura temporal: **{evid}**",
+        "",
+        "## Friendly vs Non-Friendly",
+        "",
+        f"| Grupo | N | Eventos | Stake | P&L | ROI | IC90 | IC95 | P(>0) | P(>5%) |",
+        f"|---|---:|---:|---:|---:|---:|---|---|---:|---:|",
+    ]
+    for g in ("FRIENDLY", "NON_FRIENDLY"):
+        b = friendly[g]
+        bb = b.get("bootstrap") or {}
+        lines.append(
+            f"| {g} | {b['n']} | {b['events']} | {b['stake']:.2f} | {money(b['pnl'])} | {pct(b['roi'])} | "
+            f"{ci_txt(bb.get('ci90'))} | {ci_txt(bb.get('ci95'))} | {pct(bb.get('p_gt_0'))} | {pct(bb.get('p_gt_0_05'))} |"
+        )
+    lines += [
+        f"",
+        f"- delta_ROI (NF − F) = **{pct(friendly.get('delta_roi_nf_minus_f'))}**",
+        f"- P(delta_ROI > 0) = **{pct(friendly.get('p_delta_gt_0'))}** (diagnóstico; não altera filtro)",
+        "",
+        "## CLV (VALID_STRICT)",
+        "",
+        "| Janela | N | Eventos | Coverage | Média | Mediana | IC90 mean | IC95 mean | P(mean>0) |",
+        "|---|---:|---:|---:|---:|---:|---|---|---:|",
+    ]
+    for c in clv_results:
+        lines.append(
+            f"| {c.get('label')} | {c['n']} | {c['events']} | {pct(c['coverage'])} | "
+            f"{fmt_clv(c['mean_obs'])} | {fmt_clv(c['median_obs'])} | "
+            f"[{fmt_clv(c['ci90_mean'][0])}, {fmt_clv(c['ci90_mean'][1])}] | "
+            f"[{fmt_clv(c['ci95_mean'][0])}, {fmt_clv(c['ci95_mean'][1])}] | "
+            f"{pct(c['p_mean_gt_0'])} |"
+        )
+    lines += [
+        "",
+        f"ROI realizado e CLV mesma direção? **{('sim' if clv_same_dir else 'não') if clv_same_dir is not None else '—'}**",
+        "",
+        "## Tabela executiva obrigatória",
+        "",
+        "| Pergunta | Resposta |",
+        "|---|---|",
+        f"| Primeiro LIVE_OK | {recon.get('first_live_ok_utc') or '—'} |",
+        f"| Cutoff | {cutoff_utc} |",
+        f"| LIVE_OK total | {recon['total_live_ok']} |",
+        f"| Ordens resolvidas | {recon['total_resolved']} |",
+        f"| Eventos únicos | {recon.get('n_event_id_resolved')} resolvidos / {recon['n_event_id_unique']} LIVE_OK |",
+        f"| Stake resolvida | {recon['stake_resolved']:.2f} |",
+        f"| P&L acumulado | {money(recon['pnl_resolved'])} |",
+        f"| ROI acumulado | {pct(recon['roi_resolved'])} |",
+        f"| IC90 ROI cluster | {ci_txt(event_boot.get('ci90'))} |",
+        f"| IC95 ROI cluster | {ci_txt(event_boot.get('ci95'))} |",
+        f"| P(ROI > 0) | **{pct(event_boot.get('p_gt_0'))}** |",
+        f"| P(ROI > 2%) | {pct(event_boot.get('p_gt_0_02'))} |",
+        f"| P(ROI > 5%) | {pct(event_boot.get('p_gt_0_05'))} |",
+        f"| P(ROI > 10%) | {pct(event_boot.get('p_gt_0_10'))} |",
+        f"| P(ROI < 0%) | {pct(event_boot.get('p_lt_0'))} |",
+        f"| P(ROI>0) sem maior evento vencedor | {pct((rA or {}).get('p_gt_0'))} |",
+        f"| P(ROI>0) sem top 3 eventos | {pct((rB or {}).get('p_gt_0'))} |",
+        f"| Friendly ROI / P(ROI>0) | {pct(f_roi)} / {pct(f_p)} |",
+        f"| Non-Friendly ROI / P(ROI>0) | {pct(nf_roi)} / {pct(nf_p)} |",
+        f"| CLV closing médio | {fmt_clv((cc or {}).get('mean_obs'))} |",
+        f"| CLV closing mediano | {fmt_clv((cc or {}).get('median_obs'))} |",
+        f"| P(CLV closing médio > 0) | {pct((cc or {}).get('p_mean_gt_0'))} |",
+        f"| Statistical readiness | `{readiness}` |",
+        "",
+        "## Respostas simples",
+        "",
+        f"1. ROI acumulado real H3BUP_vNext: **{pct(recon['roi_resolved'])}** (void no denominador).",
+        f"2. P(ROI>0) bootstrap por ordem: **{pct(order_boot.get('p_gt_0'))}**.",
+        f"3. P(ROI>0) bootstrap cluster evento (principal): **{pct(event_boot.get('p_gt_0'))}**.",
+        f"4. IC90 cluster: **{ci_txt(event_boot.get('ci90'))}**.",
+        f"5. IC95 cluster: **{ci_txt(event_boot.get('ci95'))}**.",
+        f"6. P(ROI>5%) cluster: **{pct(event_boot.get('p_gt_0_05'))}**.",
+        f"7. Sem principais eventos vencedores: ROI permanece positivo? "
+        f"**{('sim' if rB and (rB.get('roi') or 0) > 0 else 'não') if rB else '—'}** "
+        f"(P>0 sem top1={pct((rA or {}).get('p_gt_0'))}, sem top3={pct((rB or {}).get('p_gt_0'))}).",
+        f"8. Friendly vs Non-Friendly: F={pct(f_roi)} vs NF={pct(nf_roi)}; "
+        f"P(delta>0)={pct(friendly.get('p_delta_gt_0'))} — "
+        f"{'diferença clara' if friendly.get('p_delta_gt_0') is not None and (friendly.get('p_delta_gt_0') > 0.8 or friendly.get('p_delta_gt_0') < 0.2) else 'não diferem de forma clara'}.",
+        f"9. CLV: média closing={fmt_clv((cc or {}).get('mean_obs'))}, P(mean>0)={pct((cc or {}).get('p_mean_gt_0'))} — "
+        f"{'confirma a direção do ROI' if clv_same_dir else 'contradiz / não alinhado' if clv_same_dir is False else '—'}.",
+        f"10. Evidência atual: **{label}** (`{readiness}`) — "
+        f"{'ainda inconclusiva para edge positivo operacional' if label in ('NO_CLEAR_ROI_EDGE','POSITIVE_ROI_HIGHLY_UNCERTAIN','FIRST_READING','NEGATIVE_ROI_SIGNAL','CLV_CONFLICTS_WITH_REALIZED_ROI') or readiness != 'RELIABLE_READING_CANDIDATE' else 'suporta edge com reservas'}.",
         "",
         "## Avisos",
     ]
@@ -1021,14 +1252,13 @@ def write_executive(
         lines.extend([f"- {w}" for w in warnings])
     else:
         lines.append("- (nenhum)")
-    lines.extend(
-        [
-            "",
-            "## Nota",
-            "Análise exclusivamente estatística/read-only. Não alterar exposição com base neste resultado.",
-            f"Day-cluster: N_dias={day_boot.get('n_clusters')} · P(ROI>0)={pct(day_boot.get('p_gt_0'))} · IC95={day_boot.get('ci95')}",
-        ]
-    )
+    lines += [
+        "",
+        "## Segurança",
+        "READ-ONLY. Policy/stake/bridge/executor/accounting/CLV/Telegram inalterados. 0 ordens / 0 betslips.",
+        f"CLV 5m P(mean>0)={pct((c5 or {}).get('p_mean_gt_0'))} · 15m={pct((c15 or {}).get('p_mean_gt_0'))}.",
+        f"Day-cluster N={day_boot.get('n_clusters')} P(>0)={pct(day_boot.get('p_gt_0'))}.",
+    ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1210,6 +1440,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --- Temporal ---
     print("[2E-A] temporal...")
     temporal = temporal_analysis(resolved, n_boot=n_boot, seed=seed + 60)
+
+    print("[2E-A] periods + concentration...")
+    periods = period_slices(resolved, cutoff, n_boot=n_boot, seed=seed + 80)
+    concentration = concentration_shares(resolved)
 
     label, readiness = classify(recon, event_boot, clv_results, robustness)
     # extra warnings
@@ -1475,6 +1709,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "clv": clv_results,
         "roi_clv": roi_clv,
         "temporal": temporal,
+        "periods": periods,
+        "concentration": concentration,
         "classification": label,
         "statistical_readiness": readiness,
         "final_status": status,
@@ -1485,6 +1721,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     (out_root / "h3bup_bootstrap_summary.json").write_text(
         json.dumps(meta, indent=2, default=str), encoding="utf-8"
     )
+
+    write_csv(
+        out_root / "h3bup_bootstrap_periods.csv",
+        [
+            {
+                "period": p["period"],
+                "n": p["n"],
+                "events": p["events"],
+                "stake": p["stake"],
+                "pnl": p["pnl"],
+                "roi": p["roi"],
+                "ci90_lo": (p.get("ci90") or [None, None])[0],
+                "ci90_hi": (p.get("ci90") or [None, None])[1],
+                "ci95_lo": (p.get("ci95") or [None, None])[0],
+                "ci95_hi": (p.get("ci95") or [None, None])[1],
+                "p_gt_0": p.get("p_gt_0"),
+            }
+            for p in periods
+        ],
+    )
+    write_csv(out_root / "h3bup_bootstrap_concentration.csv", [concentration])
 
     write_methodology(
         out_root / "h3bup_bootstrap_methodology.md",
@@ -1500,10 +1757,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         friendly=friendly,
         clv_results=clv_results,
         temporal=temporal,
+        periods=periods,
+        concentration=concentration,
         label=label,
         readiness=readiness,
         status=status,
         warnings=warnings,
+        cutoff_utc=cutoff,
     )
 
     # copy docs to docs/
