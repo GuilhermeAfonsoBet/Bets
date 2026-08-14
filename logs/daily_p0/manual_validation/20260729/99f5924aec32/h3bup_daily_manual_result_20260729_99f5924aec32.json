@@ -1,0 +1,209 @@
+{
+  "ok": true,
+  "status": "DAILY_MANUAL_VALIDATION_WITH_WARNINGS",
+  "run_id": "99f5924aec32",
+  "git_commit": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "report_date_utc": "2026-07-29",
+  "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+  "cohort_window_end_utc": "2026-07-30T00:00:00+00:00",
+  "parity_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+  "performance_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+  "generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+  "v1_exit_code": 0,
+  "v2_exit_code": 0,
+  "out_dir": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32",
+  "artifacts": {
+    "v1_pdf": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/H3BUP_DAILY_V1_MANUAL_VALIDATION_20260729_99f5924aec32.pdf",
+    "v2_pdf": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/H3BUP_DAILY_V2_MANUAL_PREVIEW_20260729_99f5924aec32.pdf",
+    "snapshot": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_v2_manual_snapshot_20260729_99f5924aec32.json",
+    "md": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_v2_manual_report_20260729_99f5924aec32.md",
+    "health": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_health_20260729_99f5924aec32.json",
+    "alerts": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_alerts_20260729_99f5924aec32.csv",
+    "parity_csv": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_v1_vs_v2_20260729_99f5924aec32.csv",
+    "funnel": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_execution_funnel_20260729_99f5924aec32.csv",
+    "e2e": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_e2e_20260729_99f5924aec32.csv",
+    "clv": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_clv_20260729_99f5924aec32.csv",
+    "settlement": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_settlement_20260729_99f5924aec32.csv",
+    "source_manifest": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_source_manifest_20260729_99f5924aec32.json",
+    "executive_summary": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_executive_summary_20260729_99f5924aec32.md",
+    "run_log": "/home/betbot/Bets/betinasia_bot/logs/daily_p0/manual_validation/20260729/99f5924aec32/h3bup_daily_manual_run_20260729_99f5924aec32.log"
+  },
+  "official_preserved": true,
+  "telegram_sent": false,
+  "timers": "NEXT                            LEFT LAST                         PASSED UNIT                              ACTIVATES\nThu 2026-07-30 22:01:14 UTC 2h 13min Wed 2026-07-29 22:01:53 UTC 21h ago betinasia-daily-full-report.timer betinasia-daily-full-report.service\nThu 2026-07-30 22:10:54 UTC 2h 23min Wed 2026-07-29 22:10:55 UTC 21h ago betinasia-daily-v2-shadow.timer   betinasia-daily-v2-shadow.service\n\n2 timers listed.\n",
+  "live_ok_v2": 24,
+  "parity_rows": [
+    {
+      "metric": "LIVE_OK",
+      "v1": 22,
+      "v2": 24,
+      "delta": 2.0,
+      "status": "FILTER_DIFFERENCE",
+      "cause": "V2 filters H3BUP_vNext + created_at UTC closed cohort",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "stake placed",
+      "v1": 220.0,
+      "v2": 240.0,
+      "delta": 20.0,
+      "status": "FILTER_DIFFERENCE",
+      "cause": "same universe when H3BUP filtered",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "open",
+      "v1": 9,
+      "v2": 1,
+      "delta": -8.0,
+      "status": "JOIN_DIFFERENCE",
+      "cause": "accounting join",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "settled",
+      "v1": 3,
+      "v2": 21,
+      "delta": 18.0,
+      "status": "JOIN_DIFFERENCE",
+      "cause": "accounting join; V2 separates void",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "void",
+      "v1": null,
+      "v2": 2,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "V2 explicit void/push",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "missing",
+      "v1": null,
+      "v2": 0,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "join difference if ledger incomplete",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "P&L",
+      "v1": null,
+      "v2": 6.600000000000001,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "resolved vs mixed account",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "ROI",
+      "v1": -0.014333333333333384,
+      "v2": 0.02869565217391305,
+      "delta": 0.04302898550724643,
+      "status": "EXPECTED_DEFINITION_CHANGE",
+      "cause": "V2 principal=roi_resolved (void in denom) | definition/universe differ between V1 tables and V2 H3BUP filter",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "fast <=6s",
+      "v1": null,
+      "v2": 24,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "V1 dual 5s/6s; V2 Daily fixed <=6s — expected definition change",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "study fast <4s",
+      "v1": null,
+      "v2": 23,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "exploratory study contract",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "POST_5M strict",
+      "v1": null,
+      "v2": 7,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "VALID_STRICT only",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "POST_15M strict",
+      "v1": null,
+      "v2": 6,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "VALID_STRICT only",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "CLOSING strict",
+      "v1": null,
+      "v2": 8,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "VALID_STRICT only",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "E2E LIVE_OK",
+      "v1": null,
+      "v2": 23,
+      "delta": null,
+      "status": "PARITY_UNAVAILABLE",
+      "cause": "E2E all-traces vs cohort window — source/window difference",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "ROIw Total",
+      "v1": 24.03,
+      "v2": 2.869565217391305,
+      "delta": -21.160434782608696,
+      "status": "FILTER_DIFFERENCE",
+      "cause": "Same formula when universe matches; V2 also emits settled-aware roiw_total_v2",
+      "correct_version": "both_versioned"
+    },
+    {
+      "metric": "fair_edge",
+      "v1": "omitted_or_zero_risk",
+      "v2": "NOT_IMPLEMENTED",
+      "delta": null,
+      "status": "UNKNOWN",
+      "cause": "V2 explicit NOT_IMPLEMENTED",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "cohort_timestamp",
+      "v1": "mixed created_at + post date tables",
+      "v2": "created_at UTC only",
+      "delta": null,
+      "status": "EXPECTED_DEFINITION_CHANGE",
+      "cause": "V1 dual attribution — expected definition change",
+      "correct_version": "v2"
+    },
+    {
+      "metric": "report_date",
+      "v1": "2026-07-29",
+      "v2": "2026-07-29",
+      "delta": null,
+      "status": "MATCH",
+      "cause": "parity requires same report_date_utc",
+      "correct_version": "v2"
+    }
+  ],
+  "unknown_principal": [],
+  "safety": {
+    "telegram_official": false,
+    "v1_official_overwritten": false,
+    "v2_latest_altered": false,
+    "policy_altered": false,
+    "stake_altered": false,
+    "orders_created": false,
+    "betslips_opened": false
+  }
+}

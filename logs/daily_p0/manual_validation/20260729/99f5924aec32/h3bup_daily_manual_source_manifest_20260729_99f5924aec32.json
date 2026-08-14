@@ -1,0 +1,128 @@
+{
+  "executor_live": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:46:42.403913+00:00",
+    "size": 73252869,
+    "sha256_prefix": "33ed288e744855ac",
+    "source_cutoff_utc": "2026-07-30T19:46:42.403913+00:00",
+    "age_seconds": 43.488302,
+    "status": "HEALTHY"
+  },
+  "accounting_health": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/accounting_health.json",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:42:32.367145+00:00",
+    "size": 1004,
+    "sha256_prefix": "4bfbe8bb362ddce1",
+    "source_cutoff_utc": "2026-07-30T19:42:32.367145+00:00",
+    "health_json_status": "ACCOUNTING_OK",
+    "age_seconds": 293.52507,
+    "status": "HEALTHY"
+  },
+  "accounting_daily_report": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/accounting_daily_report.json",
+    "exists": true,
+    "mtime_utc": "2026-07-29T22:02:45.837136+00:00",
+    "size": 1681,
+    "sha256_prefix": "dea9d95c61c391d4",
+    "source_cutoff_utc": "2026-07-29T22:02:45.837136+00:00",
+    "age_seconds": 78280.055079,
+    "status": "WATCH"
+  },
+  "e2e_trace": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_e2e_trace.jsonl",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:47:13.391536+00:00",
+    "size": 21113051,
+    "sha256_prefix": "96ad79b4dff84e99",
+    "source_cutoff_utc": "2026-07-30T19:47:13.391536+00:00",
+    "age_seconds": 12.500679,
+    "status": "HEALTHY"
+  },
+  "clv_health": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_health.json",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:47:03.837727+00:00",
+    "size": 1034,
+    "sha256_prefix": "2e189679c863e487",
+    "source_cutoff_utc": "2026-07-30T19:47:03.837727+00:00",
+    "health_json_status": "WATCH",
+    "age_seconds": 22.054488,
+    "status": "WATCH"
+  },
+  "clv_obligations": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_obligations.jsonl",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:45:32.799057+00:00",
+    "size": 457613,
+    "sha256_prefix": "e3d5cab3f863e0fc",
+    "source_cutoff_utc": "2026-07-30T19:45:32.799057+00:00",
+    "age_seconds": 113.093158,
+    "status": "HEALTHY"
+  },
+  "policy_current": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/wf_policy_current.json",
+    "exists": true,
+    "mtime_utc": "2026-06-29T13:15:03.295096+00:00",
+    "size": 9770,
+    "sha256_prefix": "8009c8fa4b67b75f",
+    "source_cutoff_utc": "2026-06-29T13:15:03.295096+00:00",
+    "age_seconds": 2701942.597119,
+    "notes": [
+      "mtime age ignored; fingerprint/content used"
+    ],
+    "status": "CURRENT_UNCHANGED",
+    "config_eval": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "8009c8fa4b67b75f",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    }
+  },
+  "risk_params": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/bridge_risk_params.json",
+    "exists": true,
+    "mtime_utc": "2026-07-20T15:16:08.267440+00:00",
+    "size": 580,
+    "sha256_prefix": "6a38c6ddd893a215",
+    "source_cutoff_utc": "2026-07-20T15:16:08.267440+00:00",
+    "age_seconds": 880277.624775,
+    "notes": [
+      "mtime age ignored; fingerprint/content used"
+    ],
+    "status": "CURRENT_UNCHANGED",
+    "config_eval": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "6a38c6ddd893a215",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    }
+  },
+  "accounting_balance": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194227__balance.csv",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:42:27.797773+00:00",
+    "size": 2986327,
+    "sha256_prefix": "33df7fb23b36d392",
+    "source_cutoff_utc": "2026-07-30T19:42:27.797773+00:00",
+    "age_seconds": 298.094442,
+    "status": "HEALTHY"
+  },
+  "accounting_open_stakes": {
+    "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194232__open_stakes.csv",
+    "exists": true,
+    "mtime_utc": "2026-07-30T19:42:32.344143+00:00",
+    "size": 34008,
+    "sha256_prefix": "a67caaac15206ad3",
+    "source_cutoff_utc": "2026-07-30T19:42:32.344143+00:00",
+    "age_seconds": 293.548072,
+    "status": "HEALTHY"
+  }
+}

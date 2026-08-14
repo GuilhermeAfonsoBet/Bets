@@ -1,0 +1,79 @@
+{
+  "report_health": {
+    "status": "HEALTHY",
+    "notes": [
+      "REPORT_HEALTH distinct from STRATEGY_OPERATIONS_HEALTH"
+    ]
+  },
+  "operations_health": {
+    "status": "WATCH",
+    "notes": [
+      "derived from services externally; Daily V2 does not restart services"
+    ]
+  },
+  "data_quality": {
+    "accounting": "HEALTHY",
+    "e2e": "HEALTHY",
+    "clv": "WATCH"
+  },
+  "statistical_readiness": {
+    "roi": "PARTIAL",
+    "clv": "INSUFFICIENT_N",
+    "e2e": "AVAILABLE"
+  },
+  "source_manifest": {
+    "executor_live": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:16:23.002305+00:00",
+      "age_seconds": 57.560129
+    },
+    "accounting_health": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:12:30.838815+00:00",
+      "age_seconds": 289.723619
+    },
+    "accounting_daily_report": {
+      "status": "WATCH",
+      "cutoff": "2026-07-28T22:02:42.108069+00:00",
+      "age_seconds": 83678.454365
+    },
+    "e2e_trace": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:16:52.228003+00:00",
+      "age_seconds": 28.334431
+    },
+    "clv_health": {
+      "status": "WATCH",
+      "cutoff": "2026-07-29T21:17:17.370322+00:00",
+      "age_seconds": 3.192112
+    },
+    "clv_obligations": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T20:54:03.279857+00:00",
+      "age_seconds": 1397.282577
+    },
+    "policy_current": {
+      "status": "STALE",
+      "cutoff": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2620937.267338
+    },
+    "risk_params": {
+      "status": "STALE",
+      "cutoff": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 799272.294994
+    },
+    "accounting_balance": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:12:23.724155+00:00",
+      "age_seconds": 296.838279
+    },
+    "accounting_open_stakes": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-29T21:12:30.786811+00:00",
+      "age_seconds": 289.775623
+    }
+  },
+  "generated_at_utc": "2026-07-29T21:17:20.562498+00:00",
+  "run_id": "c80914813bbe",
+  "publish": false
+}

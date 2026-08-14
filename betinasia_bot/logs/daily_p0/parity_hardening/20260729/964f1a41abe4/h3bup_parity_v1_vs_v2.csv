@@ -1,0 +1,6 @@
+metric,v1,v2_parity,v2_full,status,cause
+LIVE_OK,22,22,24,MATCH,parity filters created_at<=parity_as_of
+stake_placed,220.0,220.0,240.0,MATCH,same as LIVE_OK set
+open,9,6,1,AS_OF_MATURITY_DIFFERENCE,V1 health subset + maturity
+settled,3,15,21,AS_OF_MATURITY_DIFFERENCE,settlements after cutoff
+order_set_hash,ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb,ad50fa18dc0b6bd1fd8e39b5c3dc761bc5c59a56b14ac72598291e4a22c897cb,50d209a999f8c4a8759e3fd732ce9acc2fba6ada63c34f50847c326a7a3caf52,MATCH,SHA256 sorted order_ids

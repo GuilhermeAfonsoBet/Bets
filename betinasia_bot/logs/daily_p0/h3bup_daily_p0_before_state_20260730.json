@@ -1,0 +1,37 @@
+{
+  "captured_at_utc": "2026-07-30T18:37:06.091355+00:00",
+  "git_head": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "timers": "NEXT                            LEFT LAST                         PASSED UNIT                              ACTIVATES\nThu 2026-07-30 22:01:14 UTC 3h 24min Wed 2026-07-29 22:01:53 UTC 20h ago betinasia-daily-full-report.timer betinasia-daily-full-report.service\nThu 2026-07-30 22:10:54 UTC 3h 33min Wed 2026-07-29 22:10:55 UTC 20h ago betinasia-daily-v2-shadow.timer   betinasia-daily-v2-shadow.service\n\n2 timers listed.\n",
+  "env": {
+    "H3BUP_DAILY_V2_ENABLED": null,
+    "H3BUP_DAILY_V2_TELEGRAM_PREVIEW": null,
+    "H3BUP_DAILY_V2_OFFICIAL": null,
+    "H3BUP_DAILY_V2_PUBLISH": null
+  },
+  "artifacts": {
+    "v2_latest_snapshot": {
+      "path": "logs/daily_v2/latest_snapshot.json",
+      "exists": true,
+      "sha256": "7c46b209039899523e9d995d5a3304d8568d987439780b2260e778e12a1f1b0c",
+      "size": 14269
+    },
+    "v2_latest_md": {
+      "path": "logs/daily_v2/latest_report.md",
+      "exists": true,
+      "sha256": "9f0111e85eef758182a338148a1c62f0f3a1fa7a54b86b562de538c77b327e3e",
+      "size": 4460
+    },
+    "v2_latest_pdf": {
+      "path": "logs/daily_v2/latest_preview.pdf",
+      "exists": true,
+      "sha256": "62aa92ca001b47ca8279ff1d126ca43564df884865672312b8dfe5307ababadd",
+      "size": 8241
+    },
+    "v1_latest_md": {
+      "path": "logs/daily_reports/20260729/report_daily.md",
+      "exists": true,
+      "sha256": "3a1e58b7b2e01519cdf6b60dd8685324bcd6bc1675525c846c773634a23b8d7c",
+      "size": 98136
+    }
+  }
+}

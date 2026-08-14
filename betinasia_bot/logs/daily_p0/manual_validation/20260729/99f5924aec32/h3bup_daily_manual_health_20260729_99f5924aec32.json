@@ -1,0 +1,212 @@
+{
+  "manual_validation": true,
+  "run_id": "99f5924aec32",
+  "report_date_utc": "2026-07-29",
+  "report_health": {
+    "status": "HEALTHY",
+    "reasons": [],
+    "evidence": {},
+    "affected_metrics": []
+  },
+  "operations_health": {
+    "status": "WATCH",
+    "reasons": [
+      "service health proxies WATCH"
+    ],
+    "evidence": {},
+    "affected_metrics": []
+  },
+  "data_quality": {
+    "status": "WATCH",
+    "reasons": [
+      "source freshness and/or CLV collection WATCH"
+    ],
+    "evidence": {},
+    "affected_metrics": []
+  },
+  "statistical_readiness": {
+    "status": "INSUFFICIENT_N",
+    "reasons": [
+      "N < 30 for inference"
+    ],
+    "evidence": {},
+    "affected_metrics": [
+      "clv",
+      "roi",
+      "e2e"
+    ]
+  },
+  "config": {
+    "policy": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "8009c8fa4b67b75f",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    },
+    "risk_params": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "6a38c6ddd893a215",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    }
+  },
+  "cutoffs": {
+    "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+    "cohort_window_end_utc": "2026-07-30T00:00:00+00:00",
+    "parity_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "performance_as_of_utc": "2026-07-29T22:01:54.606850+00:00",
+    "generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+    "as_of_now_utc": "2026-07-30T19:47:33.593343+00:00",
+    "note": "Paridade congelada no cutoff do V1 oficial; as_of_now é diagnóstico separado"
+  },
+  "parity": {
+    "v1_report_path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.md",
+    "v1_report_day_folder": "20260729",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Comparação de paridade usa o cutoff lógico do V1. Eventos após v1_report_cutoff_utc até v2_generated_at_utc são apenas diagnóstico intraday e não entram na paridade.",
+    "parity_cutoff_utc": "2026-07-29T22:01:54.606850+00:00"
+  },
+  "source_manifest": {
+    "executor_live": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:46:42.403913+00:00",
+      "size": 73252869,
+      "sha256_prefix": "33ed288e744855ac",
+      "source_cutoff_utc": "2026-07-30T19:46:42.403913+00:00",
+      "age_seconds": 43.488302,
+      "status": "HEALTHY"
+    },
+    "accounting_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/accounting_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:32.367145+00:00",
+      "size": 1004,
+      "sha256_prefix": "4bfbe8bb362ddce1",
+      "source_cutoff_utc": "2026-07-30T19:42:32.367145+00:00",
+      "health_json_status": "ACCOUNTING_OK",
+      "age_seconds": 293.52507,
+      "status": "HEALTHY"
+    },
+    "accounting_daily_report": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting_daily_report.json",
+      "exists": true,
+      "mtime_utc": "2026-07-29T22:02:45.837136+00:00",
+      "size": 1681,
+      "sha256_prefix": "dea9d95c61c391d4",
+      "source_cutoff_utc": "2026-07-29T22:02:45.837136+00:00",
+      "age_seconds": 78280.055079,
+      "status": "WATCH"
+    },
+    "e2e_trace": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_e2e_trace.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:47:13.391536+00:00",
+      "size": 21113051,
+      "sha256_prefix": "96ad79b4dff84e99",
+      "source_cutoff_utc": "2026-07-30T19:47:13.391536+00:00",
+      "age_seconds": 12.500679,
+      "status": "HEALTHY"
+    },
+    "clv_health": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_health.json",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:47:03.837727+00:00",
+      "size": 1034,
+      "sha256_prefix": "2e189679c863e487",
+      "source_cutoff_utc": "2026-07-30T19:47:03.837727+00:00",
+      "health_json_status": "WATCH",
+      "age_seconds": 22.054488,
+      "status": "WATCH"
+    },
+    "clv_obligations": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_obligations.jsonl",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:45:32.799057+00:00",
+      "size": 457613,
+      "sha256_prefix": "e3d5cab3f863e0fc",
+      "source_cutoff_utc": "2026-07-30T19:45:32.799057+00:00",
+      "age_seconds": 113.093158,
+      "status": "HEALTHY"
+    },
+    "policy_current": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/wf_policy_current.json",
+      "exists": true,
+      "mtime_utc": "2026-06-29T13:15:03.295096+00:00",
+      "size": 9770,
+      "sha256_prefix": "8009c8fa4b67b75f",
+      "source_cutoff_utc": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2701942.597119,
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ],
+      "status": "CURRENT_UNCHANGED",
+      "config_eval": {
+        "file_status": "OK",
+        "runtime_status": "UNVERIFIED",
+        "fingerprint": "8009c8fa4b67b75f",
+        "drift": "CURRENT_UNCHANGED",
+        "notes": [
+          "mtime age ignored; fingerprint/content used"
+        ]
+      }
+    },
+    "risk_params": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/bridge_risk_params.json",
+      "exists": true,
+      "mtime_utc": "2026-07-20T15:16:08.267440+00:00",
+      "size": 580,
+      "sha256_prefix": "6a38c6ddd893a215",
+      "source_cutoff_utc": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 880277.624775,
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ],
+      "status": "CURRENT_UNCHANGED",
+      "config_eval": {
+        "file_status": "OK",
+        "runtime_status": "UNVERIFIED",
+        "fingerprint": "6a38c6ddd893a215",
+        "drift": "CURRENT_UNCHANGED",
+        "notes": [
+          "mtime age ignored; fingerprint/content used"
+        ]
+      }
+    },
+    "accounting_balance": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194227__balance.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:27.797773+00:00",
+      "size": 2986327,
+      "sha256_prefix": "33df7fb23b36d392",
+      "source_cutoff_utc": "2026-07-30T19:42:27.797773+00:00",
+      "age_seconds": 298.094442,
+      "status": "HEALTHY"
+    },
+    "accounting_open_stakes": {
+      "path": "/home/betbot/Bets/betinasia_bot/logs/accounting/20260730_194232__open_stakes.csv",
+      "exists": true,
+      "mtime_utc": "2026-07-30T19:42:32.344143+00:00",
+      "size": 34008,
+      "sha256_prefix": "a67caaac15206ad3",
+      "source_cutoff_utc": "2026-07-30T19:42:32.344143+00:00",
+      "age_seconds": 293.548072,
+      "status": "HEALTHY"
+    }
+  },
+  "generated_at_utc": "2026-07-30T19:47:25.884636+00:00",
+  "git_commit": "d4a3d42d501cd44597401376de3f599d8cde9038",
+  "hostname": "ubuntu-s-2vcpu-4gb-120gb-intel-sgp1-01"
+}
