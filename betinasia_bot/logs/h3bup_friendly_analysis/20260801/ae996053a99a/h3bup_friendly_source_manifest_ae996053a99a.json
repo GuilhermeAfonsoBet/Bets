@@ -1,0 +1,26 @@
+{
+  "run_id": "ae996053a99a",
+  "root": "/home/betbot/Bets/betinasia_bot",
+  "executor_jsonl": "/home/betbot/Bets/betinasia_bot/logs/executor_live.jsonl",
+  "executor_exists": true,
+  "balance_paths": [
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_010115__balance.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_010610__balance.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_011113__balance.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_011610__balance.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_012110__balance.csv"
+  ],
+  "open_paths": [
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_010118__open_stakes.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_010614__open_stakes.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_011116__open_stakes.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_011613__open_stakes.csv",
+    "/home/betbot/Bets/betinasia_bot/logs/accounting/20260801_012113__open_stakes.csv"
+  ],
+  "clv_snapshots": "/home/betbot/Bets/betinasia_bot/logs/h3bup_clv_snapshots.jsonl",
+  "clv_exists": true,
+  "cutoff_utc": "2026-08-01T01:22:38.188974+00:00",
+  "outputs_dir": "/home/betbot/Bets/betinasia_bot/logs/h3bup_friendly_analysis/20260801/ae996053a99a",
+  "read_only": true,
+  "operational_changes": false
+}

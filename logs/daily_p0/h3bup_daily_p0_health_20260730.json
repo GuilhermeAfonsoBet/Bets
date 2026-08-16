@@ -1,0 +1,111 @@
+{
+  "report_health": {
+    "status": "HEALTHY"
+  },
+  "operations_health": {
+    "status": "WATCH"
+  },
+  "data_quality": {
+    "status": "WATCH"
+  },
+  "statistical_readiness": {
+    "status": "INSUFFICIENT_N"
+  },
+  "config": {
+    "policy": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "8009c8fa4b67b75f",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    },
+    "risk_params": {
+      "file_status": "OK",
+      "runtime_status": "UNVERIFIED",
+      "fingerprint": "6a38c6ddd893a215",
+      "drift": "CURRENT_UNCHANGED",
+      "notes": [
+        "mtime age ignored; fingerprint/content used"
+      ]
+    }
+  },
+  "parity": {
+    "v1_report_path": "/home/betbot/Bets/betinasia_bot/logs/daily_reports/20260729/report_daily.md",
+    "v1_report_day_folder": "20260729",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_generated_at_utc": "2026-07-30T18:42:37.230518+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "parity_status": "CUTOFF_ALIGNED",
+    "cutoffs_equal": true,
+    "note": "Comparação de paridade usa o cutoff lógico do V1. Eventos após v1_report_cutoff_utc até v2_generated_at_utc são apenas diagnóstico intraday e não entram na paridade."
+  },
+  "cutoffs": {
+    "cohort_window_start_utc": "2026-07-29T00:00:00+00:00",
+    "cohort_window_end_utc": "2026-07-30T00:00:00+00:00",
+    "performance_as_of_utc": "2026-07-30T18:42:37.230443+00:00",
+    "v1_report_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_comparison_cutoff_utc": "2026-07-29T22:01:54.606850+00:00",
+    "v2_generated_at_utc": "2026-07-30T18:42:37.230518+00:00",
+    "parity_status": "CUTOFF_ALIGNED"
+  },
+  "source_manifest": {
+    "executor_live": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:41:40.614529+00:00",
+      "age_seconds": 56.615914
+    },
+    "accounting_health": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:37:35.705642+00:00",
+      "age_seconds": 301.524801
+    },
+    "accounting_daily_report": {
+      "status": "WATCH",
+      "cutoff": "2026-07-29T22:02:45.837136+00:00",
+      "age_seconds": 74391.393307
+    },
+    "e2e_trace": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:42:16.125608+00:00",
+      "age_seconds": 21.104835
+    },
+    "clv_health": {
+      "status": "WATCH",
+      "cutoff": "2026-07-30T18:42:14.609477+00:00",
+      "age_seconds": 22.620966
+    },
+    "clv_obligations": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:30:04.633817+00:00",
+      "age_seconds": 752.596626
+    },
+    "policy_current": {
+      "status": "CURRENT_UNCHANGED",
+      "cutoff": "2026-06-29T13:15:03.295096+00:00",
+      "age_seconds": 2698053.935347
+    },
+    "risk_params": {
+      "status": "CURRENT_UNCHANGED",
+      "cutoff": "2026-07-20T15:16:08.267440+00:00",
+      "age_seconds": 876388.963003
+    },
+    "accounting_balance": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:42:30.798883+00:00",
+      "age_seconds": 6.43156
+    },
+    "accounting_open_stakes": {
+      "status": "HEALTHY",
+      "cutoff": "2026-07-30T18:37:35.685640+00:00",
+      "age_seconds": 301.544803
+    }
+  },
+  "generated_at_utc": "2026-07-30T18:42:37.230518+00:00",
+  "run_id": "aeb30a9f16bc",
+  "official": false,
+  "telegram_preview_enabled": false,
+  "pdf": "/home/betbot/Bets/betinasia_bot/logs/daily_v2/H3BUP_DAILY_V2_PREVIEW_20260729_aeb30a9f16bc.pdf",
+  "pdf_preview_labeled": true
+}

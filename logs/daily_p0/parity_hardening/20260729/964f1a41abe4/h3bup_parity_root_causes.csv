@@ -1,0 +1,6 @@
+ID,metric,symptom,affected_order_ids,root_cause,correct_behaviour,classification,patch_applied,publication_blocker,owner
+PAR-001,LIVE_OK 22×24,V1=22 V2_full=24,"1938082582,1938105954",2 LIVE_OK after V1 cutoff included in V2 DAILY_CLOSED full day,parity view filters created_at<=parity_as_of → MATCH 22,EXPECTED_SCOPE_DIFFERENCE,filter_orders_as_of + dual views,no,reporting
+PAR-002,stake 220×240,same two post-cutoff orders × stake 10,"1938082582,1938105954",consequence of PAR-001,parity stake 220,EXPECTED_SCOPE_DIFFERENCE,parity as-of universe,no,reporting
+PAR-003,open 9×1,V1 accounting-health open=9; matured open=1,,AS_OF_MATURITY_DIFFERENCE + V1 health block used activation subset (n=12) not day universe (n=22),compare open only under same as_of and same order set,AS_OF_MATURITY_DIFFERENCE,parity_as_of vs matured_as_of sections,no,reporting
+PAR-004,settled 3×21,V1 health settled=3; matured settled=21,,settlements posted after V1 cutoff; plus V1 health subset,parity uses snapshot/post-date<=cutoff; matured shows later settlements,AS_OF_MATURITY_DIFFERENCE,dual settlement views,no,reporting
+PAR-005,ROI definition,V1 health ROI settled partial vs V2 roi_resolved,,EXPECTED_DEFINITION_CHANGE: V2 principal=roi_resolved (void in denom),keep roi_resolved; document void; show roi_decided_ex_void,EXPECTED_DEFINITION_CHANGE,documented in methodology,no,reporting

@@ -1,0 +1,13 @@
+{
+  "roi_vs_zero_sign_flip": {
+    "status": "OK",
+    "method": "event_pnl_sign_flip",
+    "null": "event-level PnL signs exchangeable under no-edge (exploratory)",
+    "observed_roi": -0.01551020408163266,
+    "p_one_sided": 0.3994520109597808,
+    "p_two_sided": 0.7930241395172096,
+    "n_perm": 50000,
+    "note": "Exploratory; not an operational gate."
+  },
+  "disclaimer": "P(ROI>0) from bootstrap \u2260 classical p-value. Sign-flip is exploratory."
+}

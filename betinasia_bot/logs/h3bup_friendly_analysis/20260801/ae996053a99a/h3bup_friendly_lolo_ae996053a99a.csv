@@ -1,0 +1,5 @@
+scenario,excluded_leagues,n_live_ok,stake_placed,pnl_resolved,roi_resolved
+total,,74,740.0,-277.1,-0.49482142857142863
+without_top1_league,UEFA Europa League,69,690.0,-148.3,-0.2851923076923077
+without_top3_leagues,UEFA Europa League|CONMEBOL Copa Sudamericana|Colombia Cup,63,630.0,-138.75000000000003,-0.30163043478260876
+without_top5_leagues,UEFA Europa League|CONMEBOL Copa Sudamericana|Colombia Cup|UEFA Champions League|Club Friendly,16,160.0,-4.600000000000001,-0.11500000000000003

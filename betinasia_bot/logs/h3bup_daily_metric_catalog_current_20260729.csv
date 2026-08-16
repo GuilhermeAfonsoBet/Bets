@@ -1,0 +1,27 @@
+metric_id,display_name_pt,version,universe,primary_timestamp,time_window,formula,unit,includes_open,void_policy,missing_oid_policy,h3bup_policy_filter,source_primary,status_if_unavailable,notes_pt
+live_ok_24h,LIVE_OK (24h),v1,LIVE_OK+rolling,event/created_at,rolling 24h from generation,count status=LIVE_OK,count,n/a,n/a,n/a,no,executor_live.jsonl,omit/0 ambiguous,KPI operacional; sample 20260728 = 2
+dry_ok_24h,DRY_OK (24h),v1,DRY_OK,event,rolling 24h,count,count,n/a,n/a,n/a,no,executor_live.jsonl,omit,Shadow vs live
+cap_blocked_24h,CAP_BLOCKED (24h),v1,accepted funnel,event,rolling 24h,count CAP_BLOCKED,count,n/a,n/a,n/a,no,executor_live.jsonl,omit,Capacidade; sample capacity blocks
+pnl_today,P&L hoje,v1,ledger,post/local,civil today REPORT_TZ,sum amounts today,currency,n/a,included if posted,n/a,no,balance CSV,Accounting indisponível,America/Sao_Paulo
+pnl_week,P&L semana,v1,ledger,post/local,Mon-today REPORT_TZ,sum,currency,n/a,included,n/a,no,balance CSV,—,REPORT_TZ
+pnl_month,P&L mês,v1,ledger,post/local,YYYY-MM REPORT_TZ,sum,currency,n/a,included,n/a,no,balance CSV,—,REPORT_TZ
+acct_pnl_post_date,P&L acct por post date,v1,ledger daily,post_date_utc,per post date UTC,sum pnl,currency,via posts,void in day,n/a,no,balance CSV,—,Coorte A dual
+roiw_total,ROIw Total,v1,Back LIVE_OK,created_at_utc,per exec day UTC,(sum pnl / sum exposure)*100,percent,yes if in ledger,pnl≈0 included in sums,excluded from num/den,NOT applied,executor+balance,— / None if den=0,Métrica complementar; w=exposure
+roiw_liquidado,ROIw liquidado (tese),v1,fast/slow subsets settled,created_at,tese windows,same on settled rows only,percent,excluded when open_stakes present,settled-like,excluded,partial,executor+balance+open,— without open_stakes,Requer open_stakes
+roi_settled,ROI settled,v1_health/v2,SETTLED_ORDER,created_at cohort settle as-of,as-of cutoff,sum pnl_settled / sum stake_settled,fraction,NO excluded,void pnl0 stake in den,missing counted separately,yes in reconcile H3BUP,reconcile+health,UNAVAILABLE_STALE/MISSING,Principal performance settled
+roi_mean_per_order,ROI mean por ordem,v1,subsets,created_at,tese/adh,mean of per-order roi,percent,depends,depends,excluded,no,executor+acct,—,Diferente de ROIw
+call_to_done_p50_24h,Latência p50 call_to_done 24h,v1,sucessos,timing,rolling 24h,percentile 50,ms,n/a,n/a,n/a,no,executor timing,—,Não é pre_submit
+call_to_done_p90_24h,Latência p90 call_to_done 24h,v1,sucessos,timing,rolling 24h,percentile 90,ms,n/a,n/a,n/a,no,executor timing,check vs threshold,Gate operacional V1
+fast_pre_submit_old,Back Pre fast (old<=6s),v1,Back Pre,created_at,pré-tese,pre_submit_ms<=6000,bool/count,n/a,n/a,NA separate poorly,no,validation_summary,—,Conceito fast#1
+fast_pre_submit_post,Back Pre fast (post<=5s),v1,Back Pre,created_at,pós 2026-04-20,pre_submit_ms<=5000,bool/count,n/a,n/a,—,no,EXECUTOR_BACKPRE_FAST_MAX_PRE_SUBMIT_MS,—,Conceito fast#2
+fast_call_to_done_cf,Contrafactual lat<=6s,v1,acct joined,mixed,per day tables,call_to_done_ms<=6000,filter,depends,—,excluded,no,timing+ledger,—,Conceito fast#3
+daily_fast_le_6s,DAILY_FAST_LE_6S,v2,LIVE_OK H3BUP,created_at,execution_day_utc,pre_submit_ms<=6000,count/rate,n/a,n/a,PRE_SUBMIT_MS_NA bucket,yes,executor,AVAILABLE/MISSING ms,Contrato utilizador Daily
+study_fast_lt_4s,STUDY_FAST_LT_4S,v2,LIVE_OK H3BUP,created_at,execution_day_utc,pre_submit_ms<4000,count/rate,n/a,n/a,NA bucket,yes,executor,exploratory label,Nunca substitui Daily fast
+e2e_ws_live_ok,E2E WS→LIVE_OK,v1_patch/v2,E2E_TRACE,event_ts,diagnostic,live_ok_ts-ws_ts,ms,n/a,n/a,n/a,H3BUP path,e2e_trace,INSUFFICIENT_N,Ausente no sample 20260728
+clv_post_5m,CLV POST_5M strict,v1_patch/v2,CLV_VALID_STRICT,live_ok_ts,post activation,valid strict count / stats,count,n/a,n/a,NOT_DUE/MISSING,yes,clv_health,INSUFFICIENT_N if n<30,Forward-only
+fair_edge,Fair edge / de-vig,v2_explicit,NOT_APPLICABLE,n/a,n/a,NOT_IMPLEMENTED,n/a,n/a,n/a,n/a,n/a,n/a,NOT_IMPLEMENTED,Não implementar como 0
+utc_adherence_7d,Aderência UTC 7d,v1,exec+scores,day utc,7d window,per_day adherence structs,mixed,n/a,n/a,n/a,no,adh JSON,—,Janela distinta de 24h KPI
+schema_version_envelope,schema_version,v1_missing/v2=2,report,n/a,n/a,const 2 in V2,int,n/a,n/a,n/a,n/a,snapshot,MISSING in V1,Gap V1
+run_id,run_id,v1_missing/v2,report,n/a,n/a,uuid/hex,string,n/a,n/a,n/a,n/a,snapshot,MISSING in V1,Gap V1
+report_health,report_health,v1_missing/v2,report,cutoff,as-of,HEALTHY|WATCH|PARTIAL|CRITICAL|FAILED,enum,n/a,n/a,n/a,n/a,manifest aggregate,MISSING in V1,Gap V1
+report_cutoff_utc,report_cutoff_utc,v1_missing/v2,report,cutoff,as-of,ISO datetime,string,n/a,n/a,n/a,n/a,window,MISSING in V1,Gap V1

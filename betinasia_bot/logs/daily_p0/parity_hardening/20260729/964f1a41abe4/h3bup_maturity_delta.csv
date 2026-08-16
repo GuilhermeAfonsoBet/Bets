@@ -1,0 +1,8 @@
+metric,parity_as_of,matured_as_of,delta
+open,6,1,-5
+settled,15,21,6
+void,1,2,1
+missing,0,0,0
+stake_resolved,160.0,230.0,
+pnl_resolved,-6.51,6.600000000000001,
+roi_resolved,-0.0406875,0.02869565217391305,
